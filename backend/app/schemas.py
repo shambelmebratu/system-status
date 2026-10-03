@@ -1,0 +1,72 @@
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from .config import get_settings
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class ServerCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    host: str = Field(min_length=1, max_length=255)
+    monitor_mode: str = Field(default="agent", pattern="^(ping|agent)$")
+    check_interval_seconds: int = Field(default_factory=lambda: get_settings().check_interval_seconds, ge=5, le=86400)
+    endpoint: str = Field(default="", max_length=500)
+    agent_token: str = ""
+    enabled: bool = True
+    cpu_threshold: float = Field(default_factory=lambda: get_settings().cpu_threshold, ge=1, le=100)
+    memory_threshold: float = Field(default_factory=lambda: get_settings().memory_threshold, ge=1, le=100)
+    disk_threshold: float = Field(default_factory=lambda: get_settings().disk_threshold, ge=1, le=100)
+    load_threshold: float = Field(default_factory=lambda: get_settings().load_threshold, ge=0)
+    swap_threshold: float = Field(default_factory=lambda: get_settings().swap_threshold, ge=1, le=100)
+    process_names: str = ""
+    process_threshold: float = Field(default_factory=lambda: get_settings().process_threshold, ge=1, le=100)
+
+    @model_validator(mode="after")
+    def require_agent_fields_for_metrics(self):
+        if self.monitor_mode == "agent":
+            if not self.endpoint:
+                raise ValueError("Agent endpoint is required for host metrics mode")
+        return self
+
+
+class ServiceCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    url: str = Field(min_length=8, max_length=500)
+    expected_status: int = Field(200, ge=100, le=599)
+    interval_seconds: int = Field(60, ge=15, le=86400)
+    enabled: bool = True
+    server_id: int | None = None
+
+
+class ChannelCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    type: str = Field(default="telegram", pattern="^(telegram|webhook|slack|whatsapp)$")
+    token: str = ""
+    chat_id: str = ""
+    endpoint: str = ""
+    phone_number_id: str = ""
+    template_name: str = ""
+    template_language: str = "en_US"
+    enabled: bool = True
+
+    @model_validator(mode="after")
+    def validate_provider_fields(self):
+        if self.type == "telegram" and (len(self.token) < 10 or not self.chat_id):
+            raise ValueError("Telegram requires a bot token and chat/group ID")
+        if self.type == "slack" and not self.endpoint.startswith("https://hooks.slack.com/"):
+            raise ValueError("Slack requires an HTTPS Incoming Webhook URL")
+        if self.type == "webhook" and not self.endpoint.startswith(("https://", "http://")):
+            raise ValueError("Webhook requires an HTTP or HTTPS URL")
+        if self.type == "whatsapp":
+            if len(self.token) < 20:
+                raise ValueError("WhatsApp requires a Meta Cloud API access token")
+            if not self.phone_number_id or not self.chat_id or not self.template_name:
+                raise ValueError("WhatsApp requires phone number ID, recipient number, and approved template name")
+        return self
+
+
+class ORMModel(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
