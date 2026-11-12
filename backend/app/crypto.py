@@ -22,6 +22,7 @@ def _fernet() -> Fernet:
         except ValueError:
             pass  # any other non-empty value is treated as a passphrase
     source = key or settings.jwt_secret
+    # NOTE: this salt predates the SM-Watch rename and must never change: it derives the key that decrypts stored secrets.
     derived = hashlib.sha256(b"northstar-secrets:" + source.encode()).digest()
     return Fernet(base64.urlsafe_b64encode(derived))
 

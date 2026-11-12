@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .config import get_settings
@@ -93,10 +95,53 @@ class AgentReport(BaseModel):
     platform: str = Field(default="", max_length=255)
     agent_version: str = Field(default="", max_length=32)
     processes: list[ProcessSample] = Field(default_factory=list, max_length=100)
+    capabilities: list[str] = Field(default_factory=list, max_length=20)
 
 
 class TokenBody(BaseModel):
     token: str = Field(min_length=10, max_length=200)
+
+
+class EnrollmentCreate(BaseModel):
+    label: str = Field(default="", max_length=100)
+    expires_minutes: int = Field(default=15, ge=1, le=24 * 60)  # short-lived by design: 15 minutes unless the admin picks otherwise
+    max_uses: int | None = Field(default=None, ge=1, le=10000)       # None = unlimited
+
+
+class EnrollRequest(BaseModel):
+    hostname: str = Field(min_length=1, max_length=255)
+    machine_id: str = Field(default="", max_length=128)
+    platform: str = Field(default="", max_length=255)
+    agent_version: str = Field(default="", max_length=32)
+
+
+class ScheduledMessageIn(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    text: str = Field(min_length=1, max_length=4000)
+    channel_ids: list[int] = Field(min_length=1, max_length=50)
+    repeat: str = Field(default="daily", pattern="^(once|daily|weekly)$")
+    time_of_day: str = Field(default="09:00", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    days_of_week: list[int] = Field(default_factory=list, max_length=7)  # 1=Mon..7=Sun; empty = every day
+    run_at: datetime | None = None                                       # required for repeat=once
+    timezone: str = Field(default="UTC", max_length=64)
+    enabled: bool = True
+
+
+class LogQuery(BaseModel):
+    """A log request the dashboard queues for an agent. Every field is re-validated by the agent before use."""
+    source: str = Field(pattern="^(inventory|docker|journal|file)$")
+    target: str = Field(default="", max_length=300, pattern=r"^[A-Za-z0-9@_.:/\-]*$")  # container name, systemd unit, or file path
+    lines: int = Field(default=200, ge=1, le=2000)
+    since_minutes: int = Field(default=0, ge=0, le=60 * 24 * 30)                     # 0 = no time limit
+    grep: str = Field(default="", max_length=200)                                     # plain substring, case-insensitive (not a regex)
+    priority: str = Field(default="", pattern="^(|emerg|alert|crit|err|warning|notice|info|debug)$")
+
+
+class LogResult(BaseModel):
+    ok: bool
+    output: str = Field(default="", max_length=600_000)
+    error: str = Field(default="", max_length=2000)
+    truncated: bool = False
 
 
 class PasswordChange(BaseModel):

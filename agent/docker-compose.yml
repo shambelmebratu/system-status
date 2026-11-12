@@ -1,10 +1,10 @@
 services:
-  northstar-agent:
-    image: ${AGENT_IMAGE:-northstar-agent:local}
+  sm-watch-agent:
+    image: ${AGENT_IMAGE:-sm-watch-agent:local}
     build:
       context: ..
       dockerfile: agent/Dockerfile
-    container_name: northstar-agent
+    container_name: sm-watch-agent
     restart: unless-stopped
     pid: host
     read_only: true
@@ -12,15 +12,19 @@ services:
       - path: .env
         required: false
     environment:
-      AGENT_TOKEN: ${AGENT_TOKEN:?Set AGENT_TOKEN in agent/.env}
-      # Push mode (recommended): set NORTHSTAR_URL and no inbound port is needed. Leave empty for pull mode.
-      NORTHSTAR_URL: ${NORTHSTAR_URL:-}
+      # Recommended: a join token from the dashboard (Servers -> Add server -> Install agent). The agent registers itself
+      # and keeps its own token in the sm-watch-agent-data volume. Alternatively set a per-server AGENT_TOKEN.
+      SMWATCH_JOIN: ${SMWATCH_JOIN:-}
+      AGENT_TOKEN: ${AGENT_TOKEN:-}
+      # Push mode (recommended): set SMWATCH_URL and no inbound port is needed. Leave empty for pull mode.
+      SMWATCH_URL: ${SMWATCH_URL:-}
       AGENT_HOST_ROOT: ${AGENT_HOST_ROOT:-/host}
       AGENT_PROCFS_PATH: ${AGENT_PROCFS_PATH:-/host/proc}
       AGENT_DISK_PATH: ${AGENT_DISK_PATH:-/host}
       AGENT_PROCESS_TOP_N: ${AGENT_PROCESS_TOP_N:-20}
       AGENT_PROCESS_SAMPLE_SECONDS: ${AGENT_PROCESS_SAMPLE_SECONDS:-0.15}
     volumes:
+      - sm-watch-agent-data:/var/lib/sm-watch-agent
       - /:${AGENT_HOST_ROOT:-/host}:ro,rslave
       - /proc:${AGENT_PROCFS_PATH:-/host/proc}:ro
     ports:
@@ -37,3 +41,6 @@ services:
       timeout: 3s
       start_period: 5s
       retries: 3
+
+volumes:
+  sm-watch-agent-data:

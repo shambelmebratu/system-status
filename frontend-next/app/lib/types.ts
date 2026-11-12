@@ -5,7 +5,7 @@ export type ProcessSample = { pid: number; name: string; user?: string; cpu: num
 export type Metrics = {
   hostname?: string; platform?: string; agent_version?: string; cpu?: number; cpu_count?: number; memory?: number; disk?: number;
   load?: number; swap?: number; uptime_seconds?: number; net_rx_bps?: number | null; net_tx_bps?: number | null;
-  latency_ms?: number; reachability?: string; processes?: ProcessSample[];
+  latency_ms?: number; reachability?: string; processes?: ProcessSample[]; capabilities?: string[];
 };
 
 export type Server = {
@@ -43,3 +43,14 @@ export type ServiceHistory = {
   latency_max: number | null; recent_failures: { t: string; error: string | null; http_status: number | null }[]; daily: Daily[];
 };
 export type Range = '1h' | '6h' | '24h' | '7d' | '30d';
+
+export type Enrollment = {
+  id: number; label: string; token: string; uses: number; max_uses: number | null; created_at: string; expires_at: string | null;
+  last_used_at: string | null; revoked: boolean; active: boolean; state: 'active' | 'expired' | 'revoked' | 'used up';
+};
+
+export type ScheduledMessage = {
+  id: number; name: string; text: string; channel_ids: number[]; repeat: 'once' | 'daily' | 'weekly'; time_of_day: string; days_of_week: number[];
+  run_at: string | null; timezone: string; enabled: boolean; next_run_at: string | null; last_run_at: string | null;
+  last_status: 'sent' | 'partial' | 'failed' | 'missed' | null; last_error: string | null; preview: string | null;
+};

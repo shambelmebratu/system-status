@@ -12,9 +12,9 @@ INSECURE_DEFAULTS = {
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    app_name: str = "Northstar Operations"
+    app_name: str = "SM-Watch"
     environment: str = "production"
-    database_url: str = "postgresql+psycopg://northstar:northstar@postgres:5432/northstar"
+    database_url: str = "postgresql+psycopg://smwatch:smwatch@postgres:5432/smwatch"
     jwt_secret: str = "change-this-secret-before-production"
     admin_email: str = "admin@example.com"
     admin_password: str = "change-me-now"
@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     reminder_minutes: int = 30         # minimum gap between repeat alerts while a target stays down
     alert_retry_minutes: int = 60      # undelivered alerts older than this are expired, not retried
     public_status_enabled: bool = True
+    host_agent_token_file: str = ""  # when set, the API provisions a server entry + token for the bundled host agent
     public_url: str = ""  # externally reachable control-plane URL shown in agent install commands (e.g. https://monitor.example.com)
     cookie_secure: bool = False  # set true when served over HTTPS
     login_max_attempts: int = 5
@@ -43,7 +44,7 @@ class Settings(BaseSettings):
     load_threshold: float = 10
     swap_threshold: float = 80
     process_threshold: float = 80
-    company_name: str = "Northstar Operations"
+    company_name: str = "SM-Watch"
     brand_primary_color: str = "#c9f36b"
     brand_accent_color: str = "#68d5e8"
 

@@ -59,7 +59,7 @@ function ChannelForm({ existing, onClose }: { existing?: Channel; onClose: () =>
   const [type, setType] = useState<ChannelType>(existing?.type ?? 'telegram');
   const [enabled, setEnabled] = useState(existing?.enabled ?? true);
   const keep = existing && existing.type === type ? 'Leave blank to keep the saved value' : undefined;
-  const [f, setF] = useState({ name: existing?.name ?? '', token: '', chat_id: existing?.chat_id ?? '', endpoint: '', phone_number_id: existing?.phone_number_id ?? '', template_name: existing?.template_name ?? 'northstar_alert', template_language: 'en_US' });
+  const [f, setF] = useState({ name: existing?.name ?? '', token: '', chat_id: existing?.chat_id ?? '', endpoint: '', phone_number_id: existing?.phone_number_id ?? '', template_name: existing?.template_name ?? 'smwatch_alert', template_language: 'en_US' });
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [found, setFound] = useState<{ bot: string; chats: { id: number; type: string; title: string }[] } | null>(null);

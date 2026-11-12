@@ -2,8 +2,8 @@ services:
   postgres:
     image: postgres:17-alpine
     environment:
-      POSTGRES_DB: ${POSTGRES_DB:-northstar}
-      POSTGRES_USER: ${POSTGRES_USER:-northstar}
+      POSTGRES_DB: ${POSTGRES_DB:-smwatch}
+      POSTGRES_USER: ${POSTGRES_USER:-smwatch}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-replace-this-password}
     volumes:
       - postgres_data:/var/lib/postgresql/data
@@ -20,7 +20,7 @@ services:
       dockerfile: backend/Dockerfile
     command: ["alembic", "-c", "alembic.ini", "upgrade", "head"]
     environment:
-      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-northstar}:${POSTGRES_PASSWORD:-replace-this-password}@postgres:5432/${POSTGRES_DB:-northstar}
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-smwatch}:${POSTGRES_PASSWORD:-replace-this-password}@postgres:5432/${POSTGRES_DB:-smwatch}
       JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET (32+ random chars) in .env}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD (12+ chars) in .env}
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
@@ -36,7 +36,7 @@ services:
       dockerfile: backend/Dockerfile
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
     environment:
-      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-northstar}:${POSTGRES_PASSWORD:-replace-this-password}@postgres:5432/${POSTGRES_DB:-northstar}
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-smwatch}:${POSTGRES_PASSWORD:-replace-this-password}@postgres:5432/${POSTGRES_DB:-smwatch}
       JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET (32+ random chars) in .env}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD (12+ chars) in .env}
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
@@ -44,12 +44,15 @@ services:
       ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
       CHECK_INTERVAL_SECONDS: ${CHECK_INTERVAL_SECONDS:-60}
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      HOST_AGENT_TOKEN_FILE: /shared/agent.token
     env_file:
       - path: .env
         required: false
     depends_on:
       migrate:
         condition: service_completed_successfully
+    volumes:
+      - host_agent:/shared
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
       interval: 5s
@@ -65,7 +68,7 @@ services:
     cap_add:
       - NET_RAW
     environment:
-      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-northstar}:${POSTGRES_PASSWORD:-replace-this-password}@postgres:5432/${POSTGRES_DB:-northstar}
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-smwatch}:${POSTGRES_PASSWORD:-replace-this-password}@postgres:5432/${POSTGRES_DB:-smwatch}
       JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET (32+ random chars) in .env}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD (12+ chars) in .env}
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
@@ -77,6 +80,31 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+    restart: unless-stopped
+
+  # Monitors the machine this stack runs on: metrics plus the Logs tab (container logs, journald, /var/log).
+  # It appears in the dashboard as "This server (control plane)". It mounts the host read-only and the Docker
+  # socket (root-equivalent access); set HOST_AGENT_LOGS=nodocker or off in .env to reduce that, or delete this service.
+  host-agent:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: ["python", "agent.py"]
+    pid: host
+    environment:
+      SMWATCH_URL: http://api:8000
+      AGENT_TOKEN_FILE: /shared/agent.token
+      AGENT_HOST_ROOT: /host
+      AGENT_PROCFS_PATH: /host/proc
+      AGENT_DISK_PATH: /host
+      AGENT_LOGS: ${HOST_AGENT_LOGS:-on}
+    volumes:
+      - /:/host:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - host_agent:/shared:ro
+    depends_on:
+      api:
+        condition: service_healthy
     restart: unless-stopped
 
   frontend:
@@ -94,3 +122,4 @@ services:
 
 volumes:
   postgres_data:
+  host_agent:

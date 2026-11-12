@@ -7,16 +7,18 @@ import { AppProvider, useApp } from './lib/app';
 import { Channels } from './views/Channels';
 import { Incidents } from './views/Incidents';
 import { Login } from './views/Login';
+import { Logs } from './views/Logs';
 import { Overview } from './views/Overview';
 import { Servers } from './views/Servers';
 import { Services } from './views/Services';
+import { Schedules } from './views/Schedules';
 import { Settings } from './views/Settings';
 
 type Session = { email: string } | null | 'loading';
 
 export default function Home() {
   const [session, setSession] = useState<Session>('loading');
-  const [company, setCompany] = useState('Northstar Operations');
+  const [company, setCompany] = useState('SM-Watch');
 
   useEffect(() => {
     api<{ company_name: string; primary_color: string; accent_color: string }>('/branding').then(b => {
@@ -38,8 +40,10 @@ const NAV = [
   { id: 'overview', label: 'Overview', icon: 'overview' },
   { id: 'servers', label: 'Servers', icon: 'server' },
   { id: 'services', label: 'Services', icon: 'globe' },
+  { id: 'logs', label: 'Logs', icon: 'logs' },
   { id: 'incidents', label: 'Incidents', icon: 'alert' },
   { id: 'alerts', label: 'Alerts', icon: 'bell' },
+  { id: 'schedules', label: 'Schedules', icon: 'clock' },
   { id: 'settings', label: 'Settings', icon: 'settings' },
 ];
 
@@ -54,10 +58,10 @@ function Shell({ company, email, onSignOut }: { company: string; email: string; 
   const toggleTheme = () => {
     const next = theme === 'dark' ? 'light' : 'dark';
     setTheme(next); document.documentElement.dataset.theme = next;
-    try { localStorage.setItem('ns_theme', next); } catch { /* storage unavailable */ }
+    try { localStorage.setItem('smw_theme', next); } catch { /* storage unavailable */ }
   };
 
-  const view = { overview: <Overview />, servers: <Servers />, services: <Services />, incidents: <Incidents />, alerts: <Channels />, settings: <Settings email={email} /> }[page] ?? <Overview />;
+  const view = { overview: <Overview />, servers: <Servers />, services: <Services />, incidents: <Incidents />, alerts: <Channels />, schedules: <Schedules />, logs: <Logs />, settings: <Settings email={email} /> }[page] ?? <Overview />;
 
   return (
     <div className="shell">

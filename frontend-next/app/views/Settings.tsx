@@ -1,8 +1,10 @@
 'use client';
 
-import { FormEvent, useEffect, useState } from 'react';
+import { FormEvent, Fragment, useEffect, useState } from 'react';
+import { JoinCommands, expiryText, useActiveEnrollment, useControlPlaneUrl } from '../components/join';
 import { CodeBox, Field } from '../components/ui';
 import { post } from '../lib/api';
+import { timeAgo } from '../lib/format';
 import { useApp } from '../lib/app';
 
 export function Settings({ email }: { email: string }) {
@@ -38,6 +40,53 @@ export function Settings({ email }: { email: string }) {
           <p className="sm muted" style={{ marginTop: 14 }}>{data?.services.filter(s => s.public).length ?? 0} of {data?.services.length ?? 0} services are public.</p>
         </section>
       </div>
+      <JoinTokens />
     </>
+  );
+}
+
+function JoinTokens() {
+  const { toast } = useApp();
+  const [base] = useControlPlaneUrl();
+  const enrollment = useActiveEnrollment();
+  const [label, setLabel] = useState('');
+  const [minutes, setMinutes] = useState('15');
+  const [maxUses, setMaxUses] = useState('');
+  const [openId, setOpenId] = useState<number | null>(null);
+
+  async function create(event: FormEvent) {
+    event.preventDefault();
+    try {
+      await post('/enrollments', { label, expires_minutes: Number(minutes), max_uses: maxUses ? Number(maxUses) : null });
+      setLabel(''); setMaxUses(''); toast('Join token created'); await enrollment.reload();
+    } catch (caught) { toast((caught as Error).message, true); }
+  }
+
+  return (
+    <section className="card" style={{ marginTop: 16 }}>
+      <div className="card-head"><h2>Agent join tokens</h2></div>
+      <p className="muted sm" style={{ marginBottom: 14 }}>A join token lets a server register itself as a new monitor with a single command. Anyone holding an active token can add servers to this dashboard, so links are short-lived (15 minutes by default, 24 hours at most). Add a server limit for extra safety and revoke links you no longer need. Revoking never disconnects servers that already joined.</p>
+      <form onSubmit={create} className="form-grid" style={{ marginBottom: 16, alignItems: 'end' }}>
+        <Field label="Label"><input value={label} onChange={e => setLabel(e.target.value)} placeholder="e.g. new web servers" /></Field>
+        <Field label="Expires"><select value={minutes} onChange={e => setMinutes(e.target.value)}><option value="10">in 10 minutes</option><option value="15">in 15 minutes</option><option value="60">in 1 hour</option><option value="1440">in 24 hours (maximum)</option></select></Field>
+        <Field label="Max servers (optional)"><input type="number" min={1} value={maxUses} onChange={e => setMaxUses(e.target.value)} placeholder="unlimited" /></Field>
+        <button className="btn primary">Create token</button>
+      </form>
+      {!enrollment.items?.length ? <p className="muted sm">No tokens yet.</p> : (
+        <table className="tbl"><thead><tr><th>Token</th><th>Status</th><th>Used</th><th className="hide-sm">Last used</th><th /></tr></thead><tbody>
+          {enrollment.items.map(t => (
+            <Fragment key={t.id}>
+              <tr>
+                <td><div className="name">{t.label || 'Untitled'}<small className="mono">{t.token.slice(0, 8)}…</small></div></td>
+                <td><span className={`pill ${t.active ? 'up' : 'unknown'}`}><i />{expiryText(t)}</span></td>
+                <td>{t.uses}{t.max_uses ? ` / ${t.max_uses}` : ''}</td><td className="hide-sm muted">{t.last_used_at ? timeAgo(t.last_used_at) : 'never'}</td>
+                <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>{t.active && <><button className="btn sm" onClick={() => setOpenId(openId === t.id ? null : t.id)}>{openId === t.id ? 'Hide command' : 'Show command'}</button> <button className="btn sm danger" onClick={() => enrollment.revoke(t.id)}>Revoke</button></>}</td>
+              </tr>
+              {openId === t.id && <tr><td colSpan={5}><JoinCommands token={t.token} base={base} /></td></tr>}
+            </Fragment>
+          ))}
+        </tbody></table>
+      )}
+    </section>
   );
 }

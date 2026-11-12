@@ -7,7 +7,7 @@ export async function api<T = unknown>(path: string, options: RequestInit = {}):
   const response = await fetch(`/api${path}`, {
     ...options,
     credentials: 'same-origin',
-    headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'northstar', ...(options.headers || {}) },
+    headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'smwatch', ...(options.headers || {}) },
   });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {

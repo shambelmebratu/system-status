@@ -1,4 +1,6 @@
 import json
+import logging
+import os
 import re
 import secrets
 from contextlib import asynccontextmanager
@@ -13,6 +15,9 @@ from .database import Base, engine, get_db
 from .models import AlertEvent, Channel, CheckResult, Incident, Server, Service, User
 from .monitoring import check_service, discover_telegram_chats, run_once, send_channel_test
 from .routes_agent import hash_token, router as agent_router
+from .routes_enroll import router as enroll_router
+from .routes_logs import router as logs_router
+from .routes_schedule import router as schedule_router
 from .routes_stats import router as stats_router
 from .schemas import ChannelCreate, ChannelUpdate, LoginRequest, PasswordChange, TokenBody, ServerCreate, ServiceCreate
 from .stats import uptime_by_target
@@ -22,17 +27,52 @@ from .security import COOKIE_NAME, create_token, hash_password, login_limiter, r
 settings = get_settings()
 
 
+HOST_AGENT_ID = "control-plane-host"
+
+
+def ensure_host_agent(session: Session) -> None:
+    """Provisions the dashboard entry and token for the stack's own `host-agent` service (the machine running SM-Watch)."""
+    path = settings.host_agent_token_file
+    if not path:
+        return
+    try:
+        server = session.scalar(select(Server).where(Server.machine_id == HOST_AGENT_ID))
+        try:
+            with open(path) as handle:
+                current = handle.read().strip()
+        except OSError:
+            current = ""
+        if server and current and server.token_hash == hash_token(current):
+            return
+        token = secrets.token_urlsafe(32)
+        if server is None:
+            server = Server(name="This server (control plane)", host="", monitor_mode="push", check_interval_seconds=settings.check_interval_seconds, machine_id=HOST_AGENT_ID)
+            session.add(server)
+        server.monitor_mode = "push"
+        set_token(server, token)
+        session.commit()
+        with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as handle:
+            handle.write(token)
+    except Exception:  # never block API startup on this convenience feature
+        session.rollback()
+        logging.getLogger(__name__).exception("could not provision the host agent")
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     with Session(engine) as session:
         if not session.scalar(select(User).limit(1)):
             session.add(User(email=settings.admin_email.lower(), password_hash=hash_password(settings.admin_password)))
             session.commit()
+        ensure_host_agent(session)
     yield
 
 
 app = FastAPI(title=settings.app_name, version="4.0.0", lifespan=lifespan)
 app.include_router(agent_router)
+app.include_router(enroll_router)
+app.include_router(schedule_router)
+app.include_router(logs_router)
 app.include_router(stats_router)
 
 

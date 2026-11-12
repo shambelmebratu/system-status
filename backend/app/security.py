@@ -13,9 +13,9 @@ from sqlalchemy.orm import Session
 from .config import get_settings
 from .database import get_db
 
-COOKIE_NAME = "northstar_session"
+COOKIE_NAME = "smwatch_session"
 CSRF_HEADER = "x-requested-with"
-CSRF_VALUE = "northstar"
+CSRF_VALUE = "smwatch"
 
 bearer = HTTPBearer(auto_error=False)
 

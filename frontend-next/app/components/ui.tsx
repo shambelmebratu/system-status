@@ -19,6 +19,8 @@ const ICONS: Record<string, string> = {
   moon: 'M21 12.8A9 9 0 1111.2 3a7 7 0 009.8 9.8z',
   back: 'M15 18l-6-6 6-6',
   logout: 'M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4m7 14l5-5-5-5m5 5H9',
+  logs: 'M4 5h16M4 10h16M4 15h10M4 20h7',
+  clock: 'M12 2a10 10 0 100 20 10 10 0 000-20zm0 5v5l3 2',
   star: 'M12 2l3 7 7 .6-5.3 4.7 1.6 7.2L12 17.8 5.7 21.5l1.6-7.2L2 9.6 9 9l3-7z',
   external: 'M14 4h6v6m0-6L10 14M20 14v6H4V4h6',
 };

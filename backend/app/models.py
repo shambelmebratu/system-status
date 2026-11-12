@@ -41,6 +41,7 @@ class Server(Base):
     fail_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     public: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     token_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    machine_id: Mapped[str | None] = mapped_column(String(64), index=True)
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     services: Mapped[list["Service"]] = relationship(passive_deletes=True)
@@ -140,3 +141,55 @@ class Incident(Base):
     detail: Mapped[str | None] = mapped_column(Text)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class Enrollment(Base):
+    """A join token an admin hands out; agents present it once to register themselves as new servers."""
+    __tablename__ = "enrollments"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    label: Mapped[str] = mapped_column(String(100), default="")
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    token: Mapped[str] = mapped_column(EncryptedText)  # stored encrypted so the admin can copy the command again later
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    max_uses: Mapped[int | None] = mapped_column(Integer)
+    uses: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    revoked: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ScheduledMessage(Base):
+    """A message sent to chosen notification channels on a schedule (e.g. a daily stand-up reminder)."""
+    __tablename__ = "scheduled_messages"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100))
+    text: Mapped[str] = mapped_column(Text)
+    channel_ids: Mapped[str] = mapped_column(Text, default="[]")          # JSON list of channel ids
+    repeat: Mapped[str] = mapped_column(String(10), default="daily")      # once | daily | weekly
+    time_of_day: Mapped[str] = mapped_column(String(5), default="09:00")  # HH:MM in `timezone`
+    days_of_week: Mapped[str] = mapped_column(String(20), default="")     # "1,2,3,4,5" (Mon=1..Sun=7); empty = every day
+    run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))  # one-time runs (UTC)
+    timezone: Mapped[str] = mapped_column(String(64), default="UTC")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    pending_channel_ids: Mapped[str | None] = mapped_column(Text)         # channels still to retry for the current run
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_status: Mapped[str | None] = mapped_column(String(20))           # sent | partial | failed | missed
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class LogRequest(Base):
+    """A short-lived, on-demand log fetch: queued by the dashboard, executed by the server's agent, read back by the dashboard."""
+    __tablename__ = "log_requests"
+    __table_args__ = (Index("ix_log_requests_server_status", "server_id", "status"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    server_id: Mapped[int] = mapped_column(ForeignKey("servers.id", ondelete="CASCADE"))
+    query: Mapped[str] = mapped_column(Text)                     # JSON of the validated LogQuery
+    status: Mapped[str] = mapped_column(String(10), default="pending")  # pending | running | done | error
+    output: Mapped[str | None] = mapped_column(Text)
+    error: Mapped[str | None] = mapped_column(Text)
+    truncated: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

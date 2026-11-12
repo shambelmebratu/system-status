@@ -3,6 +3,8 @@
 import { FormEvent, useEffect, useState } from 'react';
 import { AvailabilityPanel } from '../components/availability';
 import { AreaChart, Ring } from '../components/charts';
+import { JoinCommands, expiryText, useActiveEnrollment, useControlPlaneUrl } from '../components/join';
+import { LogsPanel } from '../components/logs';
 import { CodeBox, Empty, Field, Icon, Meter, Modal, StatusPill } from '../components/ui';
 import { api, del, post, put } from '../lib/api';
 import { useApp, usePoll } from '../lib/app';
@@ -56,6 +58,8 @@ function ServerDetail({ server }: { server: Server }) {
   const [range, setRange] = useState<Range>('24h');
   const [editing, setEditing] = useState(false);
   const [rotated, setRotated] = useState<string | null>(null);
+  const [tab, setTab] = useState<'overview' | 'logs'>('overview');
+  const canLogs = server.monitor_mode === 'push' && !!server.last_metrics?.capabilities?.includes('logs');
   const history = usePoll(() => api<ServerHistory>(`/servers/${server.id}/history?range=${range}`), [server.id, range], 20000);
   const incidents = usePoll(() => api<Incident[]>('/incidents?limit=200'), [server.id], 30000);
   const m = server.last_metrics;
@@ -84,13 +88,15 @@ function ServerDetail({ server }: { server: Server }) {
         <button className="btn sm danger" onClick={remove}>Remove</button>
       </div>
 
+      {canLogs && <div className="seg" style={{ marginBottom: 16 }}><button className={tab === 'overview' ? 'on' : ''} onClick={() => setTab('overview')}>Overview</button><button className={tab === 'logs' ? 'on' : ''} onClick={() => setTab('logs')}>Logs</button></div>}
       {server.last_status === 'down' && server.last_error && <div className="err" style={{ marginBottom: 16 }}>{server.last_error}</div>}
+      {tab === 'logs' && canLogs && <LogsPanel serverId={server.id} />}
       {never && (
         <div className="card" style={{ marginBottom: 16 }}><div className="card-head"><h2>Waiting for the agent</h2></div>
           <p className="muted">No report has been received yet. Install the agent with the token shown when this server was created (use <b>Rotate token</b> to get a new one).</p></div>
       )}
 
-      <div className="grid g-side">
+      <div className="grid g-side" style={tab === 'logs' && canLogs ? { display: 'none' } : undefined}>
         <div className="grid">
           <section className="card">
             <div className="card-head"><h2>Current</h2><span className="grow" /><span className="sm muted">{server.monitor_mode === 'push' ? `last report ${timeAgo(server.last_seen_at)}` : `checked ${timeAgo(server.last_checked_at)}`}</span></div>
@@ -198,6 +204,7 @@ function ServerWizard({ existing, onClose }: { existing?: Server; onClose: () =>
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [created, setCreated] = useState<Server | null>(null);
+  const [joining, setJoining] = useState(false);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -220,14 +227,15 @@ function ServerWizard({ existing, onClose }: { existing?: Server; onClose: () =>
 
   if (created) return <Modal title={`Install the agent on ${created.name}`} onClose={() => { onClose(); go(`servers/${created.id}`); }} wide><InstallInstructions token={created.install_token!} serverId={created.id} /></Modal>;
 
+  if (joining) return <JoinModal onClose={onClose} />;
   if (!mode) {
     return (
       <Modal title="Add a server" onClose={onClose}>
         <p className="muted">How do you want to monitor it?</p>
         <div className="method">
-          <button onClick={() => setMode('push')}><b>Install agent <span className="tag">recommended</span></b><span>Full metrics: CPU, memory, disk, network, processes. The agent reports out, so no inbound ports or VPN needed.</span></button>
-          <button onClick={() => setMode('ping')}><b>Ping only</b><span>Just check that a host answers ICMP ping. Nothing to install.</span></button>
-          <button onClick={() => setMode('agent')}><b>Pull agent</b><span>The control plane polls an agent’s /metrics endpoint. Needs that port to be reachable from here.</span></button>
+          <button onClick={() => setJoining(true)}><b>Install agent <span className="tag">recommended</span></b><span>One command on the server. It registers itself and reports CPU, memory, disk, network and processes. No inbound ports needed.</span></button>
+          <button onClick={() => setMode('ping')}><b>Ping only</b><span>Just check that a host answers ping. Nothing to install: enter an IP or hostname.</span></button>
+          <button onClick={() => setMode('agent')}><b>Advanced: pull agent</b><span>The control plane polls an agent’s /metrics endpoint. Needs that port to be reachable from here.</span></button>
         </div>
       </Modal>
     );
@@ -267,6 +275,37 @@ function ServerWizard({ existing, onClose }: { existing?: Server; onClose: () =>
   );
 }
 
+function JoinModal({ onClose }: { onClose: () => void }) {
+  const { data, go } = useApp();
+  const [base, setBase] = useControlPlaneUrl();
+  const enrollment = useActiveEnrollment();
+  const [opened] = useState(() => Date.now());
+  const joined = (data?.servers ?? []).filter(s => s.monitor_mode === 'push' && new Date((s as unknown as { created_at: string }).created_at).getTime() >= opened - 5000);
+  const local = /localhost|127\.0\.0\.1/.test(base);
+  const e = enrollment.active;
+  return (
+    <Modal title="Install the agent on a server" onClose={onClose} wide>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+        <ol className="steps">
+          <li><b>Run this one command on the server</b>
+            {enrollment.error ? <div className="err">{enrollment.error}</div>
+              : !enrollment.items ? <p className="muted sm">Creating your install link…</p>
+              : !e ? <div className="banner">The install link expired. <button className="btn sm primary" style={{ marginLeft: 8 }} onClick={() => void enrollment.renew()}>Generate a new command</button></div>
+              : <JoinCommands token={e.token} base={base} />}
+          </li>
+          <li><b>That’s it</b><span className="sm muted">The server registers itself under its hostname and appears below within seconds. You can rename it, set alert thresholds or add it to the status page afterwards. Run the same command on as many servers as you like.</span></li>
+        </ol>
+        {local && <div className="banner">This dashboard is open on <b>localhost</b>, which other servers can’t reach. Set <code>PUBLIC_URL</code> in the control plane’s <code>.env</code> to its real address, or edit it here:<input style={{ marginTop: 8, width: '100%' }} className="field" value={base} onChange={ev => setBase(ev.target.value.replace(/\/$/, ''))} /></div>}
+        {e && <div className="sm muted">For safety this link is random and short-lived: <b>{expiryText(e)}</b>. Anyone who has it can add a server until then; {e.uses} server{e.uses === 1 ? '' : 's'} joined so far. <button className="btn ghost sm" onClick={() => void enrollment.renew()}>New link</button> <button className="btn ghost sm" onClick={() => enrollment.revoke(e.id)}>Revoke</button> <button className="btn ghost sm" onClick={() => go('settings')}>Manage join tokens</button></div>}
+        <div className="waiting">
+          {joined.length === 0 ? <><span className="spinner" />Waiting for a server to join… (this page updates automatically)</>
+            : <div>{joined.map(j => <div key={j.id}><span className="good">●</span> <b>{j.name}</b> joined{j.last_seen_at ? ` · reporting (${timeAgo(j.last_seen_at)})` : ' · waiting for its first report'} <button className="btn sm ghost" onClick={() => { onClose(); go(`servers/${j.id}`); }}>Open</button></div>)}</div>}
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
 function InstallInstructions({ token, serverId }: { token: string; serverId: number }) {
   const { data } = useApp();
   const [base, setBase] = useState('');
@@ -279,9 +318,9 @@ function InstallInstructions({ token, serverId }: { token: string; serverId: num
   const server = data?.servers.find(s => s.id === serverId);
   const connected = !!server?.last_seen_at;
   const local = /localhost|127\.0\.0\.1/.test(base);
-  const linux = `curl -fsSL ${base}/api/agent/install.sh | sudo NORTHSTAR_URL=${base} NORTHSTAR_TOKEN=${token} bash`;
-  const docker = `docker run -d --name northstar-agent --restart unless-stopped --pid host \\
-  -v /:/host:ro -e NORTHSTAR_URL=${base} -e AGENT_TOKEN=${token} \\
+  const linux = `curl -fsSL ${base}/api/agent/install.sh | sudo SMWATCH_URL=${base} SMWATCH_TOKEN=${token} bash`;
+  const docker = `docker run -d --name sm-watch-agent --restart unless-stopped --pid host \\
+  -v /:/host:ro -e SMWATCH_URL=${base} -e AGENT_TOKEN=${token} \\
   -e AGENT_HOST_ROOT=/host -e AGENT_PROCFS_PATH=/host/proc -e AGENT_DISK_PATH=/host \\
   python:3.12-slim sh -c "pip install -q psutil && python -c \\"import urllib.request as u; u.urlretrieve('${base}/api/agent/agent.py','/agent.py')\\" && exec python /agent.py"`;
   return (
@@ -298,8 +337,8 @@ function InstallInstructions({ token, serverId }: { token: string; serverId: num
         </ol>
       ) : (
         <ol className="steps">
-          <li><b>Run on any Docker host</b><CodeBox value={docker} /><span className="sm muted">No repo or image build needed. It mounts the host read-only so metrics describe the host, not the container. Logs: <code>docker logs -f northstar-agent</code></span></li>
-          <li><b>Remove</b><CodeBox value="docker rm -f northstar-agent" /></li>
+          <li><b>Run on any Docker host</b><CodeBox value={docker} /><span className="sm muted">No repo or image build needed. It mounts the host read-only so metrics describe the host, not the container. Logs: <code>docker logs -f sm-watch-agent</code></span></li>
+          <li><b>Remove</b><CodeBox value="docker rm -f sm-watch-agent" /></li>
         </ol>
       )}
       <div className="waiting">{connected ? <><span className="good">●</span><b>Agent connected</b> · first report {timeAgo(server?.last_seen_at)}</> : <><span className="spinner" />Waiting for the first report… (checks every 10s)</>}</div>

@@ -1,21 +1,31 @@
 #!/usr/bin/env bash
-# Northstar agent installer (Linux + systemd). Safe to re-run: it updates the agent in place.
+# SM-Watch agent installer (Linux + systemd). Safe to re-run: it updates the agent in place.
 #
-#   curl -fsSL https://CONTROL_PLANE/api/agent/install.sh | \
-#     sudo NORTHSTAR_URL=https://CONTROL_PLANE NORTHSTAR_TOKEN=... bash
+# Normal use: copy the one-line command from the dashboard (Servers -> Add server -> Install agent):
+#   curl -fsSL https://CONTROL_PLANE/api/agent/join/<join-token> | sudo bash
+# The link is random and expires after 15 minutes. Registration happens in the first second, so a slow
+# package download afterwards can never make the link expire mid-install.
+#
+# Log access for the dashboard's Logs tab (default: on). Put the variable before "bash":
+#   ... | sudo SMWATCH_LOGS=nodocker bash    journald + log files, but no Docker socket access
+#   ... | sudo SMWATCH_LOGS=off bash         the dashboard cannot read any logs from this server
 #
 # Other commands:
-#   ... | sudo bash -s -- status      show service state and the last log lines
-#   ... | sudo bash -s -- uninstall   remove the agent completely
+#   curl -fsSL https://CONTROL_PLANE/api/agent/install.sh | sudo bash -s -- status      service state + connection test
+#   curl -fsSL https://CONTROL_PLANE/api/agent/install.sh | sudo bash -s -- uninstall   remove the agent completely
+#
+# Advanced (per-server token instead of a join link):
+#   curl -fsSL https://CONTROL_PLANE/api/agent/install.sh | sudo SMWATCH_URL=https://CONTROL_PLANE SMWATCH_TOKEN=... bash
 set -euo pipefail
 
-INSTALL_DIR=/opt/northstar-agent
-ENV_FILE=/etc/northstar-agent.env
-SERVICE=northstar-agent
-USER_NAME=northstar-agent
+INSTALL_DIR=/opt/sm-watch-agent
+ENV_FILE=/etc/sm-watch-agent.env
+STATE_DIR=/var/lib/sm-watch-agent
+STATE_FILE=$STATE_DIR/agent.json
+SERVICE=sm-watch-agent
+USER_NAME=sm-watch-agent
 
 say()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
-warn() { printf '\033[1;33m==>\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "run as root (put sudo before 'bash')"
@@ -24,10 +34,10 @@ case "${1:-install}" in
   uninstall)
     systemctl disable --now "$SERVICE" 2>/dev/null || true
     rm -f "/etc/systemd/system/${SERVICE}.service" "$ENV_FILE"
-    rm -rf "$INSTALL_DIR"
+    rm -rf "$INSTALL_DIR" "$STATE_DIR"
     id "$USER_NAME" >/dev/null 2>&1 && userdel "$USER_NAME" || true
     systemctl daemon-reload 2>/dev/null || true
-    say "Northstar agent removed. You can delete the server in the dashboard."
+    say "SM-Watch agent removed. You can delete the server in the dashboard."
     exit 0 ;;
   status)
     systemctl status "$SERVICE" --no-pager -l 2>&1 | head -15 || true
@@ -37,20 +47,62 @@ case "${1:-install}" in
   *) die "unknown command '$1' (use: install | status | uninstall)" ;;
 esac
 
-: "${NORTHSTAR_URL:?set NORTHSTAR_URL, e.g. https://monitor.example.com}"
-: "${NORTHSTAR_TOKEN:?set NORTHSTAR_TOKEN (copy the full command from Servers -> Add server)}"
-NORTHSTAR_URL="${NORTHSTAR_URL%/}"
-[ "${#NORTHSTAR_TOKEN}" -ge 32 ] || die "NORTHSTAR_TOKEN looks too short; copy the whole command from the dashboard"
-case "$NORTHSTAR_URL" in http://localhost*|http://127.*|https://localhost*) die "NORTHSTAR_URL points at localhost, which is this server itself. Use the control plane's real address." ;; esac
-command -v systemctl >/dev/null 2>&1 || die "systemd was not found. Use the Docker install instead (see the README / dashboard Docker tab)."
+: "${SMWATCH_URL:?set SMWATCH_URL, e.g. https://monitor.example.com}"
+SMWATCH_URL="${SMWATCH_URL%/}"
+SMWATCH_JOIN="${SMWATCH_JOIN:-}"
+SMWATCH_TOKEN="${SMWATCH_TOKEN:-}"
+SMWATCH_LOGS="${SMWATCH_LOGS:-on}"
+case "$SMWATCH_LOGS" in on|nodocker|off) ;; *) die "SMWATCH_LOGS must be on, nodocker or off" ;; esac
+if [ -n "$SMWATCH_TOKEN" ] && [ "${#SMWATCH_TOKEN}" -lt 32 ]; then die "SMWATCH_TOKEN looks too short; copy the whole command from the dashboard"; fi
+case "$SMWATCH_URL" in http://localhost*|http://127.*|https://localhost*) die "SMWATCH_URL points at localhost, which is this server itself. Use the control plane's real address." ;; esac
+command -v systemctl >/dev/null 2>&1 || die "systemd was not found. Use the Docker command instead (dashboard: Install agent -> Docker)."
+command -v curl >/dev/null 2>&1 || die "curl is required"
+
+# --- registration: exchange the short-lived join link for this server's own private token (needs only curl)
+register() {
+  local host mid plat body resp code json
+  host=$(hostname 2>/dev/null | tr -cd 'A-Za-z0-9._-' | cut -c1-200); [ -n "$host" ] || host=server
+  mid=$(cat /etc/machine-id 2>/dev/null || cat /var/lib/dbus/machine-id 2>/dev/null || echo "$host")
+  mid=$(printf %s "$mid" | tr -cd 'A-Za-z0-9-' | cut -c1-120)
+  plat=$(uname -sr 2>/dev/null | tr -cd 'A-Za-z0-9 ._-' | cut -c1-200)
+  body=$(printf '{"hostname":"%s","machine_id":"%s","platform":"%s","agent_version":"installer"}' "$host" "$mid" "$plat")
+  resp=$(curl -sS -m 30 -w '\n%{http_code}' -X POST -H 'Content-Type: application/json' -H "Authorization: Bearer $SMWATCH_JOIN" -d "$body" "$SMWATCH_URL/api/agent/enroll") \
+    || die "cannot reach $SMWATCH_URL from this server (check the address, DNS, firewall and TLS)"
+  code=${resp##*$'\n'}; json=${resp%$'\n'*}
+  case "$code" in
+    200) ;;
+    401) die "this install link is invalid, expired or revoked. Links last 15 minutes: copy a fresh command from the dashboard (Servers -> Add server -> Install agent)." ;;
+    403) die "this install link has reached its server limit. Create a new one in the dashboard (Settings -> Agent join tokens)." ;;
+    429) die "too many failed attempts from this address; wait a few minutes and try again." ;;
+    *)   die "registration failed (HTTP $code). Is $SMWATCH_URL an SM-Watch control plane?" ;;
+  esac
+  local token name id
+  token=$(printf %s "$json" | sed -n 's/.*"agent_token":"\([^"]*\)".*/\1/p')
+  name=$(printf %s "$json" | sed -n 's/.*"name":"\([^"]*\)".*/\1/p')
+  id=$(printf %s "$json" | sed -n 's/.*"server_id":\([0-9]*\).*/\1/p')
+  [ "${#token}" -ge 32 ] || die "unexpected reply from the control plane while registering"
+  install -d -m 700 "$STATE_DIR"
+  ( umask 077; printf '{"url": "%s", "token": "%s", "server_id": %s, "name": "%s"}\n' "$SMWATCH_URL" "$token" "${id:-0}" "$name" > "$STATE_FILE" )
+  say "Registered with $SMWATCH_URL as \"$name\""
+}
+
+HAVE_STATE=no
+if [ -z "$SMWATCH_TOKEN" ]; then
+  if [ -s "$STATE_FILE" ] && grep -q "\"url\": *\"$SMWATCH_URL\"" "$STATE_FILE"; then
+    HAVE_STATE=yes   # already registered: this run is an update, the join link is not needed
+    say "This server is already registered; updating the agent"
+  else
+    [ -n "$SMWATCH_JOIN" ] || die "no install link: copy the full command from the dashboard (Servers -> Add server -> Install agent)"
+    register
+  fi
+fi
 
 # --- prerequisites: install anything missing with the distro's package manager
 need=()
-command -v curl >/dev/null 2>&1 || need+=(curl)
 command -v python3 >/dev/null 2>&1 || need+=(python3)
 if ! python3 -c 'import venv, ensurepip' >/dev/null 2>&1; then need+=(venv); fi
 if [ "${#need[@]}" -gt 0 ]; then
-  say "Installing prerequisites: ${need[*]}"
+  say "Installing prerequisites: ${need[*]} (this can take a minute)"
   pkgs=()
   for n in "${need[@]}"; do
     case "$n" in
@@ -58,12 +110,14 @@ if [ "${#need[@]}" -gt 0 ]; then
       *) pkgs+=("$n") ;;
     esac
   done
-  if   command -v apt-get >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs[@]}"
-  elif command -v dnf     >/dev/null 2>&1; then dnf install -y -q "${pkgs[@]}"
-  elif command -v yum     >/dev/null 2>&1; then yum install -y -q "${pkgs[@]}"
-  elif command -v zypper  >/dev/null 2>&1; then zypper -q install -y "${pkgs[@]}"
-  elif command -v apk     >/dev/null 2>&1; then apk add -q "${pkgs[@]}"
-  else die "missing ${need[*]} and no supported package manager found; install them manually"; fi
+  if [ "${#pkgs[@]}" -gt 0 ]; then
+    if   command -v apt-get >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs[@]}" >/dev/null
+    elif command -v dnf     >/dev/null 2>&1; then dnf install -y -q "${pkgs[@]}"
+    elif command -v yum     >/dev/null 2>&1; then yum install -y -q "${pkgs[@]}"
+    elif command -v zypper  >/dev/null 2>&1; then zypper -q install -y "${pkgs[@]}"
+    elif command -v apk     >/dev/null 2>&1; then apk add -q "${pkgs[@]}"
+    else die "missing ${need[*]} and no supported package manager found; install them manually and re-run"; fi
+  fi
 fi
 python3 -c 'import sys, venv; assert sys.version_info >= (3, 8)' 2>/dev/null || die "python3 >= 3.8 is required"
 
@@ -71,38 +125,61 @@ say "Installing the agent to $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 [ -x "$INSTALL_DIR/venv/bin/python" ] || python3 -m venv "$INSTALL_DIR/venv"
 "$INSTALL_DIR/venv/bin/pip" install --quiet --disable-pip-version-check --upgrade pip psutil
-curl -fsSL "$NORTHSTAR_URL/api/agent/agent.py" -o "$INSTALL_DIR/agent.py.new" \
-  || die "could not download the agent from $NORTHSTAR_URL (is the URL reachable from this server?)"
+curl -fsSL "$SMWATCH_URL/api/agent/agent.py" -o "$INSTALL_DIR/agent.py.new" \
+  || die "could not download the agent from $SMWATCH_URL (is the URL reachable from this server?)"
 mv "$INSTALL_DIR/agent.py.new" "$INSTALL_DIR/agent.py"
 
 id "$USER_NAME" >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin "$USER_NAME"
 chown -R root:root "$INSTALL_DIR"
+install -d -m 700 "$STATE_DIR"
 
-umask 077
-cat > "$ENV_FILE" <<ENV
-NORTHSTAR_URL=$NORTHSTAR_URL
-AGENT_TOKEN=$NORTHSTAR_TOKEN
-AGENT_MODE=push
-ENV
+# --- preflight: prove the connection and credentials work BEFORE starting the service, with a readable error
+check() { (cd / && env -i PATH="$PATH" SMWATCH_URL="$SMWATCH_URL" AGENT_TOKEN="$SMWATCH_TOKEN" AGENT_STATE_DIR="$STATE_DIR" "$INSTALL_DIR/venv/bin/python" "$INSTALL_DIR/agent.py" --check 2>&1); }
+say "Testing the connection to $SMWATCH_URL"
+if ! out=$(check); then
+  if [ "$HAVE_STATE" = yes ] && [ -n "$SMWATCH_JOIN" ]; then
+    say "The saved registration is no longer valid (server removed in the dashboard?); registering again"
+    rm -f "$STATE_FILE"; register
+    out=$(check) || { printf '%s\n' "$out" >&2; die "connection test failed (nothing was started). Fix the problem above and re-run."; }
+  else
+    printf '%s\n' "$out" >&2
+    die "connection test failed (nothing was started). Fix the problem above and re-run the command."
+  fi
+fi
+printf '    %s\n' "$out"
+chown -R "$USER_NAME":"$USER_NAME" "$STATE_DIR"
+
+# The service needs only the URL: its private token lives in $STATE_DIR, and the shared install link is never stored.
+( umask 077
+  { echo "SMWATCH_URL=$SMWATCH_URL"
+    echo "AGENT_MODE=push"
+    echo "AGENT_STATE_DIR=$STATE_DIR"
+    echo "AGENT_LOGS=$SMWATCH_LOGS"
+    [ -n "$SMWATCH_TOKEN" ] && echo "AGENT_TOKEN=$SMWATCH_TOKEN"
+    true
+  } > "$ENV_FILE" )
 chown root:"$USER_NAME" "$ENV_FILE"
 chmod 640 "$ENV_FILE"
 
-# --- preflight: prove the URL and token work BEFORE starting the service, with a readable error
-say "Testing the connection to $NORTHSTAR_URL"
-if ! out=$(cd / && env -i PATH="$PATH" NORTHSTAR_URL="$NORTHSTAR_URL" AGENT_TOKEN="$NORTHSTAR_TOKEN" "$INSTALL_DIR/venv/bin/python" "$INSTALL_DIR/agent.py" --check 2>&1); then
-  printf '%s\n' "$out" >&2
-  die "connection test failed (nothing was started). Fix the problem above and re-run the same command."
+# Read-only log access: journald (systemd-journal), /var/log files such as nginx (adm), and container logs (docker).
+# Membership of the docker group is powerful (it is root-equivalent on this server); use SMWATCH_LOGS=nodocker to skip it.
+LOG_GROUPS=""
+if [ "$SMWATCH_LOGS" != "off" ]; then
+  for g in systemd-journal adm; do getent group "$g" >/dev/null 2>&1 && LOG_GROUPS="$LOG_GROUPS $g"; done
+  if [ "$SMWATCH_LOGS" = "on" ] && getent group docker >/dev/null 2>&1; then LOG_GROUPS="$LOG_GROUPS docker"; fi
 fi
-printf '    %s\n' "$out"
+GROUP_LINE=""
+[ -n "$LOG_GROUPS" ] && GROUP_LINE="SupplementaryGroups=${LOG_GROUPS# }"
 
 cat > "/etc/systemd/system/${SERVICE}.service" <<UNIT
 [Unit]
-Description=Northstar monitoring agent
+Description=SM-Watch monitoring agent
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 User=$USER_NAME
+$GROUP_LINE
 EnvironmentFile=$ENV_FILE
 ExecStart=$INSTALL_DIR/venv/bin/python $INSTALL_DIR/agent.py
 Restart=always
@@ -111,6 +188,7 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=true
+ReadWritePaths=$STATE_DIR
 
 [Install]
 WantedBy=multi-user.target
@@ -121,8 +199,9 @@ systemctl enable "$SERVICE" >/dev/null 2>&1
 systemctl restart "$SERVICE"
 sleep 2
 if systemctl is-active --quiet "$SERVICE"; then
-  say "Done. The server should show as online in the dashboard within a minute."
-  say "Logs: journalctl -u $SERVICE -f   |   Status: re-run this script with 'status'   |   Remove: 'uninstall'"
+  say "Done. The server is now reporting to the dashboard."
+  [ -n "$LOG_GROUPS" ] && say "Log access for the dashboard:${LOG_GROUPS}  (change with SMWATCH_LOGS=nodocker|off)"
+  say "Logs: journalctl -u $SERVICE -f"
 else
   journalctl -u "$SERVICE" --no-pager -n 20 2>/dev/null || true
   die "the agent service failed to start (see the log above)"

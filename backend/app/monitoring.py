@@ -17,7 +17,7 @@ from sqlalchemy import delete, select
 
 from .config import get_settings
 from .database import SessionLocal
-from .models import AlertEvent, Channel, CheckResult, Incident, MetricSample, Server, Service
+from .models import AlertEvent, Channel, CheckResult, Incident, LogRequest, MetricSample, Server, Service
 from .netguard import safe_urlopen, validate_host
 
 logger = logging.getLogger(__name__)
@@ -62,7 +62,7 @@ def _ping_once(host: str) -> float | None:
         identifier = (os.getpid() ^ int(time.time() * 1000)) & 0xFFFF
         sequence = 1
         started = time.perf_counter()
-        payload = b"northstar-ping"
+        payload = b"sm-watch-ping"
         header = struct.pack("!BBHHH", 8, 0, 0, identifier, sequence)
         checksum = icmp_checksum(header + payload)
         packet = struct.pack("!BBHHH", 8, 0, checksum, identifier, sequence) + payload
@@ -141,7 +141,7 @@ def send_alert(message: str, session) -> tuple[bool, str | None]:
 
 
 def post_json(url: str, payload: dict, token: str = "") -> tuple[bool, str]:
-    headers = {"Content-Type": "application/json", "User-Agent": "Northstar-Monitor/1.0"}
+    headers = {"Content-Type": "application/json", "User-Agent": "SM-Watch-Monitor/1.0"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     request = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=headers, method="POST")
@@ -174,7 +174,7 @@ def send_whatsapp(channel: Channel, text: str) -> tuple[bool, str]:
         "template": {
             "name": channel.template_name,
             "language": {"code": channel.template_language or "en_US"},
-            "components": [{"type": "body", "parameters": [{"type": "text", "text": text[:900]}]}],
+            "components": [{"type": "body", "parameters": [{"type": "text", "text": re.sub(r"\s*[\r\n\t]+\s*", " | ", text)[:900]}]}],
         },
     }
     return post_json(url, payload, channel.token)
@@ -239,7 +239,7 @@ def deliver_channel(channel: Channel, text: str) -> tuple[bool, str]:
     if channel.type == "webhook":
         if not channel.endpoint:
             return False, "Webhook URL is missing"
-        payload = {"source": "Northstar Operations", "text": text, "sent_at": datetime.now(timezone.utc).isoformat()}
+        payload = {"source": "SM-Watch", "text": text, "sent_at": datetime.now(timezone.utc).isoformat()}
         return post_json(channel.endpoint, payload, channel.token or "")
     if channel.type == "whatsapp":
         return send_whatsapp(channel, text)
@@ -257,7 +257,7 @@ def deliver_event(event: AlertEvent, session) -> None:
 
 
 def send_channel_test(channel: Channel) -> tuple[bool, str]:
-    message = f"Northstar test notification · {channel.name}"
+    message = f"SM-Watch test notification · {channel.name}"
     try:
         delivered, detail = deliver_channel(channel, message)
     except Exception as error:
@@ -275,7 +275,7 @@ def probe_service(service: Service) -> dict:
     error_message = None
     status = "down"
     try:
-        request = urllib.request.Request(service.url, headers={"User-Agent": "Northstar-Uptime/1.0"})
+        request = urllib.request.Request(service.url, headers={"User-Agent": "SM-Watch-Uptime/1.0"})
         try:
             with safe_urlopen(request, timeout=10) as response:
                 http_status = response.status
@@ -498,6 +498,8 @@ def run_once() -> None:
         session.commit()
         retry_pending_alerts(session)
         session.commit()
+        from .scheduler import run_due_schedules
+        run_due_schedules(session)
     finally:
         session.close()
 
@@ -509,6 +511,7 @@ def prune_history() -> None:
     try:
         session.execute(delete(CheckResult).where(CheckResult.checked_at < now - timedelta(days=settings.check_retention_days)))
         session.execute(delete(MetricSample).where(MetricSample.ts < now - timedelta(days=settings.metric_retention_days)))
+        session.execute(delete(LogRequest).where(LogRequest.created_at < now - timedelta(minutes=15)))  # fetched logs are never archived
         session.commit()
     finally:
         session.close()
