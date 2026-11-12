@@ -1,12 +1,14 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, post } from '../lib/api';
-import { Field } from './ui';
+import { Icon } from './ui';
 
 type Inventory = { files: string[]; journal: boolean; units: string[]; docker: boolean; containers: { name: string; state: string; image: string }[]; notes: string[] };
 type Source = 'docker' | 'journal' | 'file';
 type LogResponse = { id: number; status: 'pending' | 'running' | 'done' | 'error'; output: string; error: string | null; truncated: boolean };
+type Level = 'error' | 'warn' | 'info' | 'debug' | '';
+type Row = { n: number; ts: string; tsTitle: string; level: Level; msg: string };
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -23,7 +25,59 @@ async function runQuery(serverId: number, query: Record<string, unknown>, isCanc
   throw new Error('Timed out waiting for the agent');
 }
 
-const levelOf = (line: string) => (/\b(error|err|fatal|crit|critical|panic|emerg|exception|traceback|failed|denied)\b/i.test(line) ? 'bad' : /\b(warn|warning|timeout|retry|deprecated)\b/i.test(line) ? 'warn' : '');
+/* ---------------------------------------------------------------- parsing */
+const TS_PREFIX = [
+  /^(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?)\s+/,   // docker, journald short-iso, app logs
+  /^(\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}:\d{2})\s+/,                                         // nginx error log
+  /^([A-Z][a-z]{2}\s+\d{1,2} \d{2}:\d{2}:\d{2})\s+/,                                     // classic syslog
+];
+const NGINX_TS = /\[(\d{2})\/([A-Za-z]{3})\/(\d{4}):(\d{2}:\d{2}:\d{2}) ([+-]\d{4})\]/;
+const NGINX_STATUS = /"\s*(?:[A-Z]+) [^"]*"\s+(\d{3})\s/;
+const MONTHS: Record<string, string> = { Jan: '01', Feb: '02', Mar: '03', Apr: '04', May: '05', Jun: '06', Jul: '07', Aug: '08', Sep: '09', Oct: '10', Nov: '11', Dec: '12' };
+const ERR = /\b(error|err|fatal|crit(?:ical)?|panic|emerg|alert|exception|traceback|failed|failure|denied|refused|segfault|oom)\b/i;
+const WARN = /\b(warn(?:ing)?|timeout|timed out|retry(?:ing)?|deprecated|slow)\b/i;
+const DBG = /\b(debug|trace)\b/i;
+const INF = /\b(info|notice)\b/i;
+
+function when(raw: string): { ts: string; title: string } {
+  let iso = raw.replace(' ', 'T').replace(',', '.').replace(/([+-]\d{2})(\d{2})$/, '$1:$2');
+  if (/^\d{4}\/\d{2}\/\d{2}/.test(raw)) iso = raw.replace(/\//g, '-').replace(' ', 'T');
+  const date = new Date(iso);
+  if (!isNaN(date.getTime())) return { ts: date.toLocaleTimeString([], { hour12: false }), title: date.toLocaleString() };
+  return { ts: raw, title: raw };
+}
+
+function parse(output: string): Row[] {
+  return output.split('\n').filter(l => l.length).map((line, i) => {
+    let ts = '', title = '', msg = line;
+    for (const rx of TS_PREFIX) {
+      const m = rx.exec(line);
+      if (m) { ({ ts, title } = when(m[1])); msg = line.slice(m[0].length); break; }
+    }
+    if (!ts) {
+      const nx = NGINX_TS.exec(line);
+      if (nx) { ({ ts, title } = when(`${nx[3]}-${MONTHS[nx[2]] ?? '01'}-${nx[1]}T${nx[4]}${nx[5].slice(0, 3)}:${nx[5].slice(3)}`)); }
+    }
+    // HTTP access logs: the status code decides (5xx error, 4xx warning). Everything else is judged by its wording.
+    const status = NGINX_STATUS.exec(line);
+    let level: Level = status && status[1][0] === '5' ? 'error' : status && status[1][0] === '4' ? 'warn' : '';
+    if (!level) level = ERR.test(msg) ? 'error' : WARN.test(msg) ? 'warn' : DBG.test(msg) ? 'debug' : INF.test(msg) ? 'info' : '';
+    // The badge already says it, so drop a leading "INFO:" / "ERROR " token from the text.
+    const lead = /^\[?(INFO|WARN(?:ING)?|ERROR|ERR|DEBUG|NOTICE|CRITICAL|FATAL)\]?[:\s]+/i.exec(msg);
+    if (lead && level) msg = msg.slice(lead[0].length);
+    return { n: i + 1, ts, tsTitle: title, level, msg };
+  });
+}
+
+const escapeRx = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+function Highlight({ text, term }: { text: string; term: string }) {
+  if (!term) return <>{text}</>;
+  const parts = text.split(new RegExp(`(${escapeRx(term)})`, 'ig'));
+  return <>{parts.map((p, i) => (i % 2 ? <mark key={i}>{p}</mark> : <Fragment key={i}>{p}</Fragment>))}</>;
+}
+
+const LEVEL_LABEL: Record<string, string> = { error: 'ERR', warn: 'WARN', info: 'INFO', debug: 'DBG' };
+const SOURCES: { id: Source; label: string; icon: string }[] = [{ id: 'docker', label: 'Containers', icon: 'server' }, { id: 'journal', label: 'System journal', icon: 'logs' }, { id: 'file', label: 'Log files', icon: 'overview' }];
 
 export function LogsPanel({ serverId }: { serverId: number }) {
   const [inventory, setInventory] = useState<Inventory | null>(null);
@@ -31,104 +85,156 @@ export function LogsPanel({ serverId }: { serverId: number }) {
   const [target, setTarget] = useState('');
   const [lines, setLines] = useState('200');
   const [since, setSince] = useState('0');
-  const [grep, setGrep] = useState('');
-  const [priority, setPriority] = useState('');
+  const [search, setSearch] = useState('');
+  const [applied, setApplied] = useState('');
+  const [levelFilter, setLevelFilter] = useState<'all' | 'error' | 'warn'>('all');
   const [output, setOutput] = useState<string | null>(null);
-  const [meta, setMeta] = useState('');
+  const [fetchedAt, setFetchedAt] = useState<Date | null>(null);
+  const [took, setTook] = useState(0);
+  const [truncated, setTruncated] = useState(false);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
-  const [auto, setAuto] = useState(false);
+  const [live, setLive] = useState(false);
   const [wrap, setWrap] = useState(false);
+  const [stuck, setStuck] = useState(true);
   const run = useRef(0);
-  const box = useRef<HTMLPreElement>(null);
+  const scroller = useRef<HTMLDivElement>(null);
+  const first = useRef(true);
 
-  // What can this server's agent read?
+  const fetchLogs = useCallback(async (opts: { quiet?: boolean; src?: Source; tgt?: string; filter?: string } = {}) => {
+    const src = opts.src ?? source, tgt = opts.tgt ?? target;
+    if (!tgt) return;
+    const filter = opts.filter ?? search;
+    const mine = ++run.current;
+    const started = performance.now();
+    if (!opts.quiet) setBusy(true);
+    setError('');
+    try {
+      const result = await runQuery(serverId, { source: src, target: tgt, lines: Number(lines), since_minutes: src === 'file' ? 0 : Number(since), grep: filter, priority: '' }, () => run.current !== mine);
+      setOutput(result.output); setTruncated(result.truncated); setApplied(filter); setFetchedAt(new Date()); setTook((performance.now() - started) / 1000);
+    } catch (e) { if ((e as Error).message !== 'cancelled') setError((e as Error).message); }
+    finally { if (run.current === mine) setBusy(false); }
+  }, [serverId, source, target, lines, since, search]);
+
+  // What can this server's agent read? Then load the first source automatically.
   useEffect(() => {
     const mine = ++run.current;
-    setInventory(null); setOutput(null); setError(''); setTarget('');
+    setInventory(null); setOutput(null); setError(''); setTarget(''); first.current = true;
     runQuery(serverId, { source: 'inventory' }, () => run.current !== mine)
       .then(result => {
         const inv = JSON.parse(result.output) as Inventory;
         setInventory(inv);
-        const first: Source = inv.docker && inv.containers.length ? 'docker' : inv.journal ? 'journal' : 'file';
-        setSource(first);
-        setTarget(first === 'docker' ? inv.containers[0].name : first === 'journal' ? 'all' : inv.files[0] ?? '');
+        const src: Source = inv.docker && inv.containers.length ? 'docker' : inv.journal ? 'journal' : 'file';
+        const tgt = src === 'docker' ? inv.containers[0].name : src === 'journal' ? 'all' : inv.files[0] ?? '';
+        setSource(src); setTarget(tgt);
+        if (tgt) void fetchLogs({ src, tgt, filter: '' });
       })
       .catch(e => (e as Error).message !== 'cancelled' && setError((e as Error).message));
     return () => { run.current++; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [serverId]);
 
-  const fetchLogs = useCallback(async (quiet = false) => {
-    if (!target) return;
-    const mine = ++run.current;
-    if (!quiet) setBusy(true);
-    setError('');
-    try {
-      const result = await runQuery(serverId, { source, target, lines: Number(lines), since_minutes: Number(since), grep, priority: source === 'journal' ? priority : '' }, () => run.current !== mine);
-      setOutput(result.output);
-      setMeta(`${result.output ? result.output.split('\n').length : 0} lines${result.truncated ? ' (truncated to the newest 400 KB)' : ''} · fetched ${new Date().toLocaleTimeString()}`);
-      requestAnimationFrame(() => { if (box.current) box.current.scrollTop = box.current.scrollHeight; });
-    } catch (e) { if ((e as Error).message !== 'cancelled') setError((e as Error).message); }
-    finally { if (run.current === mine) setBusy(false); }
-  }, [serverId, source, target, lines, since, grep, priority]);
+  useEffect(() => { if (!live) return; const t = setInterval(() => void fetchLogs({ quiet: true }), 5000); return () => clearInterval(t); }, [live, fetchLogs]);
 
-  useEffect(() => {
-    if (!auto) return;
-    const timer = setInterval(() => void fetchLogs(true), 6000);
-    return () => clearInterval(timer);
-  }, [auto, fetchLogs]);
+  const rows = useMemo(() => (output ? parse(output) : []), [output]);
+  const counts = useMemo(() => ({ error: rows.filter(r => r.level === 'error').length, warn: rows.filter(r => r.level === 'warn').length }), [rows]);
+  const shown = useMemo(() => rows.filter(r => levelFilter === 'all' || r.level === levelFilter), [rows, levelFilter]);
+
+  // Keep following the newest lines (like `tail -f`) unless the user scrolled up.
+  useEffect(() => { const el = scroller.current; if (el && stuck) el.scrollTop = el.scrollHeight; }, [shown, stuck]);
+  const onScroll = () => { const el = scroller.current; if (el) setStuck(el.scrollHeight - el.scrollTop - el.clientHeight < 40); };
 
   const targets = useMemo(() => {
-    if (!inventory) return [] as { value: string; label: string }[];
-    if (source === 'docker') return inventory.containers.map(c => ({ value: c.name, label: `${c.name}  (${c.state})` }));
-    if (source === 'journal') return [{ value: 'all', label: 'All units (whole journal)' }, ...inventory.units.map(u => ({ value: u, label: u }))];
+    if (!inventory) return [] as { value: string; label: string; dot?: string }[];
+    if (source === 'docker') return inventory.containers.map(c => ({ value: c.name, label: c.name, dot: c.state }));
+    if (source === 'journal') return [{ value: 'all', label: 'Whole journal (all units)' }, ...inventory.units.map(u => ({ value: u, label: u }))];
     return inventory.files.map(f => ({ value: f, label: f }));
   }, [inventory, source]);
 
   const pick = (next: Source) => {
-    setSource(next); setOutput(null);
-    setTarget(next === 'docker' ? inventory?.containers[0]?.name ?? '' : next === 'journal' ? 'all' : inventory?.files[0] ?? '');
+    if (next === source) return;
+    const tgt = next === 'docker' ? inventory?.containers[0]?.name ?? '' : next === 'journal' ? 'all' : inventory?.files[0] ?? '';
+    setSource(next); setTarget(tgt); setOutput(null); setLive(false);
+    void fetchLogs({ src: next, tgt });
   };
+  const changeTarget = (tgt: string) => { setTarget(tgt); setOutput(null); void fetchLogs({ tgt }); };
   const download = () => {
     const url = URL.createObjectURL(new Blob([output ?? ''], { type: 'text/plain' }));
     const a = document.createElement('a'); a.href = url; a.download = `${target.replace(/[^A-Za-z0-9_.-]+/g, '_') || 'logs'}.log`; a.click(); URL.revokeObjectURL(url);
   };
 
-  if (error && !inventory) return <div className="card"><div className="err">{error}</div><p className="muted sm" style={{ marginTop: 10 }}>Logs need the SM-Watch agent (version 2.3+) running on the server with log access enabled. Re-run the install command on the server to update it.</p></div>;
-  if (!inventory) return <div className="card"><div className="waiting"><span className="spinner" />Asking the agent which logs it can read…</div></div>;
+  if (error && !inventory) return (
+    <div className="lv"><div className="lv-empty"><Icon name="alert" size={26} /><h3>Can’t reach this server’s agent</h3><p>{error}</p>
+      <p className="muted sm">Logs need the SM-Watch agent (2.3+) running on the server with log access enabled. Re-run the install command on the server to update it.</p></div></div>);
+  if (!inventory) return (
+    <div className="lv"><div className="lv-skel">{Array.from({ length: 9 }, (_, i) => <i key={i} style={{ width: `${40 + ((i * 37) % 55)}%` }} />)}</div>
+      <div className="lv-foot"><span className="spinner" /> Asking the agent which logs it can read…</div></div>);
 
-  const available: [Source, string, boolean][] = [['docker', `Docker containers (${inventory.containers.length})`, inventory.docker], ['journal', 'System journal', inventory.journal], ['file', `Log files (${inventory.files.length})`, inventory.files.length > 0]];
+  const available: Record<Source, boolean> = { docker: inventory.docker && inventory.containers.length > 0, journal: inventory.journal, file: inventory.files.length > 0 };
+  const total: Record<Source, number> = { docker: inventory.containers.length, journal: inventory.units.length, file: inventory.files.length };
   return (
-    <div className="card">
-      <div className="seg" style={{ marginBottom: 14, flexWrap: 'wrap' }}>
-        {available.map(([id, label, ok]) => <button key={id} className={source === id ? 'on' : ''} disabled={!ok} title={ok ? '' : 'Not available on this server'} style={ok ? undefined : { opacity: 0.4 }} onClick={() => pick(id)}>{label}</button>)}
+    <div className="lv">
+      <div className="lv-head">
+        <div className="lv-tabs" role="tablist">
+          {SOURCES.map(s => (
+            <button key={s.id} role="tab" aria-selected={source === s.id} className={source === s.id ? 'on' : ''} disabled={!available[s.id]} title={available[s.id] ? '' : 'Not available on this server'} onClick={() => pick(s.id)}>
+              <Icon name={s.icon} size={15} />{s.label}<span className="lv-count">{total[s.id]}</span>
+            </button>))}
+        </div>
+        <span className="grow" />
+        <button className={`lv-live ${live ? 'on' : ''}`} onClick={() => setLive(!live)} aria-pressed={live} title="Refresh every 5 seconds"><i />{live ? 'Live' : 'Live off'}</button>
+        <button className="btn sm" onClick={() => void fetchLogs()} disabled={busy || !target}><Icon name="refresh" size={14} />{busy ? 'Loading…' : 'Refresh'}</button>
       </div>
-      {inventory.notes.length > 0 && <p className="muted sm" style={{ marginBottom: 12 }}>{inventory.notes.join(' · ')}</p>}
-      <form className="form-grid" style={{ alignItems: 'end', marginBottom: 14 }} onSubmit={e => { e.preventDefault(); void fetchLogs(); }}>
-        <Field label={source === 'docker' ? 'Container' : source === 'journal' ? 'Unit' : 'File'}>
-          <select value={target} onChange={e => setTarget(e.target.value)}>{targets.length === 0 && <option value="">Nothing available</option>}{targets.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}</select>
-        </Field>
-        <Field label="Filter (contains)"><input value={grep} onChange={e => setGrep(e.target.value)} placeholder="e.g. error, 502, GET /api" maxLength={200} /></Field>
-        <Field label="Lines"><select value={lines} onChange={e => setLines(e.target.value)}>{['100', '200', '500', '1000', '2000'].map(n => <option key={n} value={n}>last {n}</option>)}</select></Field>
-        {source !== 'file' && <Field label="Time"><select value={since} onChange={e => setSince(e.target.value)}><option value="0">any time</option><option value="15">last 15 min</option><option value="60">last hour</option><option value="360">last 6 hours</option><option value="1440">last 24 hours</option><option value="10080">last 7 days</option></select></Field>}
-        {source === 'journal' && <Field label="Minimum level"><select value={priority} onChange={e => setPriority(e.target.value)}><option value="">all</option><option value="err">errors</option><option value="warning">warnings +</option><option value="notice">notices +</option><option value="info">info +</option></select></Field>}
-        <button className="btn primary" disabled={busy || !target}>{busy ? 'Fetching…' : 'Show logs'}</button>
+
+      <form className="lv-filters" onSubmit={e => { e.preventDefault(); void fetchLogs({ filter: search }); }}>
+        <label className="lv-target"><span className="lv-dot" data-state={targets.find(t => t.value === target)?.dot ?? ''} />
+          <select value={target} onChange={e => changeTarget(e.target.value)} aria-label={source === 'docker' ? 'Container' : source === 'journal' ? 'Unit' : 'File'}>
+            {targets.length === 0 && <option value="">Nothing available</option>}{targets.map(t => <option key={t.value} value={t.value}>{t.label}{t.dot && t.dot !== 'running' ? `  (${t.dot})` : ''}</option>)}</select></label>
+        <label className="lv-search"><Icon name="logs" size={15} />
+          <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search in logs…  (press Enter)" maxLength={200} aria-label="Search" />
+          {(search || applied) && <button type="button" aria-label="Clear search" onClick={() => { setSearch(''); if (applied) void fetchLogs({ filter: '' }); }}><Icon name="x" size={14} /></button>}</label>
+        {source !== 'file' && <select value={since} onChange={e => { setSince(e.target.value); }} onBlur={() => undefined} aria-label="Time range" className="lv-select">
+          <option value="0">Any time</option><option value="15">Last 15 min</option><option value="60">Last hour</option><option value="360">Last 6 hours</option><option value="1440">Last 24 hours</option><option value="10080">Last 7 days</option></select>}
+        <select value={lines} onChange={e => setLines(e.target.value)} aria-label="Number of lines" className="lv-select">{['100', '200', '500', '1000', '2000'].map(n => <option key={n} value={n}>{n} lines</option>)}</select>
+        <button className="btn primary sm" disabled={busy || !target}>Apply</button>
+        <div className="lv-levels" role="group" aria-label="Level filter">
+          <button type="button" className={levelFilter === 'all' ? 'on' : ''} onClick={() => setLevelFilter('all')}>All</button>
+          <button type="button" className={`err ${levelFilter === 'error' ? 'on' : ''}`} onClick={() => setLevelFilter(levelFilter === 'error' ? 'all' : 'error')}>Errors <b>{counts.error}</b></button>
+          <button type="button" className={`wrn ${levelFilter === 'warn' ? 'on' : ''}`} onClick={() => setLevelFilter(levelFilter === 'warn' ? 'all' : 'warn')}>Warnings <b>{counts.warn}</b></button>
+        </div>
       </form>
-      {error && <div className="err" style={{ marginBottom: 12 }}>{error}</div>}
-      {output !== null && (
-        <>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8, flexWrap: 'wrap' }}>
-            <span className="muted sm">{meta}</span><span style={{ flex: 1 }} />
-            <label className="check"><input type="checkbox" checked={auto} onChange={e => setAuto(e.target.checked)} />Auto-refresh</label>
-            <label className="check"><input type="checkbox" checked={wrap} onChange={e => setWrap(e.target.checked)} />Wrap</label>
-            <button className="btn sm" onClick={() => void navigator.clipboard?.writeText(output)}>Copy</button>
-            <button className="btn sm" onClick={download}>Download</button>
-          </div>
-          <pre ref={box} className="logbox" style={{ whiteSpace: wrap ? 'pre-wrap' : 'pre' }}>
-            {output === '' ? <span className="muted">No matching log lines.</span> : output.split('\n').map((line, i) => <span key={i} className={levelOf(line)}>{line}{'\n'}</span>)}
-          </pre>
-        </>
-      )}
+      {inventory.notes.length > 0 && <div className="lv-note">{inventory.notes.join(' · ')}</div>}
+      {error && <div className="lv-error" role="alert"><Icon name="alert" size={15} />{error}<button className="btn sm" onClick={() => void fetchLogs()}>Retry</button></div>}
+
+      <div className="lv-body">
+        <div className="lv-cols"><span>#</span><span>Time</span><span>Level</span><span>Message</span></div>
+        {output === null || (busy && output === null) ? (
+          <div className="lv-skel">{Array.from({ length: 12 }, (_, i) => <i key={i} style={{ width: `${30 + ((i * 53) % 65)}%` }} />)}</div>
+        ) : shown.length === 0 ? (
+          <div className="lv-empty"><Icon name="logs" size={26} /><h3>{rows.length ? 'No lines at this level' : applied ? 'No lines match your search' : 'No log output'}</h3>
+            <p>{rows.length ? 'Choose “All” to see every line.' : applied ? <>Nothing contains “{applied}” in the {lines} most recent lines. Try a different term or more lines.</> : 'This source has not written anything in the selected time range.'}</p></div>
+        ) : (
+          <div className={`lv-scroll ${wrap ? 'wrap' : ''}`} ref={scroller} onScroll={onScroll}>
+            {shown.map(r => (
+              <div key={r.n} className={`lv-row ${r.level}`}>
+                <span className="n">{r.n}</span><span className="t" title={r.tsTitle}>{r.ts}</span>
+                <span className="l">{r.level && <em className={r.level}>{LEVEL_LABEL[r.level]}</em>}</span>
+                <span className="m"><Highlight text={r.msg} term={applied} /></span>
+              </div>))}
+          </div>)}
+        {!stuck && shown.length > 0 && <button className="lv-jump" onClick={() => { setStuck(true); const el = scroller.current; if (el) el.scrollTop = el.scrollHeight; }}>↓ Jump to latest</button>}
+      </div>
+
+      <div className="lv-foot">
+        <span><b>{shown.length.toLocaleString()}</b>{shown.length !== rows.length ? ` of ${rows.length.toLocaleString()}` : ''} lines</span>
+        {counts.error > 0 && <span className="bad">{counts.error} error{counts.error === 1 ? '' : 's'}</span>}{counts.warn > 0 && <span className="warn">{counts.warn} warning{counts.warn === 1 ? '' : 's'}</span>}
+        {truncated && <span className="warn">newest 400 KB only</span>}
+        {fetchedAt && <span className="muted">fetched {fetchedAt.toLocaleTimeString()} · {took.toFixed(1)}s</span>}
+        <span className="grow" />
+        <label className="check"><input type="checkbox" checked={wrap} onChange={e => setWrap(e.target.checked)} />Wrap lines</label>
+        <button className="btn ghost sm" onClick={() => void navigator.clipboard?.writeText(shown.map(r => `${r.ts} ${r.msg}`.trim()).join('\n'))} disabled={!shown.length}>Copy</button>
+        <button className="btn ghost sm" onClick={download} disabled={!output}>Download</button>
+      </div>
     </div>
   );
 }
