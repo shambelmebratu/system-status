@@ -3,3 +3,8 @@ __pycache__/
 *.py[cod]
 .venv/
 node_modules/
+
+# Next.js build output
+frontend-next/.next/
+frontend-next/node_modules/
+.pytest_cache/

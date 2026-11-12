@@ -10,8 +10,8 @@ class LoginRequest(BaseModel):
 
 class ServerCreate(BaseModel):
     name: str = Field(min_length=1, max_length=100)
-    host: str = Field(min_length=1, max_length=255)
-    monitor_mode: str = Field(default="agent", pattern="^(ping|agent)$")
+    host: str = Field(default="", max_length=255)
+    monitor_mode: str = Field(default="agent", pattern="^(ping|agent|push)$")
     check_interval_seconds: int = Field(default_factory=lambda: get_settings().check_interval_seconds, ge=5, le=86400)
     endpoint: str = Field(default="", max_length=500)
     agent_token: str = ""
@@ -21,14 +21,16 @@ class ServerCreate(BaseModel):
     disk_threshold: float = Field(default_factory=lambda: get_settings().disk_threshold, ge=1, le=100)
     load_threshold: float = Field(default_factory=lambda: get_settings().load_threshold, ge=0)
     swap_threshold: float = Field(default_factory=lambda: get_settings().swap_threshold, ge=1, le=100)
+    public: bool = False
     process_names: str = ""
     process_threshold: float = Field(default_factory=lambda: get_settings().process_threshold, ge=1, le=100)
 
     @model_validator(mode="after")
     def require_agent_fields_for_metrics(self):
-        if self.monitor_mode == "agent":
-            if not self.endpoint:
-                raise ValueError("Agent endpoint is required for host metrics mode")
+        if self.monitor_mode in ("ping", "agent") and not self.host:
+            raise ValueError("Host is required for ping and pull-agent monitors")
+        if self.monitor_mode == "agent" and not self.endpoint:
+            raise ValueError("Agent endpoint is required for host metrics mode")
         return self
 
 
@@ -38,6 +40,7 @@ class ServiceCreate(BaseModel):
     expected_status: int = Field(200, ge=100, le=599)
     interval_seconds: int = Field(60, ge=15, le=86400)
     enabled: bool = True
+    public: bool = False
     server_id: int | None = None
 
 
@@ -66,6 +69,52 @@ class ChannelCreate(BaseModel):
             if not self.phone_number_id or not self.chat_id or not self.template_name:
                 raise ValueError("WhatsApp requires phone number ID, recipient number, and approved template name")
         return self
+
+
+class ProcessSample(BaseModel):
+    pid: int
+    name: str = Field(max_length=100)
+    user: str = Field(default="", max_length=100)
+    cpu: float = Field(ge=0, le=100000)
+    memory: float = Field(default=0, ge=0, le=100)
+
+
+class AgentReport(BaseModel):
+    cpu: float = Field(ge=0, le=100)
+    memory: float = Field(ge=0, le=100)
+    disk: float = Field(ge=0, le=100)
+    load: float = Field(ge=0, le=100000)
+    swap: float = Field(ge=0, le=100)
+    uptime_seconds: int | None = Field(default=None, ge=0)
+    cpu_count: int | None = Field(default=None, ge=1, le=4096)
+    net_rx_bps: float | None = Field(default=None, ge=0)
+    net_tx_bps: float | None = Field(default=None, ge=0)
+    hostname: str = Field(default="", max_length=255)
+    platform: str = Field(default="", max_length=255)
+    agent_version: str = Field(default="", max_length=32)
+    processes: list[ProcessSample] = Field(default_factory=list, max_length=100)
+
+
+class TokenBody(BaseModel):
+    token: str = Field(min_length=10, max_length=200)
+
+
+class PasswordChange(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=12, max_length=200)
+
+
+class ChannelUpdate(BaseModel):
+    """Edit payload: blank secret fields keep the stored value (secrets are never sent back to the browser)."""
+    name: str = Field(min_length=1, max_length=100)
+    type: str = Field(default="telegram", pattern="^(telegram|webhook|slack|whatsapp)$")
+    token: str = ""
+    chat_id: str = ""
+    endpoint: str = ""
+    phone_number_id: str = ""
+    template_name: str = ""
+    template_language: str = "en_US"
+    enabled: bool = True
 
 
 class ORMModel(BaseModel):

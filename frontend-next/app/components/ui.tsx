@@ -1,0 +1,79 @@
+'use client';
+
+import { ReactNode, useEffect, useState } from 'react';
+import type { Status } from '../lib/types';
+
+const ICONS: Record<string, string> = {
+  overview: 'M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z',
+  server: 'M4 4h16v6H4V4zm0 10h16v6H4v-6zM7 7h.01M7 17h.01',
+  globe: 'M12 2a10 10 0 100 20 10 10 0 000-20zm0 0c3 3 4 6.5 4 10s-1 7-4 10c-3-3-4-6.5-4-10s1-7 4-10zM2 12h20',
+  alert: 'M12 3l10 18H2L12 3zm0 7v5m0 3h.01',
+  bell: 'M18 8a6 6 0 10-12 0c0 7-3 9-3 9h18s-3-2-3-9zM13.7 21a2 2 0 01-3.4 0',
+  settings: 'M12 15a3 3 0 100-6 3 3 0 000 6zm7.4-3a7.4 7.4 0 00-.1-1.3l2-1.6-2-3.4-2.4 1a7.6 7.6 0 00-2.2-1.3L14.3 3H9.7l-.4 2.4a7.6 7.6 0 00-2.2 1.3l-2.4-1-2 3.4 2 1.6a7.4 7.4 0 000 2.6l-2 1.6 2 3.4 2.4-1a7.6 7.6 0 002.2 1.3l.4 2.4h4.6l.4-2.4a7.6 7.6 0 002.2-1.3l2.4 1 2-3.4-2-1.6c.1-.4.1-.9.1-1.3z',
+  plus: 'M12 5v14M5 12h14',
+  check: 'M5 12l5 5 9-10',
+  x: 'M6 6l12 12M18 6L6 18',
+  refresh: 'M21 12a9 9 0 11-3-6.7L21 8m0-5v5h-5',
+  menu: 'M4 6h16M4 12h16M4 18h16',
+  sun: 'M12 17a5 5 0 100-10 5 5 0 000 10zM12 1v2m0 18v2M4.2 4.2l1.4 1.4m12.8 12.8l1.4 1.4M1 12h2m18 0h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4',
+  moon: 'M21 12.8A9 9 0 1111.2 3a7 7 0 009.8 9.8z',
+  back: 'M15 18l-6-6 6-6',
+  logout: 'M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4m7 14l5-5-5-5m5 5H9',
+  star: 'M12 2l3 7 7 .6-5.3 4.7 1.6 7.2L12 17.8 5.7 21.5l1.6-7.2L2 9.6 9 9l3-7z',
+  external: 'M14 4h6v6m0-6L10 14M20 14v6H4V4h6',
+};
+
+export function Icon({ name, size = 18 }: { name: keyof typeof ICONS | string; size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d={ICONS[name] || ''} />
+    </svg>
+  );
+}
+
+const STATUS_LABEL: Record<string, string> = { up: 'Operational', down: 'Down', alert: 'Alert', unknown: 'Pending' };
+export function StatusPill({ status, label }: { status: Status | string; label?: string }) {
+  const key = ['up', 'down', 'alert'].includes(status) ? status : 'unknown';
+  return <span className={`pill ${key}`}><i />{label ?? STATUS_LABEL[key]}</span>;
+}
+
+export function Empty({ title, children, action }: { title: string; children?: ReactNode; action?: ReactNode }) {
+  return <div className="empty"><h3>{title}</h3>{children && <p>{children}</p>}{action}</div>;
+}
+
+export function Modal({ title, onClose, children, wide }: { title: string; onClose: () => void; children: ReactNode; wide?: boolean }) {
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => event.key === 'Escape' && onClose();
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+  return (
+    <div className="overlay" onMouseDown={event => event.target === event.currentTarget && onClose()}>
+      <div className="modal" role="dialog" aria-modal="true" aria-label={title} style={wide ? { maxWidth: 860 } : undefined}>
+        <div className="modal-head"><h2>{title}</h2><button className="btn ghost sm" onClick={onClose} aria-label="Close"><Icon name="x" /></button></div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+export function CodeBox({ value }: { value: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <div className="codebox">
+      {value}
+      <button className="btn sm" type="button" onClick={() => { void navigator.clipboard?.writeText(value); setCopied(true); setTimeout(() => setCopied(false), 1500); }}>
+        {copied ? 'Copied' : 'Copy'}
+      </button>
+    </div>
+  );
+}
+
+export function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
+  return <label className="field">{label}{children}{hint && <small>{hint}</small>}</label>;
+}
+
+export function Meter({ value, warnAt, badAt }: { value: number; warnAt: number; badAt: number }) {
+  const cls = value >= badAt ? 'bad' : value >= warnAt ? 'warn' : '';
+  return <div className={`bar ${cls}`}><i style={{ width: `${Math.min(100, Math.max(0, value))}%` }} /></div>;
+}

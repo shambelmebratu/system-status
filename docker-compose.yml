@@ -21,7 +21,10 @@ services:
     command: ["alembic", "-c", "alembic.ini", "upgrade", "head"]
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-northstar}:${POSTGRES_PASSWORD:-replace-this-password}@postgres:5432/${POSTGRES_DB:-northstar}
-      JWT_SECRET: ${JWT_SECRET:-change-this-secret-before-production}
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET (32+ random chars) in .env}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD (12+ chars) in .env}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
+      ENVIRONMENT: ${ENVIRONMENT:-production}
     depends_on:
       postgres:
         condition: service_healthy
@@ -34,10 +37,13 @@ services:
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-northstar}:${POSTGRES_PASSWORD:-replace-this-password}@postgres:5432/${POSTGRES_DB:-northstar}
-      JWT_SECRET: ${JWT_SECRET:-change-this-secret-before-production}
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET (32+ random chars) in .env}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD (12+ chars) in .env}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
+      ENVIRONMENT: ${ENVIRONMENT:-production}
       ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
-      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-change-me-now}
       CHECK_INTERVAL_SECONDS: ${CHECK_INTERVAL_SECONDS:-60}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
     env_file:
       - path: .env
         required: false
@@ -60,6 +66,10 @@ services:
       - NET_RAW
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-northstar}:${POSTGRES_PASSWORD:-replace-this-password}@postgres:5432/${POSTGRES_DB:-northstar}
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET (32+ random chars) in .env}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD (12+ chars) in .env}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
+      ENVIRONMENT: ${ENVIRONMENT:-production}
       CHECK_INTERVAL_SECONDS: ${CHECK_INTERVAL_SECONDS:-60}
     env_file:
       - path: .env
