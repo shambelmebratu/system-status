@@ -145,11 +145,13 @@ def tidy_reason(line: str) -> str:
     return line.replace(" >= ", " ≥ ")
 
 
-def format_alert(kind: str, state: str, name: str, lines: list[str] | str | None = None, *, at: datetime | None = None, link: str | None = None, duration: float | None = None) -> str:
+def format_alert(kind: str, state: str, name: str, lines: list[str] | str | None = None, *, at: datetime | None = None, link: str | None = None, duration: float | None = None, where: str | None = None) -> str:
     """kind: Server / Service / Cluster. state: down, still_down, alert, still_alert, recovered."""
     icon, label = _STATE[state]
     when = (at or datetime.now(timezone.utc)).astimezone(timezone.utc).strftime("%d %b %Y, %H:%M UTC")
     out = [f"{icon} <b>{label}</b> · {esc(kind)}", f"<b>{esc(name)}</b>"]
+    if where and where != name:
+        out.append(f"🖥 {esc(where)}")
     items = [lines] if isinstance(lines, str) else [x for x in (lines or []) if x]
     if len(items) == 1:
         out.append(esc(tidy_reason(items[0])))
@@ -163,6 +165,29 @@ def format_alert(kind: str, state: str, name: str, lines: list[str] | str | None
     if link:
         out.append(f"🔗 {esc(link)}")
     return "\n".join(out)
+
+
+def server_where(server) -> str | None:
+    """Where a server is: its host name and address, so an alert is understandable without opening the dashboard."""
+    import ipaddress
+    try:
+        metrics = json.loads(server.last_metrics) if server.last_metrics else {}
+    except ValueError:
+        metrics = {}
+    parts = [str(metrics.get("hostname") or "").strip()]
+    address = (server.host or "").strip() or (server.last_agent_ip or "").strip()
+    try:   # the address an agent connects from is useless when it is a container network (docker bridge) or loopback
+        ip = ipaddress.ip_address(address)
+        if ip.is_loopback or ip in ipaddress.ip_network("172.16.0.0/12"):
+            address = ""
+    except ValueError:
+        pass
+    parts.append(address)
+    unique = []
+    for part in parts:
+        if part and part not in unique and part.lower() != str(server.name).lower():
+            unique.append(part)
+    return " · ".join(unique) or None
 
 
 def plain_text(message: str) -> str:
@@ -467,12 +492,12 @@ def apply_server_result(session, server: Server, status: str, failures: list[str
     resolved = sync_incident(session, "server", server, status, detail)
     if status == "down":
         if previous != "down" or should_notify_again(session, "server", server.id):
-            queue_event(session, "server", server, "critical", format_alert("Server", "down" if previous != "down" else "still_down", server.name, error, at=now), deliver)
+            queue_event(session, "server", server, "critical", format_alert("Server", "down" if previous != "down" else "still_down", server.name, error, at=now, where=server_where(server)), deliver)
     elif status == "alert":
         if previous != "alert" or should_notify_again(session, "server", server.id):
-            queue_event(session, "server", server, "critical", format_alert("Server", "alert" if previous != "alert" else "still_alert", server.name, failures, at=now), deliver)
+            queue_event(session, "server", server, "critical", format_alert("Server", "alert" if previous != "alert" else "still_alert", server.name, failures, at=now, where=server_where(server)), deliver)
     elif previous in ("down", "alert"):
-        queue_event(session, "server", server, "info", format_alert("Server", "recovered", server.name, "Host reachable and all resource checks are within their thresholds.", at=now, duration=outage_seconds(resolved)), deliver)
+        queue_event(session, "server", server, "info", format_alert("Server", "recovered", server.name, "Host reachable and all resource checks are within their thresholds.", at=now, duration=outage_seconds(resolved), where=server_where(server)), deliver)
 
 
 def is_due(last_checked_at, interval_seconds: int) -> bool:

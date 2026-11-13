@@ -63,7 +63,7 @@ export function Users() {
 }
 
 function UserForm({ existing, onClose, onSaved }: { existing?: Me; onClose: () => void; onSaved: (credentials?: { email: string; password: string }) => void }) {
-  const { me, toast } = useApp();
+  const { me, toast, confirm } = useApp();
   const isSelf = existing?.id === me.id;
   const [email, setEmail] = useState(existing?.email ?? '');
   const [name, setName] = useState(existing?.name ?? '');
@@ -84,7 +84,7 @@ function UserForm({ existing, onClose, onSaved }: { existing?: Me; onClose: () =
     } catch (caught) { setError((caught as Error).message); } finally { setBusy(false); }
   }
   async function remove() {
-    if (!existing || !window.confirm(`Delete ${existing.email}? They are signed out immediately and this cannot be undone.`)) return;
+    if (!existing || !(await confirm(`Delete ${existing.email}?\n\nThey are signed out immediately and this cannot be undone.`))) return;
     try { await del(`/users/${existing.id}`); toast('User deleted'); onSaved(); } catch (caught) { setError((caught as Error).message); }
   }
 

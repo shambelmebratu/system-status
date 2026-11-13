@@ -55,7 +55,7 @@ function ServerList() {
 }
 
 function ServerDetail({ server }: { server: Server }) {
-  const { go, toast, refresh, canOperate } = useApp();
+  const { go, toast, refresh, canOperate, confirm } = useApp();
   const [range, setRange] = useState<Range>('24h');
   const [editing, setEditing] = useState(false);
   const [rotated, setRotated] = useState<string | null>(null);
@@ -70,15 +70,15 @@ function ServerDetail({ server }: { server: Server }) {
   const never = server.monitor_mode === 'push' && !server.last_seen_at;
 
   async function remove() {
-    if (!window.confirm(`Remove ${server.name} and its history?`)) return;
+    if (!(await confirm(`Remove ${server.name}?\n\nIts history is deleted too. This cannot be undone.`))) return;
     try { await del(`/servers/${server.id}`); toast('Server removed'); await refresh(); go('servers'); } catch (e) { toast((e as Error).message, true); }
   }
   async function rotate() {
-    if (!window.confirm('Rotate this server’s agent token?\n\nA new token is delivered to the agent automatically at its next report, and the old one stops working as soon as the agent has switched. Nothing needs to be reinstalled.')) return;
+    if (!(await confirm('Rotate this server’s agent token?\n\nA new token is delivered to the agent automatically at its next report, and the old one stops working as soon as the agent has switched. Nothing needs to be reinstalled.'))) return;
     try { toast((await post<{ detail?: string }>(`/servers/${server.id}/rotate-token`)).detail ?? 'Token rotation started'); await refresh(); } catch (e) { toast((e as Error).message, true); }
   }
   async function revokeNow() {
-    if (!window.confirm('Revoke this token NOW?\n\nUse this if the token may be stolen. The old token stops working immediately and the agent goes offline until you install the new token on the server.')) return;
+    if (!(await confirm('Revoke this token NOW?\n\nUse this if the token may be stolen. The old token stops working immediately and the agent goes offline until you install the new token on the server.'))) return;
     try { setRotated((await post<{ install_token: string }>(`/servers/${server.id}/rotate-token?immediate=true`)).install_token); await refresh(); } catch (e) { toast((e as Error).message, true); }
   }
 

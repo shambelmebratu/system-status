@@ -1289,3 +1289,26 @@ def test_scheduled_purge_follows_the_schedule(client):
         from sqlalchemy import select
         assert db.scalar(select(CheckResult).where(CheckResult.target_id == 9001, CheckResult.checked_at < datetime.now(timezone.utc) - timedelta(days=31))) is None
         assert retention.run_scheduled(db) is None                                         # not due again straight away
+
+
+def test_alerts_say_where_the_server_is():
+    from types import SimpleNamespace
+    from app import monitoring as m
+    srv = SimpleNamespace(name="Web 1", host="", last_agent_ip="203.0.113.9", last_metrics=json.dumps({"hostname": "web-01.prod"}))
+    assert m.server_where(srv) == "web-01.prod · 203.0.113.9"
+    bridge = SimpleNamespace(name="This server (control plane)", host="", last_agent_ip="172.18.0.7", last_metrics=json.dumps({"hostname": "erp-node-1"}))
+    assert m.server_where(bridge) == "erp-node-1"                                    # a docker-bridge address says nothing
+    named = SimpleNamespace(name="db", host="10.0.0.5", last_agent_ip="10.0.0.5", last_metrics=None)
+    assert m.server_where(named) == "10.0.0.5"
+    text = m.format_alert("Server", "down", "Web 1", "unreachable", where=m.server_where(srv))
+    assert text.splitlines()[:3] == ["🔴 <b>DOWN</b> · Server", "<b>Web 1</b>", "🖥 web-01.prod · 203.0.113.9"]
+
+
+def test_custom_log_patterns_accept_spaces_and_commas_and_explain_errors():
+    from app.log_policy import LogPolicy
+    p = LogPolicy.model_validate({"files": {"enabled": True, "mode": "selected", "custom": ["/var/log/nginx/* /var/log/containers/*", "/srv/app/*.log,/srv/b/*.log"]}})
+    assert p.files.custom == ["/var/log/nginx/*", "/var/log/containers/*", "/srv/app/*.log", "/srv/b/*.log"]
+    with pytest.raises(Exception, match="'var/log/x' is not allowed"):
+        LogPolicy.model_validate({"files": {"enabled": True, "mode": "selected", "custom": ["var/log/x"]}})
+    with pytest.raises(Exception, match="not allowed"):
+        LogPolicy.model_validate({"files": {"enabled": True, "mode": "selected", "custom": ["/var/log/../etc/passwd"]}})

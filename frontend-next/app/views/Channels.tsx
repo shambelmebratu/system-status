@@ -18,7 +18,7 @@ const HELP: Record<ChannelType, string> = {
 const plainAlert = (m: string) => m.replace(/<\/?b>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
 
 export function Channels() {
-  const { channels, data, refresh, toast } = useApp();
+  const { channels, data, refresh, toast, confirm } = useApp();
   const [adding, setAdding] = useState(false);
   const [editing, setEditing] = useState<Channel | null>(null);
   const [busy, setBusy] = useState<number | null>(null);
@@ -28,7 +28,7 @@ export function Channels() {
     try { toast((await post<{ detail: string }>(`/channels/${id}/test`)).detail || 'Test sent'); } catch (e) { toast(`Test failed: ${(e as Error).message}`, true); } finally { setBusy(null); }
   }
   async function remove(id: number, name: string) {
-    if (!window.confirm(`Remove channel ${name}?`)) return;
+    if (!(await confirm(`Remove channel ${name}?\n\nAlerts will no longer be sent to it.`))) return;
     try { await del(`/channels/${id}`); toast('Channel removed'); await refresh(); } catch (e) { toast((e as Error).message, true); }
   }
 

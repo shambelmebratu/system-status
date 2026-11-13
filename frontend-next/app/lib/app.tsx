@@ -3,11 +3,13 @@
 import { createContext, ReactNode, useCallback, useContext, useEffect, useRef, useState } from 'react';
 import { api } from './api';
 import type { Channel, Dashboard, Me } from './types';
+import { ConfirmModal } from '../components/confirm';
 
 type Toast = { id: number; text: string; error: boolean };
 type Ctx = {
   data: Dashboard | null; channels: Channel[]; refresh: () => Promise<void>; toast: (text: string, error?: boolean) => void;
   go: (path: string) => void; route: string[];
+  confirm: (message: string, opts?: { confirmLabel?: string; danger?: boolean }) => Promise<boolean>;
   me: Me; canOperate: boolean; isAdmin: boolean; reloadMe: () => Promise<void>;
 };
 const AppContext = createContext<Ctx>(null as never);
@@ -32,6 +34,8 @@ export function AppProvider({ children, me, reloadMe, onUnauthorized }: { childr
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [route, go] = useRoute();
   const seq = useRef(0);
+  const [dialog, setDialog] = useState<{ message: string; confirmLabel?: string; danger?: boolean; resolve: (ok: boolean) => void } | null>(null);
+  const confirm = useCallback((message: string, opts?: { confirmLabel?: string; danger?: boolean }) => new Promise<boolean>(resolve => setDialog({ message, ...opts, resolve })), []);
 
   const refresh = useCallback(async () => {
     try {
@@ -55,8 +59,9 @@ export function AppProvider({ children, me, reloadMe, onUnauthorized }: { childr
   }, []);
 
   return (
-    <AppContext.Provider value={{ data, channels, refresh, toast, go, route, me, canOperate: me.role !== 'viewer', isAdmin: me.role === 'admin', reloadMe }}>
+    <AppContext.Provider value={{ data, channels, refresh, toast, confirm, go, route, me, canOperate: me.role !== 'viewer', isAdmin: me.role === 'admin', reloadMe }}>
       {children}
+      {dialog && <ConfirmModal {...dialog} onClose={ok => { dialog.resolve(ok); setDialog(null); }} />}
       <div className="toasts" aria-live="polite">{toasts.map(t => <div key={t.id} className={`toast ${t.error ? 'error' : ''}`}>{t.text}</div>)}</div>
     </AppContext.Provider>
   );

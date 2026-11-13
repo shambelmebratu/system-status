@@ -155,6 +155,11 @@ def evaluate(report: K8sReport) -> tuple[str, str | None]:
     return "up", None
 
 
+def cluster_where(cluster: Cluster) -> str | None:
+    bits = [f"Kubernetes {cluster.k8s_version}" if cluster.k8s_version else "", cluster.last_agent_ip or ""]
+    return " · ".join(b for b in bits if b) or None
+
+
 def apply_cluster_status(db: Session, cluster: Cluster, status: str, detail: str | None, deliver: bool = False) -> None:
     previous = cluster.last_status
     now = datetime.now(timezone.utc)
@@ -166,9 +171,9 @@ def apply_cluster_status(db: Session, cluster: Cluster, status: str, detail: str
         if previous != status or should_notify_again(db, "cluster", cluster.id):
             problems = (json.loads(cluster.summary).get("problems") if cluster.summary else None) if status == "alert" else None
             state = status if previous != status else f"still_{status}"
-            queue_event(db, "cluster", cluster, "critical", format_alert("Cluster", state, cluster.name, problems or detail, at=now), deliver)
+            queue_event(db, "cluster", cluster, "critical", format_alert("Cluster", state, cluster.name, problems or detail, at=now, where=cluster_where(cluster)), deliver)
     elif previous in ("down", "alert"):
-        queue_event(db, "cluster", cluster, "info", format_alert("Cluster", "recovered", cluster.name, "All nodes are ready and workloads are healthy.", at=now, duration=outage_seconds(resolved)), deliver)
+        queue_event(db, "cluster", cluster, "info", format_alert("Cluster", "recovered", cluster.name, "All nodes are ready and workloads are healthy.", at=now, duration=outage_seconds(resolved), where=cluster_where(cluster)), deliver)
 
 
 def check_cluster_heartbeats(session: Session) -> None:

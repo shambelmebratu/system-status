@@ -42,7 +42,7 @@ function ServiceList() {
 }
 
 function ServiceDetail({ service }: { service: Service }) {
-  const { go, toast, refresh, canOperate } = useApp();
+  const { go, toast, refresh, canOperate, confirm } = useApp();
   const [range, setRange] = useState<Range>('24h');
   const [editing, setEditing] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -59,7 +59,7 @@ function ServiceDetail({ service }: { service: Service }) {
     } catch (e) { toast((e as Error).message, true); } finally { setBusy(false); }
   }
   async function remove() {
-    if (!window.confirm(`Remove ${service.name} and its history?`)) return;
+    if (!(await confirm(`Remove ${service.name}?\n\nIts history is deleted too. This cannot be undone.`))) return;
     try { await del(`/services/${service.id}`); toast('Service removed'); await refresh(); go('services'); } catch (e) { toast((e as Error).message, true); }
   }
 

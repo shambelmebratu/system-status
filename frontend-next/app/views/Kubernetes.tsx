@@ -64,24 +64,41 @@ export function Kubernetes() {
         <div className="card"><Empty title="No clusters yet" action={canOperate ? <button className="btn primary" onClick={() => go('kubernetes/new')}>Connect your first cluster</button> : undefined}>
           Install a small read-only agent in a cluster to see nodes, pods, workloads, autoscalers and resource usage, and to read pod logs on demand.</Empty></div>
       ) : (
-        <div className="tilegrid">
-          {clusters.map(c => {
-            const s = c.summary;
-            return (
-              <div key={c.id} className="card tile" onClick={() => go(`kubernetes/${c.id}`)}>
-                <div className="tile-top"><div className="grow"><div className="name">{c.name}</div><small className="muted">{c.k8s_version || 'waiting for the agent'}</small></div><StatusPill status={c.status} /></div>
-                {s ? (
-                  <div className="minis">
-                    <div className="mini">Nodes<b>{s.nodes_ready}/{s.nodes_total}</b></div>
-                    <div className="mini">Pods<b>{s.pods_running}/{s.pods_total}</b></div>
-                    <div className="mini">Failing<b className={s.pods_crashloop + s.pods_failed ? 'bad' : ''}>{s.pods_crashloop + s.pods_failed}</b></div>
-                  </div>
-                ) : <div className="muted sm" style={{ minHeight: 48 }}>{c.last_error || 'No report received yet.'}</div>}
-                <div className="foot"><span className="tag">{s?.namespaces ?? 0} namespaces</span><span>seen {timeAgo(c.last_seen_at)}</span></div>
-              </div>
-            );
-          })}
-        </div>
+        <>
+          <div className="kpis" style={{ marginBottom: 16 }}>
+            <Kpi icon="k8s" label="Clusters" value={clusters.length} sub={`${clusters.filter(c => c.status === 'up').length} healthy`} tone={clusters.some(c => c.status !== 'up') ? 'warn' : 'good'} />
+            <Kpi icon="server" label="Nodes" value={clusters.reduce((n, c) => n + (c.summary?.nodes_total ?? 0), 0)} sub={`${clusters.reduce((n, c) => n + (c.summary?.nodes_ready ?? 0), 0)} ready`} />
+            <Kpi icon="overview" label="Pods" value={clusters.reduce((n, c) => n + (c.summary?.pods_total ?? 0), 0).toLocaleString()} sub={`${clusters.reduce((n, c) => n + (c.summary?.pods_running ?? 0), 0).toLocaleString()} running`} />
+            <Kpi icon="alert" label="Failing pods" value={clusters.reduce((n, c) => n + (c.summary ? c.summary.pods_crashloop + c.summary.pods_failed : 0), 0)} tone={clusters.some(c => c.summary && c.summary.pods_crashloop + c.summary.pods_failed > 0) ? 'bad' : 'good'} />
+          </div>
+          <div className="tilegrid">
+            {clusters.map(c => {
+              const s = c.summary;
+              const cpu = s?.cpu_m != null && s.cpu_alloc_m ? (s.cpu_m / s.cpu_alloc_m) * 100 : null;
+              const mem = s?.mem_mib != null && s.mem_alloc_mib ? (s.mem_mib / s.mem_alloc_mib) * 100 : null;
+              return (
+                <div key={c.id} className="card tile" onClick={() => go(`kubernetes/${c.id}`)}>
+                  <div className="tile-top"><span className="kpi-ico"><Icon name="k8s" size={16} /></span><div className="grow"><div className="name">{c.name}</div><small className="muted">{c.k8s_version || 'waiting for the agent'} · {s?.namespaces ?? 0} namespaces</small></div><StatusPill status={c.status} /></div>
+                  {s ? (
+                    <>
+                      <div className="minis">
+                        <div className="mini">Nodes<b>{s.nodes_ready}/{s.nodes_total}</b></div>
+                        <div className="mini">Pods<b>{s.pods_running}/{s.pods_total}</b></div>
+                        <div className="mini">Failing<b className={s.pods_crashloop + s.pods_failed ? 'bad' : ''}>{s.pods_crashloop + s.pods_failed}</b></div>
+                      </div>
+                      <div className="minis" style={{ gridTemplateColumns: '1fr 1fr' }}>
+                        <div className="mini">CPU {cpu != null ? pct(cpu, 0) : '–'}{cpu != null ? <Meter value={cpu} warnAt={70} badAt={90} /> : <div className="bar" />}</div>
+                        <div className="mini">Memory {mem != null ? pct(mem, 0) : '–'}{mem != null ? <Meter value={mem} warnAt={75} badAt={90} /> : <div className="bar" />}</div>
+                      </div>
+                      {s.problems.length > 0 && <div className="sm warn trunc" title={s.problems.join('\n')}>⚠ {s.problems[0]}{s.problems.length > 1 ? ` (+${s.problems.length - 1})` : ''}</div>}
+                    </>
+                  ) : <div className="muted sm" style={{ minHeight: 48 }}>{c.last_error || 'No report received yet.'}</div>}
+                  <div className="foot"><span className="tag">agent {c.agent_version ? `v${c.agent_version}` : '–'}</span><span>seen {timeAgo(c.last_seen_at)}</span></div>
+                </div>
+              );
+            })}
+          </div>
+        </>
       )}
       {route[1] === 'new' && canOperate && <AddCluster onClose={() => { go('kubernetes'); void reload(); }} />}
     </>
@@ -123,14 +140,14 @@ function AddCluster({ onClose }: { onClose: () => void }) {
 type TabId = 'overview' | 'workloads' | 'pods' | 'nodes' | 'scaling' | 'network' | 'events' | 'logs' | 'settings';
 
 function ClusterDetail({ cluster, reload }: { cluster: Cluster; reload: () => Promise<void> }) {
-  const { go, toast, canOperate, isAdmin } = useApp();
+  const { go, toast, canOperate, isAdmin, confirm } = useApp();
   const [tab, setTab] = useState<TabId>('overview');
   const tabs: [TabId, string][] = [['overview', 'Overview'], ['workloads', 'Workloads'], ['pods', 'Pods'], ['nodes', 'Nodes'], ['scaling', 'Autoscaling'], ['network', 'Network & storage'], ['events', 'Events']];
   if (canOperate) tabs.push(['logs', 'Logs'], ['settings', 'Settings']);
   const offline = !cluster.last_seen_at || Date.now() - new Date(cluster.last_seen_at).getTime() > 120000;
 
   async function remove() {
-    if (!window.confirm(`Remove ${cluster.name} and its history? (The agent in the cluster is not uninstalled: delete the 'smwatch' namespace there.)`)) return;
+    if (!(await confirm(`Remove ${cluster.name}?\n\nIts history is deleted from SM-Watch. The agent inside the cluster is not uninstalled: delete the 'smwatch' namespace there.`))) return;
     try { await del(`/clusters/${cluster.id}`); toast('Cluster removed'); go('kubernetes'); } catch (e) { toast((e as Error).message, true); }
   }
   return (
@@ -142,7 +159,7 @@ function ClusterDetail({ cluster, reload }: { cluster: Cluster; reload: () => Pr
         <span className="sm muted">agent {cluster.agent_version ? `v${cluster.agent_version}` : '–'} · seen {timeAgo(cluster.last_seen_at)}</span>
         {canOperate && <button className="btn sm danger" onClick={remove}>Remove</button>}
       </div>
-      <div className="seg" style={{ marginBottom: 16, flexWrap: 'wrap' }}>{tabs.map(([id, label]) => <button key={id} className={tab === id ? 'on' : ''} onClick={() => setTab(id)}>{label}</button>)}</div>
+      <div className="tabs" role="tablist">{tabs.map(([id, label]) => <button key={id} role="tab" aria-selected={tab === id} className={tab === id ? 'on' : ''} onClick={() => setTab(id)}>{label}</button>)}</div>
       {cluster.status !== 'up' && cluster.last_error && <div className="err" style={{ marginBottom: 16 }}>{cluster.last_error}</div>}
       {offline && tab !== 'overview' && tab !== 'settings' ? <div className="card"><Empty title="The cluster agent is offline">It has not reported for over 2 minutes, so live data cannot be fetched. Check the <code>smwatch-agent</code> pod in the <code>smwatch</code> namespace.</Empty></div> : (
         <>
@@ -177,36 +194,153 @@ function NamespaceSelect({ cluster, value, onChange }: { cluster: Cluster; value
   );
 }
 
+const mib = (v: number) => (v >= 1024 ? `${(v / 1024).toFixed(v >= 10240 ? 0 : 1)} GiB` : `${Math.round(v)} MiB`);
+const cores = (m: number) => (m >= 1000 ? `${(m / 1000).toFixed(m >= 10000 ? 0 : 1)} cores` : `${Math.round(m)}m`);
+const level = (p: number, warn = 70, bad = 90) => (p >= bad ? 'bad' : p >= warn ? 'warn' : 'good');
+
+function Kpi({ icon, label, value, sub, tone, children }: { icon: string; label: string; value: ReactNode; sub?: ReactNode; tone?: 'good' | 'warn' | 'bad'; children?: ReactNode }) {
+  return (
+    <div className={`kpi ${tone ?? ''}`}>
+      <div className="kpi-head"><span className="kpi-ico"><Icon name={icon} size={16} /></span><span className="kpi-label">{label}</span></div>
+      <div className="kpi-value">{value}</div>
+      {sub && <div className="kpi-sub">{sub}</div>}
+      {children}
+    </div>
+  );
+}
+
+function StackBar({ parts }: { parts: { label: string; value: number; color: string }[] }) {
+  const total = parts.reduce((n, p) => n + p.value, 0) || 1;
+  return (
+    <div>
+      <div className="stack">{parts.filter(p => p.value > 0).map(p => <i key={p.label} style={{ width: `${(p.value / total) * 100}%`, background: p.color }} title={`${p.label}: ${p.value}`} />)}</div>
+      <div className="stack-legend">{parts.map(p => <span key={p.label}><i style={{ background: p.color }} />{p.label} <b>{p.value}</b></span>)}</div>
+    </div>
+  );
+}
+
+function TopList({ title, rows, format, color, hint }: { title: string; rows: { name: string; sub: string; value: number }[]; format: (v: number) => string; color: string; hint?: string }) {
+  const max = Math.max(1, ...rows.map(r => r.value));
+  return (
+    <section className="card">
+      <div className="card-head"><h2>{title}</h2>{hint && <><span className="grow" /><span className="sm muted">{hint}</span></>}</div>
+      {rows.length === 0 ? <p className="muted sm">No data.</p> : <div className="toplist">{rows.map(r => (
+        <div key={r.sub + r.name} className="toprow">
+          <div className="toprow-name" title={`${r.sub}/${r.name}`}><b>{r.name}</b><small>{r.sub}</small></div>
+          <div className="toprow-bar"><i style={{ width: `${(r.value / max) * 100}%`, background: color }} /></div>
+          <span className="toprow-val">{format(r.value)}</span>
+        </div>))}</div>}
+    </section>
+  );
+}
+
 function Overview({ cluster }: { cluster: Cluster }) {
   const s = cluster.summary;
   const hist = usePoll(() => api<{ points: Point[]; samples: number }>(`/clusters/${cluster.id}/history?range=24h`), [cluster.id], 30000);
+  const online = !!cluster.last_seen_at && Date.now() - new Date(cluster.last_seen_at).getTime() < 120000;
+  const pods = useCluster<Items<Pod>>(online && s ? cluster.id : 0, online && s ? { kind: 'pods', limit: 500 } : null, [], 30000);
+  const podUse = useCluster<Items<PodUsage> & { available: boolean }>(online && s ? cluster.id : 0, online && s ? { kind: 'pod_metrics' } : null, [], 30000);
+  const nodes = useCluster<Items<NodeRow>>(online && s ? cluster.id : 0, online && s ? { kind: 'nodes' } : null, [], 30000);
+  const nodeUse = useCluster<Items<{ name: string; cpu_m: number; mem_mib: number }> & { available: boolean }>(online && s ? cluster.id : 0, online && s ? { kind: 'node_metrics' } : null, [], 30000);
+  const events = useCluster<Items<Ev>>(online && s ? cluster.id : 0, online && s ? { kind: 'events', warnings_only: true, limit: 8 } : null, [], 30000);
   if (!s) return <div className="card"><Empty title="Waiting for the agent">No report has been received yet. Run the install command on a machine with kubectl access.</Empty></div>;
+
   const cpuPct = s.cpu_m != null && s.cpu_alloc_m ? (s.cpu_m / s.cpu_alloc_m) * 100 : null;
   const memPct = s.mem_mib != null && s.mem_alloc_mib ? (s.mem_mib / s.mem_alloc_mib) * 100 : null;
-  const points = (hist.value?.points ?? []).map(p => ({ ...p, cpu_pct: p.cpu_m != null && p.cpu_alloc_m ? Number(p.cpu_m) / Number(p.cpu_alloc_m) * 100 : undefined, mem_pct: p.mem_mib != null && p.mem_alloc_mib ? Number(p.mem_mib) / Number(p.mem_alloc_mib) * 100 : undefined }));
+  const failing = s.pods_crashloop + s.pods_failed;
+  const workloads = s.deployments_total + s.statefulsets_total + s.daemonsets_total;
+  const unavailable = s.deployments_unavailable + s.statefulsets_unavailable + s.daemonsets_unavailable;
+  const issues = s.problems.length;
+  const points = hist.value?.points ?? [];
+
+  const podList = pods.data?.data?.items ?? [];
+  const usage = new Map((podUse.data?.data?.items ?? []).map(x => [`${x.ns}/${x.name}`, x]));
+  const topCpu = [...(podUse.data?.data?.items ?? [])].sort((a, b) => b.cpu_m - a.cpu_m).slice(0, 7).map(x => ({ name: x.name, sub: x.ns, value: x.cpu_m }));
+  const topMem = [...(podUse.data?.data?.items ?? [])].sort((a, b) => b.mem_mib - a.mem_mib).slice(0, 7).map(x => ({ name: x.name, sub: x.ns, value: x.mem_mib }));
+  const topRestarts = [...podList].filter(p => p.restarts > 0).sort((a, b) => b.restarts - a.restarts).slice(0, 7).map(p => ({ name: p.name, sub: p.ns, value: p.restarts }));
+  const byNs = new Map<string, { pods: number; mem: number; cpu: number }>();
+  for (const p of podList) { const r = byNs.get(p.ns) ?? { pods: 0, mem: 0, cpu: 0 }; const u = usage.get(`${p.ns}/${p.name}`); r.pods++; r.mem += u?.mem_mib ?? 0; r.cpu += u?.cpu_m ?? 0; byNs.set(p.ns, r); }
+  const topNs = [...byNs.entries()].sort((a, b) => (b[1].mem || b[1].pods) - (a[1].mem || a[1].pods)).slice(0, 7).map(([name, r]) => ({ name, sub: `${r.pods} pods`, value: r.mem || r.pods }));
+  const nsUsesMem = [...byNs.values()].some(r => r.mem > 0);
+  const noReq = podList.filter(p => p.status === 'Running' && !p.cpu_req_m && !p.mem_req_mib && !p.ns.startsWith('kube-')).length;
+  const noLimit = podList.filter(p => p.status === 'Running' && !p.mem_lim_mib && !p.ns.startsWith('kube-')).length;
+
   return (
     <div className="grid">
-      {s.problems.length > 0 && <section className="card"><div className="card-head"><h2>Needs attention</h2></div><ul style={{ margin: '0 0 0 18px' }}>{s.problems.map((p, i) => <li key={i} className="sm">{p}</li>)}</ul></section>}
-      <section className="card"><div className="grid g3">
-        <Stat label="Nodes ready" value={`${s.nodes_ready}/${s.nodes_total}`} bad={s.nodes_ready < s.nodes_total} sub={s.not_ready_nodes.length ? `not ready: ${s.not_ready_nodes.join(', ')}` : undefined} />
-        <Stat label="Pods running" value={`${s.pods_running}/${s.pods_total}`} sub={`${s.pods_pending} pending · ${s.pods_failed} failed · ${s.pods_succeeded} completed`} />
-        <Stat label="Crash-looping" value={s.pods_crashloop} bad={s.pods_crashloop > 0} sub={`${s.restarts} restarts in total`} />
-        <Stat label="Deployments" value={s.deployments_total} bad={s.deployments_unavailable > 0} sub={`${s.deployments_unavailable} unavailable`} />
-        <Stat label="StatefulSets / DaemonSets" value={`${s.statefulsets_total} / ${s.daemonsets_total}`} bad={s.statefulsets_unavailable + s.daemonsets_unavailable > 0} sub={`${s.statefulsets_unavailable + s.daemonsets_unavailable} unavailable`} />
-        <Stat label="Namespaces · HPAs" value={`${s.namespaces} · ${s.hpa_total}`} />
-      </div></section>
-      <section className="card">
-        <div className="card-head"><h2>Cluster usage</h2><span className="grow" />{!s.usage_available && <span className="sm muted">metrics-server not available: showing allocatable only</span>}</div>
-        {s.usage_available ? (
-          <div className="grid g2">
-            <div><div className="sm muted">CPU {Math.round(s.cpu_m ?? 0)}m of {Math.round(s.cpu_alloc_m ?? 0)}m</div><Meter value={cpuPct ?? 0} warnAt={70} badAt={90} /></div>
-            <div><div className="sm muted">Memory {Math.round(s.mem_mib ?? 0)} of {Math.round(s.mem_alloc_mib ?? 0)} MiB</div><Meter value={memPct ?? 0} warnAt={75} badAt={90} /></div>
-          </div>
-        ) : <p className="muted sm">Allocatable: {Math.round(s.cpu_alloc_m ?? 0)}m CPU, {Math.round(s.mem_alloc_mib ?? 0)} MiB memory. Install metrics-server to see live usage and per-pod usage.</p>}
-        {s.usage_available && <AreaChart points={points} height={170} unit="%" yMax={100} series={[{ key: 'cpu_pct', label: 'CPU', color: 'var(--c1)', format: v => pct(v, 0) }, { key: 'mem_pct', label: 'Memory', color: 'var(--c2)', format: v => pct(v, 0) }]} />}
+      <section className={`hero ${cluster.status}`}>
+        <span className="hero-ico"><Icon name={cluster.status === 'up' ? 'check' : 'alert'} size={22} /></span>
+        <div style={{ minWidth: 0 }}>
+          <div className="hero-title">{cluster.status === 'up' ? 'All systems healthy' : issues ? `${issues} issue${issues === 1 ? '' : 's'} need attention` : cluster.status === 'down' ? 'Agent is not reporting' : 'Degraded'}</div>
+          <div className="hero-sub">{s.nodes_ready}/{s.nodes_total} nodes ready · {s.pods_running}/{s.pods_total} pods running · {workloads} workloads · {s.namespaces} namespaces · Kubernetes {cluster.k8s_version}</div>
+        </div>
       </section>
+      {s.problems.length > 0 && <section className="card" style={{ borderColor: 'color-mix(in srgb, var(--warn) 45%, var(--line))' }}><div className="card-head"><h2>Needs attention</h2></div><ul className="problems">{s.problems.map((p, i) => <li key={i}>{p}</li>)}</ul></section>}
+
+      <div className="kpis">
+        <Kpi icon="server" label="Nodes" value={<>{s.nodes_ready}<small>/{s.nodes_total}</small></>} tone={s.nodes_ready < s.nodes_total ? 'bad' : 'good'} sub={s.not_ready_nodes.length ? `not ready: ${s.not_ready_nodes.join(', ')}` : 'all ready'} />
+        <Kpi icon="k8s" label="Pods" value={<>{s.pods_running}<small>/{s.pods_total}</small></>} tone={failing ? 'bad' : s.pods_pending ? 'warn' : 'good'} sub={`${s.pods_pending} pending · ${failing} failing · ${s.pods_succeeded} done`} />
+        <Kpi icon="overview" label="CPU" value={cpuPct != null ? pct(cpuPct, 0) : '–'} tone={cpuPct != null ? level(cpuPct) : undefined} sub={s.cpu_m != null ? `${cores(s.cpu_m)} of ${cores(s.cpu_alloc_m ?? 0)}` : 'metrics-server not installed'}>{cpuPct != null && <Meter value={cpuPct} warnAt={70} badAt={90} />}</Kpi>
+        <Kpi icon="logs" label="Memory" value={memPct != null ? pct(memPct, 0) : '–'} tone={memPct != null ? level(memPct, 75, 90) : undefined} sub={s.mem_mib != null ? `${mib(s.mem_mib)} of ${mib(s.mem_alloc_mib ?? 0)}` : 'metrics-server not installed'}>{memPct != null && <Meter value={memPct} warnAt={75} badAt={90} />}</Kpi>
+        <Kpi icon="alert" label="Restarts" value={s.restarts.toLocaleString()} tone={s.pods_crashloop ? 'bad' : undefined} sub={`${s.pods_crashloop} crash-looping now`} />
+        <Kpi icon="globe" label="Workloads" value={workloads} tone={unavailable ? 'bad' : 'good'} sub={`${s.deployments_total} deploy · ${s.statefulsets_total} sts · ${s.daemonsets_total} ds · ${s.hpa_total} HPA`} />
+      </div>
+
+      <div className="grid g2">
+        <section className="card"><div className="card-head"><h2>Pod status</h2></div>
+          <StackBar parts={[{ label: 'Running', value: s.pods_running, color: 'var(--good)' }, { label: 'Pending', value: s.pods_pending, color: 'var(--warn)' }, { label: 'Failed', value: s.pods_failed, color: 'var(--bad)' }, { label: 'Completed', value: s.pods_succeeded, color: 'var(--info)' }]} />
+          {pods.data && <div className="chips" style={{ marginTop: 14 }}>
+            <span className={`chip ${noReq ? 'warn' : ''}`} title="Running pods with neither CPU nor memory requests">{noReq} without requests</span>
+            <span className={`chip ${noLimit ? 'warn' : ''}`} title="Running pods without a memory limit">{noLimit} without memory limit</span>
+            {s.pods_truncated && <span className="chip warn">large cluster: partial list</span>}
+          </div>}
+        </section>
+        <section className="card"><div className="card-head"><h2>Workload health</h2></div>
+          {[['Deployments', s.deployments_total, s.deployments_unavailable], ['StatefulSets', s.statefulsets_total, s.statefulsets_unavailable], ['DaemonSets', s.daemonsets_total, s.daemonsets_unavailable]].map(([name, total, bad]) => (
+            <div key={name as string} className="hrow"><span>{name}</span><span className="grow" /><b className={(bad as number) ? 'bad' : 'good'}>{(total as number) - (bad as number)}/{total as number}</b><span className="sm muted">available</span></div>))}
+          <div className="hrow"><span>Autoscalers (HPA)</span><span className="grow" /><b>{s.hpa_total}</b></div>
+        </section>
+      </div>
+
+      <div className="grid g2">
+        <section className="card"><div className="card-head"><h2>CPU, last 24 h</h2><span className="grow" />{s.cpu_m != null && <span className="sm muted">now {cores(s.cpu_m)}</span>}</div>
+          <AreaChart points={points} height={150} series={[{ key: 'cpu_m', label: 'Used', color: 'var(--c1)', format: v => cores(v) }]} />
+          {s.cpu_alloc_m != null && <div className="sm muted" style={{ marginTop: 6 }}>Capacity {cores(s.cpu_alloc_m)}</div>}</section>
+        <section className="card"><div className="card-head"><h2>Memory, last 24 h</h2><span className="grow" />{s.mem_mib != null && <span className="sm muted">now {mib(s.mem_mib)}</span>}</div>
+          <AreaChart points={points} height={150} series={[{ key: 'mem_mib', label: 'Used', color: 'var(--c2)', format: v => mib(v) }]} />
+          {s.mem_alloc_mib != null && <div className="sm muted" style={{ marginTop: 6 }}>Capacity {mib(s.mem_alloc_mib)}</div>}</section>
+      </div>
       <section className="card"><div className="card-head"><h2>Pods over time</h2></div>
-        <AreaChart points={hist.value?.points ?? []} height={150} series={[{ key: 'pods_running', label: 'Running', color: 'var(--c1)' }, { key: 'pods_failing', label: 'Failing', color: 'var(--bad)' }]} /></section>
+        <AreaChart points={points} height={130} series={[{ key: 'pods_running', label: 'Running', color: 'var(--good)' }, { key: 'pods_failing', label: 'Failing', color: 'var(--bad)' }]} /></section>
+
+      {nodes.data && (nodes.data.data?.items ?? []).length > 0 && (
+        <section className="card"><div className="card-head"><h2>Nodes</h2></div>
+          <div className="nodegrid">{(nodes.data.data?.items ?? []).map(n => {
+            const u = (nodeUse.data?.data?.items ?? []).find(x => x.name === n.name);
+            const cp = u ? (u.cpu_m / n.cpu_alloc_m) * 100 : null, mp = u ? (u.mem_mib / n.mem_alloc_mib) * 100 : null;
+            const issues = n.conditions.filter(c => (c.type === 'Ready' ? c.status !== 'True' : c.status === 'True'));
+            const podsHere = podList.filter(p => p.node === n.name).length;
+            return (
+              <div key={n.name} className="nodecard">
+                <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}><b className="trunc" title={n.name}>{n.name}</b><span className="grow" /><StatusPill status={n.ready && !issues.length ? 'up' : 'alert'} label={n.ready ? (issues.length ? issues.map(i => i.type).join(', ') : 'Ready') : 'Not ready'} /></div>
+                <div className="sm muted">{n.roles.join(', ')} · {n.version} · {n.ip}</div>
+                <div className="nrow"><span>CPU</span>{cp != null ? <><Meter value={cp} warnAt={70} badAt={90} /><b>{pct(cp, 0)}</b></> : <span className="muted sm">{cores(n.cpu_alloc_m)}</span>}</div>
+                <div className="nrow"><span>Memory</span>{mp != null ? <><Meter value={mp} warnAt={75} badAt={90} /><b>{pct(mp, 0)}</b></> : <span className="muted sm">{mib(n.mem_alloc_mib)}</span>}</div>
+                <div className="nrow"><span>Pods</span><Meter value={(podsHere / Math.max(1, n.pods_cap)) * 100} warnAt={80} badAt={95} /><b>{podsHere}/{n.pods_cap}</b></div>
+              </div>);
+          })}</div>
+        </section>)}
+
+      <div className="grid g2">
+        <TopList title="Top pods by CPU" rows={topCpu} format={cores} color="var(--c1)" hint={podUse.data?.data?.available === false ? 'needs metrics-server' : undefined} />
+        <TopList title="Top pods by memory" rows={topMem} format={mib} color="var(--c2)" hint={podUse.data?.data?.available === false ? 'needs metrics-server' : undefined} />
+        <TopList title={nsUsesMem ? 'Namespaces by memory' : 'Namespaces by pods'} rows={topNs} format={v => (nsUsesMem ? mib(v) : String(v))} color="var(--c4)" />
+        <TopList title="Most restarts" rows={topRestarts} format={v => `${v}×`} color="var(--warn)" />
+      </div>
+
+      <section className="card"><div className="card-head"><h2>Recent warnings</h2></div>
+        {!events.data ? <p className="muted sm">{events.error || 'Loading…'}</p> : (events.data.data?.items ?? []).length === 0 ? <p className="muted sm">No warning events. 🎉</p> : (
+          <div className="tbl-wrap"><table className="tbl"><tbody>{(events.data.data?.items ?? []).map((e, i) => <tr key={i}><td className="sm" style={{ whiteSpace: 'nowrap' }}>{timeAgo(e.last)}{e.count > 1 && <small> ×{e.count}</small>}</td><td className="warn"><b>{e.reason}</b></td><td className="sm mono">{e.ns ? `${e.ns}/` : ''}{e.object}</td><td className="sm">{e.message}</td></tr>)}</tbody></table></div>)}
+      </section>
     </div>
   );
 }
@@ -490,7 +624,7 @@ function glob(pattern: string, value: string): boolean {
 
 /* ---------------------------------------------------------------- settings */
 function ClusterSettings({ cluster, isAdmin, reload }: { cluster: Cluster; isAdmin: boolean; reload: () => Promise<void> }) {
-  const { toast } = useApp();
+  const { toast, confirm } = useApp();
   const [name, setName] = useState(cluster.name);
   const [rotated, setRotated] = useState<string | null>(null);
   const [policy, setPolicy] = useState<K8sLogPolicy>(cluster.log_policy);
@@ -500,7 +634,7 @@ function ClusterSettings({ cluster, isAdmin, reload }: { cluster: Cluster; isAdm
 
   async function run(fn: () => Promise<unknown>, ok: string) { try { await fn(); toast(ok); await reload(); } catch (e) { toast((e as Error).message, true); } }
   async function revokeNow() {
-    if (!window.confirm('Revoke the agent token NOW?\n\nThe agent goes offline until you patch the new token into its Secret.')) return;
+    if (!(await confirm('Revoke the agent token NOW?\n\nThe agent goes offline until you patch the new token into its Secret.'))) return;
     try { setRotated((await post<{ install_token: string }>(`/clusters/${cluster.id}/rotate-token?immediate=true`)).install_token); await reload(); } catch (e) { toast((e as Error).message, true); }
   }
   return (
@@ -516,7 +650,7 @@ function ClusterSettings({ cluster, isAdmin, reload }: { cluster: Cluster; isAdm
           {cluster.last_agent_ip && <tr><td className="muted">Last seen from</td><td className="mono">{cluster.last_agent_ip}</td></tr>}
           <tr><td className="muted">Registered by</td><td className="sm">{cluster.created_by || '–'}</td></tr></tbody></table>
         <div style={{ display: 'flex', gap: 8, marginTop: 12, flexWrap: 'wrap' }}>
-          <button className="btn sm" disabled={cluster.token_rotation_pending} onClick={() => { if (window.confirm('Rotate the agent token? It is delivered to the agent automatically and saved to its Secret.')) void run(() => post(`/clusters/${cluster.id}/rotate-token`), 'Token rotation started'); }}>{cluster.token_rotation_pending ? 'Rotation pending…' : 'Rotate token'}</button>
+          <button className="btn sm" disabled={cluster.token_rotation_pending} onClick={async () => { if (await confirm('Rotate the agent token?\n\nThe new token is delivered to the agent automatically and saved to its Secret. Nothing needs to be reinstalled.', { danger: false, confirmLabel: 'Rotate token' })) void run(() => post(`/clusters/${cluster.id}/rotate-token`), 'Token rotation started'); }}>{cluster.token_rotation_pending ? 'Rotation pending…' : 'Rotate token'}</button>
           <button className="btn sm danger" onClick={revokeNow}>Revoke now</button>
         </div>
       </section>

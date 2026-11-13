@@ -20,7 +20,13 @@ const PRESETS: { label: string; hint: string; policy: Policy }[] = [
   { label: 'Nothing', hint: 'Turn log access off for this server', policy: { docker: { enabled: false, include: [], exclude: [] }, journal: { enabled: false, units: [] }, files: { enabled: false, mode: 'all', categories: [], custom: [] } } },
 ];
 
-const lines = (v: string) => v.split('\n').map(x => x.trim()).filter(Boolean);
+const lines = (v: string) => v.split(/[\s,]+/).map(x => x.trim()).filter(Boolean);
+
+/** One pattern per line. Keeps what you type as-is (so Enter and spaces work) and reports the parsed list. */
+function PatternList({ value, onChange, placeholder }: { value: string[]; onChange: (v: string[]) => void; placeholder: string }) {
+  const [text, setText] = useState(value.join('\n'));
+  return <textarea rows={3} value={text} onChange={e => { setText(e.target.value); onChange(lines(e.target.value)); }} placeholder={placeholder} style={{ width: '100%', fontFamily: 'var(--mono)', fontSize: 12 }} />;
+}
 const summary = (p: Policy) => [
   `Containers: ${!p.docker.enabled ? 'off' : p.docker.include.join(', ') === '*' && !p.docker.exclude.length ? 'all' : 'selected'}`,
   `Journal: ${!p.journal.enabled ? 'off' : p.journal.units.join(', ') === '*' ? 'all' : 'selected units'}`,
@@ -58,8 +64,7 @@ function PolicyEditor({ serverId, initial, onClose, onSaved }: { serverId: numbe
     event.preventDefault(); setError(''); setBusy(true);
     try { await put(`/servers/${serverId}/log-policy`, p); onSaved(); } catch (e) { setError((e as Error).message); } finally { setBusy(false); }
   }
-  const area = (value: string[], on: (v: string[]) => void, placeholder: string) => (
-    <textarea rows={3} value={value.join('\n')} onChange={e => on(lines(e.target.value))} placeholder={placeholder} style={{ width: '100%', fontFamily: 'var(--mono)', fontSize: 12 }} />);
+  const area = (value: string[], on: (v: string[]) => void, placeholder: string) => <PatternList value={value} onChange={on} placeholder={placeholder} />;
   const block = (title: string, enabled: boolean, set: (v: boolean) => void, children: React.ReactNode) => (
     <fieldset style={{ border: '1px solid var(--line)', borderRadius: 12, padding: 14, margin: 0, opacity: enabled ? 1 : 0.7 }}>
       <legend style={{ padding: '0 6px' }}><label className="check"><input type="checkbox" checked={enabled} onChange={e => set(e.target.checked)} /><b>{title}</b></label></legend>

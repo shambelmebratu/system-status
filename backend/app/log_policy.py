@@ -5,6 +5,7 @@ what the agent's own local settings (AGENT_LOGS, the fixed allow-list of log loc
 import fnmatch
 import json
 
+import re
 from pydantic import BaseModel, Field, field_validator
 
 # Human-friendly groups of log files, shown as checkboxes in the dashboard.
@@ -34,10 +35,10 @@ class _Patterns(BaseModel):
     @staticmethod
     def clean(values: list[str]) -> list[str]:
         out = []
-        for value in values:
-            value = value.strip()
-            if value and value not in out:
-                out.append(value)
+        for raw in values:
+            for value in re.split(r"[\s,]+", raw.strip()):      # one per line, but spaces/commas between patterns are fine too
+                if value and value not in out:
+                    out.append(value)
         return out[:50]
 
 
@@ -49,7 +50,6 @@ class DockerPolicy(_Patterns):
     @field_validator("include", "exclude")
     @classmethod
     def valid(cls, v: list[str]) -> list[str]:
-        import re
         v = cls.clean(v)
         if any(not re.match(GLOB, item) for item in v):
             raise ValueError("Patterns may contain letters, digits and . _ - : / @ * ? [ ] only")
@@ -89,8 +89,9 @@ class FilesPolicy(_Patterns):
     def valid_paths(cls, v: list[str]) -> list[str]:
         import re
         v = cls.clean(v)
-        if any(not item.startswith("/") or ".." in item or not re.match(GLOB, item) for item in v):
-            raise ValueError("Custom file patterns must be absolute paths (starting with /), without '..'")
+        bad = [item for item in v if not item.startswith("/") or ".." in item or not re.match(GLOB, item)]
+        if bad:
+            raise ValueError(f"'{bad[0]}' is not allowed: custom file patterns must be absolute paths starting with / (no '..'), e.g. /var/log/nginx/*.log")
         return v
 
 

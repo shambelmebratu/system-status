@@ -24,7 +24,7 @@ const size = (n: number | null) => (n == null ? '' : n > 1e9 ? `${(n / 1e9).toFi
 
 /** Admin: how long each kind of data is kept, the automatic purge schedule, and a manual purge. */
 export function RetentionCard() {
-  const { toast } = useApp();
+  const { toast, confirm } = useApp();
   const { value, reload } = usePoll(() => api<View>('/retention'), [], 30000);
   const [days, setDays] = useState<Record<string, string>>({});
   const [auto, setAuto] = useState(true);
@@ -58,7 +58,7 @@ export function RetentionCard() {
     if (!chosen.length) { toast('Tick the kinds of data to purge first', true); return; }
     const scope = Number(olderThan) === 0 ? 'EVERYTHING' : `everything older than ${olderThan} days`;
     const rows = chosen.reduce((n, k) => n + stats[k].rows, 0);
-    if (!window.confirm(`Permanently delete ${scope} in:\n\n${chosen.map(k => `• ${stats[k].label}`).join('\n')}\n\nUp to ${rows.toLocaleString()} rows. This cannot be undone.`)) return;
+    if (!(await confirm(`Permanently delete ${scope} in:\n\n${chosen.map(k => `• ${stats[k].label}`).join('\n')}\n\nUp to ${rows.toLocaleString()} rows. This cannot be undone.`))) return;
     setBusy(true);
     try {
       const r = await post<{ deleted: Record<string, number> }>('/retention/purge', { categories: chosen, older_than_days: Number(olderThan) });

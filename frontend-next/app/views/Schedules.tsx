@@ -18,14 +18,14 @@ function when(item: ScheduledMessage): string {
 }
 
 export function Schedules() {
-  const { channels, toast } = useApp();
+  const { channels, toast, confirm } = useApp();
   const list = usePoll(() => api<ScheduledMessage[]>('/scheduled-messages'), [], 20000);
   const [editing, setEditing] = useState<ScheduledMessage | 'new' | null>(null);
   const [busy, setBusy] = useState<number | null>(null);
   const items = list.value;
 
   async function sendNow(item: ScheduledMessage) {
-    if (!window.confirm(`Send “${item.name}” to its channels right now?`)) return;
+    if (!(await confirm(`Send “${item.name}” now?\n\nIt goes to its channels immediately.`, { danger: false, confirmLabel: 'Send now' }))) return;
     setBusy(item.id);
     try { toast((await post<{ detail: string }>(`/scheduled-messages/${item.id}/send`)).detail); await list.reload(); } catch (e) { toast(`Send failed: ${(e as Error).message}`, true); } finally { setBusy(null); }
   }
@@ -33,7 +33,7 @@ export function Schedules() {
     try { await put(`/scheduled-messages/${item.id}`, toBody(item, { enabled: !item.enabled })); await list.reload(); } catch (e) { toast((e as Error).message, true); }
   }
   async function remove(item: ScheduledMessage) {
-    if (!window.confirm(`Delete “${item.name}”?`)) return;
+    if (!(await confirm(`Delete “${item.name}”?\n\nThis scheduled message will no longer be sent.`))) return;
     try { await del(`/scheduled-messages/${item.id}`); toast('Deleted'); await list.reload(); } catch (e) { toast((e as Error).message, true); }
   }
 
