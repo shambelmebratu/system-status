@@ -1,6 +1,7 @@
 """Scheduled messages: compute the next run in the schedule's own time zone, send to the chosen channels, retry failures."""
 import json
 import logging
+from .config import get_settings
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -9,9 +10,7 @@ from sqlalchemy import select
 from .models import Channel, ScheduledMessage
 
 logger = logging.getLogger(__name__)
-MAX_ATTEMPTS = 3          # per run: first try + 2 retries, one minute apart
-RETRY_DELAY = timedelta(minutes=1)
-MISSED_AFTER = timedelta(minutes=15)  # a reminder delivered much later than planned is just noise: skip it
+# Tries per run, retry delay and the "too late, skip it" window come from .env (SCHEDULE_* settings).
 
 
 def get_zone(name: str) -> ZoneInfo:
@@ -99,7 +98,7 @@ def run_due_schedules(session) -> None:
     for item in due:
         try:
             planned = item.next_run_at if item.next_run_at.tzinfo else item.next_run_at.replace(tzinfo=timezone.utc)
-            if item.attempts == 0 and now - planned > MISSED_AFTER:
+            if item.attempts == 0 and now - planned > timedelta(minutes=get_settings().schedule_missed_minutes):
                 item.last_status, item.last_error, item.last_run_at = "missed", f"Skipped: worker was not running at {planned.isoformat()}", now
                 schedule_next(item, now)
                 continue
@@ -113,18 +112,18 @@ def run_due_schedules(session) -> None:
                 item.last_error = "; ".join(errors)[:1000] or None
                 logger.info("scheduled message sent id=%s name=%s", item.id, item.name)
                 schedule_next(item, now)
-            elif item.attempts >= MAX_ATTEMPTS:
+            elif item.attempts >= get_settings().schedule_max_attempts:
                 item.last_status = "failed" if len(failed) >= total else "partial"
                 item.last_error = "; ".join(errors)[:1000]
                 logger.error("scheduled message failed id=%s errors=%s", item.id, item.last_error)
                 schedule_next(item, now)
             else:
                 item.pending_channel_ids = json.dumps(failed)
-                item.last_status, item.last_error = "failed", "; ".join(errors)[:1000] + f" (retrying, attempt {item.attempts}/{MAX_ATTEMPTS})"
-                item.next_run_at = now + RETRY_DELAY
+                item.last_status, item.last_error = "failed", "; ".join(errors)[:1000] + f" (retrying, attempt {item.attempts}/{get_settings().schedule_max_attempts})"
+                item.next_run_at = now + timedelta(minutes=get_settings().schedule_retry_minutes)
             session.commit()
         except Exception:
             session.rollback()
             logger.exception("scheduled message crashed id=%s", item.id)
-            item.next_run_at = now + RETRY_DELAY * 5  # never let one bad schedule spin every second
+            item.next_run_at = now + timedelta(minutes=get_settings().schedule_retry_minutes) * 5  # never let one bad schedule spin every second
             session.commit()

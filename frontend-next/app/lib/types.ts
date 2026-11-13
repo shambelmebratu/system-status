@@ -31,6 +31,7 @@ export type Incident = {
 export type Dashboard = {
   servers: Server[]; services: Service[]; events: AlertEvent[];
   threshold_defaults: { cpu: number; memory: number; disk: number; load: number; swap: number; process: number; server_interval_seconds: number };
+  limits?: { usage_warn_percent: number; usage_bad_percent: number; k8s_offline_seconds: number; enrollment_default_minutes: number; enrollment_max_minutes: number; log_result_ttl_minutes: number };
   summary: { servers: number; services: number; up: number; alerts: number; open_incidents: number };
 };
 export type Point = { t: string; [key: string]: number | string | undefined };

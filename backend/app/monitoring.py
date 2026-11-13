@@ -536,7 +536,8 @@ def _defer(session, target) -> None:
 
 
 def heartbeat_grace(interval_seconds: int) -> int:
-    return max(30, interval_seconds * 3)
+    s = get_settings()
+    return max(s.heartbeat_min_grace_seconds, interval_seconds * s.heartbeat_missed_reports)
 
 
 def run_once() -> None:

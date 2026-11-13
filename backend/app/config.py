@@ -54,6 +54,27 @@ class Settings(BaseSettings):
     load_threshold: float = 10
     swap_threshold: float = 80
     process_threshold: float = 80
+    # --- operational limits (all overridable in .env; nothing below is hard-coded elsewhere) ---
+    heartbeat_missed_reports: int = 3          # a push agent is "down" after this many report intervals of silence...
+    heartbeat_min_grace_seconds: int = 30      # ...but never sooner than this
+    k8s_report_interval_seconds: int = 30      # how often the in-cluster agent reports
+    k8s_heartbeat_grace_seconds: int = 100     # silence before a cluster is marked down
+    k8s_offline_seconds: int = 120             # live queries are refused when the agent has been silent this long
+    k8s_max_pending_requests: int = 8          # queued dashboard questions per cluster
+    log_result_ttl_minutes: int = 15           # fetched logs are deleted after this long
+    log_pickup_timeout_seconds: int = 45       # an agent must pick up a log request within this time
+    log_max_pending_per_server: int = 5
+    enrollment_default_minutes: int = 15       # install links: default lifetime ...
+    enrollment_max_minutes: int = 1440         # ... and the longest an admin may choose
+    alert_retention_days: int = 90             # defaults for the admin-editable retention (Settings > Data retention)
+    incident_retention_days: int = 365
+    link_retention_days: int = 7
+    audit_min_retention_days: int = 30         # the audit log can never be kept shorter, or purged, below this
+    schedule_max_attempts: int = 3             # scheduled messages: tries per run
+    schedule_retry_minutes: int = 1
+    schedule_missed_minutes: int = 15          # a reminder this late is skipped instead of sent
+    usage_warn_percent: float = 70             # dashboard colouring of usage bars (amber)
+    usage_bad_percent: float = 90              # (red)
     company_name: str = "SM-Watch"
     brand_primary_color: str = "#c9f36b"
     brand_accent_color: str = "#68d5e8"

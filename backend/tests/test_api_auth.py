@@ -1312,3 +1312,23 @@ def test_custom_log_patterns_accept_spaces_and_commas_and_explain_errors():
         LogPolicy.model_validate({"files": {"enabled": True, "mode": "selected", "custom": ["var/log/x"]}})
     with pytest.raises(Exception, match="not allowed"):
         LogPolicy.model_validate({"files": {"enabled": True, "mode": "selected", "custom": ["/var/log/../etc/passwd"]}})
+
+
+def test_operational_limits_come_from_settings(client, monkeypatch):
+    from app import monitoring
+    from app.config import get_settings
+    s = get_settings()
+    assert monitoring.heartbeat_grace(60) == max(s.heartbeat_min_grace_seconds, 60 * s.heartbeat_missed_reports)
+    monkeypatch.setattr(s, "heartbeat_missed_reports", 5)
+    monkeypatch.setattr(s, "heartbeat_min_grace_seconds", 200)
+    assert monitoring.heartbeat_grace(60) == 300 and monitoring.heartbeat_grace(10) == 200       # changing the setting changes the behaviour
+    sign_in(client)
+    monkeypatch.setattr(s, "enrollment_max_minutes", 30)
+    assert client.post("/api/enrollments", headers=CSRF, json={"expires_minutes": 60}).status_code == 422
+    assert client.post("/api/enrollments", headers=CSRF, json={"expires_minutes": 30}).status_code == 200
+    default = client.post("/api/enrollments", headers=CSRF, json={}).json()
+    assert default["expires_at"]                                                                  # default lifetime applied
+    dash = client.get("/api/dashboard").json()["limits"]
+    assert dash["enrollment_max_minutes"] == 30 and "usage_warn_percent" in dash and dash["k8s_offline_seconds"] == s.k8s_offline_seconds
+    server = client.post("/api/servers", headers=CSRF, json={"name": "hot", "host": "10.9.9.9", "monitor_mode": "ping", "process_threshold": 250}).status_code
+    assert server == 200                                                                          # process CPU is per-core, so > 100 is valid

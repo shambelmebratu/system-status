@@ -25,7 +25,7 @@ class ServerCreate(BaseModel):
     swap_threshold: float = Field(default_factory=lambda: get_settings().swap_threshold, ge=1, le=100)
     public: bool = False
     process_names: str = ""
-    process_threshold: float = Field(default_factory=lambda: get_settings().process_threshold, ge=1, le=100)
+    process_threshold: float = Field(default_factory=lambda: get_settings().process_threshold, ge=1, le=1000)   # per-core %: 100 = one full core
 
     @model_validator(mode="after")
     def require_agent_fields_for_metrics(self):
@@ -104,7 +104,7 @@ class TokenBody(BaseModel):
 
 class EnrollmentCreate(BaseModel):
     label: str = Field(default="", max_length=100)
-    expires_minutes: int = Field(default=15, ge=1, le=24 * 60)  # short-lived by design: 15 minutes unless the admin picks otherwise
+    expires_minutes: int = Field(default_factory=lambda: get_settings().enrollment_default_minutes, ge=1)   # default and maximum come from .env (ENROLLMENT_*)
     max_uses: int | None = Field(default=None, ge=1, le=10000)       # None = unlimited
 
 

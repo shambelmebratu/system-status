@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { api, post, put } from '../lib/api';
-import { useApp, usePoll } from '../lib/app';
+import { useApp, useLimits, usePoll } from '../lib/app';
 import { timeAgo } from '../lib/format';
 import { Field } from './ui';
 
@@ -18,12 +18,13 @@ const WEEKDAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Satur
 const HINT: Record<string, string> = {
   checks: 'One row per check; the biggest table over time.', metrics: 'CPU, memory, disk and network samples.', alerts: 'Sent alert messages and their delivery state.',
   incidents: 'Resolved incidents only. Open ones are never purged.', audit: 'Who did what. Kept at least 30 days.', links: 'Expired or revoked install links.',
-  transient: 'Logs that were fetched on demand. Already deleted after 15 minutes.',
+  transient: 'Logs that were fetched on demand. Deleted automatically after a short time.',
 };
 const size = (n: number | null) => (n == null ? '' : n > 1e9 ? `${(n / 1e9).toFixed(1)} GB` : n > 1e6 ? `${(n / 1e6).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1e3))} KB`);
 
 /** Admin: how long each kind of data is kept, the automatic purge schedule, and a manual purge. */
 export function RetentionCard() {
+  const lim = useLimits();
   const { toast, confirm } = useApp();
   const { value, reload } = usePoll(() => api<View>('/retention'), [], 30000);
   const [days, setDays] = useState<Record<string, string>>({});
@@ -70,7 +71,7 @@ export function RetentionCard() {
   return (
     <section className="card" style={{ marginTop: 16 }}>
       <div className="card-head"><h2>Data retention & purge</h2></div>
-      <p className="muted sm" style={{ marginBottom: 14 }}>Choose how long each kind of data is kept. Anything older is deleted automatically on the schedule below, or you can purge by hand. Logs from your servers and clusters are never stored here: they are read on demand and dropped after 15 minutes.</p>
+      <p className="muted sm" style={{ marginBottom: 14 }}>Choose how long each kind of data is kept. Anything older is deleted automatically on the schedule below, or you can purge by hand. Logs from your servers and clusters are never stored here: they are read on demand and dropped after {lim.logTtl} minutes.</p>
       <div className="tbl-wrap"><table className="tbl">
         <thead><tr><th style={{ width: 28 }} /><th>Data</th><th className="num">Rows</th><th className="hide-sm">Oldest</th><th className="num hide-sm">Size</th><th style={{ width: 150 }}>Keep for</th></tr></thead>
         <tbody>{ORDER.map(k => (
@@ -80,7 +81,7 @@ export function RetentionCard() {
             <td className="num">{stats[k].rows.toLocaleString()}</td>
             <td className="hide-sm sm muted">{stats[k].oldest ? timeAgo(stats[k].oldest) : '–'}</td>
             <td className="num hide-sm sm muted">{size(stats[k].bytes)}</td>
-            <td>{k === 'transient' ? <span className="muted sm">15 minutes</span> : <span style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}><input type="number" style={{ width: 80 }} min={k === 'audit' ? value.audit_min_days : 1} max={3650} value={days[k] ?? ''} onChange={e => setDays({ ...days, [k]: e.target.value })} aria-label={`Days to keep ${stats[k].label}`} /> days</span>}</td>
+            <td>{k === 'transient' ? <span className="muted sm">{lim.logTtl} minutes</span> : <span style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}><input type="number" style={{ width: 80 }} min={k === 'audit' ? value.audit_min_days : 1} max={3650} value={days[k] ?? ''} onChange={e => setDays({ ...days, [k]: e.target.value })} aria-label={`Days to keep ${stats[k].label}`} /> days</span>}</td>
           </tr>))}
         </tbody></table></div>
 

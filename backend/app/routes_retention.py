@@ -28,7 +28,7 @@ class PurgeRequest(BaseModel):
 
 def view(db: Session) -> dict:
     cfg = retention.load(db)
-    return {"settings": cfg, "stats": retention.stats(db), "audit_min_days": retention.AUDIT_MIN_DAYS, "now": datetime.now(timezone.utc).isoformat()}
+    return {"settings": cfg, "stats": retention.stats(db), "audit_min_days": retention.audit_min_days(), "now": datetime.now(timezone.utc).isoformat()}
 
 
 @router.get("")
@@ -45,8 +45,8 @@ def update(payload: RetentionUpdate, request: Request, user: dict = Depends(requ
             raise HTTPException(422, f"Unknown data kind '{key}'")
         if not 1 <= days <= 3650:
             raise HTTPException(422, "Retention must be between 1 and 3650 days")
-        if key == "audit" and days < retention.AUDIT_MIN_DAYS:
-            raise HTTPException(422, f"The audit log must be kept at least {retention.AUDIT_MIN_DAYS} days")
+        if key == "audit" and days < retention.audit_min_days():
+            raise HTTPException(422, f"The audit log must be kept at least {retention.audit_min_days()} days")
         if cfg["days"].get(key) != days:
             changes.append(f"{key}={days}d")
             cfg["days"][key] = days

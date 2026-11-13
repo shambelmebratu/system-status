@@ -7,7 +7,7 @@ import { CodeBox, Field } from '../components/ui';
 import { post, put } from '../lib/api';
 import { ROLE_INFO } from '../lib/types';
 import { timeAgo } from '../lib/format';
-import { useApp } from '../lib/app';
+import { useApp, useLimits } from '../lib/app';
 
 export function Settings() {
   const { toast, data, me, canOperate, isAdmin, reloadMe } = useApp();
@@ -71,14 +71,17 @@ function JoinTokens() {
   const [base] = useControlPlaneUrl();
   const enrollment = useActiveEnrollment();
   const [label, setLabel] = useState('');
-  const [minutes, setMinutes] = useState('15');
+  const lim = useLimits();
+  const [minutes, setMinutes] = useState('');
+  const choices = [...new Set([10, lim.enrollDefault, 60, lim.enrollMax])].filter(m => m <= lim.enrollMax).sort((a, b) => a - b);
+  const label_ = (m: number) => (m < 60 ? `in ${m} minutes` : m % 60 === 0 && m < 1440 ? `in ${m / 60} hour${m === 60 ? '' : 's'}` : m === 1440 ? 'in 24 hours' : `in ${m} minutes`) + (m === lim.enrollMax ? ' (maximum)' : '');
   const [maxUses, setMaxUses] = useState('');
   const [openId, setOpenId] = useState<number | null>(null);
 
   async function create(event: FormEvent) {
     event.preventDefault();
     try {
-      await post('/enrollments', { label, expires_minutes: Number(minutes), max_uses: maxUses ? Number(maxUses) : null });
+      await post('/enrollments', { label, expires_minutes: Number(minutes || lim.enrollDefault), max_uses: maxUses ? Number(maxUses) : null });
       setLabel(''); setMaxUses(''); toast('Join token created'); await enrollment.reload();
     } catch (caught) { toast((caught as Error).message, true); }
   }
@@ -86,10 +89,10 @@ function JoinTokens() {
   return (
     <section className="card" style={{ marginTop: 16 }}>
       <div className="card-head"><h2>Agent join tokens</h2></div>
-      <p className="muted sm" style={{ marginBottom: 14 }}>A join token lets a server register itself as a new monitor with a single command. Anyone holding an active token can add servers to this dashboard, so links are short-lived (15 minutes by default, 24 hours at most). Add a server limit for extra safety and revoke links you no longer need. Revoking never disconnects servers that already joined.</p>
+      <p className="muted sm" style={{ marginBottom: 14 }}>A join token lets a server register itself as a new monitor with a single command. Anyone holding an active token can add servers to this dashboard, so links are short-lived ({lim.enrollDefault} minutes by default, {Math.round(lim.enrollMax / 60)} hours at most). Add a server limit for extra safety and revoke links you no longer need. Revoking never disconnects servers that already joined.</p>
       <form onSubmit={create} className="form-grid" style={{ marginBottom: 16, alignItems: 'end' }}>
         <Field label="Label"><input value={label} onChange={e => setLabel(e.target.value)} placeholder="e.g. new web servers" /></Field>
-        <Field label="Expires"><select value={minutes} onChange={e => setMinutes(e.target.value)}><option value="10">in 10 minutes</option><option value="15">in 15 minutes</option><option value="60">in 1 hour</option><option value="1440">in 24 hours (maximum)</option></select></Field>
+        <Field label="Expires"><select value={minutes || String(lim.enrollDefault)} onChange={e => setMinutes(e.target.value)}>{choices.map(m => <option key={m} value={m}>{label_(m)}</option>)}</select></Field>
         <Field label="Max servers (optional)"><input type="number" min={1} value={maxUses} onChange={e => setMaxUses(e.target.value)} placeholder="unlimited" /></Field>
         <button className="btn primary">Create token</button>
       </form>

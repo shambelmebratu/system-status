@@ -299,6 +299,10 @@ Review the manifest first by running the `curl` alone. It creates a `smwatch` na
 
 **Images.** `sm-watch-k8s-agent` is published with the other images (override with `K8S_AGENT_IMAGE`). Live CPU/memory needs metrics-server in the cluster; without it everything else still works.
 
+## Configuration: nothing is hard-coded
+
+Alert limits are set **per server** (Edit the server) and per cluster log policy by admins; defaults for new servers come from `CPU_THRESHOLD`, `MEMORY_THRESHOLD`, `DISK_THRESHOLD`, `LOAD_THRESHOLD`, `SWAP_THRESHOLD` and `PROCESS_THRESHOLD`. Process CPU is per core (100 = one full core, so values above 100 are valid). All timing and size limits (agent heartbeat grace, Kubernetes report/offline times, log result lifetime, install-link lifetime, retention defaults, scheduled-message retries, usage-bar colours) are `.env` settings, listed with their defaults in `.env.example`, and the dashboard reads them from the API. Retention and purge schedules are edited by admins in Settings.
+
 ## Data retention and purging
 
 Settings → **Data retention & purge** (admins) controls how long each kind of data is kept: uptime history, server/cluster metrics, alert messages, resolved incidents, the audit log (minimum 30 days) and expired install links. Anything older is deleted automatically **hourly, daily or weekly** (daily/weekly at a time you choose, UTC). You can also tick data kinds and **purge now** (older than N days, or everything). Open incidents are never purged, every settings change and purge is written to the audit log, and the table shows row counts, oldest entry and (PostgreSQL) disk size. Defaults come from `CHECK_RETENTION_DAYS`, `METRIC_RETENTION_DAYS` and `AUDIT_RETENTION_DAYS`; alerts default to 90 days. Fetched logs are never archived (deleted after 15 minutes).

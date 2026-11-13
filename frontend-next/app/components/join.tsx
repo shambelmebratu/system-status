@@ -56,10 +56,10 @@ export function useActiveEnrollment() {
   const active = items?.find(i => i.active && (!i.expires_at || new Date(i.expires_at).getTime() > Date.now())) ?? null;   // newest first
   return {
     items, active, error, busy, reload: load,
-    /** Creates a fresh link (valid 15 minutes) on demand. */
+    /** Creates a fresh link on demand (lifetime = ENROLLMENT_DEFAULT_MINUTES on the server). */
     generate: async (label = 'Dashboard') => {
       setBusy(true);
-      try { await post('/enrollments', { label, expires_minutes: 15 }); await load(); } catch (e) { setError((e as Error).message); } finally { setBusy(false); }
+      try { await post('/enrollments', { label }); await load(); } catch (e) { setError((e as Error).message); } finally { setBusy(false); }
     },
     revoke: async (id: number) => { await del(`/enrollments/${id}`); await load(); },
   };

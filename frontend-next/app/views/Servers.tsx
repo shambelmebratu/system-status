@@ -8,7 +8,7 @@ import { LogsPanel } from '../components/logs';
 import { LogPolicyCard } from '../components/logpolicy';
 import { CodeBox, Empty, Field, Icon, Meter, Modal, StatusPill } from '../components/ui';
 import { api, del, post, put } from '../lib/api';
-import { useApp, usePoll } from '../lib/app';
+import { useApp, useLimits, usePoll } from '../lib/app';
 import { bytesPerSecond, duration, ms, pct, timeAgo } from '../lib/format';
 import type { Incident, Mode, Range, Server, ServerHistory } from '../lib/types';
 import { IncidentList } from './Overview';
@@ -28,6 +28,7 @@ export function Servers() {
 
 function ServerList() {
   const { data, go, canOperate } = useApp();
+  const lim = useLimits();
   const servers = data!.servers;
   return (
     <>
@@ -41,7 +42,7 @@ function ServerList() {
                 <div className="tile-top"><div className="grow"><div className="name">{s.name}</div><small className="muted">{m?.hostname || s.host || 'waiting for first report'}</small></div><StatusPill status={s.last_status} /></div>
                 {m?.cpu != null ? (
                   <div className="minis">
-                    {(['cpu', 'memory', 'disk'] as const).map(k => <div key={k} className="mini">{k === 'cpu' ? 'CPU' : k === 'memory' ? 'Memory' : 'Disk'}<b>{pct(m[k], 0)}</b><Meter value={m[k]!} warnAt={s[`${k}_threshold` as const] * 0.85} badAt={s[`${k}_threshold` as const]} /></div>)}
+                    {(['cpu', 'memory', 'disk'] as const).map(k => <div key={k} className="mini">{k === 'cpu' ? 'CPU' : k === 'memory' ? 'Memory' : 'Disk'}<b>{pct(m[k], 0)}</b><Meter value={m[k]!} warnAt={s[`${k}_threshold` as const] * (lim.warn / lim.bad)} badAt={s[`${k}_threshold` as const]} /></div>)}
                   </div>
                 ) : <div className="muted sm" style={{ minHeight: 48 }}>{s.last_status === 'down' ? s.last_error : s.monitor_mode === 'ping' ? `Latency ${ms(m?.latency_ms)}` : 'No metrics received yet.'}</div>}
                 <div className="foot"><span className="tag">{MODE_LABEL[s.monitor_mode]}</span><span>{s.monitor_mode === 'push' ? `seen ${timeAgo(s.last_seen_at)}` : `checked ${timeAgo(s.last_checked_at)}`}</span></div>
@@ -270,7 +271,7 @@ function ServerWizard({ existing, onClose }: { existing?: Server; onClose: () =>
             <h3 className="muted sm" style={{ textTransform: 'uppercase', letterSpacing: '.6px' }}>Alert thresholds</h3>
             <div className="form-grid">
               {([['cpu', 'CPU %'], ['memory', 'Memory %'], ['disk', 'Disk %'], ['load', 'Load (1m)'], ['swap', 'Swap %'], ['process', 'Process CPU %']] as const).map(([k, label]) =>
-                <Field key={k} label={label}><input type="number" step="any" min={0} value={th[k]} onChange={e => setTh({ ...th, [k]: e.target.value })} required /></Field>)}
+                <Field key={k} label={label} hint={k === 'process' ? 'Per core: 100 = one full core.' : undefined}><input type="number" step="any" min={0} value={th[k]} onChange={e => setTh({ ...th, [k]: e.target.value })} required /></Field>)}
               <Field label="Watch processes" hint="Comma-separated names; blank = any process."><input value={processNames} onChange={e => setProcessNames(e.target.value)} placeholder="nginx, postgres" /></Field>
             </div>
           </>
@@ -288,6 +289,7 @@ function ServerWizard({ existing, onClose }: { existing?: Server; onClose: () =>
 
 function JoinModal({ onClose }: { onClose: () => void }) {
   const { data, go } = useApp();
+  const lim = useLimits();
   const [base, setBase] = useControlPlaneUrl();
   const enrollment = useActiveEnrollment();
   const [opened] = useState(() => Date.now());
@@ -301,7 +303,7 @@ function JoinModal({ onClose }: { onClose: () => void }) {
           <li><b>Run this one command on the server</b>
             {enrollment.error ? <div className="err">{enrollment.error}</div>
               : !enrollment.items ? <p className="muted sm">Loading…</p>
-              : !e ? <div className="banner">No active install link. A link is only created when you need one and works for 15 minutes. <button className="btn sm primary" style={{ marginLeft: 8 }} disabled={enrollment.busy} onClick={() => void enrollment.generate()}>Generate install command</button></div>
+              : !e ? <div className="banner">No active install link. A link is only created when you need one and works for {lim.enrollDefault} minutes. <button className="btn sm primary" style={{ marginLeft: 8 }} disabled={enrollment.busy} onClick={() => void enrollment.generate()}>Generate install command</button></div>
               : <JoinCommands token={e.token} base={base} />}
           </li>
           <li><b>That’s it</b><span className="sm muted">The server registers itself under its hostname and appears below within seconds. You can rename it, set alert thresholds or add it to the status page afterwards. Run the same command on as many servers as you like.</span></li>

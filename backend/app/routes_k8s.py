@@ -23,7 +23,7 @@ from .models import CheckResult, Cluster, ClusterSample, Incident, K8sRequest
 from .monitoring import format_alert, outage_seconds, queue_event, record_result, should_notify_again, sync_incident
 from .routes_agent import hash_token
 from .routes_enroll import control_plane_url, find_enrollment
-from .routes_logs import PICKUP_TIMEOUT, REQUEST_TTL, _Waiter, _wake
+from .routes_logs import _Waiter, _wake, pickup_timeout, request_ttl
 from .security import RANK, agent_gate, client_ip, login_limiter, require_admin, require_operator, require_user
 from .stats import aware, bucketize
 
@@ -32,9 +32,7 @@ router = APIRouter(tags=["kubernetes"])
 NAME_PATTERN = r"^[A-Za-z0-9]([A-Za-z0-9._-]{0,58}[A-Za-z0-9])?$"
 NS = r"^([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)?$"
 KINDS = "namespaces|nodes|pods|deployments|statefulsets|daemonsets|jobs|cronjobs|services|ingresses|hpa|events|pvcs|quotas|pod_metrics|node_metrics|describe|logs"
-MAX_PENDING = 8
-REPORT_INTERVAL = 30
-HEARTBEAT_GRACE = 100   # seconds without a report before the cluster is considered down
+# Limits come from .env (K8S_* settings), see config.py.
 
 
 # ---------------------------------------------------------------------------------------------------------------- schemas
@@ -179,9 +177,10 @@ def apply_cluster_status(db: Session, cluster: Cluster, status: str, detail: str
 def check_cluster_heartbeats(session: Session) -> None:
     """Called by the worker every second: a cluster whose agent has gone silent is marked down (and alerts)."""
     now = datetime.now(timezone.utc)
+    cfg = get_settings()
     for cluster in session.scalars(select(Cluster).where(Cluster.enabled.is_(True), Cluster.last_seen_at.is_not(None))).all():
         silent = (now - aware(cluster.last_seen_at)).total_seconds()
-        if silent > HEARTBEAT_GRACE and (cluster.last_checked_at is None or (now - aware(cluster.last_checked_at)).total_seconds() >= REPORT_INTERVAL or cluster.last_status != "down"):
+        if silent > cfg.k8s_heartbeat_grace_seconds and (cluster.last_checked_at is None or (now - aware(cluster.last_checked_at)).total_seconds() >= cfg.k8s_report_interval_seconds or cluster.last_status != "down"):
             apply_cluster_status(session, cluster, "down", f"No agent heartbeat for {int(silent)}s", deliver=True)
 
 
@@ -402,7 +401,7 @@ def agent_report(payload: K8sReport, request: Request, authorization: str | None
     status, detail = evaluate(payload)
     apply_cluster_status(db, cluster, status, detail, deliver=False)   # alerts are queued; the worker delivers them
     db.commit()
-    return {**reply, "interval_seconds": REPORT_INTERVAL, "log_policy": parse_policy(cluster.log_policy)}
+    return {**reply, "interval_seconds": get_settings().k8s_report_interval_seconds, "log_policy": parse_policy(cluster.log_policy)}
 
 
 def _claim(authorization: str | None) -> tuple[int, list[dict]]:
@@ -410,8 +409,8 @@ def _claim(authorization: str | None) -> tuple[int, list[dict]]:
         cluster, _ = _cluster_by_token(db, authorization)
         if cluster is None:
             raise HTTPException(401, "Invalid agent token")
-        fresh = datetime.now(timezone.utc) - PICKUP_TIMEOUT
-        items = db.scalars(select(K8sRequest).where(K8sRequest.cluster_id == cluster.id, K8sRequest.status == "pending", K8sRequest.created_at >= fresh).order_by(K8sRequest.id).limit(MAX_PENDING)).all()
+        fresh = datetime.now(timezone.utc) - pickup_timeout()
+        items = db.scalars(select(K8sRequest).where(K8sRequest.cluster_id == cluster.id, K8sRequest.status == "pending", K8sRequest.created_at >= fresh).order_by(K8sRequest.id).limit(get_settings().k8s_max_pending_requests)).all()
         tasks = []
         for item in items:
             item.status = "running"
@@ -559,11 +558,11 @@ def ask(cluster_id: int, payload: K8sQuery, request: Request, user: dict = Depen
         if payload.resource not in ("node", "namespace") and not payload.namespace:
             raise HTTPException(422, "A namespace is required for this resource")
     now = datetime.now(timezone.utc)
-    if not cluster.last_seen_at or (now - aware(cluster.last_seen_at)).total_seconds() > 120:
-        raise HTTPException(503, "The cluster agent is offline (no report in the last 2 minutes).")
-    db.execute(delete(K8sRequest).where(K8sRequest.created_at < now - REQUEST_TTL))
-    pending = db.scalar(select(func.count()).select_from(K8sRequest).where(K8sRequest.cluster_id == cluster_id, K8sRequest.status.in_(("pending", "running")), K8sRequest.created_at >= now - PICKUP_TIMEOUT)) or 0
-    if pending >= MAX_PENDING:
+    if not cluster.last_seen_at or (now - aware(cluster.last_seen_at)).total_seconds() > get_settings().k8s_offline_seconds:
+        raise HTTPException(503, f"The cluster agent is offline (no report in the last {get_settings().k8s_offline_seconds // 60 or 1} min).")
+    db.execute(delete(K8sRequest).where(K8sRequest.created_at < now - request_ttl()))
+    pending = db.scalar(select(func.count()).select_from(K8sRequest).where(K8sRequest.cluster_id == cluster_id, K8sRequest.status.in_(("pending", "running")), K8sRequest.created_at >= now - pickup_timeout())) or 0
+    if pending >= get_settings().k8s_max_pending_requests:
         raise HTTPException(429, "Too many requests are already waiting for this cluster")
     item = K8sRequest(cluster_id=cluster_id, query=payload.model_dump_json())
     db.add(item)
@@ -580,7 +579,7 @@ def _read(cluster_id: int, request_id: int) -> dict:
         if not item or item.cluster_id != cluster_id:
             raise HTTPException(404, "Request not found (results are kept for 15 minutes)")
         status, error = item.status, item.error
-        if status in ("pending", "running") and datetime.now(timezone.utc) - aware(item.created_at) > PICKUP_TIMEOUT:
+        if status in ("pending", "running") and datetime.now(timezone.utc) - aware(item.created_at) > pickup_timeout():
             status, error = "error", "The cluster agent did not answer in time."
         query = json.loads(item.query)
         result = {"id": item.id, "status": status, "error": error, "truncated": item.truncated, "query": query}

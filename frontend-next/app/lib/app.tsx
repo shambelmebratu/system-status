@@ -67,6 +67,16 @@ export function AppProvider({ children, me, reloadMe, onUnauthorized }: { childr
   );
 }
 
+/** Operational limits configured in .env (served by the API, so nothing is hard-coded in the UI). */
+export function useLimits() {
+  const { data } = useApp();
+  const l = data?.limits;
+  return {
+    warn: l?.usage_warn_percent ?? 70, bad: l?.usage_bad_percent ?? 90, offlineMs: (l?.k8s_offline_seconds ?? 120) * 1000,
+    enrollDefault: l?.enrollment_default_minutes ?? 15, enrollMax: l?.enrollment_max_minutes ?? 1440, logTtl: l?.log_result_ttl_minutes ?? 15,
+  };
+}
+
 /** Re-runs `load` on an interval (and when deps change); returns data, loading and a manual reload. */
 export function usePoll<T>(load: () => Promise<T>, deps: unknown[], intervalMs = 15000) {
   const [value, setValue] = useState<T | null>(null);

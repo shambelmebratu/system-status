@@ -30,14 +30,17 @@ CATEGORIES = {
     "links": "Expired install links",
     "transient": "Fetched logs (temporary)",
 }
-AUDIT_MIN_DAYS = 30
+def audit_min_days() -> int:
+    return get_settings().audit_min_retention_days
+
+
 FREQUENCIES = ("hourly", "daily", "weekly")
 
 
 def defaults() -> dict:
     s = get_settings()
     return {
-        "days": {"checks": s.check_retention_days, "metrics": s.metric_retention_days, "alerts": 90, "incidents": 365, "audit": max(AUDIT_MIN_DAYS, s.audit_retention_days), "links": 7},
+        "days": {"checks": s.check_retention_days, "metrics": s.metric_retention_days, "alerts": s.alert_retention_days, "incidents": s.incident_retention_days, "audit": max(audit_min_days(), s.audit_retention_days), "links": s.link_retention_days},
         "auto": True,
         "frequency": "hourly",
         "time": "03:00",        # UTC, for daily and weekly runs
@@ -105,8 +108,8 @@ def purge(db: Session, categories: list[str], older_than_days: dict[str, int] | 
     for category in categories:
         days = older_than_days.get(category) if isinstance(older_than_days, dict) else older_than_days
         cutoff = now - timedelta(days=days) if days else None
-        if category == "audit" and (cutoff is None or days < AUDIT_MIN_DAYS):
-            raise ValueError(f"The audit log can only be purged for entries older than {AUDIT_MIN_DAYS} days")
+        if category == "audit" and (cutoff is None or days < audit_min_days()):
+            raise ValueError(f"The audit log can only be purged for entries older than {audit_min_days()} days")
         result[category] = _delete_older(db, category, cutoff)
     return result
 
@@ -136,8 +139,8 @@ def run_scheduled(db: Session) -> dict | None:
     """Worker hook: purges by the configured retention when the schedule says it is time. Returns what was deleted."""
     cfg = load(db)
     # Fetched logs are transient whatever the schedule says.
-    db.execute(delete(LogRequest).where(LogRequest.created_at < datetime.now(timezone.utc) - timedelta(minutes=15)))
-    db.execute(delete(K8sRequest).where(K8sRequest.created_at < datetime.now(timezone.utc) - timedelta(minutes=15)))
+    db.execute(delete(LogRequest).where(LogRequest.created_at < datetime.now(timezone.utc) - timedelta(minutes=get_settings().log_result_ttl_minutes)))
+    db.execute(delete(K8sRequest).where(K8sRequest.created_at < datetime.now(timezone.utc) - timedelta(minutes=get_settings().log_result_ttl_minutes)))
     if not due(cfg):
         db.commit()
         return None

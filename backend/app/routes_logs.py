@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from . import log_policy as policy_lib
 from .audit import audit
+from .config import get_settings
 from .database import SessionLocal, get_db
 from .models import LogRequest, Server
 from .routes_agent import hash_token
@@ -19,9 +20,13 @@ from .security import agent_gate, login_limiter, require_admin, require_operator
 from .stats import aware
 
 router = APIRouter(tags=["logs"])
-MAX_PENDING_PER_SERVER = 5
-REQUEST_TTL = timedelta(minutes=15)   # results are transient: nothing is archived on the control plane
-PICKUP_TIMEOUT = timedelta(seconds=45)
+# Limits come from .env (LOG_* settings). Fetched logs are transient: nothing is archived on the control plane.
+def request_ttl() -> timedelta:
+    return timedelta(minutes=get_settings().log_result_ttl_minutes)
+
+
+def pickup_timeout() -> timedelta:
+    return timedelta(seconds=get_settings().log_pickup_timeout_seconds)
 
 
 # --- instant wake-ups --------------------------------------------------------------------------------------------
@@ -93,9 +98,9 @@ def request_logs(server_id: int, payload: LogQuery, request: Request, user: dict
         audit(db, request, "logs.denied", user=user, target=f"server:{server_id}", success=False, detail=f"{payload.source}:{payload.target} blocked by the server's log policy", commit=True)
         raise HTTPException(403, f"This server's log policy does not allow reading {payload.source} '{payload.target}'. An admin can change it under Server page → Log access.")
     now = datetime.now(timezone.utc)
-    db.execute(delete(LogRequest).where(LogRequest.created_at < now - REQUEST_TTL))
-    pending = db.scalar(select(func.count()).select_from(LogRequest).where(LogRequest.server_id == server_id, LogRequest.status.in_(("pending", "running")), LogRequest.created_at >= now - PICKUP_TIMEOUT)) or 0
-    if pending >= MAX_PENDING_PER_SERVER:
+    db.execute(delete(LogRequest).where(LogRequest.created_at < now - request_ttl()))
+    pending = db.scalar(select(func.count()).select_from(LogRequest).where(LogRequest.server_id == server_id, LogRequest.status.in_(("pending", "running")), LogRequest.created_at >= now - pickup_timeout())) or 0
+    if pending >= get_settings().log_max_pending_per_server:
         raise HTTPException(429, "Too many log requests are already waiting for this server")
     item = LogRequest(server_id=server_id, query=payload.model_dump_json())
     db.add(item)
@@ -112,7 +117,7 @@ def _read(server_id: int, request_id: int) -> dict:
         if not item or item.server_id != server_id:
             raise HTTPException(404, "Log request not found (results are kept for 15 minutes)")
         status, error = item.status, item.error
-        if status in ("pending", "running") and datetime.now(timezone.utc) - aware(item.created_at) > PICKUP_TIMEOUT:
+        if status in ("pending", "running") and datetime.now(timezone.utc) - aware(item.created_at) > pickup_timeout():
             status, error = "error", "The agent did not answer in time. Is the server online and the agent running?"
         query = json.loads(item.query)
         output = item.output or ""
@@ -176,8 +181,8 @@ def _claim(authorization: str | None) -> tuple[int, list[dict]]:
     """Authenticates the agent and hands out each pending request exactly once (own short DB session)."""
     with SessionLocal() as db:
         server = agent_server(authorization, db)
-        fresh = datetime.now(timezone.utc) - PICKUP_TIMEOUT
-        items = db.scalars(select(LogRequest).where(LogRequest.server_id == server.id, LogRequest.status == "pending", LogRequest.created_at >= fresh).order_by(LogRequest.id).limit(MAX_PENDING_PER_SERVER)).all()
+        fresh = datetime.now(timezone.utc) - pickup_timeout()
+        items = db.scalars(select(LogRequest).where(LogRequest.server_id == server.id, LogRequest.status == "pending", LogRequest.created_at >= fresh).order_by(LogRequest.id).limit(get_settings().log_max_pending_per_server)).all()
         tasks = []
         for item in items:
             item.status = "running"

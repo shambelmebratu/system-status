@@ -42,6 +42,9 @@ def list_enrollments(_: dict = Depends(require_operator), db: Session = Depends(
 
 @router.post("/api/enrollments")
 def create_enrollment(payload: EnrollmentCreate, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+    limit = get_settings().enrollment_max_minutes
+    if payload.expires_minutes > limit:
+        raise HTTPException(422, f"Install links can be valid for at most {limit} minutes")
     token = "smwj_" + secrets.token_urlsafe(24)  # 192 bits from the OS CSPRNG: unguessable, never reused
     item = Enrollment(
         label=payload.label, token=token, token_hash=hash_token(token), max_uses=payload.max_uses, created_by=user["email"],

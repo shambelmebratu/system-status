@@ -53,7 +53,7 @@ const NAV: { id: string; label: string; icon: string; min: Role }[] = [
   { id: 'logs', label: 'Logs', icon: 'logs', min: 'operator' },
   { id: 'incidents', label: 'Incidents', icon: 'alert', min: 'viewer' },
   { id: 'alerts', label: 'Alerts', icon: 'bell', min: 'operator' },
-  { id: 'schedules', label: 'Schedules', icon: 'clock', min: 'operator' },
+  { id: 'schedules', label: 'Scheduled messages', icon: 'clock', min: 'operator' },
   { id: 'users', label: 'Users', icon: 'users', min: 'admin' },
   { id: 'audit', label: 'Audit log', icon: 'shield', min: 'admin' },
   { id: 'settings', label: 'Settings', icon: 'settings', min: 'viewer' },

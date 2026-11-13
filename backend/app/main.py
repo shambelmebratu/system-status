@@ -275,6 +275,10 @@ def dashboard(_: dict = Depends(require_user), db: Session = Depends(get_db)) ->
             "process": settings.process_threshold,
             "server_interval_seconds": settings.check_interval_seconds,
         },
+        "limits": {
+            "usage_warn_percent": settings.usage_warn_percent, "usage_bad_percent": settings.usage_bad_percent, "k8s_offline_seconds": settings.k8s_offline_seconds,
+            "enrollment_default_minutes": settings.enrollment_default_minutes, "enrollment_max_minutes": settings.enrollment_max_minutes, "log_result_ttl_minutes": settings.log_result_ttl_minutes,
+        },
         "summary": {"servers": len(servers), "services": len(services), "up": statuses.count("up"), "alerts": sum(value in ("alert", "down", "degraded") for value in statuses), "open_incidents": open_incidents},
     }
 

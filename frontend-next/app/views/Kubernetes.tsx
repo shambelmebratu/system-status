@@ -6,7 +6,7 @@ import { useActiveEnrollment, useControlPlaneUrl } from '../components/join';
 import { Highlight, LEVEL_LABEL, parse } from '../components/logs';
 import { CodeBox, Empty, Field, Icon, Meter, Modal, StatusPill } from '../components/ui';
 import { api, del, post, put } from '../lib/api';
-import { useApp, usePoll } from '../lib/app';
+import { useApp, useLimits, usePoll } from '../lib/app';
 import { pct, timeAgo } from '../lib/format';
 import type { Cluster, K8sLogPolicy, Point } from '../lib/types';
 
@@ -50,6 +50,7 @@ type Items<R> = { items: R[]; truncated: boolean };
 
 /* ---------------------------------------------------------------- routing */
 export function Kubernetes() {
+  const lim = useLimits();
   const { route, go, canOperate } = useApp();
   const { value: clusters, reload } = usePoll(() => api<Cluster[]>('/clusters'), [], 10000);
   if (!clusters) return <p className="muted">Loading…</p>;
@@ -87,8 +88,8 @@ export function Kubernetes() {
                         <div className="mini">Failing<b className={s.pods_crashloop + s.pods_failed ? 'bad' : ''}>{s.pods_crashloop + s.pods_failed}</b></div>
                       </div>
                       <div className="minis" style={{ gridTemplateColumns: '1fr 1fr' }}>
-                        <div className="mini">CPU {cpu != null ? pct(cpu, 0) : '–'}{cpu != null ? <Meter value={cpu} warnAt={70} badAt={90} /> : <div className="bar" />}</div>
-                        <div className="mini">Memory {mem != null ? pct(mem, 0) : '–'}{mem != null ? <Meter value={mem} warnAt={75} badAt={90} /> : <div className="bar" />}</div>
+                        <div className="mini">CPU {cpu != null ? pct(cpu, 0) : '–'}{cpu != null ? <Meter value={cpu} warnAt={lim.warn} badAt={lim.bad} /> : <div className="bar" />}</div>
+                        <div className="mini">Memory {mem != null ? pct(mem, 0) : '–'}{mem != null ? <Meter value={mem} warnAt={lim.warn} badAt={lim.bad} /> : <div className="bar" />}</div>
                       </div>
                       {s.problems.length > 0 && <div className="sm warn trunc" title={s.problems.join('\n')}>⚠ {s.problems[0]}{s.problems.length > 1 ? ` (+${s.problems.length - 1})` : ''}</div>}
                     </>
@@ -107,6 +108,7 @@ export function Kubernetes() {
 
 /* ---------------------------------------------------------------- add a cluster */
 function AddCluster({ onClose }: { onClose: () => void }) {
+  const lim = useLimits();
   const [name, setName] = useState('');
   const [base] = useControlPlaneUrl();
   const { active, error, busy, generate } = useActiveEnrollment();
@@ -118,15 +120,15 @@ function AddCluster({ onClose }: { onClose: () => void }) {
         <Field label="Cluster name" hint="Letters, digits, dots, dashes. e.g. prod-eu"><input value={name} onChange={e => setName(e.target.value.trim())} placeholder="prod-eu" maxLength={60} autoFocus /></Field>
         {error && <div className="err">{error}</div>}
         {!valid ? <span className="muted sm">Enter a valid name to get the install command.</span>
-          : !active ? <div className="banner">An install link is created only when you need one and works for 15 minutes. <button className="btn sm primary" style={{ marginLeft: 8 }} disabled={busy} onClick={() => void generate('Kubernetes')}>Generate install command</button></div>
-          : <><span className="sm muted">Run this with a kubeconfig that can create cluster roles (the link works for 15 minutes):</span><CodeBox value={cmd} /></>}
+          : !active ? <div className="banner">An install link is created only when you need one and works for {lim.enrollDefault} minutes. <button className="btn sm primary" style={{ marginLeft: 8 }} disabled={busy} onClick={() => void generate('Kubernetes')}>Generate install command</button></div>
+          : <><span className="sm muted">Run this with a kubeconfig that can create cluster roles (the link works for {lim.enrollDefault} minutes):</span><CodeBox value={cmd} /></>}
         <div className="card" style={{ background: 'var(--bg)' }}>
           <b className="sm">What gets installed</b>
           <ul className="sm muted" style={{ margin: '6px 0 0 18px' }}>
             <li>A <code>smwatch</code> namespace with one pod that only makes <b>outbound</b> HTTPS calls to this dashboard.</li>
             <li>A <b>read-only</b> ClusterRole: namespaces, nodes, pods, workloads, services, ingresses, HPAs, events, PVCs, metrics. <b>No Secrets, no ConfigMaps, no exec, no write access.</b></li>
             <li>The agent may update only its own token Secret, so a rotated token survives restarts.</li>
-            <li>Nothing is shipped or stored: lists and logs are fetched on demand and discarded after 15 minutes.</li>
+            <li>Nothing is shipped or stored: lists and logs are fetched on demand and discarded after {lim.logTtl} minutes.</li>
           </ul>
         </div>
         <span className="sm muted">Use an <b>https://</b> address for the dashboard. Review the manifest first with the same command without <code>| kubectl apply -f -</code>.</span>
@@ -140,11 +142,12 @@ function AddCluster({ onClose }: { onClose: () => void }) {
 type TabId = 'overview' | 'workloads' | 'pods' | 'nodes' | 'scaling' | 'network' | 'events' | 'logs' | 'settings';
 
 function ClusterDetail({ cluster, reload }: { cluster: Cluster; reload: () => Promise<void> }) {
+  const lim = useLimits();
   const { go, toast, canOperate, isAdmin, confirm } = useApp();
   const [tab, setTab] = useState<TabId>('overview');
   const tabs: [TabId, string][] = [['overview', 'Overview'], ['workloads', 'Workloads'], ['pods', 'Pods'], ['nodes', 'Nodes'], ['scaling', 'Autoscaling'], ['network', 'Network & storage'], ['events', 'Events']];
   if (canOperate) tabs.push(['logs', 'Logs'], ['settings', 'Settings']);
-  const offline = !cluster.last_seen_at || Date.now() - new Date(cluster.last_seen_at).getTime() > 120000;
+  const offline = !cluster.last_seen_at || Date.now() - new Date(cluster.last_seen_at).getTime() > lim.offlineMs;
 
   async function remove() {
     if (!(await confirm(`Remove ${cluster.name}?\n\nIts history is deleted from SM-Watch. The agent inside the cluster is not uninstalled: delete the 'smwatch' namespace there.`))) return;
@@ -196,7 +199,7 @@ function NamespaceSelect({ cluster, value, onChange }: { cluster: Cluster; value
 
 const mib = (v: number) => (v >= 1024 ? `${(v / 1024).toFixed(v >= 10240 ? 0 : 1)} GiB` : `${Math.round(v)} MiB`);
 const cores = (m: number) => (m >= 1000 ? `${(m / 1000).toFixed(m >= 10000 ? 0 : 1)} cores` : `${Math.round(m)}m`);
-const level = (p: number, warn = 70, bad = 90) => (p >= bad ? 'bad' : p >= warn ? 'warn' : 'good');
+const level = (p: number, warn: number, bad: number) => (p >= bad ? 'bad' : p >= warn ? 'warn' : 'good');
 
 function Kpi({ icon, label, value, sub, tone, children }: { icon: string; label: string; value: ReactNode; sub?: ReactNode; tone?: 'good' | 'warn' | 'bad'; children?: ReactNode }) {
   return (
@@ -235,9 +238,10 @@ function TopList({ title, rows, format, color, hint }: { title: string; rows: { 
 }
 
 function Overview({ cluster }: { cluster: Cluster }) {
+  const lim = useLimits();
   const s = cluster.summary;
   const hist = usePoll(() => api<{ points: Point[]; samples: number }>(`/clusters/${cluster.id}/history?range=24h`), [cluster.id], 30000);
-  const online = !!cluster.last_seen_at && Date.now() - new Date(cluster.last_seen_at).getTime() < 120000;
+  const online = !!cluster.last_seen_at && Date.now() - new Date(cluster.last_seen_at).getTime() < lim.offlineMs;
   const pods = useCluster<Items<Pod>>(online && s ? cluster.id : 0, online && s ? { kind: 'pods', limit: 500 } : null, [], 30000);
   const podUse = useCluster<Items<PodUsage> & { available: boolean }>(online && s ? cluster.id : 0, online && s ? { kind: 'pod_metrics' } : null, [], 30000);
   const nodes = useCluster<Items<NodeRow>>(online && s ? cluster.id : 0, online && s ? { kind: 'nodes' } : null, [], 30000);
@@ -279,8 +283,8 @@ function Overview({ cluster }: { cluster: Cluster }) {
       <div className="kpis">
         <Kpi icon="server" label="Nodes" value={<>{s.nodes_ready}<small>/{s.nodes_total}</small></>} tone={s.nodes_ready < s.nodes_total ? 'bad' : 'good'} sub={s.not_ready_nodes.length ? `not ready: ${s.not_ready_nodes.join(', ')}` : 'all ready'} />
         <Kpi icon="k8s" label="Pods" value={<>{s.pods_running}<small>/{s.pods_total}</small></>} tone={failing ? 'bad' : s.pods_pending ? 'warn' : 'good'} sub={`${s.pods_pending} pending · ${failing} failing · ${s.pods_succeeded} done`} />
-        <Kpi icon="overview" label="CPU" value={cpuPct != null ? pct(cpuPct, 0) : '–'} tone={cpuPct != null ? level(cpuPct) : undefined} sub={s.cpu_m != null ? `${cores(s.cpu_m)} of ${cores(s.cpu_alloc_m ?? 0)}` : 'metrics-server not installed'}>{cpuPct != null && <Meter value={cpuPct} warnAt={70} badAt={90} />}</Kpi>
-        <Kpi icon="logs" label="Memory" value={memPct != null ? pct(memPct, 0) : '–'} tone={memPct != null ? level(memPct, 75, 90) : undefined} sub={s.mem_mib != null ? `${mib(s.mem_mib)} of ${mib(s.mem_alloc_mib ?? 0)}` : 'metrics-server not installed'}>{memPct != null && <Meter value={memPct} warnAt={75} badAt={90} />}</Kpi>
+        <Kpi icon="overview" label="CPU" value={cpuPct != null ? pct(cpuPct, 0) : '–'} tone={cpuPct != null ? level(cpuPct, lim.warn, lim.bad) : undefined} sub={s.cpu_m != null ? `${cores(s.cpu_m)} of ${cores(s.cpu_alloc_m ?? 0)}` : 'metrics-server not installed'}>{cpuPct != null && <Meter value={cpuPct} warnAt={lim.warn} badAt={lim.bad} />}</Kpi>
+        <Kpi icon="logs" label="Memory" value={memPct != null ? pct(memPct, 0) : '–'} tone={memPct != null ? level(memPct, lim.warn, lim.bad) : undefined} sub={s.mem_mib != null ? `${mib(s.mem_mib)} of ${mib(s.mem_alloc_mib ?? 0)}` : 'metrics-server not installed'}>{memPct != null && <Meter value={memPct} warnAt={lim.warn} badAt={lim.bad} />}</Kpi>
         <Kpi icon="alert" label="Restarts" value={s.restarts.toLocaleString()} tone={s.pods_crashloop ? 'bad' : undefined} sub={`${s.pods_crashloop} crash-looping now`} />
         <Kpi icon="globe" label="Workloads" value={workloads} tone={unavailable ? 'bad' : 'good'} sub={`${s.deployments_total} deploy · ${s.statefulsets_total} sts · ${s.daemonsets_total} ds · ${s.hpa_total} HPA`} />
       </div>
@@ -323,8 +327,8 @@ function Overview({ cluster }: { cluster: Cluster }) {
               <div key={n.name} className="nodecard">
                 <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}><b className="trunc" title={n.name}>{n.name}</b><span className="grow" /><StatusPill status={n.ready && !issues.length ? 'up' : 'alert'} label={n.ready ? (issues.length ? issues.map(i => i.type).join(', ') : 'Ready') : 'Not ready'} /></div>
                 <div className="sm muted">{n.roles.join(', ')} · {n.version} · {n.ip}</div>
-                <div className="nrow"><span>CPU</span>{cp != null ? <><Meter value={cp} warnAt={70} badAt={90} /><b>{pct(cp, 0)}</b></> : <span className="muted sm">{cores(n.cpu_alloc_m)}</span>}</div>
-                <div className="nrow"><span>Memory</span>{mp != null ? <><Meter value={mp} warnAt={75} badAt={90} /><b>{pct(mp, 0)}</b></> : <span className="muted sm">{mib(n.mem_alloc_mib)}</span>}</div>
+                <div className="nrow"><span>CPU</span>{cp != null ? <><Meter value={cp} warnAt={lim.warn} badAt={lim.bad} /><b>{pct(cp, 0)}</b></> : <span className="muted sm">{cores(n.cpu_alloc_m)}</span>}</div>
+                <div className="nrow"><span>Memory</span>{mp != null ? <><Meter value={mp} warnAt={lim.warn} badAt={lim.bad} /><b>{pct(mp, 0)}</b></> : <span className="muted sm">{mib(n.mem_alloc_mib)}</span>}</div>
                 <div className="nrow"><span>Pods</span><Meter value={(podsHere / Math.max(1, n.pods_cap)) * 100} warnAt={80} badAt={95} /><b>{podsHere}/{n.pods_cap}</b></div>
               </div>);
           })}</div>
@@ -426,6 +430,7 @@ function Pods({ cluster }: { cluster: Cluster }) {
 type NodeRow = { name: string; ready: boolean; roles: string[]; version: string; os: string; kernel: string; runtime: string; arch: string; ip: string; unschedulable: boolean; taints: number;
   cpu_alloc_m: number; mem_alloc_mib: number; pods_cap: number; conditions: { type: string; status: string; reason: string; message: string }[] };
 function Nodes({ cluster }: { cluster: Cluster }) {
+  const lim = useLimits();
   const nodes = useCluster<Items<NodeRow>>(cluster.id, { kind: 'nodes' }, [], 20000);
   const usage = useCluster<Items<{ name: string; cpu_m: number; mem_mib: number }> & { available: boolean }>(cluster.id, { kind: 'node_metrics' }, [], 20000);
   const [describe, setDescribe] = useState<string | null>(null);
@@ -439,8 +444,8 @@ function Nodes({ cluster }: { cluster: Cluster }) {
             <td><div className="name">{n.name}<small>{n.os}</small></div></td>
             <td><StatusPill status={n.ready && !issues.length ? 'up' : 'alert'} label={n.ready ? (issues.length ? issues.map(i => i.type).join(', ') : 'Ready') : 'Not ready'} />{n.unschedulable && <span className="tag">cordoned</span>}</td>
             <td className="sm">{n.roles.join(', ')}</td>
-            <td>{cp != null ? <><div className="sm">{Math.round(x!.cpu_m)}m / {Math.round(n.cpu_alloc_m)}m</div><Meter value={cp} warnAt={70} badAt={90} /></> : <span className="muted sm">{Math.round(n.cpu_alloc_m)}m allocatable</span>}</td>
-            <td>{mp != null ? <><div className="sm">{Math.round(x!.mem_mib)} / {Math.round(n.mem_alloc_mib)} MiB</div><Meter value={mp} warnAt={75} badAt={90} /></> : <span className="muted sm">{Math.round(n.mem_alloc_mib)} MiB allocatable</span>}</td>
+            <td>{cp != null ? <><div className="sm">{Math.round(x!.cpu_m)}m / {Math.round(n.cpu_alloc_m)}m</div><Meter value={cp} warnAt={lim.warn} badAt={lim.bad} /></> : <span className="muted sm">{Math.round(n.cpu_alloc_m)}m allocatable</span>}</td>
+            <td>{mp != null ? <><div className="sm">{Math.round(x!.mem_mib)} / {Math.round(n.mem_alloc_mib)} MiB</div><Meter value={mp} warnAt={lim.warn} badAt={lim.bad} /></> : <span className="muted sm">{Math.round(n.mem_alloc_mib)} MiB allocatable</span>}</td>
             <td className="sm mono">{n.version}</td><td className="sm mono">{n.ip}</td></tr>); })}
       </tbody></table></div>}
       {usage.data && usage.data.data?.available === false && <p className="sm muted">Live usage needs metrics-server in the cluster.</p>}
