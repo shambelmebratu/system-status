@@ -5,7 +5,7 @@ export type ProcessSample = { pid: number; name: string; user?: string; cpu: num
 export type Metrics = {
   hostname?: string; platform?: string; agent_version?: string; cpu?: number; cpu_count?: number; memory?: number; disk?: number;
   load?: number; swap?: number; uptime_seconds?: number; net_rx_bps?: number | null; net_tx_bps?: number | null;
-  latency_ms?: number; reachability?: string; processes?: ProcessSample[]; capabilities?: string[]; install?: 'systemd' | 'macos' | 'docker' | 'bundled' | '';
+  latency_ms?: number; reachability?: string; processes?: ProcessSample[]; capabilities?: string[]; os?: string; kernel?: string; arch?: string; install?: 'systemd' | 'macos' | 'docker' | 'bundled' | '';
 };
 
 export type Server = {

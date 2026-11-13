@@ -1385,3 +1385,35 @@ def test_docker_update_script_is_served_without_secrets(client):
     assert r.status_code == 200 and r.text.startswith("#!/usr/bin/env bash\nexport SMWATCH_AGENT_IMAGE=")
     assert "docker rm -f" in r.text and "AGENT_TOKEN" not in r.text.split("set -euo pipefail")[0]
     assert "smwj_" not in r.text and "SMWATCH_JOIN" not in r.text                           # needs no link and carries none
+
+
+def test_a_public_address_on_the_machines_own_interface_is_its_public_ip():
+    from types import SimpleNamespace
+    from app import monitoring
+    vps = SimpleNamespace(name="s", host="", last_agent_ip="172.80.35.5", last_metrics=json.dumps({"hostname": "server1", "ips": [
+        {"iface": "eth0", "ip": "165.22.66.188"}, {"iface": "eth0", "ip": "10.19.0.5"}, {"iface": "eth1", "ip": "10.114.0.2"}, {"iface": "tailscale0", "ip": "100.64.1.2"}]}))
+    assert monitoring.server_addresses(vps) == {"public_ip": "165.22.66.188", "private_ips": ["10.19.0.5", "10.114.0.2", "100.64.1.2"]}   # LAN first, CGNAT last
+    assert monitoring.server_where(vps) == "server1 · 165.22.66.188"
+    configured = SimpleNamespace(name="s", host="", last_agent_ip="", last_metrics=json.dumps({"public_ip": "93.184.216.34", "ips": [{"iface": "eth0", "ip": "165.22.66.188"}]}))
+    assert monitoring.server_addresses(configured)["public_ip"] == "93.184.216.34"              # an admin-configured address wins
+    nat = SimpleNamespace(name="s", host="", last_agent_ip="93.184.216.34", last_metrics=json.dumps({"ips": [{"iface": "eth0", "ip": "192.168.1.20"}]}))
+    assert monitoring.server_addresses(nat) == {"public_ip": "93.184.216.34", "private_ips": ["192.168.1.20"]}
+
+
+def test_agent_reports_the_real_os_not_the_python_platform_string(tmp_path, monkeypatch):
+    import importlib, sys
+    root = tmp_path / "host"; (root / "etc").mkdir(parents=True)
+    (root / "etc/os-release").write_text('NAME="Ubuntu"\nVERSION_ID="22.04"\nPRETTY_NAME="Ubuntu 22.04.5 LTS"\n')
+    monkeypatch.setenv("AGENT_HOST_ROOT", str(root))
+    sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+    sys.modules.pop("agent", None)
+    agent = importlib.import_module("agent")
+    try:
+        if sys.platform != "darwin":
+            assert agent.os_name() == "Ubuntu 22.04.5 LTS"
+        assert agent.kernel_version() and "glibc" not in agent.kernel_version()
+        for name in ("tunl0", "flannel.1", "cni0", "docker0", "veth1", "br-abc", "lo"):
+            assert name.lower().startswith(agent._SKIP_IFACES), name
+        assert not "eth0".startswith(agent._SKIP_IFACES) and not "tailscale0".startswith(agent._SKIP_IFACES) and not "ens3".startswith(agent._SKIP_IFACES)
+    finally:
+        sys.modules.pop("agent", None)

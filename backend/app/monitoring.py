@@ -181,15 +181,18 @@ def server_addresses(server) -> dict:
     def is_global(value) -> bool:
         return is_public(value)
 
-    private = []
+    reported = []
     for entry in metrics.get("ips") or []:
         ip = entry.get("ip") if isinstance(entry, dict) else None
-        if ip and ip not in private:
-            private.append(ip)
-    candidates = [metrics.get("public_ip"), server.last_agent_ip, (server.host or "").strip()]
-    public = next((c for c in candidates if c and is_global(c)), None)
+        if ip and ip not in reported:
+            reported.append(ip)
+    # An address on the machine's own interface that is publicly routable IS its public address (typical for a VPS), not a private one.
+    on_interface_public = [ip for ip in reported if ipaddress.ip_address(ip).is_global]
+    private = [ip for ip in reported if ip not in on_interface_public]
     seen = (server.last_agent_ip or "").strip()
     colocated = metrics.get("install") == "bundled" or in_container_network(seen)   # runs next to the control plane (shares its Docker network)
+    configured = metrics.get("public_ip") if is_global(metrics.get("public_ip")) else None
+    public = configured or (on_interface_public[0] if on_interface_public else None) or next((c for c in (seen, (server.host or "").strip()) if c and is_global(c)), None)
     if not public and colocated:   # then its public address is the control plane's own
         public = control_plane_public_ip() or None
     if not private and seen and not colocated:   # an older agent that reports no addresses: the LAN address it connects from
@@ -199,6 +202,8 @@ def server_addresses(server) -> dict:
                 private.append(seen)
         except ValueError:
             pass
+    rank = lambda ip: 0 if ipaddress.ip_address(ip).is_private and not ipaddress.ip_address(ip) in ipaddress.ip_network("100.64.0.0/10") else 1  # noqa: E731
+    private = sorted(dict.fromkeys(private), key=rank)
     return {"public_ip": public, "private_ips": [p for p in private if p != public]}
 
 

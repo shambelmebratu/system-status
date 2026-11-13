@@ -109,6 +109,9 @@ def collect() -> dict[str, Any]:
     return {
         "hostname": host_name(),
         "platform": platform.platform()[:255],
+        "os": os_name(),
+        "kernel": kernel_version(),
+        "arch": platform.machine()[:30],
         "agent_version": AGENT_VERSION,
         "cpu": round(psutil.cpu_percent(interval=0.25), 1),
         "cpu_count": psutil.cpu_count() or 1,
@@ -128,7 +131,7 @@ def collect() -> dict[str, Any]:
     }
 
 
-_SKIP_IFACES = ("lo", "docker", "br-", "veth", "cni", "flannel", "cali", "vxlan", "kube", "virbr", "cilium", "weave", "podman")
+_SKIP_IFACES = ("lo", "docker", "br-", "veth", "cni", "flannel", "cali", "vxlan", "kube", "virbr", "cilium", "weave", "podman", "tunl", "ipip", "gre", "sit", "dummy", "nodelocal", "antrea", "lxc", "ovs", "geneve", "tun", "nerdctl", "lxd")
 AGENT_PUBLIC_IP = os.getenv("AGENT_PUBLIC_IP", "").strip()              # optional: tell the dashboard this server's public address
 AGENT_PUBLIC_IP_URL = os.getenv("AGENT_PUBLIC_IP_URL", "").strip()      # optional: a URL that returns the caller's address (off by default: no outside calls)
 _public_cache: dict = {"at": 0.0, "ip": ""}
@@ -210,6 +213,34 @@ def install_kind() -> str:
     if os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv"):
         return "docker"
     return "macos" if sys.platform == "darwin" else "systemd"
+
+
+def os_name() -> str:
+    """The operating system of the HOST, e.g. "Ubuntu 22.04.5 LTS" (inside Docker the container's own distro is meaningless)."""
+    if sys.platform == "darwin":
+        return f"macOS {platform.mac_ver()[0]}".strip()
+    for path in (os.path.join(AGENT_HOST_ROOT, "etc/os-release"), os.path.join(AGENT_HOST_ROOT, "usr/lib/os-release"), "/etc/os-release"):
+        try:
+            with open(path) as handle:
+                values = dict(line.rstrip("\n").split("=", 1) for line in handle if "=" in line and not line.startswith("#"))
+            pretty = values.get("PRETTY_NAME", "").strip().strip('"')
+            if pretty:
+                return pretty[:100]
+            name = values.get("NAME", "").strip().strip('"')
+            if name:
+                return f"{name} {values.get('VERSION_ID', '').strip().strip(chr(34))}".strip()[:100]
+        except (OSError, ValueError):
+            continue
+    return platform.system()[:100]
+
+
+def kernel_version() -> str:
+    """The host's kernel (the kernel is shared with containers, so this is right inside Docker too)."""
+    try:
+        with open(os.path.join(os.getenv("AGENT_PROCFS_PATH") or "/proc", "sys/kernel/osrelease")) as handle:
+            return handle.read().strip()[:60]
+    except OSError:
+        return platform.release()[:60]
 
 
 def host_name() -> str:

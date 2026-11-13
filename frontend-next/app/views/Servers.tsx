@@ -162,7 +162,10 @@ function ServerDetail({ server }: { server: Server }) {
             <div className="card-head"><h2>System</h2></div>
             <table className="tbl"><tbody>
               <tr><td className="muted">Hostname</td><td>{m?.hostname || server.host || '–'}</td></tr>
-              {m?.platform && <tr><td className="muted">Platform</td><td className="sm">{m.platform}</td></tr>}
+              {m?.os ? <>
+                <tr><td className="muted">Operating system</td><td>{m.os}</td></tr>
+                {(m.kernel || m.arch) && <tr><td className="muted">Kernel</td><td className="sm">{[m.kernel, m.arch].filter(Boolean).join(' · ')}</td></tr>}
+              </> : m?.platform && <tr><td className="muted">Platform</td><td className="sm">{m.platform}</td></tr>}
               {server.monitor_mode !== 'ping' && <>
                 <tr><td className="muted">CPU cores</td><td>{m?.cpu_count ?? '–'}</td></tr>
                 <tr><td className="muted">Uptime</td><td>{m?.uptime_seconds != null ? duration(m.uptime_seconds) : '–'}</td></tr>
