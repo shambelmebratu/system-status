@@ -1355,3 +1355,33 @@ def test_server_shows_public_and_private_addresses_and_update_state(client, monk
     assert av.version_tuple("2.10.0") > av.version_tuple("2.9.9")                             # numeric, not alphabetical
     text = open(os.path.join(os.path.dirname(main.__file__), "..", "agent_install.sh")).read()
     assert "update)" in text and "install.sh | sudo bash -s -- update" in text
+
+
+def test_an_address_on_the_control_planes_own_network_is_never_public(monkeypatch):
+    import ipaddress
+    from types import SimpleNamespace
+    from app import monitoring, netinfo
+    from app.config import get_settings
+    # 172.80.x.x is a valid PUBLIC range, but here it is the Docker network the API itself is attached to
+    monkeypatch.setattr(netinfo, "local_networks", lambda: (ipaddress.ip_network("172.80.35.0/24"),))
+    monkeypatch.setattr(netinfo, "running_in_container", lambda: True)
+    assert not netinfo.is_public("172.80.35.5") and netinfo.is_public("172.80.36.5") and netinfo.is_public("93.184.216.34")
+    assert not netinfo.is_public("10.0.0.1") and not netinfo.is_public("garbage") and not netinfo.is_public(None)
+    monkeypatch.setattr(get_settings(), "host_public_ip", "93.184.216.99")
+    old_bundled = SimpleNamespace(name="This server (control plane)", host="", last_agent_ip="172.80.35.5", last_metrics=json.dumps({"hostname": "server1.ashewa.com"}))   # agent 2.7: reports nothing else
+    addr = monitoring.server_addresses(old_bundled)
+    assert addr == {"public_ip": "93.184.216.99", "private_ips": []}                       # the control plane's public address, not the container's
+    assert monitoring.server_where(old_bundled) == "server1.ashewa.com · 93.184.216.99"
+    new_bundled = SimpleNamespace(name="x", host="", last_agent_ip="172.80.35.5", last_metrics=json.dumps({"install": "bundled", "ips": [{"iface": "eth0", "ip": "192.168.1.10"}]}))
+    assert monitoring.server_addresses(new_bundled) == {"public_ip": "93.184.216.99", "private_ips": ["192.168.1.10"]}
+    remote = SimpleNamespace(name="r", host="", last_agent_ip="172.80.36.5", last_metrics=json.dumps({"ips": [{"iface": "eth0", "ip": "10.1.1.1"}]}))
+    assert monitoring.server_addresses(remote) == {"public_ip": "172.80.36.5", "private_ips": ["10.1.1.1"]}   # a remote agent seen from outside the network IS public
+    monkeypatch.setattr(get_settings(), "host_public_ip", "")
+
+
+def test_docker_update_script_is_served_without_secrets(client):
+    anon = TestClient(main.app)
+    r = anon.get("/api/agent/docker-update.sh")
+    assert r.status_code == 200 and r.text.startswith("#!/usr/bin/env bash\nexport SMWATCH_AGENT_IMAGE=")
+    assert "docker rm -f" in r.text and "AGENT_TOKEN" not in r.text.split("set -euo pipefail")[0]
+    assert "smwj_" not in r.text and "SMWATCH_JOIN" not in r.text                           # needs no link and carries none

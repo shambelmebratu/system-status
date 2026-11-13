@@ -159,3 +159,12 @@ def join_script(token: str, request: Request, db: Session = Depends(get_db)) -> 
 def join_docker_script(token: str, request: Request, db: Session = Depends(get_db)) -> str:
     """Docker variant: `curl -fsSL <url>/api/agent/join/<token>/docker | sudo bash`."""
     return render(request, token, db, "agent_install_docker.sh")
+
+
+@router.get("/api/agent/docker-update.sh", response_class=PlainTextResponse)
+def docker_update_script(request: Request) -> str:
+    """`curl -fsSL <url>/api/agent/docker-update.sh | sudo bash`: updates a Docker agent in place, no link or token needed.
+    The script contains only the public image name; the agent's own settings are read from its local container."""
+    body = (ROOT / "agent_update_docker.sh").read_text()
+    body = "\n".join(line for i, line in enumerate(body.splitlines()) if not (i == 0 and line.startswith("#!")))
+    return f"#!/usr/bin/env bash\nexport SMWATCH_AGENT_IMAGE={shell_quote(resolved_agent_image(get_settings()))}\n{body}\n"

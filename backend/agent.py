@@ -26,6 +26,7 @@ import platform
 import re
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -133,8 +134,43 @@ AGENT_PUBLIC_IP_URL = os.getenv("AGENT_PUBLIC_IP_URL", "").strip()      # option
 _public_cache: dict = {"at": 0.0, "ip": ""}
 
 
+def _host_namespace_addresses() -> list[dict]:
+    """Addresses of the HOST, read from its network namespace (/proc/1/net) when the agent runs in a container with the host's /proc
+    mounted: the container's own address on a Docker network says nothing about the machine."""
+    base = os.path.join(os.getenv("AGENT_PROCFS_PATH") or "", "1", "net")
+    if not os.getenv("AGENT_PROCFS_PATH"):
+        return []
+    try:
+        with open(os.path.join(base, "route")) as handle:
+            next(handle)
+            networks = []
+            for line in handle:
+                f = line.split()
+                if len(f) < 8 or int(f[1], 16) == 0 or int(f[2], 16) != 0:     # directly attached networks only
+                    continue
+                net = ipaddress.ip_network((socket.inet_ntoa(struct.pack("<L", int(f[1], 16))), bin(int(f[7], 16)).count("1")), strict=False)
+                networks.append((f[0], net))
+        found, last = [], None
+        with open(os.path.join(base, "fib_trie")) as handle:
+            for line in handle:
+                line = line.strip()
+                if line.startswith("|--"):
+                    last = line[3:].strip()
+                elif line.startswith("/32 host LOCAL") and last:
+                    ip = ipaddress.ip_address(last)
+                    iface = next((name for name, net in networks if ip in net), None)
+                    if iface and not ip.is_loopback and not ip.is_link_local and not iface.lower().startswith(_SKIP_IFACES):
+                        found.append({"iface": iface[:30], "ip": str(ip)})
+        return found[:10]
+    except (OSError, ValueError, StopIteration):
+        return []
+
+
 def local_addresses() -> list[dict]:
     """This machine's own (private) IPv4 addresses, without loopback, link-local and container-network interfaces."""
+    host = _host_namespace_addresses()
+    if host:
+        return host
     found = []
     try:
         for name, addrs in psutil.net_if_addrs().items():

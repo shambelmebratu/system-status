@@ -301,9 +301,9 @@ Review the manifest first by running the `curl` alone. It creates a `smwatch` na
 
 ## Agent addresses and updates
 
-Each server shows its **public IP** (the address the control plane sees it connect from, or `AGENT_PUBLIC_IP` / `AGENT_PUBLIC_IP_URL` if you set one on the agent; nothing contacts the outside by default) and its **private IPs** (its own LAN addresses, container networks excluded). Alerts and Telegram messages name the server with its host name and public IP, falling back to a private one.
+Each server shows its **public IP** (the address the control plane sees it connect from, or `AGENT_PUBLIC_IP` / `AGENT_PUBLIC_IP_URL` if you set one on the agent; nothing contacts the outside by default). An address on a network the control plane itself is attached to (for example a Docker network) is never called public, even if its number is in a public range; the agent bundled with SM-Watch shows the control plane's public address instead (`HOST_PUBLIC_IP`, or what `PUBLIC_URL` resolves to) and its **private IPs** (its own LAN addresses, container networks excluded). Alerts and Telegram messages name the server with its host name and public IP, falling back to a private one.
 
-When a newer agent ships with your control plane, the server page shows **Agent update available** with the right command: `curl -fsSL <url>/api/agent/install.sh | sudo bash -s -- update` for systemd/macOS agents (keeps identity and settings, no link or token), `docker compose pull host-agent && docker compose up -d host-agent` for the bundled agent, and the Docker install command for standalone Docker agents. Clusters show `kubectl -n smwatch rollout restart deployment/smwatch-agent`.
+When a newer agent ships with your control plane, the server page shows **Agent update available** with the right command: `curl -fsSL <url>/api/agent/install.sh | sudo bash -s -- update` for systemd/macOS agents (keeps identity and settings, no link or token), `docker compose pull host-agent && docker compose up -d host-agent` for the bundled agent, and `curl -fsSL <url>/api/agent/docker-update.sh | sudo bash` for standalone Docker agents (pulls the new image and recreates the container with its current settings, no link or token). Clusters show `kubectl -n smwatch rollout restart deployment/smwatch-agent`.
 
 ## Configuration: nothing is hard-coded
 

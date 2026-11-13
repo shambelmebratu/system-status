@@ -176,11 +176,10 @@ def server_addresses(server) -> dict:
     except ValueError:
         metrics = {}
 
+    from .netinfo import control_plane_public_ip, in_container_network, is_public
+
     def is_global(value) -> bool:
-        try:
-            return ipaddress.ip_address(value).is_global
-        except ValueError:
-            return False
+        return is_public(value)
 
     private = []
     for entry in metrics.get("ips") or []:
@@ -190,10 +189,13 @@ def server_addresses(server) -> dict:
     candidates = [metrics.get("public_ip"), server.last_agent_ip, (server.host or "").strip()]
     public = next((c for c in candidates if c and is_global(c)), None)
     seen = (server.last_agent_ip or "").strip()
-    if not private and seen and not is_global(seen):   # an older agent that reports no addresses: the LAN address it connects from
+    colocated = metrics.get("install") == "bundled" or in_container_network(seen)   # runs next to the control plane (shares its Docker network)
+    if not public and colocated:   # then its public address is the control plane's own
+        public = control_plane_public_ip() or None
+    if not private and seen and not colocated:   # an older agent that reports no addresses: the LAN address it connects from
         try:
             ip = ipaddress.ip_address(seen)
-            if ip.is_private and not ip.is_loopback and ip not in ipaddress.ip_network("172.16.0.0/12"):
+            if ip.is_private and not ip.is_loopback and ip not in ipaddress.ip_network("172.16.0.0/12"):   # (container-network noise)
                 private.append(seen)
         except ValueError:
             pass

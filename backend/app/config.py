@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     agent_image: str = ""                  # full override, e.g. registry.example.com/sm-watch-host-agent:1.2.3
     k8s_agent_image: str = ""              # image the Kubernetes manifest deploys; default <dockerhub_username>/sm-watch-k8s-agent:<smwatch_version>
     host_agent_token_file: str = ""  # when set, the API provisions a server entry + token for the bundled host agent
+    host_public_ip: str = ""  # optional: public address of the machine running SM-Watch (shown for the bundled agent); default: resolved from PUBLIC_URL
     public_url: str = ""  # externally reachable control-plane URL shown in agent install commands (e.g. https://monitor.example.com)
     cookie_secure: bool = False  # set true when served over HTTPS
     login_max_attempts: int = 5
