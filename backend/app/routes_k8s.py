@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import PlainTextResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import Session
 
@@ -87,6 +87,16 @@ class K8sReport(BaseModel):
     mem_mib: float | None = Field(default=None, ge=0)
     mem_alloc_mib: float | None = Field(default=None, ge=0)
     problems: list[str] = Field(default_factory=list, max_length=30)
+
+    @field_validator("problems", "not_ready_nodes")
+    @classmethod
+    def short_printable_items(cls, v: list[str]) -> list[str]:   # text from the cluster ends up in alerts: bounded and without control characters
+        return [" ".join("".join(ch if ch.isprintable() else " " for ch in item).split())[:300] for item in v]
+
+    @field_validator("error", "agent_version", "k8s_version")
+    @classmethod
+    def printable_only(cls, v: str) -> str:
+        return " ".join("".join(ch if ch.isprintable() else " " for ch in v).split())
 
 
 class ClusterUpdate(BaseModel):
@@ -339,8 +349,8 @@ def register_cluster(token: str, request: Request, name: str = Query(pattern=NAM
     gate = agent_gate(request, "join")
     enrollment = find_enrollment(db, token)
     if enrollment is None:
-        login_limiter.fail_unique(gate, token)
-        audit(db, request, "k8s.register", actor=f"agent:{name}", success=False, detail="invalid, expired or revoked install link", commit=True)
+        if login_limiter.fail_unique(gate, token):
+            audit(db, request, "k8s.register", actor=f"agent:{name}", success=False, detail="invalid, expired or revoked install link", commit=True)
         raise HTTPException(401, "This install link is invalid, expired or revoked. Create a new one in the dashboard.")
     cluster = db.scalar(select(Cluster).where(Cluster.name == name))
     now = datetime.now(timezone.utc)
@@ -352,7 +362,8 @@ def register_cluster(token: str, request: Request, name: str = Query(pattern=NAM
         enrollment.uses += 1
     elif cluster.last_seen_at is not None and (now - aware(cluster.last_seen_at)).total_seconds() < 600:
         # Re-issuing a token would cut off the running agent: a link must not be able to take over a live cluster by name.
-        audit(db, request, "k8s.register", actor=f"agent:{name}", success=False, detail="a cluster with that name is connected", commit=True)
+        if login_limiter.first_time(f"k8s-taken:{client_ip(request)}:{name}"):
+            audit(db, request, "k8s.register", actor=f"agent:{name}", success=False, detail="a cluster with that name is connected", commit=True)
         raise HTTPException(409, f"A cluster named '{name}' is already connected. Choose another name, or rotate its token in the dashboard.")
     new_token = secrets.token_urlsafe(32)
     set_token(cluster, new_token)
@@ -376,8 +387,8 @@ def agent_report(payload: K8sReport, request: Request, authorization: str | None
     gate = agent_gate(request, "k8s")
     cluster, digest = _cluster_by_token(db, authorization)
     if cluster is None:
-        login_limiter.fail_unique(gate, digest or "")
-        audit(db, request, "agent.auth_failed", actor="agent:k8s", detail="cluster report with an unknown token", success=False, commit=True)
+        if login_limiter.fail_unique(gate, digest or ""):
+            audit(db, request, "agent.auth_failed", actor="agent:k8s", detail="cluster report with an unknown token", success=False, commit=True)
         raise HTTPException(401, "Invalid agent token")
     if not cluster.enabled:
         raise HTTPException(403, "This cluster is disabled")
@@ -410,6 +421,8 @@ def _claim(authorization: str | None) -> tuple[int, list[dict]]:
         cluster, _ = _cluster_by_token(db, authorization)
         if cluster is None:
             raise HTTPException(401, "Invalid agent token")
+        if not cluster.enabled:
+            raise HTTPException(403, "This cluster is disabled")
         fresh = datetime.now(timezone.utc) - pickup_timeout()
         items = db.scalars(select(K8sRequest).where(K8sRequest.cluster_id == cluster.id, K8sRequest.status == "pending", K8sRequest.created_at >= fresh).order_by(K8sRequest.id).limit(get_settings().k8s_max_pending_requests)).all()
         tasks = []
@@ -438,6 +451,8 @@ async def agent_tasks(request: Request, wait: int = Query(0, ge=0, le=25), autho
         raise
     if tasks or wait == 0:
         return {"tasks": tasks}
+    if len(_task_waiters.get(cluster_id, ())) >= get_settings().agent_max_open_polls:
+        raise HTTPException(429, "Too many open task polls for this agent", headers={"Retry-After": "5"})
     with _Waiter(_task_waiters, cluster_id) as event:
         while not tasks and loop.time() < deadline:
             event.clear()
@@ -458,6 +473,8 @@ def agent_result(request_id: int, payload: K8sResult, request: Request, authoriz
     if cluster is None:
         login_limiter.fail_unique(gate, authorization or "")
         raise HTTPException(401, "Invalid agent token")
+    if not cluster.enabled:
+        raise HTTPException(403, "This cluster is disabled")
     item = db.get(K8sRequest, request_id)
     if not item or item.cluster_id != cluster.id or item.status != "running":
         raise HTTPException(404, "Unknown task")

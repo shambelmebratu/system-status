@@ -342,3 +342,42 @@ def test_agent_and_control_plane_make_identical_decisions(cred_agent):
         for source, names in targets.items():
             for name in names:
                 assert a.policy_allows(source, name) == lp.query_allowed(compiled, source, name), (raw, source, name)
+
+
+def test_agent_never_forwards_its_token_to_a_redirect_target(cred_agent):
+    """urllib re-sends Authorization on a redirect, even to another host. The agent must refuse the redirect instead."""
+    import http.server, threading, urllib.request, urllib.error
+    seen = []
+
+    class Collector(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            seen.append(self.headers.get("Authorization")); self.send_response(200); self.end_headers(); self.wfile.write(b"{}")
+        do_GET = do_POST
+        def log_message(self, *a): pass
+
+    collector = http.server.HTTPServer(("127.0.0.1", 0), Collector)
+
+    class Redirector(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.send_response(307); self.send_header("Location", f"http://127.0.0.1:{collector.server_port}/steal"); self.end_headers()
+        do_GET = do_POST
+        def log_message(self, *a): pass
+
+    redirector = http.server.HTTPServer(("127.0.0.1", 0), Redirector)
+    for server in (collector, redirector):
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+    a = cred_agent
+    previous = urllib.request._opener
+    try:
+        a.SMWATCH_URL = f"http://127.0.0.1:{redirector.server_port}"
+        a.AGENT_TOKEN = "t" * 40
+        a.install_safe_opener()
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            a._api("GET", "/api/agent/tasks")
+        assert caught.value.code == 307 and "redirect" in str(caught.value.reason)
+        with pytest.raises(urllib.error.HTTPError):
+            a.push_once()
+        assert seen == []                                               # the token never reached the other server
+    finally:
+        urllib.request.install_opener(previous) if previous else setattr(urllib.request, "_opener", None)
+        collector.shutdown(); redirector.shutdown()

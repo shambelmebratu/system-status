@@ -24,7 +24,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-AGENT_VERSION = "1.0.0"
+AGENT_VERSION = "1.1.0"
 SMWATCH_URL = os.getenv("SMWATCH_URL", "").rstrip("/")
 _TOKEN = os.getenv("SMWATCH_TOKEN", "")                       # this cluster's agent token (from the Secret the manifest created)
 AGENT_ALLOW_INSECURE = os.getenv("AGENT_ALLOW_INSECURE", "") == "1"
@@ -67,6 +67,25 @@ def _context() -> ssl.SSLContext:
     return _ssl_context
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """The agent never follows HTTP redirects. urllib would re-send the Authorization header (this agent's token) to wherever a
+    redirect points, including another host or plain http: a misconfigured or hostile proxy could collect tokens that way."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, f"refused to follow a redirect to {newurl} (credentials are never forwarded)", headers, fp)
+
+
+_k8s_opener = None
+_control_opener = urllib.request.build_opener(_NoRedirect)
+
+
+def _k8s_open(request, timeout: float):
+    global _k8s_opener
+    if _k8s_opener is None:
+        _k8s_opener = urllib.request.build_opener(_NoRedirect, urllib.request.HTTPSHandler(context=_context()))
+    return _k8s_opener.open(request, timeout=timeout)
+
+
 def kapi(path: str, params: dict | None = None, *, method: str = "GET", body: bytes | None = None, content_type: str | None = None,
          timeout: float = 20, raw: bool = False, max_bytes: int = 30_000_000):
     """One call to the Kubernetes API with the pod's own ServiceAccount token (re-read each time: it is rotated by the kubelet)."""
@@ -76,7 +95,7 @@ def kapi(path: str, params: dict | None = None, *, method: str = "GET", body: by
         headers["Content-Type"] = content_type
     request = urllib.request.Request(url, data=body, method=method, headers=headers)
     try:
-        with urllib.request.urlopen(request, timeout=timeout, context=_context()) as response:
+        with _k8s_open(request, timeout) as response:
             data = response.read(max_bytes + 1)
     except urllib.error.HTTPError as error:
         detail = error.read(2000).decode(errors="replace")
@@ -557,7 +576,7 @@ def insecure_url_problem() -> str | None:
 def _control(method: str, path: str, payload: dict | None = None, timeout: float = 20) -> dict:
     request = urllib.request.Request(f"{SMWATCH_URL}{path}", data=json.dumps(payload).encode() if payload is not None else None, method=method,
                                      headers={"Content-Type": "application/json", "Authorization": f"Bearer {_TOKEN}", "User-Agent": f"sm-watch-k8s-agent/{AGENT_VERSION}"})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with _control_opener.open(request, timeout=timeout) as response:
         return json.loads(response.read().decode() or "{}")
 
 

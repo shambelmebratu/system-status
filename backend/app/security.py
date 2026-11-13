@@ -80,6 +80,7 @@ class LoginLimiter:
     def __init__(self) -> None:
         self._hits: dict[str, deque[float]] = defaultdict(deque)
         self._seen: dict[str, dict[str, float]] = {}
+        self._once: dict[str, float] = {}
         self._lock = threading.Lock()
 
     def _prune(self, key: str, now: float, window: int) -> deque[float]:
@@ -105,20 +106,36 @@ class LoginLimiter:
             for key in keys:
                 self._hits[key].append(now)
 
-    def fail_unique(self, key: str, credential: str) -> None:
+    def fail_unique(self, key: str, credential: str) -> bool:
         """Counts a failure only the first time THIS wrong credential is seen in the window. Throttling exists to stop guessing
         (many different tokens), not to punish one stale agent repeating its old token, which would otherwise lock out every
-        other agent behind the same address."""
+        other agent behind the same address. Returns True when this credential was new (callers audit only then)."""
         settings = get_settings()
         now = time.monotonic()
         with self._lock:
             seen = self._seen.setdefault(key, {})
             for value in [v for v, t in seen.items() if now - t > settings.login_window_seconds]:
                 del seen[value]
+            credential = hashlib.sha256(credential.encode(errors="replace")).hexdigest()   # never keep what was presented (it may be a near-miss secret, or huge)
             if credential in seen:
-                return
-            seen[credential] = now
+                return False
+            if len(seen) < 64:
+                seen[credential] = now
             self._hits[key].append(now)
+            return True
+
+    def first_time(self, key: str, window: int = 300) -> bool:
+        """True once per `window` seconds for `key`. Used to write ONE audit line for a repeating event instead of one per request,
+        so an unauthenticated caller cannot grow the audit log without bound."""
+        now = time.monotonic()
+        with self._lock:
+            if len(self._once) > 20000:
+                self._once = {k: t for k, t in self._once.items() if now - t <= window}
+            last = self._once.get(key)
+            if last is not None and now - last <= window:
+                return False
+            self._once[key] = now
+            return True
 
     def reset(self, *keys: str) -> None:
         with self._lock:

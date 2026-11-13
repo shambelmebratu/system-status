@@ -46,7 +46,7 @@ function ServerList() {
                     {(['cpu', 'memory', 'disk'] as const).map(k => <div key={k} className="mini">{k === 'cpu' ? 'CPU' : k === 'memory' ? 'Memory' : 'Disk'}<b>{pct(m[k], 0)}</b><Meter value={m[k]!} warnAt={s[`${k}_threshold` as const] * (lim.warn / lim.bad)} badAt={s[`${k}_threshold` as const]} /></div>)}
                   </div>
                 ) : <div className="muted sm" style={{ minHeight: 48 }}>{s.last_status === 'down' ? s.last_error : s.monitor_mode === 'ping' ? `Latency ${ms(m?.latency_ms)}` : 'No metrics received yet.'}</div>}
-                <div className="foot"><span className="tag">{MODE_LABEL[s.monitor_mode]}</span>{s.monitor_mode === 'push' && isOlder(m?.agent_version, data?.agents?.latest) && <span className="tag warn-tag">update</span>}<span>{s.monitor_mode === 'push' ? `seen ${timeAgo(s.last_seen_at)}` : `checked ${timeAgo(s.last_checked_at)}`}</span></div>
+                <div className="foot"><span className="tag">{MODE_LABEL[s.monitor_mode]}</span>{s.monitor_mode === 'push' && isOlder(m?.agent_version, data?.agents?.latest) && <span className="tag warn-tag">update</span>}{!!s.same_machine_as?.length && <span className="tag warn-tag" title={`Same machine as ${s.same_machine_as.map(t => t.name).join(', ')}`}>duplicate</span>}<span>{s.monitor_mode === 'push' ? `seen ${timeAgo(s.last_seen_at)}` : `checked ${timeAgo(s.last_checked_at)}`}</span></div>
               </div>
             );
           })}
@@ -101,6 +101,10 @@ function ServerDetail({ server }: { server: Server }) {
       {canLogs && <div className="seg" style={{ marginBottom: 16 }}><button className={tab === 'overview' ? 'on' : ''} onClick={() => setTab('overview')}>Overview</button><button className={tab === 'logs' ? 'on' : ''} onClick={() => setTab('logs')}>Logs</button></div>}
       {server.last_status === 'down' && server.last_error && <div className="err" style={{ marginBottom: 16 }}>{server.last_error}</div>}
       {tab === 'logs' && canLogs && <LogsPanel serverId={server.id} />}
+      {!!server.same_machine_as?.length && (
+        <div className="banner" style={{ marginBottom: 16 }}>
+          <b>This machine is monitored twice.</b> It also reports as {server.same_machine_as.map((t, i) => <span key={t.id}>{i > 0 && ', '}<a href={`#servers/${t.id}`}>{t.name}</a></span>)}. Each entry has its own alert limits and sends its own alerts, so editing the limits here does not change the other one. Keep one and remove the other (or set the same limits on both).
+        </div>)}
       {outdated && <div style={{ marginBottom: 16 }}><AgentUpdate server={server} latest={latestAgent!} /></div>}
       {never && (
         <div className="card" style={{ marginBottom: 16 }}><div className="card-head"><h2>Waiting for the agent</h2></div>

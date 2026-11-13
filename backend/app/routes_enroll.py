@@ -74,6 +74,20 @@ def find_enrollment(db: Session, token: str) -> Enrollment | None:
     return item
 
 
+def clean_name(value: str) -> str:
+    """Host names come from the machine being registered: keep printable characters only (no control characters or line breaks
+    that could disguise text in the dashboard, audit log or alerts)."""
+    cleaned = "".join(ch if ch.isprintable() else " " for ch in value)
+    return " ".join(cleaned.split())[:90] or "server"
+
+
+def is_live(server: Server) -> bool:
+    from .monitoring import heartbeat_grace
+    if not server.last_seen_at:
+        return False
+    return (datetime.now(timezone.utc) - aware(server.last_seen_at)).total_seconds() <= heartbeat_grace(server.check_interval_seconds)
+
+
 def unique_name(db: Session, hostname: str) -> str:
     base = hostname.strip()[:90] or "server"
     name, n = base, 1
@@ -90,24 +104,32 @@ def enroll(payload: EnrollRequest, request: Request, db: Session = Depends(get_d
     auth = request.headers.get("authorization", "")
     item = find_enrollment(db, auth[7:] if auth.startswith("Bearer ") else "")
     if item is None:
-        login_limiter.fail_unique(client, auth)
-        audit(db, request, "agent.enroll", actor=f"agent:{payload.hostname[:80]}", success=False, detail="invalid, expired or revoked join link", commit=True)
+        if login_limiter.fail_unique(client, auth):   # one audit line per wrong link, not one per request
+            audit(db, request, "agent.enroll", actor=f"agent:{clean_name(payload.hostname)[:80]}", success=False, detail="invalid, expired or revoked join link", commit=True)
         raise HTTPException(401, "Join token is invalid, expired or revoked")
     machine = hashlib.sha256(("smwatch:" + payload.machine_id).encode()).hexdigest() if payload.machine_id else None
     server = db.scalar(select(Server).where(Server.machine_id == machine, Server.monitor_mode == "push")) if machine else None
     if server is None:
         if item.max_uses is not None and item.uses >= item.max_uses:
-            audit(db, request, "agent.enroll", actor=f"agent:{payload.hostname[:80]}", target=f"enrollment:{item.id}", success=False, detail="join link used up", commit=True)
+            if login_limiter.first_time(f"used-up:{item.id}:{client_ip(request)}"):
+                audit(db, request, "agent.enroll", actor=f"agent:{clean_name(payload.hostname)[:80]}", target=f"enrollment:{item.id}", success=False, detail="join link used up", commit=True)
             raise HTTPException(403, "This join token has reached its maximum number of uses")
         settings = get_settings()
         server = Server(
-            name=unique_name(db, payload.hostname), host="", monitor_mode="push", check_interval_seconds=settings.check_interval_seconds,
+            name=unique_name(db, clean_name(payload.hostname)), host="", monitor_mode="push", check_interval_seconds=settings.check_interval_seconds,
             cpu_threshold=settings.cpu_threshold, memory_threshold=settings.memory_threshold, disk_threshold=settings.disk_threshold,
             load_threshold=settings.load_threshold, swap_threshold=settings.swap_threshold, process_threshold=settings.process_threshold,
             machine_id=machine,
         )
         db.add(server)
         item.uses += 1
+    elif is_live(server) and server.last_agent_ip and server.last_agent_ip != client_ip(request):
+        # Re-registering re-issues the server's token and cuts the running agent off. A machine id is not a secret, so a join link
+        # alone must not be enough to take over a server that is online: a genuine re-install comes from the server's own address.
+        if login_limiter.first_time(f"takeover:{server.id}:{client_ip(request)}"):
+            audit(db, request, "agent.enroll", actor=f"agent:{clean_name(payload.hostname)[:80]}", target=f"server:{server.id}", success=False,
+                  detail=f"refused: {server.name} is online from {server.last_agent_ip}; re-registration attempted from another address", commit=True)
+        raise HTTPException(409, "This machine is already registered and currently online from a different address. Run the command on that server itself, or remove the server in the dashboard first.")
     token = secrets.token_urlsafe(32)
     server.agent_token, server.token_hash, server.enabled = token, hash_token(token), True  # a re-install rotates the server's token
     server.token_issued_at = datetime.now(timezone.utc)

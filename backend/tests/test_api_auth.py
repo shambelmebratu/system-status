@@ -1417,3 +1417,112 @@ def test_agent_reports_the_real_os_not_the_python_platform_string(tmp_path, monk
         assert not "eth0".startswith(agent._SKIP_IFACES) and not "tailscale0".startswith(agent._SKIP_IFACES) and not "ens3".startswith(agent._SKIP_IFACES)
     finally:
         sys.modules.pop("agent", None)
+
+
+# =================================================================== agent channel hardening
+def _audit_count(action):
+    from sqlalchemy import func, select
+    from app.models import AuditEvent
+    with database.SessionLocal() as db:
+        return db.scalar(select(func.count()).select_from(AuditEvent).where(AuditEvent.action == action))
+
+
+def test_repeating_a_bad_token_cannot_flood_the_audit_log(client, monkeypatch):
+    from app.config import get_settings
+    monkeypatch.setattr(get_settings(), "login_max_attempts", 1000)             # isolate the audit behaviour from the lock-out
+    anon = TestClient(main.app)
+    before = _audit_count("agent.auth_failed")
+    for _ in range(40):
+        assert anon.post("/api/agent/report", json=report(), headers={"Authorization": "Bearer same-wrong-token"}).status_code == 401
+        assert anon.post("/api/k8s-agent/report", json=HEALTHY, headers={"Authorization": "Bearer same-wrong-token-k8s"}).status_code == 401
+    assert _audit_count("agent.auth_failed") - before == 2                         # one line per distinct wrong token, not 80
+    before = _audit_count("agent.enroll")
+    for _ in range(30):
+        assert anon.post("/api/agent/enroll", json={"hostname": "x", "machine_id": "m"}, headers={"Authorization": "Bearer smwj_nope"}).status_code == 401
+    assert _audit_count("agent.enroll") - before == 1
+
+
+def test_oversized_request_bodies_are_refused_before_parsing(client):
+    anon = TestClient(main.app)
+    big = {"hostname": "x" * 400_000, "machine_id": "m"}
+    r = anon.post("/api/agent/enroll", json=big, headers={"Authorization": "Bearer smwj_nope"})
+    assert r.status_code == 413 and "too large" in r.json()["detail"]
+    def chunks():                                                                   # no Content-Length at all: still capped while streaming
+        for _ in range(600):
+            yield b"x" * 1024
+    r = anon.post("/api/agent/report", content=chunks(), headers={"Authorization": "Bearer nope", "content-type": "application/json"})
+    assert r.status_code == 413
+    sign_in(client)
+    sid, auth = _push_server(client, anon)
+    ok = anon.post("/api/agent/tasks/999999/result", json={"ok": True, "output": "y" * 500_000}, headers=auth)   # agent answers may be bigger
+    assert ok.status_code == 404                                                    # accepted size (unknown task), not 413
+    assert anon.post("/api/agent/tasks/999999/result", json={"ok": True, "output": "y" * 5_000_000}, headers=auth).status_code == 413
+
+
+def test_a_join_link_cannot_take_over_a_server_that_is_online(client, monkeypatch):
+    import app.routes_agent as ra, app.routes_enroll as re_
+    sign_in(client)
+    anon = TestClient(main.app)
+    token = client.post("/api/enrollments", headers=CSRF, json={}).json()["token"]
+    where = {"ip": "10.0.0.50"}
+    for module in (ra, re_):
+        monkeypatch.setattr(module, "client_ip", lambda request: where["ip"])
+    first = _enroll(anon, token, host="victim", machine="machine-victim").json()
+    auth = {"Authorization": f"Bearer {first['agent_token']}"}
+    assert anon.post("/api/agent/report", json=report(), headers=auth).status_code == 200          # the real agent is online from 10.0.0.50
+    where["ip"] = "10.6.6.6"                                                                          # someone else, with a valid link and the machine id
+    stolen = _enroll(anon, token, host="victim", machine="machine-victim")
+    assert stolen.status_code == 409 and "agent_token" not in stolen.text
+    assert anon.post("/api/agent/report", json=report(), headers={"Authorization": "Bearer " + "x" * 40}).status_code == 401
+    where["ip"] = "10.0.0.50"
+    assert anon.post("/api/agent/report", json=report(), headers=auth).status_code == 200          # the victim's token still works
+    again = _enroll(anon, token, host="victim", machine="machine-victim")                            # a genuine re-install: same machine, same address
+    assert again.status_code == 200 and again.json()["server_id"] == first["server_id"]
+    # an offline server (crashed, rebuilt, new address) may still be re-registered
+    from datetime import timedelta
+    from app.models import Server
+    with database.SessionLocal() as db:
+        db.get(Server, first["server_id"]).last_seen_at = datetime.now(timezone.utc) - timedelta(hours=2); db.commit()
+    where["ip"] = "10.7.7.7"
+    assert _enroll(anon, token, host="victim", machine="machine-victim").status_code == 200
+
+
+def test_disabled_agents_get_no_work_and_names_are_sanitised(client):
+    from app.models import Server
+    sign_in(client)
+    anon = TestClient(main.app)
+    token = client.post("/api/enrollments", headers=CSRF, json={}).json()["token"]
+    r = _enroll(anon, token, host="evil\nRECOVERED\x1b[31m host\t1", machine="machine-ctl").json()
+    assert r["name"] == "evil RECOVERED [31m host 1"                                                 # no line breaks or control characters
+    auth = {"Authorization": f"Bearer {r['agent_token']}"}
+    body = report(hostname="h\n<b>x</b>\x00", processes=[{"pid": 1, "name": "p\nALERT", "user": "u", "cpu": 1.0, "memory": 1.0}])
+    assert anon.post("/api/agent/report", json=body, headers=auth).status_code == 200
+    srv = next(s for s in client.get("/api/dashboard").json()["servers"] if s["id"] == r["server_id"])
+    assert srv["last_metrics"] is not None and "\\n" not in json.dumps(srv["last_metrics"]) 
+    with database.SessionLocal() as db:
+        db.get(Server, r["server_id"]).enabled = False; db.commit()
+    assert anon.get("/api/agent/tasks", headers=auth).status_code == 403
+    assert anon.post("/api/agent/tasks/1/result", json={"ok": True}, headers=auth).status_code == 403
+    assert anon.post("/api/agent/report", json=report(), headers=auth).status_code == 403
+
+
+def test_one_machine_monitored_twice_is_pointed_out(client):
+    sign_in(client)
+    anon = TestClient(main.app)
+    token = client.post("/api/enrollments", headers=CSRF, json={}).json()["token"]
+    a = _enroll(anon, token, host="twin-a", machine="twin-machine-1").json()
+    b = _enroll(anon, token, host="twin-b", machine="twin-machine-2").json()
+    c = _enroll(anon, token, host="other", machine="twin-machine-3").json()
+    def send(reg, **kw):
+        assert anon.post("/api/agent/report", json=report(**kw), headers={"Authorization": f"Bearer {reg['agent_token']}"}).status_code == 200
+    send(a, hostname="server1", uptime_seconds=500000, machine="ab" * 16)
+    send(b, hostname="server1", uptime_seconds=500003, machine="ab" * 16)          # same fingerprint
+    send(c, hostname="server1", uptime_seconds=42, machine="cd" * 16)              # same name, different machine and boot time
+    rows = {s["id"]: s for s in client.get("/api/dashboard").json()["servers"]}
+    assert [t["id"] for t in rows[a["server_id"]]["same_machine_as"]] == [b["server_id"]]
+    assert [t["name"] for t in rows[b["server_id"]]["same_machine_as"]] == [rows[a["server_id"]]["name"]]
+    assert rows[c["server_id"]]["same_machine_as"] == []
+    send(a, hostname="server1", uptime_seconds=500000, machine="")                 # older agents: same host name booted at the same moment
+    send(b, hostname="server1", uptime_seconds=500010, machine="")
+    rows = {s["id"]: s for s in client.get("/api/dashboard").json()["servers"]}
+    assert [t["id"] for t in rows[a["server_id"]]["same_machine_as"]] == [b["server_id"]]

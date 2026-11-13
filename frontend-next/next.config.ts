@@ -8,6 +8,17 @@ const securityHeaders = [
   { key: 'Cross-Origin-Opener-Policy', value: 'same-origin' },
 ];
 
+// Everything the dashboard loads comes from its own origin, so the browser is told to refuse anything else. Next.js needs inline
+// scripts/styles; development additionally needs eval for hot reloading.
+const dev = process.env.NODE_ENV !== 'production';
+securityHeaders.push({
+  key: 'Content-Security-Policy',
+  value: [
+    "default-src 'self'", `script-src 'self' 'unsafe-inline'${dev ? " 'unsafe-eval'" : ''}`, "style-src 'self' 'unsafe-inline'", "img-src 'self' data: blob:",
+    "font-src 'self' data:", `connect-src 'self'${dev ? ' ws: wss:' : ''}`, "object-src 'none'", "base-uri 'self'", "form-action 'self'", "frame-ancestors 'self'",
+  ].join('; '),
+});
+
 const nextConfig: NextConfig = {
   output: 'standalone',
   poweredByHeader: false,                                           // do not advertise the framework

@@ -39,7 +39,7 @@ from typing import Any
 
 import psutil
 
-AGENT_VERSION = "2.8.0"
+AGENT_VERSION = "2.9.0"
 _ENV_TOKEN = os.getenv("AGENT_TOKEN", "")                      # the token supplied by configuration; a rotation may supersede it (see _load_state)
 AGENT_TOKEN = ""                                                # the token in use: resolved by ensure_token() (saved state first, then configuration)
 AGENT_ALLOW_INSECURE = os.getenv("AGENT_ALLOW_INSECURE", "") == "1"   # permit http:// to a public address (not recommended)
@@ -127,6 +127,7 @@ def collect() -> dict[str, Any]:
         "ips": local_addresses(),
         "public_ip": public_address(),
         "install": install_kind(),
+        "machine": hashlib.sha256(("smwatch-machine:" + machine_id()).encode()).hexdigest()[:32],   # lets the dashboard notice one machine monitored twice
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -785,6 +786,18 @@ def fetch_logs(task: dict) -> tuple[str, bool]:
     return output, truncated
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """The agent never follows HTTP redirects. urllib would re-send the Authorization header (this agent's token) to wherever a
+    redirect points, including another host or plain http: a misconfigured or hostile proxy could collect tokens that way."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, f"refused to follow a redirect to {newurl} (credentials are never forwarded)", headers, fp)
+
+
+def install_safe_opener() -> None:
+    urllib.request.install_opener(urllib.request.build_opener(_NoRedirect))
+
+
 def _api(method: str, path: str, payload: dict | None = None, timeout: float = 20) -> dict:
     request = urllib.request.Request(
         f"{SMWATCH_URL}{path}", data=json.dumps(payload).encode() if payload is not None else None, method=method,
@@ -964,7 +977,8 @@ def _build_app():
 
     @api.get("/metrics")
     def metrics(authorization: str | None = Header(default=None)) -> dict[str, Any]:
-        if authorization != f"Bearer {AGENT_TOKEN}":
+        import hmac
+        if not hmac.compare_digest((authorization or "").encode(), f"Bearer {AGENT_TOKEN}".encode()):   # constant time: no timing oracle on the token
             raise HTTPException(401, "Invalid agent token")
         return collect()
 
@@ -980,6 +994,7 @@ def __getattr__(name: str):  # lets `uvicorn agent:app` build the pull server on
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    install_safe_opener()   # before any request: tokens are never re-sent to a redirect target
     if "--version" in sys.argv:
         print(AGENT_VERSION); return
     if "--check" in sys.argv:

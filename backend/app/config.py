@@ -65,6 +65,9 @@ class Settings(BaseSettings):
     log_result_ttl_minutes: int = 15           # fetched logs are deleted after this long
     log_pickup_timeout_seconds: int = 45       # an agent must pick up a log request within this time
     log_max_pending_per_server: int = 5
+    agent_max_open_polls: int = 4              # simultaneous held-open task polls one agent may have (a stolen token cannot exhaust connections)
+    max_request_body_kb: int = 256             # largest request body the API accepts ...
+    max_agent_result_kb: int = 4096            # ... except agent answers (log text / cluster lists)
     enrollment_default_minutes: int = 15       # install links: default lifetime ...
     enrollment_max_minutes: int = 1440         # ... and the longest an admin may choose
     alert_retention_days: int = 90             # defaults for the admin-editable retention (Settings > Data retention)

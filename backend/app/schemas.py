@@ -80,6 +80,11 @@ class ProcessSample(BaseModel):
     cpu: float = Field(ge=0, le=100000)
     memory: float = Field(default=0, ge=0, le=100)
 
+    @field_validator("name", "user")
+    @classmethod
+    def printable_only(cls, v: str) -> str:
+        return _printable(v)
+
 
 class IpEntry(BaseModel):
     iface: str = Field(default="", max_length=30)
@@ -113,6 +118,16 @@ class AgentReport(BaseModel):
     ips: list[IpEntry] = Field(default_factory=list, max_length=10)
     public_ip: str = Field(default="", max_length=45)
     install: str = Field(default="", max_length=20)
+    machine: str = Field(default="", max_length=64, pattern="^[0-9a-f]*$")
+
+    @field_validator("hostname", "platform", "os", "kernel", "arch", "install", "agent_version")
+    @classmethod
+    def printable_only(cls, v: str) -> str:
+        return _printable(v)
+
+
+def _printable(value: str) -> str:
+    return " ".join("".join(ch if ch.isprintable() else " " for ch in value).split())
 
 
 class TokenBody(BaseModel):

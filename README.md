@@ -47,6 +47,10 @@ An agent can only read from a **fixed allow-list** of log sources; it never runs
 - **Revoke immediately.** If a token may be stolen: *Server page → Revoke now* (or the Audit log shows an unexpected change). The old token stops working at once; install the new one shown on screen, or re-run the install command.
 - **Spotting theft.** The control plane records the address each agent connects from and writes an **`agent.ip_changed`** audit event when it changes; the server page shows the last address. A token suddenly used from somewhere unexpected is the signal to revoke it.
 - Removing a server in the dashboard, or disabling its monitor, cuts its token off immediately.
+- **Tokens are never forwarded.** Agents refuse HTTP redirects: a proxy that answers with a redirect cannot make an agent re-send its token to another address.
+- **A join link cannot take over a running server.** Re-registering a machine re-issues its token, so while a server is online this is only accepted from the server's own address; an attempt from elsewhere is refused and audited. (An offline server can still be re-installed.)
+- **No log flooding, no oversized uploads.** A repeated wrong token writes one audit line, not one per request. Request bodies are capped (`MAX_REQUEST_BODY_KB`, default 256 KB; agent answers `MAX_AGENT_RESULT_KB`, 4 MB) before they are read or parsed, and an agent may hold only a few task polls open (`AGENT_MAX_OPEN_POLLS`).
+- **Text from agents is treated as untrusted**: host names, process names and cluster problem text are stripped of control characters and line breaks before they reach the dashboard, the audit log or alert messages.
 
 ### Installing agents safely
 
@@ -65,6 +69,8 @@ An agent can only read from a **fixed allow-list** of log sources; it never runs
 Passwords are hashed with scrypt at the OWASP-recommended cost (N=2^17, r=8, p=1) and older hashes are upgraded automatically at the next sign-in. Sign-in takes the same time for an unknown email as for a wrong password, so accounts cannot be discovered by timing, and failures return one generic message. Wrong passwords are rate limited per address (5 misses per 5 minutes) and, more tolerantly, per account (20 per 15 minutes, so knowing an admin's email is not enough to keep them locked out); the same applies when changing a password or email. Minimum length is 12 characters, temporary passwords must be replaced at first sign-in, and the app refuses to start with a default `JWT_SECRET` or `ADMIN_PASSWORD`.
 
 ### Platform hardening
+
+- The dashboard sends a **Content-Security-Policy** (only its own origin may supply scripts, styles, images and connections), the API's interactive docs are disabled outside development, and session cookies are HTTPS-only whenever `PUBLIC_URL` is https.
 
 Outbound requests the control plane makes on your behalf (service checks, webhooks, agent endpoints, ping targets) cannot reach loopback, link-local or cloud-metadata addresses or the stack's own internal services, and every redirect is re-validated (`BLOCK_PRIVATE_TARGETS=true` also blocks LAN ranges). Notification tokens are redacted from error messages. All containers run with no new privileges and no extra capabilities (the worker keeps only `NET_RAW` for ping); the dashboard runs as an unprivileged user on a read-only filesystem; the API and database are not exposed to the network (bind the dashboard to `127.0.0.1` behind nginx with `FRONTEND_BIND`). The dashboard sends `X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy`, `Permissions-Policy` and `Cross-Origin-Opener-Policy`. Dependencies had no known vulnerabilities when this was written, and it stays that way by construction: the GitHub Action runs `pip-audit` and `npm audit` **before** it builds images, so a vulnerable dependency fails the build (nothing is pushed), and `.github/dependabot.yml` opens weekly update pull requests for Python, npm, Docker base images and Actions.
 

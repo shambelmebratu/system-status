@@ -32,8 +32,8 @@ def report(payload: AgentReport, request: Request, authorization: str | None = H
     digest = hash_token(token) if token else None
     server = db.scalar(select(Server).where(or_(Server.token_hash == digest, Server.pending_token_hash == digest), Server.monitor_mode == "push")) if digest else None
     if server is None:
-        login_limiter.fail_unique(gate, digest or "")
-        audit(db, request, "agent.auth_failed", actor="agent:unknown", detail="report with an unknown token", success=False, commit=True)
+        if login_limiter.fail_unique(gate, digest or ""):   # one audit line per wrong token, not one per request (no log flooding)
+            audit(db, request, "agent.auth_failed", actor="agent:unknown", detail="report with an unknown token", success=False, commit=True)
         raise HTTPException(401, "Invalid agent token")
     if not server.enabled:
         raise HTTPException(403, "This server monitor is disabled")

@@ -71,6 +71,8 @@ def agent_server(authorization: str | None, db: Session) -> Server:
     server = db.scalar(select(Server).where(Server.token_hash == hash_token(token), Server.monitor_mode == "push")) if token else None
     if server is None:
         raise HTTPException(401, "Invalid agent token")
+    if not server.enabled:
+        raise HTTPException(403, "This server monitor is disabled")   # a disabled server's agent gets no work and cannot post results
     return server
 
 
@@ -206,6 +208,8 @@ async def agent_tasks(request: Request, wait: int = Query(0, ge=0, le=25), autho
         raise
     if tasks or wait == 0:
         return {"tasks": tasks}
+    if len(_task_waiters.get(server_id, ())) >= get_settings().agent_max_open_polls:   # one agent holds one poll open; a stolen token must not tie up connections
+        raise HTTPException(429, "Too many open task polls for this agent", headers={"Retry-After": "5"})
     with _Waiter(_task_waiters, server_id) as event:
         while not tasks and loop.time() < deadline:
             event.clear()                                                    # clear BEFORE checking so a wake-up in between is not lost

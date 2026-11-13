@@ -359,3 +359,21 @@ code,.mono{font-family:var(--mono);font-size:.92em}
   .minis{gap:6px}
   .kpis{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
 }
+
+/* ---- polish found by the browser audit ---- */
+.pill,.tag{white-space:nowrap}
+.tbl th{white-space:nowrap}
+.tabs{flex-wrap:wrap;overflow-x:visible;row-gap:0}                       /* every tab stays visible: none hidden behind a sideways scroll */
+@media (max-width:640px){
+  .tabs{gap:6px;border-bottom:0;margin-bottom:14px}
+  .tabs button{border:1px solid var(--line);border-radius:99px;padding:6px 12px;margin:0;font-size:12.5px;background:var(--surface)}
+  .tabs button.on{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 14%,var(--surface))}
+  /* tables marked "rowstack" become one block per row, so actions never fall off the right edge */
+  .tbl.rowstack thead{display:none}
+  .tbl.rowstack tr{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;padding:12px 0;border-bottom:1px solid var(--line)}
+  .tbl.rowstack tr:last-child{border-bottom:0}
+  .tbl.rowstack td{border:0;padding:0}
+  .tbl.rowstack td:first-child{flex:1 1 100%}
+  .tbl.rowstack td:last-child{margin-left:auto}
+  .tbl.rowstack td[colspan]{flex:1 1 100%}
+}

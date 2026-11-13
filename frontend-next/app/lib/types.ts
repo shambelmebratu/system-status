@@ -14,7 +14,7 @@ export type Server = {
   load_threshold: number; swap_threshold: number; process_names: string; process_threshold: number;
   last_status: Status; last_checked_at: string | null; last_seen_at: string | null; last_error: string | null;
   last_metrics: Metrics | null; uptime_24h: number | null; public: boolean; install_token?: string;
-  token_issued_at?: string | null; token_rotation_pending?: boolean; last_agent_ip?: string | null; public_ip?: string | null; private_ips?: string[];
+  token_issued_at?: string | null; token_rotation_pending?: boolean; last_agent_ip?: string | null; public_ip?: string | null; private_ips?: string[]; same_machine_as?: { id: number; name: string }[];
 };
 export type Service = {
   id: number; name: string; url: string; expected_status: number; interval_seconds: number; enabled: boolean; public: boolean;

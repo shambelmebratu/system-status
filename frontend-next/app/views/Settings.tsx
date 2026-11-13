@@ -97,7 +97,7 @@ function JoinTokens() {
         <button className="btn primary">Create token</button>
       </form>
       {!enrollment.items?.length ? <p className="muted sm">No tokens yet.</p> : (
-        <table className="tbl"><thead><tr><th>Token</th><th>Status</th><th>Used</th><th className="hide-sm">Last used</th><th /></tr></thead><tbody>
+        <table className="tbl rowstack"><thead><tr><th>Token</th><th>Status</th><th>Used</th><th className="hide-sm">Last used</th><th /></tr></thead><tbody>
           {enrollment.items.map(t => (
             <Fragment key={t.id}>
               <tr>

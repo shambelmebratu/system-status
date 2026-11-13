@@ -174,7 +174,8 @@ python3 -c 'import sys, venv; assert sys.version_info >= (3, 8)' 2>/dev/null || 
 say "Installing the agent to $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 [ -x "$INSTALL_DIR/venv/bin/python" ] || python3 -m venv "$INSTALL_DIR/venv"
-"$INSTALL_DIR/venv/bin/pip" install --quiet --disable-pip-version-check --upgrade pip psutil
+# One pinned dependency (override with SMWATCH_PSUTIL_VERSION): an install never pulls "whatever is newest today" as root.
+"$INSTALL_DIR/venv/bin/pip" install --quiet --disable-pip-version-check "psutil==${SMWATCH_PSUTIL_VERSION:-6.1.1}"
 curl -fsSL "$SMWATCH_URL/api/agent/agent.py" -o "$INSTALL_DIR/agent.py.new" \
   || die "could not download the agent from $SMWATCH_URL (is the URL reachable from this server?)"
 # The control plane announces the SHA-256 of the agent it serves (inside this script); refuse anything else.

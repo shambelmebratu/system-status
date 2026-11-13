@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from .config import get_settings
 from .database import Base, engine, get_db
 from .models import AlertEvent, Channel, CheckResult, Incident, Server, Service, User
+from .bodylimit import BodyLimitMiddleware
 from .agent_versions import latest_k8s_agent, latest_server_agent
 from .monitoring import server_addresses, check_service, discover_telegram_chats, run_once, send_channel_test
 from .routes_agent import hash_token, router as agent_router
@@ -75,7 +76,44 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title=settings.app_name, version="4.0.0", lifespan=lifespan)
+def same_machine_groups(servers: list) -> dict[int, list[dict]]:
+    """Servers that are really ONE machine reporting through two agents (for example the bundled agent and a separately installed
+    one). Each entry has its own limits and alerts, which is confusing: the dashboard points it out.
+    Same machine = same machine fingerprint (agent 2.9+), or the same host name booted at the same moment (older agents)."""
+    facts = []
+    for server in servers:
+        if server.monitor_mode != "push" or not server.last_metrics:
+            continue
+        try:
+            m = json.loads(server.last_metrics)
+        except ValueError:
+            continue
+        boot = None
+        try:
+            if m.get("uptime_seconds") is not None and m.get("received_at"):
+                boot = datetime.fromisoformat(m["received_at"]).timestamp() - float(m["uptime_seconds"])
+        except (ValueError, TypeError):
+            boot = None
+        facts.append((server, m.get("machine") or "", (m.get("hostname") or "").lower(), boot))
+    result: dict[int, list[dict]] = {}
+    for i, (a, a_machine, a_host, a_boot) in enumerate(facts):
+        for b, b_machine, b_host, b_boot in facts[i + 1:]:
+            same = bool(a_machine and a_machine == b_machine) or bool(a_host and a_host == b_host and a_boot is not None and b_boot is not None and abs(a_boot - b_boot) < 180)
+            if same:
+                result.setdefault(a.id, []).append({"id": b.id, "name": b.name})
+                result.setdefault(b.id, []).append({"id": a.id, "name": a.name})
+    return result
+
+
+def cookie_secure() -> bool:
+    """Session cookies are HTTPS-only whenever the dashboard is served over HTTPS (COOKIE_SECURE=true, or an https:// PUBLIC_URL)."""
+    return settings.cookie_secure or settings.public_url.lower().startswith("https://")
+
+
+_dev = settings.environment.lower() in ("development", "dev", "test")
+# The interactive API docs describe every endpoint: only served for local development.
+app = FastAPI(title=settings.app_name, version="4.0.0", lifespan=lifespan, docs_url="/docs" if _dev else None, redoc_url=None, openapi_url="/openapi.json" if _dev else None)
+app.add_middleware(BodyLimitMiddleware)   # outermost: oversized bodies are refused before anything reads them
 app.include_router(agent_router)
 app.include_router(enroll_router)
 app.include_router(schedule_router)
@@ -168,7 +206,8 @@ def login(payload: LoginRequest, request: Request, response: Response, db: Sessi
         login_limiter.check(keys[0])                                                                                            # this address: 5 misses / 5 min
         login_limiter.check(keys[1], limit=settings.login_account_max_attempts, window=settings.login_account_window_seconds)  # this account: 20 / 15 min
     except HTTPException:
-        audit(db, request, "auth.login", actor=email, success=False, detail="blocked: too many failed attempts", commit=True)
+        if login_limiter.first_time(f"blocked:{keys[0]}:{email}"):   # one line per lock-out, not one per blocked request
+            audit(db, request, "auth.login", actor=email, success=False, detail="blocked: too many failed attempts", commit=True)
         raise
     user = db.scalar(select(User).where(User.email == email))
     password_ok = verify_password(payload.password, user.password_hash if user else dummy_hash())
@@ -187,7 +226,7 @@ def login(payload: LoginRequest, request: Request, response: Response, db: Sessi
         create_token(user.id, user.email, user.token_version),
         max_age=settings.session_hours * 3600,
         httponly=True,
-        secure=settings.cookie_secure,
+        secure=cookie_secure(),
         samesite="strict",
         path="/api",
     )
@@ -222,7 +261,7 @@ def change_password(payload: PasswordChange, request: Request, response: Respons
     account.token_version += 1  # signs out every other session
     audit(db, request, "auth.password_change", user=claims, target=f"user:{account.id}")
     db.commit()
-    response.set_cookie(COOKIE_NAME, create_token(account.id, account.email, account.token_version), max_age=settings.session_hours * 3600, httponly=True, secure=settings.cookie_secure, samesite="strict", path="/api")
+    response.set_cookie(COOKIE_NAME, create_token(account.id, account.email, account.token_version), max_age=settings.session_hours * 3600, httponly=True, secure=cookie_secure(), samesite="strict", path="/api")
     return {"ok": True}
 
 
@@ -265,8 +304,12 @@ def dashboard(_: dict = Depends(require_user), db: Session = Depends(get_db)) ->
         return {**serialize(item), "uptime_24h": uptime.get((kind, item.id))}
 
     open_incidents = db.scalar(select(func.count()).select_from(Incident).where(Incident.resolved_at.is_(None))) or 0
+    server_rows = [with_uptime("server", item) for item in servers]
+    twins = same_machine_groups(servers)
+    for row in server_rows:
+        row["same_machine_as"] = twins.get(row["id"], [])
     return {
-        "servers": [with_uptime("server", item) for item in servers],
+        "servers": server_rows,
         "services": [with_uptime("service", item) for item in services],
         "events": [serialize(item) for item in events],
         "threshold_defaults": {
