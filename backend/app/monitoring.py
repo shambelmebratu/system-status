@@ -1,3 +1,4 @@
+import html
 import json
 import logging
 import os
@@ -120,17 +121,68 @@ def redact(text: str, channel: Channel) -> str:
     return re.sub(r"/bot\d+:[A-Za-z0-9_-]+", "/bot***", text)
 
 
+# ------------------------------------------------------------------------------------------------ alert message format
+# Alerts are stored with a tiny markup (<b>..</b>, everything else HTML-escaped) and rendered per channel:
+# Telegram gets real bold text, Slack gets *bold*, webhooks and WhatsApp get plain text.
+_STATE = {"down": ("🔴", "DOWN"), "still_down": ("🔴", "STILL DOWN"), "alert": ("🟠", "ALERT"), "still_alert": ("🟠", "STILL IN ALERT"), "recovered": ("✅", "RECOVERED")}
+
+
+def esc(value) -> str:
+    return html.escape(str(value), quote=False)
+
+
+def human_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    days, rest = divmod(seconds, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes, secs = divmod(rest, 60)
+    parts = [f"{days}d" if days else "", f"{hours}h" if hours else "", f"{minutes}m" if minutes else "", f"{secs}s" if secs and not days and not hours else ""]
+    return " ".join(p for p in parts if p) or "0s"
+
+
+def tidy_reason(line: str) -> str:
+    line = re.sub(r"\bPID (\d+)", r"(PID \1)", str(line))
+    return line.replace(" >= ", " ≥ ")
+
+
+def format_alert(kind: str, state: str, name: str, lines: list[str] | str | None = None, *, at: datetime | None = None, link: str | None = None, duration: float | None = None) -> str:
+    """kind: Server / Service / Cluster. state: down, still_down, alert, still_alert, recovered."""
+    icon, label = _STATE[state]
+    when = (at or datetime.now(timezone.utc)).astimezone(timezone.utc).strftime("%d %b %Y, %H:%M UTC")
+    out = [f"{icon} <b>{label}</b> · {esc(kind)}", f"<b>{esc(name)}</b>"]
+    items = [lines] if isinstance(lines, str) else [x for x in (lines or []) if x]
+    if len(items) == 1:
+        out.append(esc(tidy_reason(items[0])))
+    elif items:
+        out.extend(f"• {esc(tidy_reason(x))}" for x in items[:8])
+        if len(items) > 8:
+            out.append(f"• … and {len(items) - 8} more")
+    if duration is not None:
+        out.append(f"⏱ Was affected for {human_duration(duration)}")
+    out.append(f"🕒 {when}")
+    if link:
+        out.append(f"🔗 {esc(link)}")
+    return "\n".join(out)
+
+
+def plain_text(message: str) -> str:
+    return html.unescape(re.sub(r"</?b>", "", message))
+
+
+def slack_text(message: str) -> str:
+    return html.unescape(re.sub(r"</?b>", "*", message))
+
+
 def send_alert(message: str, session) -> tuple[bool, str | None]:
     channels = session.scalars(select(Channel).where(Channel.enabled.is_(True))).all()
     if not channels:
         return False, "No enabled notification channels are configured"
 
-    text = re.sub(r"</?b>", "", message)
     errors = []
     sent = False
     for channel in channels:
         try:
-            delivered, detail = deliver_channel(channel, text)
+            delivered, detail = deliver_channel(channel, message, rich=True)
             if delivered:
                 sent = True
             else:
@@ -214,35 +266,40 @@ def discover_telegram_chats(token: str) -> dict:
     return {"bot": me["result"].get("username"), "chats": list(chats.values())}
 
 
-def deliver_channel(channel: Channel, text: str) -> tuple[bool, str]:
+def deliver_channel(channel: Channel, text: str, rich: bool = False) -> tuple[bool, str]:
+    """rich=True: `text` carries the alert markup (<b>, escaped HTML) and is rendered for the channel; otherwise it is plain text."""
     if channel.type == "telegram":
         if not channel.token or not channel.chat_id:
             return False, "missing bot token or chat/group ID"
-        body = urllib.parse.urlencode({"chat_id": channel.chat_id, "text": text}).encode()
-        request = urllib.request.Request(f"https://api.telegram.org/bot{channel.token}/sendMessage", data=body, method="POST")
+        fields = {"chat_id": channel.chat_id, "text": text, "disable_web_page_preview": "true"}
+        if rich:
+            fields["parse_mode"] = "HTML"
+        request = urllib.request.Request(f"https://api.telegram.org/bot{channel.token}/sendMessage", data=urllib.parse.urlencode(fields).encode(), method="POST")
         try:
             with safe_urlopen(request, timeout=8) as response:
                 result = json.loads(response.read().decode())
         except HTTPError as error:
             try:
                 result = json.loads(error.read().decode())
-                return False, telegram_hint(result.get("description", f"HTTP {error.code}"))
             except (ValueError, OSError):
                 return False, f"HTTP {error.code}"
+            if rich and "parse entities" in str(result.get("description", "")).lower():
+                return deliver_channel(channel, plain_text(text))     # an old stored message with unescaped markup: send it as plain text
+            return False, telegram_hint(result.get("description", f"HTTP {error.code}"))
         if result.get("ok"):
             return True, "Delivered"
         return False, telegram_hint(result.get("description", "Telegram rejected the alert"))
     if channel.type == "slack":
         if not channel.endpoint:
             return False, "Slack Incoming Webhook URL is missing"
-        return post_json(channel.endpoint, {"text": text})
+        return post_json(channel.endpoint, {"text": slack_text(text) if rich else text})
     if channel.type == "webhook":
         if not channel.endpoint:
             return False, "Webhook URL is missing"
-        payload = {"source": "SM-Watch", "text": text, "sent_at": datetime.now(timezone.utc).isoformat()}
+        payload = {"source": "SM-Watch", "text": plain_text(text) if rich else text, "sent_at": datetime.now(timezone.utc).isoformat()}
         return post_json(channel.endpoint, payload, channel.token or "")
     if channel.type == "whatsapp":
-        return send_whatsapp(channel, text)
+        return send_whatsapp(channel, plain_text(text) if rich else text)
     return False, f"Unsupported notification type: {channel.type}"
 
 
@@ -294,7 +351,7 @@ def record_result(session, target_type: str, target_id: int, status: str, latenc
     session.add(CheckResult(target_type=target_type, target_id=target_id, status=status, latency_ms=latency_ms, http_status=http_status, error=(error or None) and error[:1000]))
 
 
-def sync_incident(session, target_type: str, target, status: str, detail: str | None, alert_title: str | None = None) -> None:
+def sync_incident(session, target_type: str, target, status: str, detail: str | None, alert_title: str | None = None):
     """Keeps exactly one open incident per target while it is failing; resolves it on recovery."""
     open_incident = session.scalar(
         select(Incident).where(Incident.target_type == target_type, Incident.target_id == target.id, Incident.resolved_at.is_(None))
@@ -309,6 +366,15 @@ def sync_incident(session, target_type: str, target, status: str, detail: str | 
             open_incident.severity, open_incident.title, open_incident.detail = severity, title, (detail or "")[:1000]
     elif open_incident is not None:
         open_incident.resolved_at = datetime.now(timezone.utc)
+        return open_incident
+    return None
+
+
+def outage_seconds(incident) -> float | None:
+    if incident is None:
+        return None
+    started = incident.started_at if incident.started_at.tzinfo else incident.started_at.replace(tzinfo=timezone.utc)
+    return (incident.resolved_at - started).total_seconds()
 
 
 def queue_event(session, target_type: str, target, severity: str, message: str, deliver: bool) -> None:
@@ -356,13 +422,12 @@ def apply_service_result(session, service: Service, result: dict) -> dict:
     service.last_http_status = result["http_status"]
     service.last_status = status
     service.last_error = result["error"]
-    sync_incident(session, "service", service, status, service.last_error)
+    resolved = sync_incident(session, "service", service, status, service.last_error)
     if status == "down":
         if previous_status != "down" or should_notify_again(session, "service", service.id):
-            heading = "Service down" if previous_status != "down" else "Service still down"
-            queue_event(session, "service", service, "critical", f"<b>{heading}: {service.name}</b>\n{service.last_error}\nChecked at {now.isoformat()}\n{service.url}", deliver=True)
+            queue_event(session, "service", service, "critical", format_alert("Service", "down" if previous_status != "down" else "still_down", service.name, service.last_error, at=now, link=service.url), deliver=True)
     elif previous_status == "down":
-        queue_event(session, "service", service, "info", f"<b>Service recovered: {service.name}</b>\nHTTP {service.last_http_status} in {service.last_latency_ms} ms\n{service.url}", deliver=True)
+        queue_event(session, "service", service, "info", format_alert("Service", "recovered", service.name, f"Responding again: HTTP {service.last_http_status} in {round(service.last_latency_ms or 0)} ms", at=now, link=service.url, duration=outage_seconds(resolved)), deliver=True)
     session.commit()
     return _service_payload(service, status, result, now)
 
@@ -399,18 +464,15 @@ def apply_server_result(session, server: Server, status: str, failures: list[str
         server.last_metrics = json.dumps(metrics)
         if all(key in metrics for key in ("cpu", "memory", "disk", "load", "swap")):  # ping-only checks carry no resource metrics
             session.add(MetricSample(server_id=server.id, ts=now, cpu=metrics["cpu"], memory=metrics["memory"], disk=metrics["disk"], load=metrics["load"], swap=metrics["swap"], net_rx_bps=metrics.get("net_rx_bps"), net_tx_bps=metrics.get("net_tx_bps")))
-    sync_incident(session, "server", server, status, detail)
-    stamp = f"\nChecked at {now.isoformat()}"
+    resolved = sync_incident(session, "server", server, status, detail)
     if status == "down":
         if previous != "down" or should_notify_again(session, "server", server.id):
-            heading = "Server down" if previous != "down" else "Server still down"
-            queue_event(session, "server", server, "critical", f"<b>{heading}: {server.name}</b>\n{error}{stamp}", deliver)
+            queue_event(session, "server", server, "critical", format_alert("Server", "down" if previous != "down" else "still_down", server.name, error, at=now), deliver)
     elif status == "alert":
         if previous != "alert" or should_notify_again(session, "server", server.id):
-            heading = "Server alert" if previous != "alert" else "Server still in alert"
-            queue_event(session, "server", server, "critical", f"<b>{heading}: {server.name}</b>\n" + "\n".join(failures) + stamp, deliver)
+            queue_event(session, "server", server, "critical", format_alert("Server", "alert" if previous != "alert" else "still_alert", server.name, failures, at=now), deliver)
     elif previous in ("down", "alert"):
-        queue_event(session, "server", server, "info", f"<b>Server recovered: {server.name}</b>\nHost reachable and resource checks are within configured thresholds.", deliver)
+        queue_event(session, "server", server, "info", format_alert("Server", "recovered", server.name, "Host reachable and all resource checks are within their thresholds.", at=now, duration=outage_seconds(resolved)), deliver)
 
 
 def is_due(last_checked_at, interval_seconds: int) -> bool:
@@ -508,17 +570,14 @@ def run_once() -> None:
 
 
 def prune_history() -> None:
-    settings = get_settings()
-    now = datetime.now(timezone.utc)
+    """Applies the admin-configured retention when the purge schedule is due (see retention.py)."""
+    from .retention import run_scheduled
     session = SessionLocal()
     try:
-        session.execute(delete(CheckResult).where(CheckResult.checked_at < now - timedelta(days=settings.check_retention_days)))
-        session.execute(delete(MetricSample).where(MetricSample.ts < now - timedelta(days=settings.metric_retention_days)))
-        session.execute(delete(LogRequest).where(LogRequest.created_at < now - timedelta(minutes=15)))  # fetched logs are never archived
-        session.execute(delete(AuditEvent).where(AuditEvent.ts < now - timedelta(days=settings.audit_retention_days)))
-        session.execute(delete(ClusterSample).where(ClusterSample.ts < now - timedelta(days=settings.metric_retention_days)))
-        session.execute(delete(K8sRequest).where(K8sRequest.created_at < now - timedelta(minutes=15)))
-        session.commit()
+        run_scheduled(session)
+    except Exception:
+        session.rollback()
+        logger.exception("scheduled purge failed")
     finally:
         session.close()
 
@@ -571,7 +630,7 @@ def run_forever() -> None:
     while True:
         try:
             run_once()
-            if time.monotonic() - last_prune > 3600:
+            if time.monotonic() - last_prune > 60:
                 prune_history()
                 last_prune = time.monotonic()
         except Exception:

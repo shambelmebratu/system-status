@@ -20,7 +20,7 @@ from .audit import audit
 from .config import get_settings, resolved_k8s_agent_image
 from .database import SessionLocal, get_db
 from .models import CheckResult, Cluster, ClusterSample, Incident, K8sRequest
-from .monitoring import queue_event, record_result, should_notify_again, sync_incident
+from .monitoring import format_alert, outage_seconds, queue_event, record_result, should_notify_again, sync_incident
 from .routes_agent import hash_token
 from .routes_enroll import control_plane_url, find_enrollment
 from .routes_logs import PICKUP_TIMEOUT, REQUEST_TTL, _Waiter, _wake
@@ -161,13 +161,14 @@ def apply_cluster_status(db: Session, cluster: Cluster, status: str, detail: str
     if cluster.last_checked_at is None or (now - aware(cluster.last_checked_at)).total_seconds() >= 55 or previous != status:
         record_result(db, "cluster", cluster.id, status, None, None, detail)   # uptime history, at most about once a minute
     cluster.last_status, cluster.last_error, cluster.last_checked_at = status, detail if status != "up" else None, now
-    sync_incident(db, "cluster", cluster, status, detail, alert_title=f"{cluster.name} has problems")
+    resolved = sync_incident(db, "cluster", cluster, status, detail, alert_title=f"{cluster.name} has problems")
     if status in ("down", "alert"):
         if previous != status or should_notify_again(db, "cluster", cluster.id):
-            heading = "Cluster down" if status == "down" else "Cluster alert"
-            queue_event(db, "cluster", cluster, "critical", f"<b>{heading}: {cluster.name}</b>\n{detail}\nChecked at {now.isoformat()}", deliver)
+            problems = (json.loads(cluster.summary).get("problems") if cluster.summary else None) if status == "alert" else None
+            state = status if previous != status else f"still_{status}"
+            queue_event(db, "cluster", cluster, "critical", format_alert("Cluster", state, cluster.name, problems or detail, at=now), deliver)
     elif previous in ("down", "alert"):
-        queue_event(db, "cluster", cluster, "info", f"<b>Cluster recovered: {cluster.name}</b>\nAll nodes ready and workloads healthy.", deliver)
+        queue_event(db, "cluster", cluster, "info", format_alert("Cluster", "recovered", cluster.name, "All nodes are ready and workloads are healthy.", at=now, duration=outage_seconds(resolved)), deliver)
 
 
 def check_cluster_heartbeats(session: Session) -> None:

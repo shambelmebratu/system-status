@@ -44,24 +44,24 @@ export function JoinCommands({ token, base }: { token: string; base: string }) {
   );
 }
 
-/** Returns the newest active join token, creating one (valid 15 minutes) if none has enough time left. */
+/** Lists join tokens. Nothing is created automatically: a token exists only after someone asks for one (`generate`). */
 export function useActiveEnrollment() {
   const [items, setItems] = useState<Enrollment[] | null>(null);
   const [error, setError] = useState('');
-  const load = async (createIfNone = false) => {
-    try {
-      let list = await api<Enrollment[]>('/enrollments');
-      const usable = (i: Enrollment) => i.active && (!i.expires_at || new Date(i.expires_at).getTime() - Date.now() > 3 * 60000);
-      if (createIfNone && !list.some(usable)) { await post('/enrollments', { label: 'Dashboard', expires_minutes: 15 }); list = await api<Enrollment[]>('/enrollments'); }
-      setItems(list); setError('');
-    } catch (e) { setError((e as Error).message); }
+  const [busy, setBusy] = useState(false);
+  const load = async () => {
+    try { setItems(await api<Enrollment[]>('/enrollments')); setError(''); } catch (e) { setError((e as Error).message); }
   };
-  useEffect(() => { void load(true); const t = setInterval(() => void load(), 10000); return () => clearInterval(t); }, []);
-  const active = items?.find(i => i.active) ?? null;   // newest first, so a freshly created token wins
+  useEffect(() => { void load(); const t = setInterval(() => { if (!document.hidden) void load(); }, 10000); return () => clearInterval(t); }, []);
+  const active = items?.find(i => i.active && (!i.expires_at || new Date(i.expires_at).getTime() > Date.now())) ?? null;   // newest first
   return {
-    items, active, error, reload: load,
-    renew: async () => { await post('/enrollments', { label: 'Dashboard', expires_minutes: 15 }); await load(); },
-    revoke: async (id: number) => { await del(`/enrollments/${id}`); await load(true); },
+    items, active, error, busy, reload: load,
+    /** Creates a fresh link (valid 15 minutes) on demand. */
+    generate: async (label = 'Dashboard') => {
+      setBusy(true);
+      try { await post('/enrollments', { label, expires_minutes: 15 }); await load(); } catch (e) { setError((e as Error).message); } finally { setBusy(false); }
+    },
+    revoke: async (id: number) => { await del(`/enrollments/${id}`); await load(); },
   };
 }
 

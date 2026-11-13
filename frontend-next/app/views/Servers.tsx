@@ -300,14 +300,14 @@ function JoinModal({ onClose }: { onClose: () => void }) {
         <ol className="steps">
           <li><b>Run this one command on the server</b>
             {enrollment.error ? <div className="err">{enrollment.error}</div>
-              : !enrollment.items ? <p className="muted sm">Creating your install link…</p>
-              : !e ? <div className="banner">The install link expired. <button className="btn sm primary" style={{ marginLeft: 8 }} onClick={() => void enrollment.renew()}>Generate a new command</button></div>
+              : !enrollment.items ? <p className="muted sm">Loading…</p>
+              : !e ? <div className="banner">No active install link. A link is only created when you need one and works for 15 minutes. <button className="btn sm primary" style={{ marginLeft: 8 }} disabled={enrollment.busy} onClick={() => void enrollment.generate()}>Generate install command</button></div>
               : <JoinCommands token={e.token} base={base} />}
           </li>
           <li><b>That’s it</b><span className="sm muted">The server registers itself under its hostname and appears below within seconds. You can rename it, set alert thresholds or add it to the status page afterwards. Run the same command on as many servers as you like.</span></li>
         </ol>
         {local && <div className="banner">This dashboard is open on <b>localhost</b>, which other servers can’t reach. Set <code>PUBLIC_URL</code> in the control plane’s <code>.env</code> to its real address, or edit it here:<input style={{ marginTop: 8, width: '100%' }} className="field" value={base} onChange={ev => setBase(ev.target.value.replace(/\/$/, ''))} /></div>}
-        {e && <div className="sm muted">For safety this link is random and short-lived: <b>{expiryText(e)}</b>. Anyone who has it can add a server until then; {e.uses} server{e.uses === 1 ? '' : 's'} joined so far. <button className="btn ghost sm" onClick={() => void enrollment.renew()}>New link</button> <button className="btn ghost sm" onClick={() => enrollment.revoke(e.id)}>Revoke</button> <button className="btn ghost sm" onClick={() => go('settings')}>Manage join tokens</button></div>}
+        {e && <div className="sm muted">For safety this link is random and short-lived: <b>{expiryText(e)}</b>. Anyone who has it can add a server until then; {e.uses} server{e.uses === 1 ? '' : 's'} joined so far. <button className="btn ghost sm" onClick={() => void enrollment.generate()}>New link</button> <button className="btn ghost sm" onClick={() => enrollment.revoke(e.id)}>Revoke</button> <button className="btn ghost sm" onClick={() => go('settings')}>Manage join tokens</button></div>}
         <div className="waiting">
           {joined.length === 0 ? <><span className="spinner" />Waiting for a server to join… (this page updates automatically)</>
             : <div>{joined.map(j => <div key={j.id}><span className="good">●</span> <b>{j.name}</b> joined{j.last_seen_at ? ` · reporting (${timeAgo(j.last_seen_at)})` : ' · waiting for its first report'} <button className="btn sm ghost" onClick={() => { onClose(); go(`servers/${j.id}`); }}>Open</button></div>)}</div>}

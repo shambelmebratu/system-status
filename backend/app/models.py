@@ -276,3 +276,12 @@ class K8sRequest(Base):
     truncated: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class AppSetting(Base):
+    """Small admin-editable settings (JSON values), e.g. the data retention and purge schedule."""
+    __tablename__ = "app_settings"
+    key: Mapped[str] = mapped_column(String(60), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, default="{}")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    updated_by: Mapped[str | None] = mapped_column(String(320))

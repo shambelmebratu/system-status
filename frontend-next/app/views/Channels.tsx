@@ -15,6 +15,8 @@ const HELP: Record<ChannelType, string> = {
   whatsapp: 'Uses the Meta WhatsApp Cloud API with an approved Utility template that has one body variable.',
 };
 
+const plainAlert = (m: string) => m.replace(/<\/?b>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+
 export function Channels() {
   const { channels, data, refresh, toast } = useApp();
   const [adding, setAdding] = useState(false);
@@ -44,7 +46,7 @@ export function Channels() {
         <section className="card"><div className="card-head"><h2>Delivery log</h2></div>
           {!data?.events.length ? <p className="muted sm">No alerts yet.</p> : <div className="timeline">{data.events.map(e => (
             <div key={e.id} className="tl-item"><span className={`tl-dot ${e.severity === 'critical' ? 'critical' : 'resolved'}`} />
-              <div className="tl-body"><div className="sm" style={{ whiteSpace: 'pre-line' }}>{e.message.replace(/<\/?b>/g, '')}</div>
+              <div className="tl-body"><div className="sm" style={{ whiteSpace: 'pre-line' }}>{plainAlert(e.message)}</div>
                 <div className="tl-meta">{timeAgo(e.created_at)} · {e.sent ? <span className="good">delivered</span> : <span className="bad">not delivered{e.delivery_error ? ` (${e.delivery_error})` : ''} · {e.delivery_attempts} attempts</span>}</div></div></div>))}</div>}
         </section>
       </div>

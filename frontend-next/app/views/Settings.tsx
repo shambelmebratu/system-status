@@ -2,6 +2,7 @@
 
 import { FormEvent, Fragment, useEffect, useState } from 'react';
 import { JoinCommands, expiryText, useActiveEnrollment, useControlPlaneUrl } from '../components/join';
+import { RetentionCard } from '../components/retention';
 import { CodeBox, Field } from '../components/ui';
 import { post, put } from '../lib/api';
 import { ROLE_INFO } from '../lib/types';
@@ -9,7 +10,7 @@ import { timeAgo } from '../lib/format';
 import { useApp } from '../lib/app';
 
 export function Settings() {
-  const { toast, data, me, canOperate, reloadMe } = useApp();
+  const { toast, data, me, canOperate, isAdmin, reloadMe } = useApp();
   const [current, setCurrent] = useState('');
   const [next, setNext] = useState('');
   const [error, setError] = useState('');
@@ -60,6 +61,7 @@ export function Settings() {
         </section>
       </div>
       {canOperate && <JoinTokens />}
+      {isAdmin && <RetentionCard />}
     </>
   );
 }

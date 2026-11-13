@@ -103,3 +103,20 @@ function PolicyEditor({ serverId, initial, onClose, onSaved }: { serverId: numbe
     </Modal>
   );
 }
+
+/** Admin shortcut on the Logs page: choose which kinds of logs this server's agent exposes (so fewer files are listed and scanned). */
+export function LogPolicyButton({ serverId, onSaved }: { serverId: number; onSaved: () => void }) {
+  const { toast } = useApp();
+  const [initial, setInitial] = useState<Policy | null>(null);
+  const [busy, setBusy] = useState(false);
+  async function open() {
+    setBusy(true);
+    try { setInitial((await api<{ policy: Policy }>(`/servers/${serverId}/log-policy`)).policy); } catch (e) { toast((e as Error).message, true); } finally { setBusy(false); }
+  }
+  return (
+    <>
+      <button className="btn" onClick={() => void open()} disabled={busy} title="Choose which kinds of logs this server exposes">Choose logs…</button>
+      {initial && <PolicyEditor serverId={serverId} initial={initial} onClose={() => setInitial(null)} onSaved={() => { setInitial(null); toast('Saved. The agent applies it at its next report (within a minute).'); onSaved(); }} />}
+    </>
+  );
+}

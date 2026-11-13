@@ -92,7 +92,7 @@ export function Kubernetes() {
 function AddCluster({ onClose }: { onClose: () => void }) {
   const [name, setName] = useState('');
   const [base] = useControlPlaneUrl();
-  const { active, error } = useActiveEnrollment();
+  const { active, error, busy, generate } = useActiveEnrollment();
   const valid = /^[A-Za-z0-9]([A-Za-z0-9._-]{0,58}[A-Za-z0-9])?$/.test(name);
   const cmd = active && valid ? `curl -fsSL -X POST "${base}/api/agent/k8s/${active.token}?name=${name}" | kubectl apply -f -` : '';
   return (
@@ -100,7 +100,9 @@ function AddCluster({ onClose }: { onClose: () => void }) {
       <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
         <Field label="Cluster name" hint="Letters, digits, dots, dashes. e.g. prod-eu"><input value={name} onChange={e => setName(e.target.value.trim())} placeholder="prod-eu" maxLength={60} autoFocus /></Field>
         {error && <div className="err">{error}</div>}
-        {cmd ? <><span className="sm muted">Run this with a kubeconfig that can create cluster roles (the link works for 15 minutes):</span><CodeBox value={cmd} /></> : <span className="muted sm">Enter a valid name to get the install command.</span>}
+        {!valid ? <span className="muted sm">Enter a valid name to get the install command.</span>
+          : !active ? <div className="banner">An install link is created only when you need one and works for 15 minutes. <button className="btn sm primary" style={{ marginLeft: 8 }} disabled={busy} onClick={() => void generate('Kubernetes')}>Generate install command</button></div>
+          : <><span className="sm muted">Run this with a kubeconfig that can create cluster roles (the link works for 15 minutes):</span><CodeBox value={cmd} /></>}
         <div className="card" style={{ background: 'var(--bg)' }}>
           <b className="sm">What gets installed</b>
           <ul className="sm muted" style={{ margin: '6px 0 0 18px' }}>

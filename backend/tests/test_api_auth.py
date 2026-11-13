@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 import os
 
 os.environ.update(ENVIRONMENT="test", JWT_SECRET="x" * 40, ADMIN_PASSWORD="correct-horse-battery", DATABASE_URL="sqlite://", AGENT_MIN_REPORT_SECONDS="0")
@@ -1162,3 +1163,129 @@ def test_k8s_token_rotation_and_revoke(client):
     assert anon.post("/api/k8s-agent/report", json=HEALTHY, headers=h(fresh)).status_code == 200
     assert client.delete(f"/api/clusters/{cid}", headers=CSRF).json()["deleted"] is True
     assert client.get(f"/api/clusters/{cid}").status_code == 404
+
+
+# =================================================================== alert message format
+def test_alert_messages_are_structured_and_safe():
+    from app import monitoring as m
+    t = m.format_alert("Server", "alert", "This server (control plane)", ["Process kubelet PID 3937987 CPU 89.8% >= 80.0%", "CPU 91% >= 85%"], at=datetime(2026, 11, 13, 16, 49, tzinfo=timezone.utc))
+    assert t.startswith("🟠 <b>ALERT</b> · Server\n<b>This server (control plane)</b>\n• Process kubelet (PID 3937987) CPU 89.8% ≥ 80.0%\n• CPU 91% ≥ 85%")
+    assert t.endswith("🕒 13 Nov 2026, 16:49 UTC")
+    single = m.format_alert("Service", "down", "API", "connection <refused> & reset", link="https://x.example")
+    assert "&lt;refused&gt; &amp; reset" in single and "🔗 https://x.example" in single and "•" not in single
+    back = m.format_alert("Server", "recovered", "web", "ok", duration=725)
+    assert back.startswith("✅ <b>RECOVERED</b>") and "⏱ Was affected for 12m 5s" in back
+    assert m.plain_text(single) == "🔴 DOWN · Service\nAPI\nconnection <refused> & reset\n" + m.plain_text(single).split("\n")[3] + "\n🔗 https://x.example"
+    assert m.slack_text(back).startswith("✅ *RECOVERED* · Server\n*web*")
+    assert m.human_duration(59) == "59s" and m.human_duration(3661) == "1h 1m" and m.human_duration(90000) == "1d 1h"
+
+
+def test_telegram_sends_rich_text_and_falls_back_to_plain(monkeypatch):
+    import urllib.parse
+    from urllib.error import HTTPError
+    from io import BytesIO
+    from app import monitoring as m
+    from app.models import Channel
+    sent = []
+
+    class Resp:
+        def __init__(self, body): self.body = body
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return self.body
+
+    def fake(request, timeout=8):
+        fields = dict(urllib.parse.parse_qsl(request.data.decode()))
+        sent.append(fields)
+        if "parse_mode" in fields and "BAD" in fields["text"]:
+            raise HTTPError(request.full_url, 400, "bad", {}, BytesIO(b'{"ok": false, "description": "Bad Request: can\'t parse entities: Unsupported start tag"}'))
+        return Resp(b'{"ok": true}')
+
+    monkeypatch.setattr(m, "safe_urlopen", fake)
+    channel = Channel(name="t", type="telegram", token="1:abc", chat_id="42")
+    assert m.deliver_channel(channel, "<b>hi</b> a &amp; b", rich=True) == (True, "Delivered")
+    assert sent[-1]["parse_mode"] == "HTML" and sent[-1]["text"] == "<b>hi</b> a &amp; b"
+    assert m.deliver_channel(channel, "BAD <tag> old message", rich=True)[0] is True
+    assert "parse_mode" not in sent[-1] and sent[-1]["text"] == "BAD <tag> old message"          # retried as plain text
+    assert m.deliver_channel(channel, "plain <text> from a schedule")[0] and "parse_mode" not in sent[-1]
+
+
+# =================================================================== retention and purge
+def _seed_history():
+    from datetime import timedelta
+    from app.models import AlertEvent, AuditEvent, CheckResult, Incident
+    now = datetime.now(timezone.utc)
+    with database.SessionLocal() as db:
+        for days in (1, 10, 400):
+            db.add(CheckResult(target_type="service", target_id=9001, status="up", checked_at=now - timedelta(days=days)))
+            db.add(AlertEvent(target_type="service", target_id=9001, severity="info", message="x", created_at=now - timedelta(days=days)))
+        db.add(Incident(target_type="service", target_id=9001, target_name="old", title="t", started_at=now - timedelta(days=500), resolved_at=now - timedelta(days=499)))
+        db.add(Incident(target_type="service", target_id=9001, target_name="open", title="t", started_at=now - timedelta(days=500)))
+        db.add(AuditEvent(actor="old", action="auth.login", ts=now - timedelta(days=400)))
+        db.commit()
+
+
+def test_retention_admin_only_validation_and_manual_purge(client):
+    from app.models import AlertEvent, AuditEvent, CheckResult, Incident
+    sign_in(client)
+    make_user(client, "ret-op@example.com", "operator")
+    op = session_for("ret-op@example.com", new_password="operator-pass-12345")
+    assert op.get("/api/retention").status_code == 403 and op.post("/api/retention/purge", headers=CSRF, json={"categories": ["checks"]}).status_code == 403
+    view = client.get("/api/retention").json()
+    assert view["settings"]["days"]["audit"] >= 30 and set(view["stats"]) >= {"checks", "metrics", "alerts", "incidents", "audit", "links", "transient"}
+    assert client.put("/api/retention", headers=CSRF, json={"days": {"audit": 5}}).status_code == 422          # the audit log keeps >= 30 days
+    assert client.put("/api/retention", headers=CSRF, json={"days": {"checks": 0}}).status_code == 422
+    assert client.put("/api/retention", headers=CSRF, json={"days": {"bogus": 5}}).status_code == 422
+    assert client.put("/api/retention", headers=CSRF, json={"time": "25:00"}).status_code == 422
+    saved = client.put("/api/retention", headers=CSRF, json={"days": {"checks": 30, "alerts": 7}, "frequency": "daily", "time": "02:30"}).json()["settings"]
+    assert saved["days"]["checks"] == 30 and saved["days"]["alerts"] == 7 and saved["frequency"] == "daily" and saved["time"] == "02:30"
+
+    _seed_history()
+    def count(model, **kw):
+        with database.SessionLocal() as db:
+            from sqlalchemy import select, func
+            return db.scalar(select(func.count()).select_from(model).where(*[getattr(model, k) == v for k, v in kw.items()]))
+    assert client.post("/api/retention/purge", headers=CSRF, json={"categories": ["audit"], "older_than_days": 5}).status_code == 422   # too recent for the audit log
+    assert client.post("/api/retention/purge", headers=CSRF, json={"categories": ["audit"], "older_than_days": 0}).status_code == 422
+    assert client.post("/api/retention/purge", headers=CSRF, json={"categories": ["nonsense"]}).status_code == 422
+    r = client.post("/api/retention/purge", headers=CSRF, json={"categories": ["checks", "alerts", "incidents"], "older_than_days": 30}).json()
+    assert r["deleted"]["checks"] >= 1 and r["deleted"]["alerts"] >= 1 and r["deleted"]["incidents"] >= 1
+    assert count(CheckResult, target_id=9001) == 2 and count(Incident, target_id=9001) == 1                    # only the 400-day row went; the OPEN incident survives
+    assert client.post("/api/retention/purge", headers=CSRF, json={"categories": ["audit"], "older_than_days": 365}).json()["deleted"]["audit"] >= 1
+    assert client.post("/api/retention/purge", headers=CSRF, json={"categories": ["checks"], "older_than_days": 0}).json()["deleted"]["checks"] >= 2   # 0 = everything
+    assert count(CheckResult, target_id=9001) == 0
+    actions = {e["action"] for e in client.get("/api/audit?limit=200&category=purge").json()}
+    assert {"purge.settings", "purge.manual"} <= actions
+
+
+def test_scheduled_purge_follows_the_schedule(client):
+    from datetime import timedelta
+    from app import retention
+    from app.models import CheckResult
+    sign_in(client)
+    client.put("/api/retention", headers=CSRF, json={"auto": True, "frequency": "daily", "time": "03:00", "days": {"checks": 30}})
+    now = datetime(2026, 11, 13, 12, 0, tzinfo=timezone.utc)
+    cfg = retention.defaults(); cfg.update(auto=True, frequency="daily", time="03:00")
+    assert retention.due(cfg, now)                                                         # never ran
+    cfg["last_run_at"] = datetime(2026, 11, 13, 3, 5, tzinfo=timezone.utc).isoformat()
+    assert not retention.due(cfg, now)                                                     # today's slot already done
+    cfg["last_run_at"] = datetime(2026, 11, 12, 3, 5, tzinfo=timezone.utc).isoformat()
+    assert retention.due(cfg, now) and not retention.due(cfg, datetime(2026, 11, 13, 2, 0, tzinfo=timezone.utc))   # before 03:00 the slot is yesterday's
+    cfg["auto"] = False
+    assert not retention.due(cfg, now)
+    cfg.update(auto=True, frequency="hourly", last_run_at=(now - timedelta(minutes=30)).isoformat())
+    assert not retention.due(cfg, now)
+    cfg["last_run_at"] = (now - timedelta(minutes=61)).isoformat()
+    assert retention.due(cfg, now)
+    cfg.update(frequency="weekly", weekday=0, time="03:00", last_run_at=datetime(2026, 11, 9, 3, 1, tzinfo=timezone.utc).isoformat())   # Mon 9 Nov ran; now is Fri 13 Nov
+    assert not retention.due(cfg, now)
+    cfg["last_run_at"] = datetime(2026, 11, 2, 3, 1, tzinfo=timezone.utc).isoformat()
+    assert retention.due(cfg, now)
+    # the worker hook really deletes by the saved retention and records the run
+    _seed_history()
+    with database.SessionLocal() as db:
+        result = retention.run_scheduled(db)
+        assert result is not None and result["checks"] >= 1
+        from sqlalchemy import select
+        assert db.scalar(select(CheckResult).where(CheckResult.target_id == 9001, CheckResult.checked_at < datetime.now(timezone.utc) - timedelta(days=31))) is None
+        assert retention.run_scheduled(db) is None                                         # not due again straight away
