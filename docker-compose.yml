@@ -1,3 +1,14 @@
+# SM-Watch stack. By default it runs the images published to Docker Hub by the GitHub Action
+# (.github/workflows/docker-publish.yml): no source code or build tools are needed on the server.
+#
+#   docker compose pull && docker compose up -d                  run the published images
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build    build from this source tree instead (development)
+#
+# The images come from Docker Hub account "shambi21" unless DOCKERHUB_USERNAME says otherwise in .env (SMWATCH_VERSION picks the tag).
+x-api-image: &api-image ${DOCKERHUB_USERNAME:-shambi21}/sm-watch-api:${SMWATCH_VERSION:-latest}
+x-host-agent-image: &host-agent-image ${DOCKERHUB_USERNAME:-shambi21}/sm-watch-host-agent:${SMWATCH_VERSION:-latest}
+x-frontend-image: &frontend-image ${DOCKERHUB_USERNAME:-shambi21}/sm-watch-frontend:${SMWATCH_VERSION:-latest}
+
 services:
   postgres:
     image: postgres:17-alpine
@@ -15,9 +26,7 @@ services:
     restart: unless-stopped
 
   migrate:
-    build:
-      context: .
-      dockerfile: backend/Dockerfile
+    image: *api-image
     command: ["alembic", "-c", "alembic.ini", "upgrade", "head"]
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-smwatch}:${POSTGRES_PASSWORD:-replace-this-password}@postgres:5432/${POSTGRES_DB:-smwatch}
@@ -31,9 +40,7 @@ services:
     restart: "no"
 
   api:
-    build:
-      context: .
-      dockerfile: backend/Dockerfile
+    image: *api-image
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-smwatch}:${POSTGRES_PASSWORD:-replace-this-password}@postgres:5432/${POSTGRES_DB:-smwatch}
@@ -61,9 +68,7 @@ services:
     restart: unless-stopped
 
   worker:
-    build:
-      context: .
-      dockerfile: backend/Dockerfile
+    image: *api-image
     command: ["python", "-m", "app.worker"]
     cap_add:
       - NET_RAW
@@ -86,9 +91,7 @@ services:
   # It appears in the dashboard as "This server (control plane)". It mounts the host read-only and the Docker
   # socket (root-equivalent access); set HOST_AGENT_LOGS=nodocker or off in .env to reduce that, or delete this service.
   host-agent:
-    build:
-      context: .
-      dockerfile: backend/Dockerfile
+    image: *host-agent-image
     command: ["python", "agent.py"]
     pid: host
     environment:
@@ -108,9 +111,7 @@ services:
     restart: unless-stopped
 
   frontend:
-    build:
-      context: frontend-next
-      dockerfile: Dockerfile
+    image: *frontend-image
     environment:
       BACKEND_URL: http://api:8000
     depends_on:

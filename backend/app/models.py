@@ -12,7 +12,11 @@ class User(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     email: Mapped[str] = mapped_column(String(320), unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(Text)
-    role: Mapped[str] = mapped_column(String(30), default="admin")
+    role: Mapped[str] = mapped_column(String(30), default="admin")   # admin | operator | viewer
+    name: Mapped[str] = mapped_column(String(100), default="", server_default="")
+    active: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    must_change_password: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     token_version: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

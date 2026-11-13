@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SM-Watch agent installer (Linux + systemd). Safe to re-run: it updates the agent in place.
+# SM-Watch agent installer (Linux + systemd, and macOS + launchd). Safe to re-run: it updates the agent in place.
 #
 # Normal use: copy the one-line command from the dashboard (Servers -> Add server -> Install agent):
 #   curl -fsSL https://CONTROL_PLANE/api/agent/join/<join-token> | sudo bash
@@ -29,9 +29,18 @@ say()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "run as root (put sudo before 'bash')"
+IS_MAC=0; [ "$(uname -s)" = "Darwin" ] && IS_MAC=1
+PLIST=/Library/LaunchDaemons/net.smwatch.agent.plist
+LABEL=net.smwatch.agent
 
 case "${1:-install}" in
   uninstall)
+    if [ "$IS_MAC" = 1 ]; then
+      launchctl bootout "system/$LABEL" 2>/dev/null || true
+      rm -rf "$PLIST" "$INSTALL_DIR" "$STATE_DIR" /var/log/sm-watch-agent.log
+      say "SM-Watch agent removed. You can delete the server in the dashboard."
+      exit 0
+    fi
     systemctl disable --now "$SERVICE" 2>/dev/null || true
     rm -f "/etc/systemd/system/${SERVICE}.service" "$ENV_FILE"
     rm -rf "$INSTALL_DIR" "$STATE_DIR"
@@ -40,6 +49,11 @@ case "${1:-install}" in
     say "SM-Watch agent removed. You can delete the server in the dashboard."
     exit 0 ;;
   status)
+    if [ "$IS_MAC" = 1 ]; then
+      launchctl print "system/$LABEL" 2>&1 | head -12 || true
+      [ -x "$INSTALL_DIR/venv/bin/python" ] && (SMWATCH_URL=$(sed -n 's/.*"url": *"\([^"]*\)".*/\1/p' "$STATE_FILE") AGENT_STATE_DIR="$STATE_DIR" "$INSTALL_DIR/venv/bin/python" "$INSTALL_DIR/agent.py" --check) || true
+      exit 0
+    fi
     systemctl status "$SERVICE" --no-pager -l 2>&1 | head -15 || true
     [ -x "$INSTALL_DIR/venv/bin/python" ] && (set -a; . "$ENV_FILE"; set +a; "$INSTALL_DIR/venv/bin/python" "$INSTALL_DIR/agent.py" --check) || true
     exit 0 ;;
@@ -55,14 +69,15 @@ SMWATCH_LOGS="${SMWATCH_LOGS:-on}"
 case "$SMWATCH_LOGS" in on|nodocker|off) ;; *) die "SMWATCH_LOGS must be on, nodocker or off" ;; esac
 if [ -n "$SMWATCH_TOKEN" ] && [ "${#SMWATCH_TOKEN}" -lt 32 ]; then die "SMWATCH_TOKEN looks too short; copy the whole command from the dashboard"; fi
 case "$SMWATCH_URL" in http://localhost*|http://127.*|https://localhost*) die "SMWATCH_URL points at localhost, which is this server itself. Use the control plane's real address." ;; esac
-command -v systemctl >/dev/null 2>&1 || die "systemd was not found. Use the Docker command instead (dashboard: Install agent -> Docker)."
+if [ "$IS_MAC" = 0 ]; then command -v systemctl >/dev/null 2>&1 || die "systemd was not found. Use the Docker command instead (dashboard: Install agent -> Docker)."; fi
 command -v curl >/dev/null 2>&1 || die "curl is required"
 
 # --- registration: exchange the short-lived join link for this server's own private token (needs only curl)
 register() {
   local host mid plat body resp code json
   host=$(hostname 2>/dev/null | tr -cd 'A-Za-z0-9._-' | cut -c1-200); [ -n "$host" ] || host=server
-  mid=$(cat /etc/machine-id 2>/dev/null || cat /var/lib/dbus/machine-id 2>/dev/null || echo "$host")
+  if [ "$IS_MAC" = 1 ]; then mid=$(ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null | awk -F'"' '/IOPlatformUUID/{print $4}'); fi
+  [ -n "${mid:-}" ] || mid=$(cat /etc/machine-id 2>/dev/null || cat /var/lib/dbus/machine-id 2>/dev/null || echo "$host")
   mid=$(printf %s "$mid" | tr -cd 'A-Za-z0-9-' | cut -c1-120)
   plat=$(uname -sr 2>/dev/null | tr -cd 'A-Za-z0-9 ._-' | cut -c1-200)
   body=$(printf '{"hostname":"%s","machine_id":"%s","platform":"%s","agent_version":"installer"}' "$host" "$mid" "$plat")
@@ -98,9 +113,14 @@ if [ -z "$SMWATCH_TOKEN" ]; then
 fi
 
 # --- prerequisites: install anything missing with the distro's package manager
+if [ "$IS_MAC" = 1 ]; then
+  command -v python3 >/dev/null 2>&1 && python3 -c 'import venv' 2>/dev/null || die "python3 is required. Run: xcode-select --install   (then re-run this command)"
+fi
 need=()
-command -v python3 >/dev/null 2>&1 || need+=(python3)
-if ! python3 -c 'import venv, ensurepip' >/dev/null 2>&1; then need+=(venv); fi
+if [ "$IS_MAC" = 0 ]; then
+  command -v python3 >/dev/null 2>&1 || need+=(python3)
+  if ! python3 -c 'import venv, ensurepip' >/dev/null 2>&1; then need+=(venv); fi
+fi
 if [ "${#need[@]}" -gt 0 ]; then
   say "Installing prerequisites: ${need[*]} (this can take a minute)"
   pkgs=()
@@ -129,8 +149,10 @@ curl -fsSL "$SMWATCH_URL/api/agent/agent.py" -o "$INSTALL_DIR/agent.py.new" \
   || die "could not download the agent from $SMWATCH_URL (is the URL reachable from this server?)"
 mv "$INSTALL_DIR/agent.py.new" "$INSTALL_DIR/agent.py"
 
-id "$USER_NAME" >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin "$USER_NAME"
-chown -R root:root "$INSTALL_DIR"
+if [ "$IS_MAC" = 0 ]; then
+  id "$USER_NAME" >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin "$USER_NAME"
+  chown -R root:root "$INSTALL_DIR"
+fi
 install -d -m 700 "$STATE_DIR"
 
 # --- preflight: prove the connection and credentials work BEFORE starting the service, with a readable error
@@ -147,6 +169,40 @@ if ! out=$(check); then
   fi
 fi
 printf '    %s\n' "$out"
+if [ "$IS_MAC" = 1 ]; then
+  # macOS: a LaunchDaemon running as root (so the unified log and /var/log are fully readable); keeps itself alive and starts at boot.
+  cat > "$PLIST" <<PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key><array><string>$INSTALL_DIR/venv/bin/python</string><string>$INSTALL_DIR/agent.py</string></array>
+  <key>EnvironmentVariables</key><dict>
+    <key>SMWATCH_URL</key><string>$SMWATCH_URL</string>
+    <key>AGENT_MODE</key><string>push</string>
+    <key>AGENT_STATE_DIR</key><string>$STATE_DIR</string>
+    <key>AGENT_LOGS</key><string>$SMWATCH_LOGS</string>
+    <key>AGENT_HOST_ROOT</key><string>/</string>
+    <key>AGENT_DISK_PATH</key><string>/</string>
+    <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin</string>
+  </dict>
+  <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/var/log/sm-watch-agent.log</string>
+  <key>StandardErrorPath</key><string>/var/log/sm-watch-agent.log</string>
+</dict></plist>
+PLISTEOF
+  chown root:wheel "$PLIST"; chmod 644 "$PLIST"
+  launchctl bootout "system/$LABEL" 2>/dev/null || true
+  launchctl bootstrap system "$PLIST" || die "launchctl could not load the service (see: log show --last 2m --predicate 'process == \"launchd\"')"
+  sleep 2
+  if launchctl print "system/$LABEL" >/dev/null 2>&1; then
+    say "Done. This Mac is now reporting to the dashboard (system log, /var/log and /Library/Logs are available in Logs)."
+    say "Agent log: tail -f /var/log/sm-watch-agent.log   |   Remove: re-run this command with 'uninstall'"
+    exit 0
+  fi
+  die "the agent service failed to start (see /var/log/sm-watch-agent.log)"
+fi
+
 chown -R "$USER_NAME":"$USER_NAME" "$STATE_DIR"
 
 # The service needs only the URL: its private token lives in $STATE_DIR, and the shared install link is never stored.

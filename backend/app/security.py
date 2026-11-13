@@ -100,6 +100,27 @@ def require_user(request: Request, credentials: HTTPAuthorizationCredentials | N
     except jwt.PyJWTError as error:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired session") from error
     account = db.get(User, int(claims["sub"]))
-    if not account or account.token_version != claims.get("ver", 0):
+    if not account or account.token_version != claims.get("ver", 0) or not account.active:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Session is no longer valid")
-    return claims
+    # Until a temporary password is replaced, the account can do nothing except change it (or sign out).
+    if account.must_change_password and request.url.path not in PASSWORD_CHANGE_PATHS:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "PASSWORD_CHANGE_REQUIRED")
+    # The role is read from the database on EVERY request, so a demotion or deactivation takes effect immediately.
+    return {**claims, "uid": account.id, "role": account.role, "name": account.name, "email": account.email}
+
+
+RANK = {"viewer": 1, "operator": 2, "admin": 3}
+PASSWORD_CHANGE_PATHS = {"/api/auth/me", "/api/auth/password", "/api/auth/logout"}
+
+
+def _at_least(minimum: str):
+    def guard(user: dict = Depends(require_user)) -> dict:
+        if RANK.get(user["role"], 0) < RANK[minimum]:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, f"Your role ({user['role']}) is not allowed to do this. It needs the {minimum} role.")
+        return user
+    guard.__name__ = f"require_{minimum}"
+    return guard
+
+
+require_operator = _at_least("operator")   # create/edit/delete monitors, alerts, schedules; read logs; manage agent links
+require_admin = _at_least("admin")         # manage users

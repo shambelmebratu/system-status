@@ -14,7 +14,7 @@ from .database import get_db
 from .models import Enrollment, Server
 from .routes_agent import hash_token
 from .schemas import EnrollmentCreate, EnrollRequest
-from .security import login_limiter, require_user
+from .security import login_limiter, require_operator
 from .stats import aware
 
 router = APIRouter(tags=["enrollment"])
@@ -35,12 +35,12 @@ def serialize_enrollment(item: Enrollment) -> dict:
 
 
 @router.get("/api/enrollments")
-def list_enrollments(_: dict = Depends(require_user), db: Session = Depends(get_db)) -> list[dict]:
+def list_enrollments(_: dict = Depends(require_operator), db: Session = Depends(get_db)) -> list[dict]:
     return [serialize_enrollment(i) for i in db.scalars(select(Enrollment).order_by(Enrollment.id.desc()).limit(100)).all()]
 
 
 @router.post("/api/enrollments")
-def create_enrollment(payload: EnrollmentCreate, _: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
+def create_enrollment(payload: EnrollmentCreate, _: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
     token = "smwj_" + secrets.token_urlsafe(24)  # 192 bits from the OS CSPRNG: unguessable, never reused
     item = Enrollment(
         label=payload.label, token=token, token_hash=hash_token(token), max_uses=payload.max_uses,
@@ -51,7 +51,7 @@ def create_enrollment(payload: EnrollmentCreate, _: dict = Depends(require_user)
 
 
 @router.delete("/api/enrollments/{item_id}")
-def revoke_enrollment(item_id: int, _: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict[str, bool]:
+def revoke_enrollment(item_id: int, _: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict[str, bool]:
     """Revokes the join token. Servers that already joined keep working (they have their own tokens)."""
     item = db.get(Enrollment, item_id)
     if item:

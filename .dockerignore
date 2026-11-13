@@ -1,5 +1,16 @@
+# Used by the images built from the repository root (backend API/worker, agent, host-agent).
+# Keep the build context small: none of these are needed inside those images.
 .env
+.env.*
+!.env.example
 .venv
 __pycache__
 *.py[cod]
+.pytest_cache
 .git
+.github
+**/node_modules
+**/.next
+frontend
+frontend-next
+*.md

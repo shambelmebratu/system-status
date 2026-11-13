@@ -4,6 +4,7 @@ import os
 import re
 import secrets
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from pydantic import ValidationError
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, Response
@@ -19,10 +20,11 @@ from .routes_enroll import router as enroll_router
 from .routes_logs import router as logs_router
 from .routes_schedule import router as schedule_router
 from .routes_stats import router as stats_router
-from .schemas import ChannelCreate, ChannelUpdate, LoginRequest, PasswordChange, TokenBody, ServerCreate, ServiceCreate
+from .schemas import ChannelCreate, ChannelUpdate, LoginRequest, PasswordChange, ProfileUpdate, TokenBody, ServerCreate, ServiceCreate
 from .stats import uptime_by_target
 from .netguard import BlockedTargetError, validate_host, validate_url
-from .security import COOKIE_NAME, create_token, hash_password, login_limiter, require_user, verify_password
+from .routes_users import router as users_router, serialize_user
+from .security import COOKIE_NAME, create_token, hash_password, login_limiter, require_operator, require_user, verify_password
 
 settings = get_settings()
 
@@ -62,7 +64,7 @@ def ensure_host_agent(session: Session) -> None:
 async def lifespan(_: FastAPI):
     with Session(engine) as session:
         if not session.scalar(select(User).limit(1)):
-            session.add(User(email=settings.admin_email.lower(), password_hash=hash_password(settings.admin_password)))
+            session.add(User(email=settings.admin_email.lower(), password_hash=hash_password(settings.admin_password), role="admin", name="Administrator"))
             session.commit()
         ensure_host_agent(session)
     yield
@@ -73,6 +75,7 @@ app.include_router(agent_router)
 app.include_router(enroll_router)
 app.include_router(schedule_router)
 app.include_router(logs_router)
+app.include_router(users_router)
 app.include_router(stats_router)
 
 
@@ -134,7 +137,12 @@ def login(payload: LoginRequest, request: Request, response: Response, db: Sessi
     if not user or not verify_password(payload.password, user.password_hash):
         login_limiter.fail(*keys)
         raise HTTPException(401, "Invalid email or password")
+    if not user.active:   # same message and same failure counting as a wrong password: do not reveal which accounts exist
+        login_limiter.fail(*keys)
+        raise HTTPException(401, "Invalid email or password")
     login_limiter.reset(*keys)
+    user.last_login_at = datetime.now(timezone.utc)
+    db.commit()
     response.set_cookie(
         COOKIE_NAME,
         create_token(user.id, user.email, user.token_version),
@@ -163,7 +171,10 @@ def change_password(payload: PasswordChange, response: Response, claims: dict = 
     account = db.get(User, int(claims["sub"]))
     if not verify_password(payload.current_password, account.password_hash):
         raise HTTPException(403, "Current password is incorrect")
+    if verify_password(payload.new_password, account.password_hash):
+        raise HTTPException(422, "Choose a password different from the current one")
     account.password_hash = hash_password(payload.new_password)
+    account.must_change_password = False
     account.token_version += 1  # signs out every other session
     db.commit()
     response.set_cookie(COOKIE_NAME, create_token(account.id, account.email, account.token_version), max_age=settings.session_hours * 3600, httponly=True, secure=settings.cookie_secure, samesite="strict", path="/api")
@@ -172,8 +183,27 @@ def change_password(payload: PasswordChange, response: Response, claims: dict = 
 
 @app.get("/api/auth/me")
 def me(user: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
-    account = db.get(User, int(user["sub"]))  # require_user guarantees it exists
-    return {"id": account.id, "email": account.email, "role": account.role}
+    account = db.get(User, user["uid"])  # require_user guarantees it exists and is active
+    return {**serialize_user(account)}
+
+
+@app.put("/api/auth/profile")
+def update_profile(payload: ProfileUpdate, user: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
+    """Edit your own name and email. Changing the email needs the current password."""
+    account = db.get(User, user["uid"])
+    account.name = payload.name.strip()
+    if payload.email and payload.email.strip().lower() != account.email:
+        key = f"profile:{account.id}"
+        login_limiter.check(key)
+        if not verify_password(payload.current_password, account.password_hash):
+            login_limiter.fail(key)
+            raise HTTPException(403, "Enter your current password to change your email")
+        email = payload.email.strip().lower()
+        if db.scalar(select(User.id).where(User.email == email, User.id != account.id)) is not None:
+            raise HTTPException(409, "That email is already in use")
+        account.email = email
+    db.commit(); db.refresh(account)
+    return serialize_user(account)
 
 
 @app.get("/api/dashboard")
@@ -206,12 +236,15 @@ def dashboard(_: dict = Depends(require_user), db: Session = Depends(get_db)) ->
 
 
 @app.get("/api/channels")
-def channels(_: dict = Depends(require_user), db: Session = Depends(get_db)) -> list[dict]:
-    return [serialize(item) for item in db.scalars(select(Channel).order_by(Channel.name)).all()]
+def channels(user: dict = Depends(require_user), db: Session = Depends(get_db)) -> list[dict]:
+    items = [serialize(item) for item in db.scalars(select(Channel).order_by(Channel.name)).all()]
+    if user["role"] == "viewer":   # viewers may see that channels exist, not how they are configured
+        return [{"id": i["id"], "name": i["name"], "type": i["type"], "enabled": i["enabled"]} for i in items]
+    return items
 
 
 @app.post("/api/channels/telegram/discover")
-def telegram_discover(payload: TokenBody, _: dict = Depends(require_user)) -> dict:
+def telegram_discover(payload: TokenBody, _: dict = Depends(require_operator)) -> dict:
     """Helps users find the right chat ID: lists chats the bot has seen recently."""
     try:
         return discover_telegram_chats(payload.token)
@@ -220,14 +253,14 @@ def telegram_discover(payload: TokenBody, _: dict = Depends(require_user)) -> di
 
 
 @app.post("/api/channels")
-def create_channel(payload: ChannelCreate, _: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
+def create_channel(payload: ChannelCreate, _: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
     if payload.type in ("slack", "webhook"):
         guard_target(validate_url, payload.endpoint, "Endpoint")
     item = Channel(**payload.model_dump()); db.add(item); db.commit(); db.refresh(item); return serialize(item)
 
 
 @app.put("/api/channels/{item_id}")
-def update_channel(item_id: int, payload: ChannelUpdate, _: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
+def update_channel(item_id: int, payload: ChannelUpdate, _: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
     item = db.get(Channel, item_id)
     if not item:
         raise HTTPException(404, "Notification channel not found")
@@ -249,7 +282,7 @@ def update_channel(item_id: int, payload: ChannelUpdate, _: dict = Depends(requi
 
 
 @app.post("/api/channels/{item_id}/test")
-def test_channel(item_id: int, _: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict[str, str | bool]:
+def test_channel(item_id: int, _: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict[str, str | bool]:
     item = db.get(Channel, item_id)
     if not item:
         raise HTTPException(404, "Notification channel not found")
@@ -260,7 +293,7 @@ def test_channel(item_id: int, _: dict = Depends(require_user), db: Session = De
 
 
 @app.delete("/api/channels/{item_id}")
-def delete_channel(item_id: int, _: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict[str, bool]:
+def delete_channel(item_id: int, _: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict[str, bool]:
     item = db.get(Channel, item_id)
     if item: db.delete(item); db.commit()
     return {"deleted": True}
@@ -276,7 +309,7 @@ def validate_server_targets(payload: ServerCreate) -> None:
 
 
 @app.post("/api/servers")
-def create_server(payload: ServerCreate, _: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
+def create_server(payload: ServerCreate, _: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
     values = payload.model_dump()
     token = values.pop("agent_token")
     if payload.monitor_mode == "push":
@@ -295,7 +328,7 @@ def create_server(payload: ServerCreate, _: dict = Depends(require_user), db: Se
 
 
 @app.put("/api/servers/{item_id}")
-def update_server(item_id: int, payload: ServerCreate, _: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
+def update_server(item_id: int, payload: ServerCreate, _: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
     item = db.get(Server, item_id)
     if not item:
         raise HTTPException(404, "Server not found")
@@ -322,7 +355,7 @@ def update_server(item_id: int, payload: ServerCreate, _: dict = Depends(require
 
 
 @app.post("/api/servers/{item_id}/rotate-token")
-def rotate_server_token(item_id: int, _: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
+def rotate_server_token(item_id: int, _: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
     """Issues a new agent token (shown once). The old token stops working immediately."""
     item = db.get(Server, item_id)
     if not item:
@@ -336,7 +369,7 @@ def rotate_server_token(item_id: int, _: dict = Depends(require_user), db: Sessi
 
 
 @app.delete("/api/servers/{item_id}")
-def delete_server(item_id: int, _: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict[str, bool]:
+def delete_server(item_id: int, _: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict[str, bool]:
     item = db.get(Server, item_id)
     if item:
         purge_history(db, "server", item.id)
@@ -345,14 +378,14 @@ def delete_server(item_id: int, _: dict = Depends(require_user), db: Session = D
 
 
 @app.post("/api/services")
-def create_service(payload: ServiceCreate, _: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
+def create_service(payload: ServiceCreate, _: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
     guard_target(validate_url, payload.url, "URL")
     if payload.server_id is not None and not db.get(Server, payload.server_id): raise HTTPException(404, "Server not found")
     item = Service(**payload.model_dump()); db.add(item); db.commit(); db.refresh(item); return serialize(item)
 
 
 @app.put("/api/services/{item_id}")
-def update_service(item_id: int, payload: ServiceCreate, _: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
+def update_service(item_id: int, payload: ServiceCreate, _: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
     item = db.get(Service, item_id)
     if not item:
         raise HTTPException(404, "Service monitor not found")
@@ -372,7 +405,7 @@ def update_service(item_id: int, payload: ServiceCreate, _: dict = Depends(requi
 
 
 @app.delete("/api/services/{item_id}")
-def delete_service(item_id: int, _: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict[str, bool]:
+def delete_service(item_id: int, _: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict[str, bool]:
     item = db.get(Service, item_id)
     if item:
         purge_history(db, "service", item.id)
@@ -381,7 +414,7 @@ def delete_service(item_id: int, _: dict = Depends(require_user), db: Session = 
 
 
 @app.post("/api/services/{item_id}/check")
-def check_service_now(item_id: int, _: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
+def check_service_now(item_id: int, _: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
     item = db.get(Service, item_id)
     if not item:
         raise HTTPException(404, "Service monitor not found")
@@ -393,6 +426,6 @@ def check_service_now(item_id: int, _: dict = Depends(require_user), db: Session
 
 
 @app.post("/api/monitor/run")
-def run_monitor(background_tasks: BackgroundTasks, _: dict = Depends(require_user)) -> dict[str, str]:
+def run_monitor(background_tasks: BackgroundTasks, _: dict = Depends(require_operator)) -> dict[str, str]:
     background_tasks.add_task(run_once)
     return {"status": "queued"}

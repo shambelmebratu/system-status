@@ -536,3 +536,192 @@ def test_unanswered_log_request_times_out(client):
         db.get(LogRequest, rid).created_at = datetime.now(timezone.utc) - timedelta(minutes=2); db.commit()
     r = client.get(f"/api/servers/{sid}/logs/{rid}").json()
     assert r["status"] == "error" and "did not answer" in r["error"]
+
+
+# ---------------------------------------------------------------- log long-polling (speed)
+def test_agent_long_poll_wakes_immediately(client):
+    import threading
+    import time
+    sign_in(client)
+    anon = TestClient(main.app)
+    sid, auth = _push_server(client, anon)
+    t0 = time.monotonic()
+    assert anon.get("/api/agent/tasks?wait=1", headers=auth).json()["tasks"] == []       # nothing queued: returns empty after ~1s
+    assert 0.8 < time.monotonic() - t0 < 3
+    got = {}
+
+    def poll():
+        start = time.monotonic()
+        got["tasks"] = anon.get("/api/agent/tasks?wait=15", headers=auth).json()["tasks"]
+        got["secs"] = time.monotonic() - start
+    worker = threading.Thread(target=poll); worker.start()
+    time.sleep(1.0)                                                                       # the agent is now parked in its long-poll
+    queued = time.monotonic()
+    rid = client.post(f"/api/servers/{sid}/logs", headers=CSRF, json={"source": "inventory"}).json()["id"]
+    worker.join(10)
+    assert got["tasks"] and got["tasks"][0]["id"] == rid
+    assert got["secs"] < 6, "the poll should return when the request is queued, not at the 15s deadline"
+    assert time.monotonic() - queued < 4                                                  # woken immediately (2s re-check is the worst case)
+
+
+def test_dashboard_long_poll_returns_when_agent_answers(client):
+    import threading
+    import time
+    sign_in(client)
+    anon = TestClient(main.app)
+    sid, auth = _push_server(client, anon)
+    rid = client.post(f"/api/servers/{sid}/logs", headers=CSRF, json={"source": "docker", "target": "web"}).json()["id"]
+    got = {}
+
+    def wait_for_result():
+        start = time.monotonic()
+        got["r"] = client.get(f"/api/servers/{sid}/logs/{rid}?wait=15").json()
+        got["secs"] = time.monotonic() - start
+    reader = threading.Thread(target=wait_for_result); reader.start()
+    time.sleep(0.8)
+    assert anon.get("/api/agent/tasks", headers=auth).json()["tasks"][0]["id"] == rid
+    anon.post(f"/api/agent/tasks/{rid}/result", headers=auth, json={"ok": True, "output": "hello logs"})
+    reader.join(10)
+    assert got["r"]["status"] == "done" and got["r"]["output"] == "hello logs" and got["secs"] < 6
+    # without ?wait the call is instant and reports the current state
+    assert client.get(f"/api/servers/{sid}/logs/{rid}").json()["status"] == "done"
+    assert client.get(f"/api/servers/{sid}/logs/{rid}?wait=99").status_code == 422        # wait is capped
+
+
+# ---------------------------------------------------------------- users, roles, profile
+PW = "temporary-password-1"
+
+
+def make_user(admin, email, role, password=PW, name=""):
+    r = admin.post("/api/users", headers=CSRF, json={"email": email, "name": name, "role": role, "password": password})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def session_for(email, password=PW, new_password=None):
+    """A separate browser session. Temporary passwords must be replaced before anything else works."""
+    c = TestClient(main.app)
+    r = c.post("/api/auth/login", json={"email": email, "password": password})
+    assert r.status_code == 200, r.text
+    if new_password:
+        assert c.post("/api/auth/password", headers=CSRF, json={"current_password": password, "new_password": new_password}).status_code == 200
+    return c
+
+
+def test_role_permission_matrix(client):
+    sign_in(client)
+    srv = client.post("/api/servers", headers=CSRF, json={"name": "m", "host": "93.184.216.50", "monitor_mode": "ping"}).json()["id"]
+    ch = _mk_channel(client, "chat")
+    make_user(client, "viewer@example.com", "viewer"); make_user(client, "operator@example.com", "operator")
+    viewer = session_for("viewer@example.com", new_password="viewer-password-123"); operator = session_for("operator@example.com", new_password="operator-password-123")
+
+    body = {"name": "x", "url": "https://example.com"}
+    allowed_read = ["/api/dashboard", "/api/incidents", "/api/uptime", f"/api/servers/{srv}/history?range=1h", f"/api/servers/{srv}/availability?range=1h"]
+    operator_only_get = ["/api/scheduled-messages", "/api/enrollments"]
+    for path in allowed_read:
+        assert viewer.get(path).status_code == 200, path
+        assert operator.get(path).status_code == 200, path
+    for path in operator_only_get:
+        assert viewer.get(path).status_code == 403, path
+        assert operator.get(path).status_code == 200, path
+    # viewers: read-only
+    for method, path, payload in [("post", "/api/servers", {"name": "v", "host": "93.184.216.51", "monitor_mode": "ping"}), ("post", "/api/services", body), ("put", f"/api/servers/{srv}", {"name": "v", "host": "1.1.1.1", "monitor_mode": "ping"}),
+                                   ("delete", f"/api/servers/{srv}", None), ("post", "/api/monitor/run", None), ("post", f"/api/channels/{ch}/test", None), ("delete", f"/api/channels/{ch}", None),
+                                   ("post", "/api/enrollments", {}), ("post", f"/api/servers/{srv}/logs", {"source": "inventory"}), ("post", "/api/scheduled-messages", {})]:
+        r = getattr(viewer, method)(path, headers=CSRF, **({"json": payload} if payload is not None else {}))
+        assert r.status_code == 403, (method, path, r.status_code)
+        assert "viewer" in r.json()["detail"] and "operator" in r.json()["detail"]
+    assert next(c for c in viewer.get("/api/channels").json() if c["id"] == ch) == {"id": ch, "name": "chat", "type": "webhook", "enabled": True}   # no configuration for viewers
+    assert "endpoint" in next(c for c in operator.get("/api/channels").json() if c["id"] == ch)
+    # operators: manage monitoring, but never users
+    assert operator.post("/api/services", headers=CSRF, json=body).status_code == 200
+    assert operator.post("/api/enrollments", headers=CSRF, json={}).status_code == 200
+    for who in (viewer, operator):
+        assert who.get("/api/users").status_code == 403
+        assert who.post("/api/users", headers=CSRF, json={"email": "z@example.com", "role": "admin", "password": PW}).status_code == 403
+        assert who.put("/api/users/1", headers=CSRF, json={"role": "viewer"}).status_code == 403
+        assert who.delete("/api/users/1", headers=CSRF).status_code == 403
+    assert client.get("/api/users").status_code == 200
+    # nobody without a session gets anything
+    assert TestClient(main.app).get("/api/users").status_code == 401
+
+
+def test_user_management_rules(client):
+    sign_in(client)
+    me = client.get("/api/auth/me").json()
+    assert me["role"] == "admin" and me["name"] == "Administrator" and me["must_change_password"] is False
+    u = make_user(client, "Carol@Example.com", "operator", name="  Carol  ")
+    assert u["email"] == "carol@example.com" and u["name"] == "Carol" and u["must_change_password"] is True      # normalised; temp password
+    assert client.post("/api/users", headers=CSRF, json={"email": "carol@example.com", "role": "viewer", "password": PW}).status_code == 409
+    for bad in [{"password": "short"}, {"role": "root"}, {"email": "not-an-email"}]:
+        assert client.post("/api/users", headers=CSRF, json={"email": "d@example.com", "role": "viewer", "password": PW, **bad}).status_code == 422, bad
+    # forced password change: nothing else works until it is replaced
+    carol = TestClient(main.app)
+    assert carol.post("/api/auth/login", json={"email": "carol@example.com", "password": PW}).status_code == 200
+    assert carol.get("/api/auth/me").json()["must_change_password"] is True
+    blocked = carol.get("/api/dashboard")
+    assert blocked.status_code == 403 and blocked.json()["detail"] == "PASSWORD_CHANGE_REQUIRED"
+    assert carol.post("/api/auth/password", headers=CSRF, json={"current_password": PW, "new_password": PW}).status_code == 422   # must differ
+    assert carol.post("/api/auth/password", headers=CSRF, json={"current_password": PW, "new_password": "carol-own-password-1"}).status_code == 200
+    assert carol.get("/api/dashboard").status_code == 200 and carol.get("/api/auth/me").json()["must_change_password"] is False
+    # self-protection
+    assert client.put(f"/api/users/{me['id']}", headers=CSRF, json={"role": "viewer"}).status_code == 409
+    assert client.put(f"/api/users/{me['id']}", headers=CSRF, json={"active": False}).status_code == 409
+    assert client.delete(f"/api/users/{me['id']}", headers=CSRF).status_code == 409
+    assert client.put(f"/api/users/{me['id']}", headers=CSRF, json={"name": "Chief"}).json()["name"] == "Chief"
+    client.put(f"/api/users/{me['id']}", headers=CSRF, json={"name": "Administrator"})
+    assert client.delete(f"/api/users/{u['id']}", headers=CSRF).status_code == 200
+    assert carol.get("/api/dashboard").status_code == 401                                           # a deleted user's session dies at once
+
+
+def test_role_and_status_changes_apply_immediately(client):
+    sign_in(client)
+    u = make_user(client, "dave@example.com", "operator")
+    dave = session_for("dave@example.com", new_password="dave-own-password-1")
+    assert dave.post("/api/services", headers=CSRF, json={"name": "a", "url": "https://example.com"}).status_code == 200
+    client.put(f"/api/users/{u['id']}", headers=CSRF, json={"role": "viewer"})
+    assert dave.get("/api/dashboard").status_code in (200, 401)                                      # token_version bumped: signed out, must sign in again
+    dave = TestClient(main.app); assert dave.post("/api/auth/login", json={"email": "dave@example.com", "password": "dave-own-password-1"}).status_code == 200
+    assert dave.post("/api/services", headers=CSRF, json={"name": "b", "url": "https://example.com"}).status_code == 403    # now a viewer
+    assert dave.get("/api/dashboard").status_code == 200
+    # disabling: existing session dies, sign-in fails with the SAME generic message as a wrong password
+    client.put(f"/api/users/{u['id']}", headers=CSRF, json={"active": False})
+    assert dave.get("/api/dashboard").status_code == 401
+    off = TestClient(main.app).post("/api/auth/login", json={"email": "dave@example.com", "password": "dave-own-password-1"})
+    wrong = TestClient(main.app).post("/api/auth/login", json={"email": "dave@example.com", "password": "nope"})
+    assert off.status_code == wrong.status_code == 401 and off.json() == wrong.json()
+    client.put(f"/api/users/{u['id']}", headers=CSRF, json={"active": True})
+    assert TestClient(main.app).post("/api/auth/login", json={"email": "dave@example.com", "password": "dave-own-password-1"}).status_code == 200
+    assert next(x for x in client.get("/api/users").json() if x["id"] == u["id"])["last_login_at"]
+
+
+def test_admin_password_reset_and_second_admin(client):
+    sign_in(client)
+    u = make_user(client, "erin@example.com", "admin")
+    erin = session_for("erin@example.com", new_password="erin-own-password-12")
+    assert erin.get("/api/users").status_code == 200                                                 # a second admin can manage users
+    me = client.get("/api/auth/me").json()
+    assert erin.put(f"/api/users/{me['id']}", headers=CSRF, json={"role": "viewer"}).status_code == 200   # ...including demoting the original admin
+    assert erin.put(f"/api/users/{u['id']}", headers=CSRF, json={"active": False}).status_code == 409     # but not disabling the last admin (herself)
+    erin.put(f"/api/users/{me['id']}", headers=CSRF, json={"role": "admin"})
+    assert client.get("/api/dashboard").status_code == 401                                          # the demotion signed the original admin out
+    sign_in(client)
+    # reset: temporary again + old sessions revoked
+    r = client.put(f"/api/users/{u['id']}", headers=CSRF, json={"password": "reset-password-123"})
+    assert r.json()["must_change_password"] is True
+    assert erin.get("/api/dashboard").status_code == 401
+    assert TestClient(main.app).post("/api/auth/login", json={"email": "erin@example.com", "password": "erin-own-password-12"}).status_code == 401
+
+
+def test_profile_update(client):
+    sign_in(client)
+    make_user(client, "frank@example.com", "viewer")
+    frank = session_for("frank@example.com", new_password="frank-own-password-1")
+    r = frank.put("/api/auth/profile", headers=CSRF, json={"name": " Frank Z "})
+    assert r.status_code == 200 and r.json()["name"] == "Frank Z" and r.json()["email"] == "frank@example.com"
+    assert frank.put("/api/auth/profile", headers=CSRF, json={"name": "F", "email": "frank2@example.com"}).status_code == 403                                   # needs the password
+    assert frank.put("/api/auth/profile", headers=CSRF, json={"name": "F", "email": "frank2@example.com", "current_password": "wrong-password"}).status_code == 403
+    assert frank.put("/api/auth/profile", headers=CSRF, json={"name": "F", "email": "admin@example.com", "current_password": "frank-own-password-1"}).status_code == 409   # taken
+    ok = frank.put("/api/auth/profile", headers=CSRF, json={"name": "F", "email": "Frank2@Example.com", "current_password": "frank-own-password-1"})
+    assert ok.status_code == 200 and ok.json()["email"] == "frank2@example.com"
+    assert TestClient(main.app).post("/api/auth/login", json={"email": "frank2@example.com", "password": "frank-own-password-1"}).status_code == 200

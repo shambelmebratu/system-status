@@ -3,18 +3,28 @@
 import { FormEvent, Fragment, useEffect, useState } from 'react';
 import { JoinCommands, expiryText, useActiveEnrollment, useControlPlaneUrl } from '../components/join';
 import { CodeBox, Field } from '../components/ui';
-import { post } from '../lib/api';
+import { post, put } from '../lib/api';
+import { ROLE_INFO } from '../lib/types';
 import { timeAgo } from '../lib/format';
 import { useApp } from '../lib/app';
 
-export function Settings({ email }: { email: string }) {
-  const { toast, data } = useApp();
+export function Settings() {
+  const { toast, data, me, canOperate, reloadMe } = useApp();
   const [current, setCurrent] = useState('');
   const [next, setNext] = useState('');
   const [error, setError] = useState('');
   const [origin, setOrigin] = useState('');
+  const [name, setName] = useState(me.name);
+  const [email, setEmail] = useState(me.email);
+  const [emailPassword, setEmailPassword] = useState('');
+  const [profileError, setProfileError] = useState('');
   useEffect(() => setOrigin(window.location.origin), []);
 
+  async function saveProfile(event: FormEvent) {
+    event.preventDefault(); setProfileError('');
+    try { await put('/auth/profile', { name, email: email !== me.email ? email : null, current_password: emailPassword }); setEmailPassword(''); toast('Profile saved'); await reloadMe(); }
+    catch (caught) { setProfileError((caught as Error).message); }
+  }
   async function submit(event: FormEvent) {
     event.preventDefault(); setError('');
     try { await post('/auth/password', { current_password: current, new_password: next }); setCurrent(''); setNext(''); toast('Password changed. Other sessions were signed out.'); }
@@ -25,22 +35,31 @@ export function Settings({ email }: { email: string }) {
     <>
       <div className="topbar"><h1>Settings</h1></div>
       <div className="grid g2">
-        <section className="card"><div className="card-head"><h2>Account</h2></div>
-          <p className="muted" style={{ marginBottom: 14 }}>Signed in as <b style={{ color: 'var(--ink)' }}>{email}</b></p>
+        <section className="card"><div className="card-head"><h2>Profile</h2><span className="grow" /><span className={`role-pill ${me.role}`}>{ROLE_INFO[me.role].label}</span></div>
+          <form onSubmit={saveProfile} style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+            <Field label="Name"><input value={name} onChange={e => setName(e.target.value)} maxLength={100} placeholder="Your name" /></Field>
+            <Field label="Email" hint="This is what you sign in with."><input type="email" value={email} onChange={e => setEmail(e.target.value)} required /></Field>
+            {email !== me.email && <Field label="Current password" hint="Needed to change your email."><input type="password" value={emailPassword} onChange={e => setEmailPassword(e.target.value)} autoComplete="current-password" required /></Field>}
+            {profileError && <div className="err" role="alert">{profileError}</div>}
+            <button className="btn primary" style={{ alignSelf: 'flex-start' }}>Save profile</button>
+          </form>
+          <p className="muted sm" style={{ marginTop: 14 }}>{ROLE_INFO[me.role].blurb}</p>
+        </section>
+        <section className="card"><div className="card-head"><h2>Password</h2></div>
           <form onSubmit={submit} style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
             <Field label="Current password"><input type="password" value={current} onChange={e => setCurrent(e.target.value)} autoComplete="current-password" required /></Field>
-            <Field label="New password" hint="At least 12 characters."><input type="password" value={next} onChange={e => setNext(e.target.value)} minLength={12} autoComplete="new-password" required /></Field>
+            <Field label="New password" hint="At least 12 characters. Signs out your other sessions."><input type="password" value={next} onChange={e => setNext(e.target.value)} minLength={12} autoComplete="new-password" required /></Field>
             {error && <div className="err" role="alert">{error}</div>}
             <button className="btn primary" style={{ alignSelf: 'flex-start' }}>Change password</button>
           </form>
         </section>
         <section className="card"><div className="card-head"><h2>Public status page</h2></div>
-          <p className="muted" style={{ marginBottom: 12 }}>Share uptime with customers. Enable “Show on the public status page” on any service.</p>
+          <p className="muted" style={{ marginBottom: 12 }}>The only page that can be opened without signing in. It shows just the servers and services you tick “Show on the public status page” for (name, status and uptime). Turn it off completely with <code>PUBLIC_STATUS_ENABLED=false</code>.</p>
           <CodeBox value={`${origin}/status`} />
-          <p className="sm muted" style={{ marginTop: 14 }}>{data?.services.filter(s => s.public).length ?? 0} of {data?.services.length ?? 0} services are public.</p>
+          <p className="sm muted" style={{ marginTop: 14 }}>{(data?.services.filter(s => s.public).length ?? 0) + (data?.servers.filter(s => s.public).length ?? 0)} item(s) are public.</p>
         </section>
       </div>
-      <JoinTokens />
+      {canOperate && <JoinTokens />}
     </>
   );
 }

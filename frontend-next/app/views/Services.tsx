@@ -10,9 +10,9 @@ import { clock, ms, pct, timeAgo, uptimeClass } from '../lib/format';
 import type { Range, Service, ServiceHistory } from '../lib/types';
 
 export function Services() {
-  const { data, route, go } = useApp();
+  const { data, route, go, canOperate } = useApp();
   if (!data) return <p className="muted">Loading…</p>;
-  if (route[1] === 'new') return <><ServiceList /><ServiceForm onClose={() => go('services')} /></>;
+  if (route[1] === 'new' && canOperate) return <><ServiceList /><ServiceForm onClose={() => go('services')} /></>;
   if (route[1]) {
     const service = data.services.find(s => s.id === Number(route[1]));
     return service ? <ServiceDetail service={service} /> : <Empty title="Service not found" action={<button className="btn" onClick={() => go('services')}>Back to services</button>} />;
@@ -21,13 +21,13 @@ export function Services() {
 }
 
 function ServiceList() {
-  const { data, go } = useApp();
+  const { data, go, canOperate } = useApp();
   const services = data!.services;
   return (
     <>
-      <div className="topbar"><h1>Services</h1><span className="grow" /><button className="btn primary" onClick={() => go('services/new')}><Icon name="plus" size={15} />Add service</button></div>
+      <div className="topbar"><h1>Services</h1><span className="grow" />{canOperate && <button className="btn primary" onClick={() => go('services/new')}><Icon name="plus" size={15} />Add service</button>}</div>
       <div className="card">
-        {services.length === 0 ? <Empty title="No services yet" action={<button className="btn primary" onClick={() => go('services/new')}>Add a website or API</button>}>Monitor any HTTP(S) endpoint for availability and response time.</Empty> : (
+        {services.length === 0 ? <Empty title="No services yet" action={canOperate ? <button className="btn primary" onClick={() => go('services/new')}>Add a website or API</button> : undefined}>Monitor any HTTP(S) endpoint for availability and response time.</Empty> : (
           <table className="tbl"><thead><tr><th>Service</th><th>Status</th><th className="num hide-sm">HTTP</th><th className="num">Response</th><th className="num">Uptime 24h</th><th className="hide-sm">Checked</th></tr></thead>
             <tbody>{services.map(s => (
               <tr key={s.id} className="link" onClick={() => go(`services/${s.id}`)}>
@@ -42,7 +42,7 @@ function ServiceList() {
 }
 
 function ServiceDetail({ service }: { service: Service }) {
-  const { go, toast, refresh } = useApp();
+  const { go, toast, refresh, canOperate } = useApp();
   const [range, setRange] = useState<Range>('24h');
   const [editing, setEditing] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -68,9 +68,9 @@ function ServiceDetail({ service }: { service: Service }) {
       <div className="topbar">
         <button className="btn ghost sm" onClick={() => go('services')}><Icon name="back" size={15} />Services</button>
         <h1>{service.name}</h1><StatusPill status={service.last_status} /><span className="grow" />
-        <button className="btn sm" onClick={checkNow} disabled={busy}><Icon name="refresh" size={14} />{busy ? 'Checking…' : 'Check now'}</button>
-        <button className="btn sm" onClick={() => setEditing(true)}>Edit</button>
-        <button className="btn sm danger" onClick={remove}>Remove</button>
+        {canOperate && <button className="btn sm" onClick={checkNow} disabled={busy}><Icon name="refresh" size={14} />{busy ? 'Checking…' : 'Check now'}</button>}
+        {canOperate && <button className="btn sm" onClick={() => setEditing(true)}>Edit</button>}
+        {canOperate && <button className="btn sm danger" onClick={remove}>Remove</button>}
       </div>
       <p className="muted" style={{ marginTop: -12, marginBottom: 18 }}><a href={service.url} target="_blank" rel="noreferrer noopener">{service.url}</a> · expects HTTP {service.expected_status} · every {service.interval_seconds}s</p>
       {service.last_status === 'down' && service.last_error && <div className="err" style={{ marginBottom: 16 }}>{service.last_error}</div>}

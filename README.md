@@ -9,7 +9,7 @@ cp .env.example .env
 # Edit .env: set JWT_SECRET, ADMIN_PASSWORD and POSTGRES_PASSWORD. Notification channels are added in the console (Alerts).
 ```
 
-The supported environment settings include `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `JWT_SECRET`, `CHECK_INTERVAL_SECONDS`, `COMPANY_NAME`, `BRAND_PRIMARY_COLOR`, and `BRAND_ACCENT_COLOR`. `CHECK_INTERVAL_SECONDS` defaults to 60 seconds and seeds new server monitor intervals; admins can override the cadence per server. The worker polls due checks every second, so scheduled times are accurate to about one second plus ping/request duration. Service/API intervals are separate and configured per service. The UI shows the saved interval on each target. `CPU_THRESHOLD`, `MEMORY_THRESHOLD`, `DISK_THRESHOLD`, `LOAD_THRESHOLD`, `SWAP_THRESHOLD`, and `PROCESS_THRESHOLD` set initial alert limits for new agent-mode servers; missing values default to 85, 90, 85, 10, 80, and 80. These are limits, not measurements: the agent supplies actual metric values. Admins can override limits per server. Missing required telemetry is treated as a failed host check rather than silently as zero. Notification channels (Telegram, Slack, webhook, WhatsApp) are configured in the console under Alerts, not in `.env`. `ALERT_AFTER_FAILURES` (default 2) is how many consecutive failed checks mark a target down, so a single dropped ping does not alert; `REMINDER_MINUTES` (default 30) throttles repeat alerts for a target that stays down. `ADMIN_EMAIL`/`ADMIN_PASSWORD` only seed the first admin; change the password later under Settings. Set `PUBLIC_URL` to the address other servers use to reach the control plane (used in agent install commands). Set `COMPANY_NAME`, `BRAND_PRIMARY_COLOR`, and `BRAND_ACCENT_COLOR` in `.env` to customize branding, then rebuild/restart the frontend and API to apply it.
+The supported environment settings include `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `JWT_SECRET`, `CHECK_INTERVAL_SECONDS`, `COMPANY_NAME`, `BRAND_PRIMARY_COLOR`, and `BRAND_ACCENT_COLOR`. `CHECK_INTERVAL_SECONDS` defaults to 60 seconds and seeds new server monitor intervals; admins can override the cadence per server. The worker polls due checks every second, so scheduled times are accurate to about one second plus ping/request duration. Service/API intervals are separate and configured per service. The UI shows the saved interval on each target. `CPU_THRESHOLD`, `MEMORY_THRESHOLD`, `DISK_THRESHOLD`, `LOAD_THRESHOLD`, `SWAP_THRESHOLD`, and `PROCESS_THRESHOLD` set initial alert limits for new agent-mode servers; missing values default to 85, 90, 85, 10, 80, and 80. These are limits, not measurements: the agent supplies actual metric values. Admins can override limits per server. Missing required telemetry is treated as a failed host check rather than silently as zero. Notification channels (Telegram, Slack, webhook, WhatsApp) are configured in the console under Alerts, not in `.env`. `ALERT_AFTER_FAILURES` (default 2) is how many consecutive failed checks mark a target down, so a single dropped ping does not alert; `REMINDER_MINUTES` (default 30) throttles repeat alerts for a target that stays down. `ADMIN_EMAIL`/`ADMIN_PASSWORD` only seed the very first admin; manage users and passwords in the dashboard afterwards (see *Users, roles and sign-in*). Set `PUBLIC_URL` to the address other servers use to reach the control plane (used in agent install commands). Set `COMPANY_NAME`, `BRAND_PRIMARY_COLOR`, and `BRAND_ACCENT_COLOR` in `.env` to customize branding, then rebuild/restart the frontend and API to apply it.
 
 ## Features
 
@@ -17,7 +17,8 @@ The supported environment settings include `POSTGRES_DB`, `POSTGRES_USER`, `POST
 - **History & uptime:** every check is stored; per-target 24h/7d/30d availability, 90-day daily bars, latency avg/p95, and CPU/memory/disk/load/swap/network time series (`CHECK_RETENTION_DAYS=365`, `METRIC_RETENTION_DAYS=14`).
 - **Incidents** open automatically on failure and resolve on recovery.
 - **Status bars** for any server or service over a selectable window: 1m, 5m, 15m, 30m, 1h, 4h, 12h, 1d, 1 month, 3 months, 1 year.
-- **Logs on demand** from any agent server: Docker containers, the system journal and files such as nginx, with filters.
+- **Users and roles** (admin, operator, viewer), profiles, temporary passwords and account disabling.
+- **Logs on demand** from any agent server (Linux and macOS): Docker containers, the system journal / macOS log, and the standard `/var/log` files such as nginx, syslog, auth and databases, with filters.
 - **Scheduled messages** to chosen alert channels (daily/weekly/one-time, any time zone).
 - **Public status page** at `/status` for services marked public (name and uptime only; set `PUBLIC_STATUS_ENABLED=false` to disable).
 - **Concurrent worker:** due checks run in parallel (`WORKER_CONCURRENCY`, default 16).
@@ -33,11 +34,18 @@ The supported environment settings include `POSTGRES_DB`, `POSTGRES_USER`, `POST
 
 ## Run with Docker Compose
 
+`docker-compose.yml` runs the **published Docker Hub images** (see *Publishing images*), so a server needs only Docker, this file and a `.env`: no source code, no build tools.
+
 ```sh
 cp .env.example .env
-# edit .env (secrets), then add notification channels in the console under Alerts
-docker compose up -d --build
+# edit .env: the secrets (JWT_SECRET, ADMIN_PASSWORD, POSTGRES_PASSWORD) ...
+docker compose pull          # download the images
+docker compose up -d         # start everything; add notification channels afterwards in the console under Alerts
 ```
+
+- **Choose the version** with `SMWATCH_VERSION` in `.env`: `latest` (every push to `main`), a release such as `1.2.3` (recommended for production) or `sha-<commit>`. `docker compose pull && docker compose up -d` upgrades; the migration service applies database changes automatically before the API starts. Roll back by setting the previous version and running the same two commands.
+- **Develop from source instead:** `docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build` builds all images from this checkout (they get the same names, so a later `pull` replaces them with the published ones). To make plain `docker compose` always build, add `COMPOSE_FILE=docker-compose.yml:docker-compose.build.yml` to `.env`.
+- The images come from the Docker Hub account `shambi21` by default; set `DOCKERHUB_USERNAME` in `.env` to use another account (for example a fork). Until the GitHub Action has pushed the images, use the build override above.
 
 If PostgreSQL was previously initialized with different credentials, `docker compose down` will not change them because the `postgres_data` volume is persistent. Reconcile the configured role without deleting data:
 
@@ -140,7 +148,7 @@ SMWATCH_URL=https://monitor.example.com SMWATCH_JOIN=<join-token> python agent.p
 SMWATCH_URL=https://monitor.example.com SMWATCH_JOIN=<join-token> python agent.py           # run
 ```
 
-Environment variables: `SMWATCH_URL` and `SMWATCH_JOIN` (join token) or `AGENT_TOKEN` (a per-server token from the advanced flow), `AGENT_STATE_DIR` (where the agent keeps its identity), `AGENT_PROCESS_TOP_N`, `AGENT_DISK_PATH`. With the repo checked out you can also use `agent/docker-compose.yml` (`cp agent/.env.example agent/.env`, set `SMWATCH_URL` and `SMWATCH_JOIN`).
+Environment variables: `SMWATCH_URL` and `SMWATCH_JOIN` (join token) or `AGENT_TOKEN` (a per-server token from the advanced flow), `AGENT_STATE_DIR` (where the agent keeps its identity), `AGENT_PROCESS_TOP_N`, `AGENT_DISK_PATH`. `agent/docker-compose.yml` is an alternative that runs the published agent image (`cp agent/.env.example agent/.env`, set `DOCKERHUB_USERNAME`, `SMWATCH_URL` and `SMWATCH_JOIN`, then `docker compose -f agent/docker-compose.yml up -d`).
 
 ### Troubleshooting
 
@@ -157,26 +165,62 @@ When something is wrong, the installer or `--check` says exactly what:
 
 Alert thresholds are per server (**Edit** the server; defaults for new servers come from `CPU_THRESHOLD` etc. in `.env`). The report interval defaults to `CHECK_INTERVAL_SECONDS` and can be changed per server. Metric samples are kept for `METRIC_RETENTION_DAYS` (14) and check history for `CHECK_RETENTION_DAYS` (365). **Ping only** uses ICMP from the worker container (`NET_RAW`, 3 attempts per check). **Pull agent**: run the agent with `AGENT_TOKEN` and no `SMWATCH_URL` (listens on 9100, token required), choose *Advanced: pull agent* in the dashboard and firewall port 9100 to the control plane.
 
+## Users, roles and sign-in
+
+The dashboard is **never open to the public**: everything requires signing in. The only pages reachable without an account are the sign-in page, the optional public status page (only the servers/services you explicitly tick, name/status/uptime only; turn it off entirely with `PUBLIC_STATUS_ENABLED=false`) and the agents' own token-protected endpoints.
+
+**First sign-in.** On first start the app creates one administrator from `ADMIN_EMAIL` and `ADMIN_PASSWORD` in `.env`. Those two variables only seed that first account; afterwards manage everything in the dashboard (changing them later does nothing).
+
+**Roles.** Admins add people under **Users**:
+
+| Role | Can do |
+| --- | --- |
+| **Admin** | Everything, including adding/editing/disabling/deleting users and changing roles |
+| **Operator** | Add, edit and remove servers, services, alert channels and scheduled messages; run checks; read logs; create agent install links. Cannot manage users |
+| **Viewer** | Read-only: overview, server/service pages, uptime, incidents, the public status page. No logs, no alert configuration, no changes |
+
+The role is checked on the server for every request (hidden buttons are only a convenience), and it is re-read from the database each time, so demoting or disabling someone takes effect **immediately** and also signs them out.
+
+**Adding a user.** *Users → Add user*, choose the role, and use the generated **temporary password** (or type one, 12+ characters). Send it to them privately; it is shown once. At first sign-in they are asked to choose their own password before they can do anything else. An admin can also **reset** someone's password the same way, or **disable** an account (kept for the record, cannot sign in).
+
+**Guard rails.** There must always be at least one active admin; you cannot change your own role, disable or delete yourself (ask another admin), so you can never lock yourself out. Failed sign-ins are rate limited, and a disabled account gets the same generic error as a wrong password.
+
+**Profile.** *Settings → Profile* lets each person change their name and email (changing the email needs the current password) and *Settings → Password* changes the password and signs out their other sessions.
+
 ## Logs
 
-**Logs** in the sidebar (or the *Logs* tab on a server) shows a server's logs on demand, with filters:
+**Logs** in the sidebar (or the *Logs* tab on a server) shows a server's logs on demand, with filters. Three sources:
 
-| Source | What | Filters |
+| Source | Linux | macOS |
 | --- | --- | --- |
-| **Docker containers** | `docker logs` of any container on the server, running or stopped | text filter, last N lines, time window |
-| **System journal** | `journalctl` for the whole journal or one unit (nginx.service, ssh.service, ...) | text filter, last N lines, time window, minimum level (errors, warnings, ...) |
-| **Log files** | nginx/apache access and error logs, syslog, auth, kernel, cron, MySQL, PostgreSQL, Redis, MongoDB, fail2ban, ufw | text filter, last N lines |
+| **Containers** | `docker logs` of every container on the host, running or stopped | same (Docker Desktop/OrbStack/Colima containers) |
+| **System journal / System log** | the systemd journal: the whole journal or one unit (nginx.service, ssh.service, ...), with level filter | the macOS unified log (`log show`): whole log or one process, with an errors-only filter. Always limited to a time window (default last hour, at most 24 h) |
+| **Log files** | everything the system and common software write under `/var/log`: syslog/messages, auth/secure, kern, daemon, cron, mail, dpkg/apt/dnf/yum, nginx, apache/httpd, caddy, traefik, haproxy, php-fpm, tomcat, MySQL/MariaDB/PostgreSQL, Redis, MongoDB, RabbitMQ, Elasticsearch, Kafka, fail2ban, ufw, audit, letsencrypt, supervisor, pm2 (any `*.log` up to three folders deep, plus the latest rotated copy) | `/var/log/*.log` (install.log, wifi.log, ...) and `/Library/Logs` |
 
-You can auto-refresh, wrap, copy or download the result; error and warning lines are highlighted.
+Filters: text search (case-insensitive "contains", highlighted), last N lines (100-2000), time window, and Errors/Warnings level buttons. Auto-refresh ("Live"), wrap, copy and download are available, and error/warning lines are highlighted.
 
-How it works, and its limits:
+### Why a source can be greyed out ("deactivated")
 
-- The agent never accepts inbound connections, so the dashboard **queues a request**, the agent picks it up within about 5 seconds, reads the log locally and posts back the result. Nothing is stored long-term: results are deleted after 15 minutes.
-- The agent reads **only a fixed allow-list** of sources. It does not run commands or shells and cannot be asked for an arbitrary path; requests are validated on the control plane *and* again by the agent (path traversal and symlinks leading outside the allow-list are refused). Add your own files with `AGENT_LOG_PATHS=/srv/app/logs/*.log,/opt/x/*.log` in `/etc/sm-watch-agent.env`.
-- The text filter is a plain case-insensitive "contains" match, not a regular expression. Each request returns at most 2000 lines / 400 KB (the newest lines win). Rotated `.gz` files are not read.
-- **Access the agent needs:** the installer adds the agent's service user to `systemd-journal` (journal), `adm` (files under `/var/log`) and, when Docker is installed, `docker` (container logs). **Membership of the `docker` group is root-equivalent on that server.** If you do not want that, install with `... | sudo SMWATCH_LOGS=nodocker bash` (journal and files only) or `SMWATCH_LOGS=off` (the dashboard cannot read any logs from that server). The Docker-variant agent mounts the Docker socket for the same purpose and honours the same variable.
-- **The machine running SM-Watch itself** is covered automatically: the stack's `host-agent` service registers it as *This server (control plane)*, so you can read the logs of the SM-Watch containers, the host journal and nginx without installing anything. That service mounts the host read-only plus the Docker socket; set `HOST_AGENT_LOGS=nodocker` or `off` in `.env`, or delete the service from `docker-compose.yml`, if you prefer not to have it.
-- Anyone who can sign in to the dashboard can read these logs, so treat dashboard access accordingly. Logs often contain IP addresses, usernames and sometimes secrets.
+The agent can only read what exists where **it** runs, and the page tells you why when a source is unavailable (hover the tab, and read the note above the log):
+
+- **The agent runs in Docker on a Mac or Windows PC.** This is the situation of the bundled `host-agent` when you run SM-Watch locally on a Mac. A container on macOS/Windows lives inside Docker's small Linux VM (OrbStack, Docker Desktop, Colima), which has no systemd journal and almost no log files, and **no container can see the computer's own logs**. Containers still work. To read the Mac's own logs, install the agent directly on it: *Servers → Add server → Install agent → shell command* (see the macOS notes below).
+- **On a Linux server this works out of the box** with the shell installer (the agent joins the `systemd-journal`, `adm` and `docker` groups) and with the bundled `host-agent`/Docker one-liner, which carry `journalctl` and read the **host's** journal files from `/var/log/journal`. A host that stores its journal only in memory (`/run/log/journal`) is supported too; a host with no journald at all (Alpine, some containers) simply has no journal.
+- **Log files: none found.** Software that logs only to the journal or to Docker (the modern default) writes no files. Add your own locations with `AGENT_LOG_PATHS=/srv/app/logs/*.log,/opt/x/*.log` (in `/etc/sm-watch-agent.env`, then `systemctl restart sm-watch-agent`).
+- **Docker tab empty:** the agent has no access to the Docker socket (installed with `SMWATCH_LOGS=nodocker`, or Docker is not installed).
+
+### macOS (and the machine you develop on)
+
+The same one-line install command works on a Mac. It detects macOS and sets up a **launchd service** (`net.smwatch.agent`, runs as root so the unified log and `/var/log` are fully readable, starts at boot, restarts on failure). Needs `python3` (`xcode-select --install` provides it). Logs: `tail -f /var/log/sm-watch-agent.log`. Remove with the same command plus `uninstall`. Without installing anything you can also run it by hand: `SMWATCH_URL=... SMWATCH_JOIN=... python3 agent.py` (see *Manual run* above).
+
+### How it works, and its limits
+
+- The agent never accepts inbound connections, so the dashboard **queues a request** and the agent, which keeps a request open to the control plane (long-polling), receives it **instantly**, reads the log locally and posts back the result; the dashboard likewise waits on the server instead of re-polling. Opening a log typically takes well under half a second on Linux (1-3 seconds for the macOS unified log, which is slow to query). The list of systemd units (which needs a slow journal scan) is only fetched when you open the journal tab, and your last choice per server is remembered.
+- **Logs are read on demand and not stored.** Results are deleted from the control plane after 15 minutes. This keeps the control plane small and avoids copying sensitive data around. The trade-off is that you cannot search a server that is offline, or look further back than the server itself retains. Metrics, by contrast, *are* stored continuously (14 days by default) for charts.
+- The agent reads **only a fixed allow-list** of sources. It does not run commands or shells and cannot be asked for an arbitrary path; requests are validated on the control plane *and* again by the agent (path traversal and symlinks leading outside the allow-list are refused, as are binary files). Add your own files with `AGENT_LOG_PATHS`.
+- The text filter is a plain "contains" match, not a regular expression. Each request returns at most 2000 lines / 400 KB (the newest lines win). Compressed (`.gz`) rotations are not read.
+- **Access the agent needs:** the Linux installer adds the agent's service user to `systemd-journal` (journal), `adm` (files under `/var/log`) and, when Docker is installed, `docker` (container logs). **Membership of the `docker` group is root-equivalent on that server.** If you do not want that, install with `... | sudo SMWATCH_LOGS=nodocker bash` (journal and files only) or `SMWATCH_LOGS=off` (the dashboard cannot read any logs from that server). The Docker-variant agent mounts the Docker socket for the same purpose and honours the same variable.
+- **The machine running SM-Watch itself** is covered by the stack's `host-agent` service, which registers it as *This server (control plane)* (on a Linux host this gives you the host journal and files plus every container's logs). That service mounts the host read-only plus the Docker socket; set `HOST_AGENT_LOGS=nodocker` or `off` in `.env`, or delete the service from `docker-compose.yml`, if you prefer not to have it.
+- Anyone with the operator or admin role can read these logs, so treat those roles accordingly. Logs often contain IP addresses, usernames and sometimes secrets.
 
 ## Scheduled messages
 
@@ -188,8 +232,36 @@ How it works, and its limits:
 - **Reliability:** a failed channel is retried twice, one minute apart, and only the failed channels are retried. If the worker was down and the planned time is more than 15 minutes in the past, the run is skipped and marked `missed` rather than sent late. **Send now** tests a message immediately; **Pause**/**Resume** keeps it without sending.
 - WhatsApp template messages cannot contain line breaks, so they are joined with ` | `.
 
+## Publishing images to Docker Hub (GitHub Actions)
+
+`.github/workflows/docker-publish.yml` tests the code and publishes four multi-architecture (amd64 + arm64) images to Docker Hub:
+
+| Image | Built from | Used for |
+| --- | --- | --- |
+| `<user>/sm-watch-api` | `backend/Dockerfile` | the API, the worker and the database migrations (one image, three compose services) |
+| `<user>/sm-watch-frontend` | `frontend-next/Dockerfile` | the web dashboard |
+| `<user>/sm-watch-agent` | `agent/Dockerfile` | the standalone agent in Docker |
+| `<user>/sm-watch-host-agent` | `backend/Dockerfile.host-agent` | the agent for the machine running SM-Watch (includes `journalctl`) |
+
+**One-time setup.** In Docker Hub create an access token (*Account settings → Personal access tokens*, permission **Read & Write**). In the GitHub repository open *Settings → Secrets and variables → Actions → New repository secret* and add:
+
+- `DOCKERHUB_USERNAME`: your Docker Hub username
+- `DOCKERHUB_TOKEN`: the access token
+
+The repositories are created on the first push. For an organisation namespace, create them first (or use a token that may create repositories).
+
+**When it runs**
+- **Pull request:** runs the tests and *builds* every image to prove it still builds. Nothing is pushed (and fork PRs never see your secrets).
+- **Push to `main`:** tests, then pushes `latest` and `sha-<short-commit>`.
+- **Tag `v1.2.3`:** tests, then pushes `1.2.3`, `1.2` and `sha-<short-commit>`. Release with `git tag v1.2.3 && git push origin v1.2.3`.
+- **Manual:** *Actions → Build and push Docker images → Run workflow*; untick *Push* for a dry run.
+
+Images are only pushed when the backend tests, the frontend type-check and the installer-script syntax check all pass. If the secrets are missing the job fails immediately with a message saying which to add.
+
+**Using the published images.** `docker-compose.yml` already pulls them (see *Run with Docker Compose*): set `DOCKERHUB_USERNAME` and `SMWATCH_VERSION` in `.env`. Pin a version tag (for example `1.2.3`) instead of `latest` in production so an update is always a deliberate step. The standalone agent needs no repo either: in `agent/.env` set `DOCKERHUB_USERNAME` (and `SMWATCH_VERSION`), or `AGENT_IMAGE` to a full image name, then `docker compose -f agent/docker-compose.yml up -d`.
+
 ## Deploy with Docker
 
-The Compose setup builds four application roles: `frontend` for Next.js, `api` for FastAPI, `worker` for scheduled monitoring, and `migrate` for Alembic. Put the control plane behind HTTPS and restrict each agent port to the API/worker network in production.
+The Compose setup runs these application roles (all from published images, or built with the override): `frontend` for Next.js, `api` for FastAPI, `worker` for scheduled monitoring, and `migrate` for Alembic. Put the control plane behind HTTPS and restrict each agent port to the API/worker network in production.
 
 For the legacy `server_status.sh`, export the same Telegram variables before running it. The token that was previously embedded in that script was removed; rotate it in Telegram if it was real.

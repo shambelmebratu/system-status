@@ -4,7 +4,7 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'rea
 import { api, post } from '../lib/api';
 import { Icon } from './ui';
 
-type Inventory = { files: string[]; journal: boolean; units: string[]; docker: boolean; containers: { name: string; state: string; image: string }[]; notes: string[] };
+type Inventory = { files: string[]; journal: boolean; journal_label?: string; platform?: string; units: string[]; docker: boolean; containers: { name: string; state: string; image: string }[]; notes: string[] };
 type Source = 'docker' | 'journal' | 'file';
 type LogResponse = { id: number; status: 'pending' | 'running' | 'done' | 'error'; output: string; error: string | null; truncated: boolean };
 type Level = 'error' | 'warn' | 'info' | 'debug' | '';
@@ -12,18 +12,31 @@ type Row = { n: number; ts: string; tsTitle: string; level: Level; msg: string }
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-/** Queues a log request for the server's agent and waits for the answer (the agent polls every few seconds). */
+/** Queues a log request and waits for the agent's answer. The server holds each GET open until the agent has answered
+ *  (long-poll), so the result appears the instant it exists instead of on the next polling tick. */
 async function runQuery(serverId: number, query: Record<string, unknown>, isCancelled: () => boolean): Promise<LogResponse> {
   const { id } = await post<{ id: number }>(`/servers/${serverId}/logs`, query);
-  for (let i = 0; i < 80; i++) {
-    await sleep(i < 10 ? 500 : 1000);
+  const deadline = Date.now() + 50_000;
+  while (Date.now() < deadline) {
     if (isCancelled()) throw new Error('cancelled');
-    const result = await api<LogResponse>(`/servers/${serverId}/logs/${id}`);
+    const result = await api<LogResponse>(`/servers/${serverId}/logs/${id}?wait=15`);
     if (result.status === 'done') return result;
     if (result.status === 'error') throw new Error(result.error || 'The agent could not read that log');
   }
   throw new Error('Timed out waiting for the agent');
 }
+
+/** The last source/target viewed on each server is remembered so the next visit can start fetching immediately. */
+type Remembered = { source: Source; target: string };
+const memKey = (serverId: number) => `smw_logs_last_${serverId}`;
+function readLast(serverId: number): Remembered | null {
+  try {
+    const v = JSON.parse(localStorage.getItem(memKey(serverId)) || 'null');
+    return v && ['docker', 'journal', 'file'].includes(v.source) && typeof v.target === 'string' && v.target ? v : null;
+  } catch { return null; }
+}
+function writeLast(serverId: number, value: Remembered) { try { localStorage.setItem(memKey(serverId), JSON.stringify(value)); } catch { /* storage unavailable */ } }
+const EMPTY_INVENTORY: Inventory = { files: [], journal: true, units: [], docker: true, containers: [], notes: [] };
 
 /* ---------------------------------------------------------------- parsing */
 const TS_PREFIX = [
@@ -78,9 +91,12 @@ function Highlight({ text, term }: { text: string; term: string }) {
 
 const LEVEL_LABEL: Record<string, string> = { error: 'ERR', warn: 'WARN', info: 'INFO', debug: 'DBG' };
 const SOURCES: { id: Source; label: string; icon: string }[] = [{ id: 'docker', label: 'Containers', icon: 'server' }, { id: 'journal', label: 'System journal', icon: 'logs' }, { id: 'file', label: 'Log files', icon: 'overview' }];
+const isMac = (inv: { platform?: string }) => inv.platform === 'macos';
 
 export function LogsPanel({ serverId }: { serverId: number }) {
   const [inventory, setInventory] = useState<Inventory | null>(null);
+  const [unitsState, setUnitsState] = useState<'idle' | 'loading' | 'done'>('idle');
+  const [provisional, setProvisional] = useState<Remembered | null>(null);
   const [source, setSource] = useState<Source>('docker');
   const [target, setTarget] = useState('');
   const [lines, setLines] = useState('200');
@@ -97,7 +113,8 @@ export function LogsPanel({ serverId }: { serverId: number }) {
   const [live, setLive] = useState(false);
   const [wrap, setWrap] = useState(false);
   const [stuck, setStuck] = useState(true);
-  const run = useRef(0);
+  const run = useRef(0);       // newest log request (older ones are ignored)
+  const invRun = useRef(0);    // newest inventory request
   const scroller = useRef<HTMLDivElement>(null);
   const first = useRef(true);
 
@@ -112,27 +129,45 @@ export function LogsPanel({ serverId }: { serverId: number }) {
     try {
       const result = await runQuery(serverId, { source: src, target: tgt, lines: Number(lines), since_minutes: src === 'file' ? 0 : Number(since), grep: filter, priority: '' }, () => run.current !== mine);
       setOutput(result.output); setTruncated(result.truncated); setApplied(filter); setFetchedAt(new Date()); setTook((performance.now() - started) / 1000);
+      writeLast(serverId, { source: src, target: tgt });
     } catch (e) { if ((e as Error).message !== 'cancelled') setError((e as Error).message); }
     finally { if (run.current === mine) setBusy(false); }
   }, [serverId, source, target, lines, since, search]);
 
-  // What can this server's agent read? Then load the first source automatically.
+  // What can this server's agent read? If we remember what was open last time, start fetching THAT log right away, in
+  // parallel with the inventory request, instead of waiting for the inventory first.
   useEffect(() => {
-    const mine = ++run.current;
-    setInventory(null); setOutput(null); setError(''); setTarget(''); first.current = true;
-    runQuery(serverId, { source: 'inventory' }, () => run.current !== mine)
+    const mine = ++invRun.current;
+    setInventory(null); setUnitsState('idle'); setOutput(null); setError(''); setTarget('');
+    const remembered = readLast(serverId);
+    setProvisional(remembered);
+    if (remembered) { setSource(remembered.source); setTarget(remembered.target); void fetchLogs({ src: remembered.source, tgt: remembered.target, filter: '' }); }
+    runQuery(serverId, { source: 'inventory' }, () => invRun.current !== mine)
       .then(result => {
         const inv = JSON.parse(result.output) as Inventory;
-        setInventory(inv);
+        setInventory(inv); setProvisional(null);
+        const stillValid = remembered && (remembered.source === 'docker' ? inv.containers.some(c => c.name === remembered.target)
+          : remembered.source === 'journal' ? inv.journal : inv.files.includes(remembered.target));
+        if (stillValid) return;
         const src: Source = inv.docker && inv.containers.length ? 'docker' : inv.journal ? 'journal' : 'file';
-        const tgt = src === 'docker' ? inv.containers[0].name : src === 'journal' ? 'all' : inv.files[0] ?? '';
+        const tgt = src === 'docker' ? (inv.containers.find(c => c.state === 'running') ?? inv.containers[0]).name : src === 'journal' ? 'all' : inv.files[0] ?? '';   // prefer a container that is actually running
         setSource(src); setTarget(tgt);
         if (tgt) void fetchLogs({ src, tgt, filter: '' });
       })
       .catch(e => (e as Error).message !== 'cancelled' && setError((e as Error).message));
-    return () => { run.current++; };
+    return () => { invRun.current++; run.current++; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [serverId]);
+
+  // The unit list needs a slow journal scan on the server, so it is only requested when the journal tab is opened.
+  const loadUnits = useCallback(() => {
+    if (unitsState !== 'idle') return;
+    setUnitsState('loading');
+    const mine = invRun.current;
+    runQuery(serverId, { source: 'inventory', target: 'units' }, () => invRun.current !== mine)
+      .then(result => { const { units } = JSON.parse(result.output) as { units: string[] }; setInventory(inv => (inv ? { ...inv, units } : inv)); setUnitsState('done'); })
+      .catch(() => setUnitsState('idle'));
+  }, [serverId, unitsState]);
 
   useEffect(() => { if (!live) return; const t = setInterval(() => void fetchLogs({ quiet: true }), 5000); return () => clearInterval(t); }, [live, fetchLogs]);
 
@@ -144,18 +179,21 @@ export function LogsPanel({ serverId }: { serverId: number }) {
   useEffect(() => { const el = scroller.current; if (el && stuck) el.scrollTop = el.scrollHeight; }, [shown, stuck]);
   const onScroll = () => { const el = scroller.current; if (el) setStuck(el.scrollHeight - el.scrollTop - el.clientHeight < 40); };
 
+  // Until the real inventory arrives, a remembered last view is shown with just that one target (so its logs can appear at once).
+  const shell = inventory ?? (provisional ? { ...EMPTY_INVENTORY, containers: provisional.source === 'docker' ? [{ name: provisional.target, state: 'running', image: '' }] : [], files: provisional.source === 'file' ? [provisional.target] : [] } : null);
   const targets = useMemo(() => {
-    if (!inventory) return [] as { value: string; label: string; dot?: string }[];
-    if (source === 'docker') return inventory.containers.map(c => ({ value: c.name, label: c.name, dot: c.state }));
-    if (source === 'journal') return [{ value: 'all', label: 'Whole journal (all units)' }, ...inventory.units.map(u => ({ value: u, label: u }))];
-    return inventory.files.map(f => ({ value: f, label: f }));
-  }, [inventory, source]);
+    if (!shell) return [] as { value: string; label: string; dot?: string }[];
+    if (source === 'docker') return [...shell.containers].sort((a, b) => Number(b.state === 'running') - Number(a.state === 'running')).map(c => ({ value: c.name, label: c.name, dot: c.state }));   // running containers first
+    if (source === 'journal') return [{ value: 'all', label: isMac(shell) ? 'Whole system log (last hour by default)' : 'Whole journal (all units)' }, ...shell.units.map(u => ({ value: u, label: u }))];
+    return shell.files.map(f => ({ value: f, label: f }));
+  }, [shell, source]);
 
   const pick = (next: Source) => {
     if (next === source) return;
-    const tgt = next === 'docker' ? inventory?.containers[0]?.name ?? '' : next === 'journal' ? 'all' : inventory?.files[0] ?? '';
+    const tgt = next === 'docker' ? (inventory?.containers.find(c => c.state === 'running') ?? inventory?.containers[0])?.name ?? '' : next === 'journal' ? 'all' : inventory?.files[0] ?? '';
     setSource(next); setTarget(tgt); setOutput(null); setLive(false);
     void fetchLogs({ src: next, tgt });
+    if (next === 'journal') loadUnits();
   };
   const changeTarget = (tgt: string) => { setTarget(tgt); setOutput(null); void fetchLogs({ tgt }); };
   const download = () => {
@@ -163,22 +201,22 @@ export function LogsPanel({ serverId }: { serverId: number }) {
     const a = document.createElement('a'); a.href = url; a.download = `${target.replace(/[^A-Za-z0-9_.-]+/g, '_') || 'logs'}.log`; a.click(); URL.revokeObjectURL(url);
   };
 
-  if (error && !inventory) return (
+  if (error && !shell) return (
     <div className="lv"><div className="lv-empty"><Icon name="alert" size={26} /><h3>Can’t reach this server’s agent</h3><p>{error}</p>
       <p className="muted sm">Logs need the SM-Watch agent (2.3+) running on the server with log access enabled. Re-run the install command on the server to update it.</p></div></div>);
-  if (!inventory) return (
+  if (!shell) return (
     <div className="lv"><div className="lv-skel">{Array.from({ length: 9 }, (_, i) => <i key={i} style={{ width: `${40 + ((i * 37) % 55)}%` }} />)}</div>
       <div className="lv-foot"><span className="spinner" /> Asking the agent which logs it can read…</div></div>);
 
-  const available: Record<Source, boolean> = { docker: inventory.docker && inventory.containers.length > 0, journal: inventory.journal, file: inventory.files.length > 0 };
-  const total: Record<Source, number> = { docker: inventory.containers.length, journal: inventory.units.length, file: inventory.files.length };
+  const available: Record<Source, boolean> = { docker: shell.docker && shell.containers.length > 0, journal: shell.journal, file: shell.files.length > 0 };
+  const total: Record<Source, string> = { docker: inventory ? String(shell.containers.length) : '…', journal: unitsState === 'done' ? String(shell.units.length) : '–', file: inventory ? String(shell.files.length) : '…' };
   return (
     <div className="lv">
       <div className="lv-head">
         <div className="lv-tabs" role="tablist">
           {SOURCES.map(s => (
-            <button key={s.id} role="tab" aria-selected={source === s.id} className={source === s.id ? 'on' : ''} disabled={!available[s.id]} title={available[s.id] ? '' : 'Not available on this server'} onClick={() => pick(s.id)}>
-              <Icon name={s.icon} size={15} />{s.label}<span className="lv-count">{total[s.id]}</span>
+            <button key={s.id} role="tab" aria-selected={source === s.id} className={source === s.id ? 'on' : ''} disabled={!available[s.id]} title={available[s.id] ? '' : (s.id === 'journal' ? shell.notes.find(n => /journal|systemd|macOS/i.test(n)) : s.id === 'file' ? shell.notes.find(n => /log files/i.test(n)) : shell.notes.find(n => /docker/i.test(n))) ?? shell.notes[0] ?? 'Not available on this server'} onClick={() => pick(s.id)}>
+              <Icon name={s.icon} size={15} />{s.id === 'journal' && shell.journal_label ? shell.journal_label : s.label}<span className="lv-count">{total[s.id]}</span>
             </button>))}
         </div>
         <span className="grow" />
@@ -203,7 +241,7 @@ export function LogsPanel({ serverId }: { serverId: number }) {
           <button type="button" className={`wrn ${levelFilter === 'warn' ? 'on' : ''}`} onClick={() => setLevelFilter(levelFilter === 'warn' ? 'all' : 'warn')}>Warnings <b>{counts.warn}</b></button>
         </div>
       </form>
-      {inventory.notes.length > 0 && <div className="lv-note">{inventory.notes.join(' · ')}</div>}
+      {shell.notes.length > 0 && <div className="lv-note">{shell.notes.map((n, i) => <p key={i}><Icon name="alert" size={14} />{n}</p>)}</div>}
       {error && <div className="lv-error" role="alert"><Icon name="alert" size={15} />{error}<button className="btn sm" onClick={() => void fetchLogs()}>Retry</button></div>}
 
       <div className="lv-body">

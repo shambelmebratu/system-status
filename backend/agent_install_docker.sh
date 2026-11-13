@@ -48,13 +48,21 @@ if [ "$SMWATCH_LOGS" = "on" ]; then
   [ -n "$sock" ] && SOCKET_MOUNT="-v $sock:/var/run/docker.sock"
 fi
 
+# System journal: the slim Python image has no journalctl. If this host keeps a systemd journal, install it inside the
+# container on first start (about 20 s) so the dashboard can read the HOST's journal. Otherwise skip the extra download.
+PREP=""
+if [ "$SMWATCH_LOGS" != "off" ] && { [ -d /var/log/journal ] || [ -d /run/log/journal ]; }; then
+  PREP="apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq --no-install-recommends systemd >/dev/null 2>&1; "
+  say "This host has a systemd journal: the container will install journalctl to read it"
+fi
+
 say "Starting the agent container"
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 docker run -d --name "$NAME" --restart unless-stopped --pid host --hostname "$(hostname)" \
   -v /:/host:ro -v sm-watch-agent-data:/var/lib/sm-watch-agent $SOCKET_MOUNT \
   -e SMWATCH_URL="$SMWATCH_URL" -e AGENT_TOKEN="$AGENT_TOKEN" -e AGENT_LOGS="$SMWATCH_LOGS" \
   -e AGENT_HOST_ROOT=/host -e AGENT_PROCFS_PATH=/host/proc -e AGENT_DISK_PATH=/host \
-  python:3.12-slim sh -c "pip install -q --disable-pip-version-check psutil && python -c \"import urllib.request as u; u.urlretrieve('$SMWATCH_URL/api/agent/agent.py','/agent.py')\" && exec python /agent.py" >/dev/null
+  python:3.12-slim sh -c "${PREP}pip install -q --disable-pip-version-check psutil && python -c \"import urllib.request as u; u.urlretrieve('$SMWATCH_URL/api/agent/agent.py','/agent.py')\" && exec python /agent.py" >/dev/null
 
 say "Waiting for the agent to start reporting (the first start downloads psutil)"
 for _ in $(seq 1 60); do

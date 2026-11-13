@@ -144,6 +144,30 @@ class LogResult(BaseModel):
     truncated: bool = False
 
 
+EMAIL_PATTERN = r"^[^@\s]{1,64}@[^@\s]+\.[^@\s]{2,}$"
+ROLE_PATTERN = "^(admin|operator|viewer)$"
+
+
+class UserCreate(BaseModel):
+    email: str = Field(max_length=320, pattern=EMAIL_PATTERN)
+    name: str = Field(default="", max_length=100)
+    role: str = Field(default="viewer", pattern=ROLE_PATTERN)
+    password: str = Field(min_length=12, max_length=200)   # temporary: the person must change it at first sign-in
+
+
+class UserUpdate(BaseModel):
+    name: str | None = Field(default=None, max_length=100)
+    role: str | None = Field(default=None, pattern=ROLE_PATTERN)
+    active: bool | None = None
+    password: str | None = Field(default=None, min_length=12, max_length=200)   # admin reset: forces a change at next sign-in
+
+
+class ProfileUpdate(BaseModel):
+    name: str = Field(default="", max_length=100)
+    email: str | None = Field(default=None, max_length=320, pattern=EMAIL_PATTERN)
+    current_password: str = Field(default="", max_length=200)   # required only when the email changes
+
+
 class PasswordChange(BaseModel):
     current_password: str
     new_password: str = Field(min_length=12, max_length=200)

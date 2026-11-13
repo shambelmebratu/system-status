@@ -13,8 +13,11 @@ import { Servers } from './views/Servers';
 import { Services } from './views/Services';
 import { Schedules } from './views/Schedules';
 import { Settings } from './views/Settings';
+import { Users } from './views/Users';
+import { ForcePasswordChange } from './views/ForcePasswordChange';
+import { ROLE_INFO, type Me, type Role } from './lib/types';
 
-type Session = { email: string } | null | 'loading';
+type Session = Me | null | 'loading';
 
 export default function Home() {
   const [session, setSession] = useState<Session>('loading');
@@ -27,48 +30,56 @@ export default function Home() {
       root.setProperty('--brand-primary', b.primary_color); root.setProperty('--brand-accent', b.accent_color);
       root.setProperty('--brand-primary-light', `color-mix(in srgb, ${b.primary_color} 55%, #0b3d2e)`);
     }).catch(() => undefined);
-    api<{ email: string }>('/auth/me').then(me => setSession({ email: me.email })).catch(() => setSession(null));
+    loadMe();
   }, []);
 
+  const loadMe = useCallback(() => api<Me>('/auth/me').then(me => setSession(me)).catch(() => setSession(null)), []);
   const onUnauthorized = useCallback(() => setSession(null), []);
   if (session === 'loading') return null;
-  if (!session) return <Login company={company} onSignedIn={() => api<{ email: string }>('/auth/me').then(me => setSession({ email: me.email }))} />;
-  return <AppProvider onUnauthorized={onUnauthorized}><Shell company={company} email={session.email} onSignOut={() => { void post('/auth/logout').catch(() => undefined); setSession(null); }} /></AppProvider>;
+  if (!session) return <Login company={company} onSignedIn={() => void loadMe()} />;
+  const signOut = () => { void post('/auth/logout').catch(() => undefined); setSession(null); };
+  // A temporary password (new account or admin reset) must be replaced before anything else is reachable.
+  if (session.must_change_password) return <ForcePasswordChange company={company} me={session} onDone={() => void loadMe()} onSignOut={signOut} />;
+  return <AppProvider me={session} reloadMe={async () => { await loadMe(); }} onUnauthorized={onUnauthorized}><Shell company={company} me={session} onSignOut={signOut} /></AppProvider>;
 }
 
-const NAV = [
-  { id: 'overview', label: 'Overview', icon: 'overview' },
-  { id: 'servers', label: 'Servers', icon: 'server' },
-  { id: 'services', label: 'Services', icon: 'globe' },
-  { id: 'logs', label: 'Logs', icon: 'logs' },
-  { id: 'incidents', label: 'Incidents', icon: 'alert' },
-  { id: 'alerts', label: 'Alerts', icon: 'bell' },
-  { id: 'schedules', label: 'Schedules', icon: 'clock' },
-  { id: 'settings', label: 'Settings', icon: 'settings' },
+const NAV: { id: string; label: string; icon: string; min: Role }[] = [
+  { id: 'overview', label: 'Overview', icon: 'overview', min: 'viewer' },
+  { id: 'servers', label: 'Servers', icon: 'server', min: 'viewer' },
+  { id: 'services', label: 'Services', icon: 'globe', min: 'viewer' },
+  { id: 'logs', label: 'Logs', icon: 'logs', min: 'operator' },
+  { id: 'incidents', label: 'Incidents', icon: 'alert', min: 'viewer' },
+  { id: 'alerts', label: 'Alerts', icon: 'bell', min: 'operator' },
+  { id: 'schedules', label: 'Schedules', icon: 'clock', min: 'operator' },
+  { id: 'users', label: 'Users', icon: 'users', min: 'admin' },
+  { id: 'settings', label: 'Settings', icon: 'settings', min: 'viewer' },
 ];
+const RANK: Record<Role, number> = { viewer: 1, operator: 2, admin: 3 };
 
-function Shell({ company, email, onSignOut }: { company: string; email: string; onSignOut: () => void }) {
+function Shell({ company, me, onSignOut }: { company: string; me: Me; onSignOut: () => void }) {
   const { route, go, data } = useApp();
   const [open, setOpen] = useState(false);
   const [theme, setTheme] = useState<'dark' | 'light'>('dark');
   useEffect(() => { setTheme(document.documentElement.dataset.theme === 'light' || (!document.documentElement.dataset.theme && matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark'); }, []);
   useEffect(() => setOpen(false), [route.join('/')]);
 
-  const page = route[0] || 'overview';
+  const allowed = NAV.filter(n => RANK[me.role] >= RANK[n.min]);
+  const requested = route[0] || 'overview';
+  const page = allowed.some(n => n.id === requested) ? requested : 'overview';   // a page your role cannot use falls back to Overview
   const toggleTheme = () => {
     const next = theme === 'dark' ? 'light' : 'dark';
     setTheme(next); document.documentElement.dataset.theme = next;
     try { localStorage.setItem('smw_theme', next); } catch { /* storage unavailable */ }
   };
 
-  const view = { overview: <Overview />, servers: <Servers />, services: <Services />, incidents: <Incidents />, alerts: <Channels />, schedules: <Schedules />, logs: <Logs />, settings: <Settings email={email} /> }[page] ?? <Overview />;
+  const view = { overview: <Overview />, servers: <Servers />, services: <Services />, incidents: <Incidents />, alerts: <Channels />, schedules: <Schedules />, logs: <Logs />, users: <Users />, settings: <Settings /> }[page] ?? <Overview />;
 
   return (
     <div className="shell">
       <div className="mobile-bar"><button className="btn ghost sm" onClick={() => setOpen(!open)} aria-label="Menu"><Icon name="menu" /></button><b>{company}</b></div>
       <aside className={`side ${open ? 'open' : ''}`}>
         <div className="brand"><span className="logo">★</span><span>{company}</span></div>
-        {NAV.map(item => (
+        {allowed.map(item => (
           <button key={item.id} className={`nav ${page === item.id ? 'active' : ''}`} onClick={() => go(item.id)}>
             <Icon name={item.icon} />{item.label}
             {item.id === 'incidents' && !!data?.summary.open_incidents && <span className="count">{data.summary.open_incidents}</span>}
@@ -78,7 +89,7 @@ function Shell({ company, email, onSignOut }: { company: string; email: string; 
         <div className="side-foot">
           <a href="/status" target="_blank" rel="noreferrer"><Icon name="external" size={13} /> Public status page</a>
           <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-            <span className="grow" style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis' }} title={email}>{email}</span>
+            <span className="grow" style={{ flex: 1, overflow: 'hidden', minWidth: 0 }} title={me.email}><b style={{ display: 'block', color: 'var(--ink)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{me.name || me.email}</b><span className={`role-pill ${me.role}`}>{ROLE_INFO[me.role].label}</span></span>
             <button className="btn ghost sm" onClick={toggleTheme} aria-label="Toggle theme"><Icon name={theme === 'dark' ? 'sun' : 'moon'} size={15} /></button>
             <button className="btn ghost sm" onClick={onSignOut} aria-label="Sign out"><Icon name="logout" size={15} /></button>
           </div>

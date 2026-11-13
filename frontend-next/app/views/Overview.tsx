@@ -9,7 +9,7 @@ import { duration, ms, pct, timeAgo } from '../lib/format';
 import type { Incident } from '../lib/types';
 
 export function Overview() {
-  const { data, go, toast, refresh } = useApp();
+  const { data, go, toast, refresh, canOperate } = useApp();
   const incidents = usePoll(() => api<Incident[]>('/incidents?limit=8'), [], 20000);
   if (!data) return <p className="muted">Loading…</p>;
 
@@ -31,7 +31,7 @@ export function Overview() {
     return (
       <>
         <div className="topbar"><h1>Overview</h1></div>
-        <div className="card"><Empty title="Let’s add your first monitor" action={<div style={{ display: 'flex', gap: 10 }}>
+        <div className="card"><Empty title={canOperate ? 'Let’s add your first monitor' : 'Nothing is monitored yet'} action={!canOperate ? undefined : <div style={{ display: 'flex', gap: 10 }}>
           <button className="btn primary" onClick={() => go('servers/new')}><Icon name="plus" />Add a server</button>
           <button className="btn" onClick={() => go('services/new')}><Icon name="globe" />Add a website / API</button></div>}>
           Install the agent on a server for CPU, memory, disk and network metrics, or point a monitor at any URL.
@@ -44,7 +44,7 @@ export function Overview() {
     <>
       <div className="topbar">
         <h1>Overview</h1><span className="grow" />
-        <button className="btn" onClick={async () => { try { await post('/monitor/run'); toast('Checks queued'); setTimeout(() => void refresh(), 2500); } catch (e) { toast((e as Error).message, true); } }}><Icon name="refresh" size={15} />Run checks now</button>
+        {canOperate && <button className="btn" onClick={async () => { try { await post('/monitor/run'); toast('Checks queued'); setTimeout(() => void refresh(), 2500); } catch (e) { toast((e as Error).message, true); } }}><Icon name="refresh" size={15} />Run checks now</button>}
       </div>
 
       <div className="hero">

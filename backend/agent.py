@@ -36,7 +36,7 @@ from typing import Any
 
 import psutil
 
-AGENT_VERSION = "2.3.0"
+AGENT_VERSION = "2.5.0"
 AGENT_TOKEN = os.getenv("AGENT_TOKEN", "")
 SMWATCH_JOIN = os.getenv("SMWATCH_JOIN", "")
 SMWATCH_URL = os.getenv("SMWATCH_URL", "").rstrip("/")
@@ -144,7 +144,15 @@ def machine_id() -> str:
                     return value
             except OSError:
                 pass
-    return hashlib.sha256(f"{host_name()}|{platform.node()}|{platform.machine()}".encode()).hexdigest()  # macOS/Windows fallback
+    if IS_MAC:   # the same id the installer registers with, so a re-registration never duplicates the machine
+        try:
+            out = subprocess.run(["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"], capture_output=True, text=True, timeout=5).stdout
+            match = re.search(r'"IOPlatformUUID" = "([^"]+)"', out)
+            if match:
+                return match.group(1)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return hashlib.sha256(f"{host_name()}|{platform.node()}|{platform.machine()}".encode()).hexdigest()  # Windows/other fallback
 
 
 def _state_file() -> str | None:
@@ -223,10 +231,28 @@ def forget_token() -> None:
 # Logs. The dashboard can ask for logs, but only from this fixed set of sources. Nothing here runs a shell, accepts
 # a command, or reads a path outside the allow-list; every request field is validated again on this side.
 # ---------------------------------------------------------------------------------------------------------------
+IS_MAC = sys.platform == "darwin"
+# A fixed allow-list of well-known log locations (never an arbitrary path). Binary files (wtmp, btmp, journal files)
+# are not listed, and anything that turns out to be binary is refused when read.
 LOG_FILE_GLOBS = [
-    "/var/log/nginx/*.log", "/var/log/apache2/*.log", "/var/log/httpd/*log", "/var/log/syslog", "/var/log/messages",
-    "/var/log/auth.log", "/var/log/secure", "/var/log/kern.log", "/var/log/dmesg", "/var/log/cron*", "/var/log/mysql/*.log",
-    "/var/log/postgresql/*.log", "/var/log/redis/*.log", "/var/log/mongodb/*.log", "/var/log/fail2ban.log", "/var/log/ufw.log",
+    # generic: anything the system or a package writes as *.log, up to three directories deep
+    "/var/log/*.log", "/var/log/*/*.log", "/var/log/*/*/*.log",
+    # system
+    "/var/log/syslog", "/var/log/syslog.1", "/var/log/messages", "/var/log/messages.1", "/var/log/auth.log", "/var/log/auth.log.1", "/var/log/secure",
+    "/var/log/kern.log", "/var/log/kern.log.1", "/var/log/dmesg", "/var/log/daemon.log", "/var/log/user.log", "/var/log/debug", "/var/log/boot.log",
+    "/var/log/cron", "/var/log/cron.log", "/var/log/maillog", "/var/log/mail.log", "/var/log/mail.err", "/var/log/audit/audit.log", "/var/log/dpkg.log",
+    "/var/log/apt/history.log", "/var/log/apt/term.log", "/var/log/yum.log", "/var/log/dnf*.log", "/var/log/zypper.log", "/var/log/pacman.log",
+    # web servers and proxies (access/error logs, including the most recent rotated copy)
+    "/var/log/nginx/*", "/var/log/apache2/*", "/var/log/httpd/*", "/var/log/caddy/*", "/var/log/traefik/*", "/var/log/haproxy*", "/var/log/varnish/*",
+    "/var/log/lighttpd/*", "/var/log/php*/*", "/var/log/php*-fpm.log", "/var/log/tomcat*/*", "/var/log/jetty*/*",
+    # databases, queues, search
+    "/var/log/mysql/*", "/var/log/mariadb/*", "/var/log/postgresql/*", "/var/log/redis/*", "/var/log/mongodb/*", "/var/log/rabbitmq/*",
+    "/var/log/elasticsearch/*", "/var/log/kibana/*", "/var/log/kafka/*", "/var/log/zookeeper/*", "/var/log/cassandra/*", "/var/log/influxdb/*",
+    # security, certificates, process managers
+    "/var/log/fail2ban.log", "/var/log/ufw.log", "/var/log/letsencrypt/*", "/var/log/supervisor/*", "/var/log/pm2/*", "/var/log/unattended-upgrades/*",
+    "/var/log/sm-watch-agent.log",
+    # macOS
+    "/Library/Logs/*.log", "/Library/Logs/*/*.log", "/var/log/system.log",
 ] + [g.strip() for g in AGENT_LOG_PATHS.split(",") if g.strip().startswith("/")]
 MAX_LOG_BYTES = 400_000
 MAX_LOG_LINES = 2000
@@ -307,17 +333,42 @@ def _demux(stream: bytes) -> str:
 
 
 def _journalctl() -> list[str] | None:
-    if shutil.which("journalctl"):
-        return ["journalctl"]
-    # Docker agent: the host's journalctl, run inside the read-only host mount.
-    if AGENT_HOST_ROOT not in ("", "/") and os.path.exists(os.path.join(AGENT_HOST_ROOT, "usr/bin/journalctl")) and shutil.which("chroot") and os.geteuid() == 0:
+    """The command prefix for reading the system journal, or None when this agent cannot read one."""
+    if IS_MAC:
+        return ["log"] if shutil.which("log") else None            # macOS unified logging
+    exe = shutil.which("journalctl")
+    in_container = AGENT_HOST_ROOT not in ("", "/")
+    if exe and in_container:
+        # The agent runs in a container with the host mounted: read the HOST's journal files, never the container's own.
+        if any(os.path.isdir(os.path.join(AGENT_HOST_ROOT, d)) for d in ("var/log/journal", "run/log/journal")):
+            return [exe, "--root", AGENT_HOST_ROOT]
+        return None
+    if exe:
+        return [exe]
+    # No journalctl in this container: fall back to the host's own binary run inside the read-only host mount.
+    if in_container and os.path.exists(os.path.join(AGENT_HOST_ROOT, "usr/bin/journalctl")) and shutil.which("chroot") and os.geteuid() == 0:
         return ["chroot", AGENT_HOST_ROOT, "/usr/bin/journalctl"]
     return None
 
 
+def _run_limited(command: list[str], max_bytes: int = 30_000_000, timeout: float = 25) -> tuple[str, str]:
+    """Runs a command, keeping at most max_bytes of its output (the macOS log can be enormous). Returns (stdout, stderr)."""
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    timer = threading.Timer(timeout, process.kill)
+    timer.start()
+    try:
+        data = process.stdout.read(max_bytes) if process.stdout else b""
+        process.kill()
+        error = process.stderr.read(4000) if process.stderr else b""
+    finally:
+        timer.cancel()
+        process.wait()
+    return data.decode(errors="replace"), error.decode(errors="replace")
+
+
 def journal_units() -> list[str]:
     base = _journalctl()
-    if not base:
+    if not base or IS_MAC:       # the macOS unified log has no unit list
         return []
     try:
         fields = subprocess.run(base + ["--no-pager", "-F", "_SYSTEMD_UNIT"], capture_output=True, text=True, timeout=15).stdout.split()
@@ -326,12 +377,53 @@ def journal_units() -> list[str]:
         return []
 
 
-def log_inventory() -> dict:
-    inventory = {"files": log_files(), "journal": _journalctl() is not None, "units": [], "docker": docker_available(), "containers": [], "notes": []}
-    if inventory["journal"]:
-        inventory["units"] = journal_units()
-    else:
-        inventory["notes"].append("journald is not readable by the agent on this server")
+_cache: dict[str, tuple[float, object]] = {}
+
+
+def _cached(key: str, ttl: float, compute):
+    """Tiny TTL cache: the dashboard asks for the inventory every time a Logs page opens."""
+    hit = _cache.get(key)
+    if hit and time.monotonic() - hit[0] < ttl:
+        return hit[1]
+    value = compute()
+    _cache[key] = (time.monotonic(), value)
+    return value
+
+
+def log_inventory(units: bool = False) -> dict:
+    """What this agent can read. The (slow) list of journal units is only built when asked for (units=True) and cached."""
+    if units:
+        return {"units": _cached("units", 600, journal_units)}
+    return _cached("inventory", 20, _build_inventory)
+
+
+def _environment_note() -> str | None:
+    """Explains the most common reason a source is empty: the agent is in Docker on a Mac/Windows PC and sees Docker's VM."""
+    try:
+        with open(os.path.join(AGENT_HOST_ROOT, "etc/os-release")) as handle:
+            release = handle.read().lower()
+        host = host_name().lower()
+    except OSError:
+        return None
+    if any(word in release or word in host for word in ("orbstack", "docker desktop", "docker-desktop", "linuxkit", "rancher desktop", "colima", "lima")):
+        return ("This agent runs inside Docker on a Mac or Windows PC, so it sees Docker's small Linux VM and not the computer's own logs. "
+                "To read this machine's system logs, install the agent directly on it (Servers → Add server → Install agent → shell command).")
+    return None
+
+
+def _build_inventory() -> dict:
+    journal = _journalctl() is not None
+    inventory = {"files": log_files(), "journal": journal, "journal_label": "System log" if IS_MAC else "System journal", "platform": "macos" if IS_MAC else "linux",
+                 "units": [], "docker": docker_available(), "containers": [], "notes": []}
+    if not journal:
+        if IS_MAC:
+            inventory["notes"].append("The macOS log tool is not available to this agent")
+        elif AGENT_HOST_ROOT not in ("", "/") and shutil.which("journalctl") is None and not os.path.isdir(os.path.join(AGENT_HOST_ROOT, "var/log/journal")) and not os.path.isdir(os.path.join(AGENT_HOST_ROOT, "run/log/journal")):
+            inventory["notes"].append("This host keeps no systemd journal (it is not a systemd machine, or journald is not running)")
+        else:
+            inventory["notes"].append("journald is not readable by the agent. Install the agent with the shell command (it joins the systemd-journal group), or give this container journalctl and the host's /var/log/journal")
+    if not inventory["files"]:
+        inventory["notes"].append("No standard log files were found on this host (nginx, syslog, auth, cron, databases, ...). Add your own with AGENT_LOG_PATHS=/path/*.log")
     if inventory["docker"]:
         try:
             inventory["containers"] = docker_containers()
@@ -340,11 +432,16 @@ def log_inventory() -> dict:
             inventory["notes"].append(f"Docker: {error}")
     elif os.path.exists(DOCKER_SOCKET):
         inventory["notes"].append("Docker is installed but the agent has no access to it (AGENT_LOGS=nodocker, or not in the docker group)")
+    environment = _environment_note()
+    if environment:
+        inventory["notes"].insert(0, environment)
     return inventory
 
 
 def _tail_file(path: str, max_bytes: int = 4_000_000) -> str:
     with open(path, "rb") as handle:
+        if b"\x00" in handle.read(4096):
+            raise ValueError("This looks like a binary file, not a text log")
         handle.seek(0, os.SEEK_END)
         size = handle.tell()
         handle.seek(max(0, size - max_bytes))
@@ -362,7 +459,7 @@ def fetch_logs(task: dict) -> tuple[str, bool]:
     needle = str(task.get("grep") or "")[:200].lower()
     priority = task.get("priority") or ""
     if source == "inventory":
-        return json.dumps(log_inventory()), False
+        return json.dumps(log_inventory(units=target == "units")), False
     if not TARGET_RE.match(target) or ".." in target:
         raise ValueError("Invalid log target")
     scan = 20000 if needle else lines   # with a filter, look further back and keep the last matches
@@ -377,18 +474,32 @@ def fetch_logs(task: dict) -> tuple[str, bool]:
     elif source == "journal":
         base = _journalctl()
         if not base:
-            raise ValueError("journald is not available to this agent")
-        command = base + ["--no-pager", "-o", "short-iso", "-n", str(scan)]
-        if target != "all":
-            command += ["-u", target]
-        if since:
-            command += ["--since", f"-{since}min"]
-        if priority in PRIORITIES:
-            command += ["-p", priority]
-        result = subprocess.run(command, capture_output=True, text=True, timeout=25, errors="replace")
-        if result.returncode != 0 and not result.stdout:
-            raise RuntimeError((result.stderr or "journalctl failed").strip()[:300])
-        text = result.stdout
+            raise ValueError("The system journal is not available to this agent")
+        if IS_MAC:
+            minutes = since or 60                                   # the unified log is huge: always bound the time window
+            command = base + ["show", "--style", "compact", "--last", f"{min(minutes, 60 * 24)}m"]
+            predicates = []
+            if target != "all":
+                predicates.append(f'process == "{target}"')          # target is validated: letters, digits and . _ : / @ - only
+            if priority in ("emerg", "alert", "crit", "err"):
+                predicates.append("(messageType == error || messageType == fault)")
+            if predicates:
+                command += ["--predicate", " && ".join(predicates)]
+            text, error_text = _run_limited(command)
+            if not text.strip() and error_text.strip():
+                raise RuntimeError(error_text.strip()[:300])
+        else:
+            command = base + ["--no-pager", "-o", "short-iso", "-n", str(scan)]
+            if target != "all":
+                command += ["-u", target]
+            if since:
+                command += ["--since", f"-{since}min"]
+            if priority in PRIORITIES:
+                command += ["-p", priority]
+            result = subprocess.run(command, capture_output=True, text=True, timeout=25, errors="replace")
+            if result.returncode != 0 and not result.stdout:
+                raise RuntimeError((result.stderr or "journalctl failed").strip()[:300])
+            text = result.stdout
     elif source == "file":
         text = _tail_file(_allowed_file(target))   # `since` does not apply: plain files have no reliable timestamps
     else:
@@ -405,30 +516,55 @@ def fetch_logs(task: dict) -> tuple[str, bool]:
     return output, truncated
 
 
-def _api(method: str, path: str, payload: dict | None = None) -> dict:
+def _api(method: str, path: str, payload: dict | None = None, timeout: float = 20) -> dict:
     request = urllib.request.Request(
         f"{SMWATCH_URL}{path}", data=json.dumps(payload).encode() if payload is not None else None, method=method,
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {AGENT_TOKEN}", "User-Agent": f"sm-watch-agent/{AGENT_VERSION}"},
     )
-    with urllib.request.urlopen(request, timeout=20) as response:
+    with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode() or "{}")
 
 
+def _run_task(task: dict) -> None:
+    try:
+        output, truncated = fetch_logs(task)
+        result = {"ok": True, "output": output, "truncated": truncated}
+    except Exception as error:
+        result = {"ok": False, "error": f"{type(error).__name__}: {error}"[:1500]}
+    try:
+        _api("POST", f"/api/agent/tasks/{int(task['id'])}/result", result)
+    except Exception as error:
+        log.debug("could not deliver log result: %s", error)
+
+
 def task_loop() -> None:
-    """Polls the control plane for log requests. Runs in its own thread so metrics reporting is never delayed."""
+    """Long-polls the control plane for log requests: the server holds the request open and answers the moment the
+    dashboard asks for something, so there is no polling delay. Requests run concurrently in a small pool. This loop
+    lives in its own thread so metrics reporting is never delayed."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="logs")
+    failures = 0
     while True:
+        started = time.monotonic()
         try:
-            if len(AGENT_TOKEN) >= 32:
-                for task in _api("GET", "/api/agent/tasks").get("tasks", []):
-                    try:
-                        output, truncated = fetch_logs(task)
-                        result = {"ok": True, "output": output, "truncated": truncated}
-                    except Exception as error:
-                        result = {"ok": False, "error": f"{type(error).__name__}: {error}"[:1500]}
-                    _api("POST", f"/api/agent/tasks/{int(task['id'])}/result", result)
+            if len(AGENT_TOKEN) < 32:
+                time.sleep(AGENT_TASK_POLL)
+                continue
+            tasks = _api("GET", "/api/agent/tasks?wait=20", timeout=35).get("tasks", [])
+            failures = 0
+            for task in tasks:
+                pool.submit(_run_task, task)
+            if not tasks and time.monotonic() - started < 2:
+                time.sleep(AGENT_TASK_POLL)   # an older control plane without long-polling answers instantly: don't spin
+        except urllib.error.HTTPError as error:
+            failures += 1
+            log.debug("task poll rejected: HTTP %s", error.code)
+            time.sleep(min(15, 2 * failures))
         except Exception as error:
+            failures += 1
             log.debug("task poll failed: %s", error)
-        time.sleep(AGENT_TASK_POLL)
+            time.sleep(min(15, 2 * failures))
 
 
 def push_once() -> int:

@@ -15,9 +15,9 @@ import { IncidentList } from './Overview';
 const MODE_LABEL: Record<Mode, string> = { push: 'Agent · push', agent: 'Agent · pull', ping: 'Ping only' };
 
 export function Servers() {
-  const { data, route, go } = useApp();
+  const { data, route, go, canOperate } = useApp();
   if (!data) return <p className="muted">Loading…</p>;
-  if (route[1] === 'new') return <><ServerList /><ServerWizard onClose={() => go('servers')} /></>;
+  if (route[1] === 'new' && canOperate) return <><ServerList /><ServerWizard onClose={() => go('servers')} /></>;
   if (route[1]) {
     const server = data.servers.find(s => s.id === Number(route[1]));
     return server ? <ServerDetail server={server} /> : <Empty title="Server not found" action={<button className="btn" onClick={() => go('servers')}>Back to servers</button>} />;
@@ -26,12 +26,12 @@ export function Servers() {
 }
 
 function ServerList() {
-  const { data, go } = useApp();
+  const { data, go, canOperate } = useApp();
   const servers = data!.servers;
   return (
     <>
-      <div className="topbar"><h1>Servers</h1><span className="grow" /><button className="btn primary" onClick={() => go('servers/new')}><Icon name="plus" size={15} />Add server</button></div>
-      {servers.length === 0 ? <div className="card"><Empty title="No servers yet" action={<button className="btn primary" onClick={() => go('servers/new')}>Install your first agent</button>}>Add a server to see live CPU, memory, disk and network metrics.</Empty></div> : (
+      <div className="topbar"><h1>Servers</h1><span className="grow" />{canOperate && <button className="btn primary" onClick={() => go('servers/new')}><Icon name="plus" size={15} />Add server</button>}</div>
+      {servers.length === 0 ? <div className="card"><Empty title="No servers yet" action={canOperate ? <button className="btn primary" onClick={() => go('servers/new')}>Install your first agent</button> : undefined}>Add a server to see live CPU, memory, disk and network metrics.</Empty></div> : (
         <div className="tilegrid">
           {servers.map(s => {
             const m = s.last_metrics;
@@ -54,12 +54,12 @@ function ServerList() {
 }
 
 function ServerDetail({ server }: { server: Server }) {
-  const { go, toast, refresh } = useApp();
+  const { go, toast, refresh, canOperate } = useApp();
   const [range, setRange] = useState<Range>('24h');
   const [editing, setEditing] = useState(false);
   const [rotated, setRotated] = useState<string | null>(null);
   const [tab, setTab] = useState<'overview' | 'logs'>('overview');
-  const canLogs = server.monitor_mode === 'push' && !!server.last_metrics?.capabilities?.includes('logs');
+  const canLogs = canOperate && server.monitor_mode === 'push' && !!server.last_metrics?.capabilities?.includes('logs');
   const history = usePoll(() => api<ServerHistory>(`/servers/${server.id}/history?range=${range}`), [server.id, range], 20000);
   const incidents = usePoll(() => api<Incident[]>('/incidents?limit=200'), [server.id], 30000);
   const m = server.last_metrics;
@@ -83,9 +83,9 @@ function ServerDetail({ server }: { server: Server }) {
         <button className="btn ghost sm" onClick={() => go('servers')}><Icon name="back" size={15} />Servers</button>
         <h1>{server.name}</h1><StatusPill status={server.last_status} /><span className="tag">{MODE_LABEL[server.monitor_mode]}</span>
         <span className="grow" />
-        {server.monitor_mode !== 'ping' && <button className="btn sm" onClick={rotate}>Rotate token</button>}
-        <button className="btn sm" onClick={() => setEditing(true)}>Edit</button>
-        <button className="btn sm danger" onClick={remove}>Remove</button>
+        {canOperate && server.monitor_mode !== 'ping' && <button className="btn sm" onClick={rotate}>Rotate token</button>}
+        {canOperate && <button className="btn sm" onClick={() => setEditing(true)}>Edit</button>}
+        {canOperate && <button className="btn sm danger" onClick={remove}>Remove</button>}
       </div>
 
       {canLogs && <div className="seg" style={{ marginBottom: 16 }}><button className={tab === 'overview' ? 'on' : ''} onClick={() => setTab('overview')}>Overview</button><button className={tab === 'logs' ? 'on' : ''} onClick={() => setTab('logs')}>Logs</button></div>}
