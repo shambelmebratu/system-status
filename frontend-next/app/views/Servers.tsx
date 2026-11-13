@@ -5,11 +5,12 @@ import { AvailabilityPanel } from '../components/availability';
 import { AreaChart, Ring } from '../components/charts';
 import { JoinCommands, expiryText, useActiveEnrollment, useControlPlaneUrl } from '../components/join';
 import { LogsPanel } from '../components/logs';
+import { AgentUpdate } from '../components/agentupdate';
 import { LogPolicyCard } from '../components/logpolicy';
 import { CodeBox, Empty, Field, Icon, Meter, Modal, StatusPill } from '../components/ui';
 import { api, del, post, put } from '../lib/api';
 import { useApp, useLimits, usePoll } from '../lib/app';
-import { bytesPerSecond, duration, ms, pct, timeAgo } from '../lib/format';
+import { bytesPerSecond, duration, isOlder, ms, pct, timeAgo } from '../lib/format';
 import type { Incident, Mode, Range, Server, ServerHistory } from '../lib/types';
 import { IncidentList } from './Overview';
 
@@ -45,7 +46,7 @@ function ServerList() {
                     {(['cpu', 'memory', 'disk'] as const).map(k => <div key={k} className="mini">{k === 'cpu' ? 'CPU' : k === 'memory' ? 'Memory' : 'Disk'}<b>{pct(m[k], 0)}</b><Meter value={m[k]!} warnAt={s[`${k}_threshold` as const] * (lim.warn / lim.bad)} badAt={s[`${k}_threshold` as const]} /></div>)}
                   </div>
                 ) : <div className="muted sm" style={{ minHeight: 48 }}>{s.last_status === 'down' ? s.last_error : s.monitor_mode === 'ping' ? `Latency ${ms(m?.latency_ms)}` : 'No metrics received yet.'}</div>}
-                <div className="foot"><span className="tag">{MODE_LABEL[s.monitor_mode]}</span><span>{s.monitor_mode === 'push' ? `seen ${timeAgo(s.last_seen_at)}` : `checked ${timeAgo(s.last_checked_at)}`}</span></div>
+                <div className="foot"><span className="tag">{MODE_LABEL[s.monitor_mode]}</span>{s.monitor_mode === 'push' && isOlder(m?.agent_version, data?.agents?.latest) && <span className="tag warn-tag">update</span>}<span>{s.monitor_mode === 'push' ? `seen ${timeAgo(s.last_seen_at)}` : `checked ${timeAgo(s.last_checked_at)}`}</span></div>
               </div>
             );
           })}
@@ -56,7 +57,7 @@ function ServerList() {
 }
 
 function ServerDetail({ server }: { server: Server }) {
-  const { go, toast, refresh, canOperate, confirm } = useApp();
+  const { data, go, toast, refresh, canOperate, confirm } = useApp();
   const [range, setRange] = useState<Range>('24h');
   const [editing, setEditing] = useState(false);
   const [rotated, setRotated] = useState<string | null>(null);
@@ -69,6 +70,8 @@ function ServerDetail({ server }: { server: Server }) {
   const showDate = range === '7d' || range === '30d';
   const mine = (incidents.value || []).filter(i => i.target_type === 'server' && i.target_id === server.id).slice(0, 6);
   const never = server.monitor_mode === 'push' && !server.last_seen_at;
+  const latestAgent = data?.agents?.latest;
+  const outdated = server.monitor_mode === 'push' && isOlder(m?.agent_version, latestAgent);
 
   async function remove() {
     if (!(await confirm(`Remove ${server.name}?\n\nIts history is deleted too. This cannot be undone.`))) return;
@@ -98,6 +101,7 @@ function ServerDetail({ server }: { server: Server }) {
       {canLogs && <div className="seg" style={{ marginBottom: 16 }}><button className={tab === 'overview' ? 'on' : ''} onClick={() => setTab('overview')}>Overview</button><button className={tab === 'logs' ? 'on' : ''} onClick={() => setTab('logs')}>Logs</button></div>}
       {server.last_status === 'down' && server.last_error && <div className="err" style={{ marginBottom: 16 }}>{server.last_error}</div>}
       {tab === 'logs' && canLogs && <LogsPanel serverId={server.id} />}
+      {outdated && <div style={{ marginBottom: 16 }}><AgentUpdate server={server} latest={latestAgent!} /></div>}
       {never && (
         <div className="card" style={{ marginBottom: 16 }}><div className="card-head"><h2>Waiting for the agent</h2></div>
           <p className="muted">No report has been received yet. Install the agent with the token shown when this server was created (use <b>Rotate token</b> to get a new one).</p></div>
@@ -163,11 +167,12 @@ function ServerDetail({ server }: { server: Server }) {
                 <tr><td className="muted">CPU cores</td><td>{m?.cpu_count ?? '–'}</td></tr>
                 <tr><td className="muted">Uptime</td><td>{m?.uptime_seconds != null ? duration(m.uptime_seconds) : '–'}</td></tr>
                 <tr><td className="muted">Network</td><td>↓ {bytesPerSecond(m?.net_rx_bps)} · ↑ {bytesPerSecond(m?.net_tx_bps)}</td></tr>
-                <tr><td className="muted">Agent</td><td>{m?.agent_version ? `v${m.agent_version}` : '–'}</td></tr>
+                <tr><td className="muted">Agent</td><td>{m?.agent_version ? `v${m.agent_version}` : '–'}{outdated && <> <span className="tag warn-tag">update available</span></>}</td></tr>
               </>}
               {server.monitor_mode !== 'ping' && <>
                 <tr><td className="muted">Agent token</td><td>{server.token_issued_at ? `issued ${timeAgo(server.token_issued_at)}` : 'age unknown'}{server.token_rotation_pending && <> · <span className="warn">rotation pending</span></>}</td></tr>
-                {server.last_agent_ip && <tr><td className="muted">Last seen from</td><td className="mono">{server.last_agent_ip}</td></tr>}
+                <tr><td className="muted">Public IP</td><td className="mono">{server.public_ip || <span className="muted">not reported</span>}</td></tr>
+                <tr><td className="muted">Private IP</td><td className="mono">{server.private_ips?.length ? server.private_ips.join(', ') : <span className="muted">not reported</span>}</td></tr>
               </>}
               <tr><td className="muted">Status page</td><td>{server.public ? 'Public' : 'Private'}</td></tr>
               <tr><td className="muted">Interval</td><td>{server.check_interval_seconds}s</td></tr>

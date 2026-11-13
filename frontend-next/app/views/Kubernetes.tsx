@@ -2,6 +2,7 @@
 
 import { FormEvent, ReactNode, useCallback, useEffect, useRef, useState } from 'react';
 import { AreaChart } from '../components/charts';
+import { ClusterAgentUpdate } from '../components/agentupdate';
 import { useActiveEnrollment, useControlPlaneUrl } from '../components/join';
 import { Highlight, LEVEL_LABEL, parse } from '../components/logs';
 import { CodeBox, Empty, Field, Icon, Meter, Modal, StatusPill } from '../components/ui';
@@ -163,6 +164,7 @@ function ClusterDetail({ cluster, reload }: { cluster: Cluster; reload: () => Pr
         {canOperate && <button className="btn sm danger" onClick={remove}>Remove</button>}
       </div>
       <div className="tabs" role="tablist">{tabs.map(([id, label]) => <button key={id} role="tab" aria-selected={tab === id} className={tab === id ? 'on' : ''} onClick={() => setTab(id)}>{label}</button>)}</div>
+      {cluster.agent_outdated && cluster.latest_agent_version && <div style={{ marginBottom: 16 }}><ClusterAgentUpdate current={cluster.agent_version} latest={cluster.latest_agent_version} /></div>}
       {cluster.status !== 'up' && cluster.last_error && <div className="err" style={{ marginBottom: 16 }}>{cluster.last_error}</div>}
       {offline && tab !== 'overview' && tab !== 'settings' ? <div className="card"><Empty title="The cluster agent is offline">It has not reported for over 2 minutes, so live data cannot be fetched. Check the <code>smwatch-agent</code> pod in the <code>smwatch</code> namespace.</Empty></div> : (
         <>
@@ -271,11 +273,11 @@ function Overview({ cluster }: { cluster: Cluster }) {
 
   return (
     <div className="grid">
-      <section className={`hero ${cluster.status}`}>
-        <span className="hero-ico"><Icon name={cluster.status === 'up' ? 'check' : 'alert'} size={22} /></span>
+      <section className={`khero ${cluster.status}`}>
+        <span className="khero-ico"><Icon name={cluster.status === 'up' ? 'check' : 'alert'} size={22} /></span>
         <div style={{ minWidth: 0 }}>
-          <div className="hero-title">{cluster.status === 'up' ? 'All systems healthy' : issues ? `${issues} issue${issues === 1 ? '' : 's'} need attention` : cluster.status === 'down' ? 'Agent is not reporting' : 'Degraded'}</div>
-          <div className="hero-sub">{s.nodes_ready}/{s.nodes_total} nodes ready · {s.pods_running}/{s.pods_total} pods running · {workloads} workloads · {s.namespaces} namespaces · Kubernetes {cluster.k8s_version}</div>
+          <div className="khero-title">{cluster.status === 'up' ? 'All systems healthy' : issues ? `${issues} issue${issues === 1 ? '' : 's'} need attention` : cluster.status === 'down' ? 'Agent is not reporting' : 'Degraded'}</div>
+          <div className="khero-sub">{s.nodes_ready}/{s.nodes_total} nodes ready · {s.pods_running}/{s.pods_total} pods running · {workloads} workloads · {s.namespaces} namespaces · Kubernetes {cluster.k8s_version}</div>
         </div>
       </section>
       {s.problems.length > 0 && <section className="card" style={{ borderColor: 'color-mix(in srgb, var(--warn) 45%, var(--line))' }}><div className="card-head"><h2>Needs attention</h2></div><ul className="problems">{s.problems.map((p, i) => <li key={i}>{p}</li>)}</ul></section>}

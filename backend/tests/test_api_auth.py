@@ -781,12 +781,12 @@ def test_agent_ip_change_is_recorded(client, monkeypatch):
     sign_in(client)
     anon = TestClient(main.app)
     sid, auth = _push_server(client, anon)
-    for ip in ("203.0.113.10", "203.0.113.10", "198.51.100.77"):                                  # same address twice, then a different one
+    for ip in ("203.0.113.10", "203.0.113.10", "93.184.216.347"):                                  # same address twice, then a different one
         monkeypatch.setattr(routes_agent, "client_ip", lambda request, ip=ip: ip)
         assert anon.post("/api/agent/report", json=report(), headers=auth).status_code == 200
     changes = [e for e in audit_rows(client, category="agent") if e["action"] == "agent.ip_changed"]
-    assert len(changes) >= 1 and "203.0.113.10 -> 198.51.100.77" in changes[0]["detail"]
-    assert next(s for s in client.get("/api/dashboard").json()["servers"] if s["id"] == sid)["last_agent_ip"] == "198.51.100.77"
+    assert len(changes) >= 1 and "203.0.113.10 -> 93.184.216.347" in changes[0]["detail"]
+    assert next(s for s in client.get("/api/dashboard").json()["servers"] if s["id"] == sid)["last_agent_ip"] == "93.184.216.347"
 
 
 def test_token_guessing_is_throttled_on_every_agent_endpoint(client):
@@ -1332,3 +1332,26 @@ def test_operational_limits_come_from_settings(client, monkeypatch):
     assert dash["enrollment_max_minutes"] == 30 and "usage_warn_percent" in dash and dash["k8s_offline_seconds"] == s.k8s_offline_seconds
     server = client.post("/api/servers", headers=CSRF, json={"name": "hot", "host": "10.9.9.9", "monitor_mode": "ping", "process_threshold": 250}).status_code
     assert server == 200                                                                          # process CPU is per-core, so > 100 is valid
+
+
+def test_server_shows_public_and_private_addresses_and_update_state(client, monkeypatch):
+    from app import agent_versions as av
+    sign_in(client)
+    anon = TestClient(main.app)
+    sid, auth = _push_server(client, anon)
+    monkeypatch.setattr(main, "client_ip", lambda request: "93.184.216.34")                    # what the control plane sees: a public address
+    import app.routes_agent as ra
+    monkeypatch.setattr(ra, "client_ip", lambda request: "93.184.216.34")
+    body = report(ips=[{"iface": "eth0", "ip": "10.0.0.5"}, {"iface": "tailscale0", "ip": "100.64.1.2"}], public_ip="", install="systemd", agent_version="2.0.0")
+    assert anon.post("/api/agent/report", json=body, headers=auth).status_code == 200
+    srv = next(s for s in client.get("/api/dashboard").json()["servers"] if s["id"] == sid)
+    assert srv["public_ip"] == "93.184.216.34" and srv["private_ips"] == ["10.0.0.5", "100.64.1.2"]
+    assert anon.post("/api/agent/report", json=report(ips=[{"iface": "x", "ip": "not-an-ip"}]), headers=auth).status_code == 422
+    from app import monitoring
+    assert monitoring.server_where(type("S", (), {"name": "n", "host": "", "last_agent_ip": "93.184.216.34", "last_metrics": json.dumps({"hostname": "h1", "ips": [{"ip": "10.0.0.5"}]})})()) == "h1 · 93.184.216.34"
+    dash = client.get("/api/dashboard").json()
+    latest = dash["agents"]["latest"]
+    assert latest and av.is_outdated("2.0.0", latest) and not av.is_outdated(latest, latest) and not av.is_outdated("99.0.0", latest) and not av.is_outdated("", latest)
+    assert av.version_tuple("2.10.0") > av.version_tuple("2.9.9")                             # numeric, not alphabetical
+    text = open(os.path.join(os.path.dirname(main.__file__), "..", "agent_install.sh")).read()
+    assert "update)" in text and "install.sh | sudo bash -s -- update" in text

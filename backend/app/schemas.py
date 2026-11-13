@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import field_validator, BaseModel, ConfigDict, Field, model_validator
 
 from .config import get_settings
 
@@ -81,6 +81,17 @@ class ProcessSample(BaseModel):
     memory: float = Field(default=0, ge=0, le=100)
 
 
+class IpEntry(BaseModel):
+    iface: str = Field(default="", max_length=30)
+    ip: str = Field(max_length=45)
+
+    @field_validator("ip")
+    @classmethod
+    def valid_ip(cls, v: str) -> str:
+        import ipaddress
+        return str(ipaddress.ip_address(v))
+
+
 class AgentReport(BaseModel):
     cpu: float = Field(ge=0, le=100)
     memory: float = Field(ge=0, le=100)
@@ -96,6 +107,9 @@ class AgentReport(BaseModel):
     agent_version: str = Field(default="", max_length=32)
     processes: list[ProcessSample] = Field(default_factory=list, max_length=100)
     capabilities: list[str] = Field(default_factory=list, max_length=20)
+    ips: list[IpEntry] = Field(default_factory=list, max_length=10)
+    public_ip: str = Field(default="", max_length=45)
+    install: str = Field(default="", max_length=20)
 
 
 class TokenBody(BaseModel):

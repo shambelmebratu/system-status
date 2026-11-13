@@ -14,7 +14,8 @@ from sqlalchemy.orm import Session
 from .config import get_settings
 from .database import Base, engine, get_db
 from .models import AlertEvent, Channel, CheckResult, Incident, Server, Service, User
-from .monitoring import check_service, discover_telegram_chats, run_once, send_channel_test
+from .agent_versions import latest_k8s_agent, latest_server_agent
+from .monitoring import server_addresses, check_service, discover_telegram_chats, run_once, send_channel_test
 from .routes_agent import hash_token, router as agent_router
 from .routes_audit import router as audit_router
 from .routes_enroll import router as enroll_router
@@ -112,6 +113,8 @@ def serialize(item):
     for key in ("created_at", "last_checked_at", "last_seen_at"):
         if result.get(key): result[key] = result[key].isoformat()
     result.pop("token_hash", None)
+    if "last_agent_ip" in result and "monitor_mode" in result:   # servers: public and private addresses, resolved on the server
+        result.update(server_addresses(item))
     if "pending_token_hash" in result:   # never expose a staged token; just whether a rotation is waiting for the agent
         result["token_rotation_pending"] = bool(result.pop("pending_token_hash"))
         result.pop("pending_token", None)
@@ -275,6 +278,7 @@ def dashboard(_: dict = Depends(require_user), db: Session = Depends(get_db)) ->
             "process": settings.process_threshold,
             "server_interval_seconds": settings.check_interval_seconds,
         },
+        "agents": {"latest": latest_server_agent(), "latest_k8s": latest_k8s_agent()},
         "limits": {
             "usage_warn_percent": settings.usage_warn_percent, "usage_bad_percent": settings.usage_bad_percent, "k8s_offline_seconds": settings.k8s_offline_seconds,
             "enrollment_default_minutes": settings.enrollment_default_minutes, "enrollment_max_minutes": settings.enrollment_max_minutes, "log_result_ttl_minutes": settings.log_result_ttl_minutes,

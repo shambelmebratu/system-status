@@ -73,10 +73,10 @@ export function Overview() {
           <section className="card">
             <div className="card-head"><h2>Services</h2><span className="grow" /><button className="btn sm ghost" onClick={() => go('services')}>View all</button></div>
             {services.length === 0 ? <Empty title="No services"><button className="btn primary" onClick={() => go('services/new')}>Add service</button></Empty> : (
-              <table className="tbl"><thead><tr><th>Service</th><th>Status</th><th className="num">Response</th><th className="num">24h</th></tr></thead>
+              <table className="tbl"><thead><tr><th>Service</th><th>Status</th><th className="num hide-sm">Response</th><th className="num">24h</th></tr></thead>
                 <tbody>{services.map(s => <tr key={s.id} className="link" onClick={() => go(`services/${s.id}`)}>
                   <td><div className="name">{s.name}<small>{s.url}</small></div></td><td><StatusPill status={s.last_status} /></td>
-                  <td className="num">{ms(s.last_latency_ms)}</td><td className="num">{pct(s.uptime_24h, 2)}</td></tr>)}</tbody></table>
+                  <td className="num hide-sm">{ms(s.last_latency_ms)}</td><td className="num">{pct(s.uptime_24h, 2)}</td></tr>)}</tbody></table>
             )}
           </section>
         </div>

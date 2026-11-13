@@ -5,7 +5,7 @@ export type ProcessSample = { pid: number; name: string; user?: string; cpu: num
 export type Metrics = {
   hostname?: string; platform?: string; agent_version?: string; cpu?: number; cpu_count?: number; memory?: number; disk?: number;
   load?: number; swap?: number; uptime_seconds?: number; net_rx_bps?: number | null; net_tx_bps?: number | null;
-  latency_ms?: number; reachability?: string; processes?: ProcessSample[]; capabilities?: string[];
+  latency_ms?: number; reachability?: string; processes?: ProcessSample[]; capabilities?: string[]; install?: 'systemd' | 'macos' | 'docker' | 'bundled' | '';
 };
 
 export type Server = {
@@ -14,7 +14,7 @@ export type Server = {
   load_threshold: number; swap_threshold: number; process_names: string; process_threshold: number;
   last_status: Status; last_checked_at: string | null; last_seen_at: string | null; last_error: string | null;
   last_metrics: Metrics | null; uptime_24h: number | null; public: boolean; install_token?: string;
-  token_issued_at?: string | null; token_rotation_pending?: boolean; last_agent_ip?: string | null;
+  token_issued_at?: string | null; token_rotation_pending?: boolean; last_agent_ip?: string | null; public_ip?: string | null; private_ips?: string[];
 };
 export type Service = {
   id: number; name: string; url: string; expected_status: number; interval_seconds: number; enabled: boolean; public: boolean;
@@ -31,6 +31,7 @@ export type Incident = {
 export type Dashboard = {
   servers: Server[]; services: Service[]; events: AlertEvent[];
   threshold_defaults: { cpu: number; memory: number; disk: number; load: number; swap: number; process: number; server_interval_seconds: number };
+  agents?: { latest: string; latest_k8s: string };
   limits?: { usage_warn_percent: number; usage_bad_percent: number; k8s_offline_seconds: number; enrollment_default_minutes: number; enrollment_max_minutes: number; log_result_ttl_minutes: number };
   summary: { servers: number; services: number; up: number; alerts: number; open_incidents: number };
 };
@@ -76,6 +77,7 @@ export type ClusterSummary = {
 export type K8sLogPolicy = { enabled: boolean; include: string[]; exclude: string[] };
 export type Cluster = {
   id: number; name: string; enabled: boolean; status: Status; last_error: string | null; last_seen_at: string | null; k8s_version: string | null; agent_version: string | null;
+  agent_outdated?: boolean; latest_agent_version?: string;
   summary: ClusterSummary | null; token_issued_at: string | null; token_rotation_pending: boolean; last_agent_ip: string | null; created_by: string | null; created_at: string;
   log_policy: K8sLogPolicy; restricted: boolean;
 };

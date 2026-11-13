@@ -167,22 +167,47 @@ def format_alert(kind: str, state: str, name: str, lines: list[str] | str | None
     return "\n".join(out)
 
 
-def server_where(server) -> str | None:
-    """Where a server is: its host name and address, so an alert is understandable without opening the dashboard."""
+def server_addresses(server) -> dict:
+    """{"public_ip": str|None, "private_ips": [str]}. The public address is the one the control plane sees the agent connect from
+    (when it is publicly routable), or the one an admin configured on the agent; private ones are the agent's own LAN addresses."""
     import ipaddress
     try:
         metrics = json.loads(server.last_metrics) if server.last_metrics else {}
     except ValueError:
         metrics = {}
-    parts = [str(metrics.get("hostname") or "").strip()]
-    address = (server.host or "").strip() or (server.last_agent_ip or "").strip()
-    try:   # the address an agent connects from is useless when it is a container network (docker bridge) or loopback
-        ip = ipaddress.ip_address(address)
-        if ip.is_loopback or ip in ipaddress.ip_network("172.16.0.0/12"):
-            address = ""
+
+    def is_global(value) -> bool:
+        try:
+            return ipaddress.ip_address(value).is_global
+        except ValueError:
+            return False
+
+    private = []
+    for entry in metrics.get("ips") or []:
+        ip = entry.get("ip") if isinstance(entry, dict) else None
+        if ip and ip not in private:
+            private.append(ip)
+    candidates = [metrics.get("public_ip"), server.last_agent_ip, (server.host or "").strip()]
+    public = next((c for c in candidates if c and is_global(c)), None)
+    seen = (server.last_agent_ip or "").strip()
+    if not private and seen and not is_global(seen):   # an older agent that reports no addresses: the LAN address it connects from
+        try:
+            ip = ipaddress.ip_address(seen)
+            if ip.is_private and not ip.is_loopback and ip not in ipaddress.ip_network("172.16.0.0/12"):
+                private.append(seen)
+        except ValueError:
+            pass
+    return {"public_ip": public, "private_ips": [p for p in private if p != public]}
+
+
+def server_where(server) -> str | None:
+    """Where a server is, for alerts: its host name and its public address (its private one only when it has no public one)."""
+    try:
+        metrics = json.loads(server.last_metrics) if server.last_metrics else {}
     except ValueError:
-        pass
-    parts.append(address)
+        metrics = {}
+    addr = server_addresses(server)
+    parts = [str(metrics.get("hostname") or "").strip(), addr["public_ip"] or (addr["private_ips"][0] if addr["private_ips"] else "")]
     unique = []
     for part in parts:
         if part and part not in unique and part.lower() != str(server.name).lower():

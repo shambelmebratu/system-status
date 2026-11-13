@@ -28,12 +28,12 @@ function ServiceList() {
       <div className="topbar"><h1>Services</h1><span className="grow" />{canOperate && <button className="btn primary" onClick={() => go('services/new')}><Icon name="plus" size={15} />Add service</button>}</div>
       <div className="card">
         {services.length === 0 ? <Empty title="No services yet" action={canOperate ? <button className="btn primary" onClick={() => go('services/new')}>Add a website or API</button> : undefined}>Monitor any HTTP(S) endpoint for availability and response time.</Empty> : (
-          <table className="tbl"><thead><tr><th>Service</th><th>Status</th><th className="num hide-sm">HTTP</th><th className="num">Response</th><th className="num">Uptime 24h</th><th className="hide-sm">Checked</th></tr></thead>
+          <table className="tbl"><thead><tr><th>Service</th><th>Status</th><th className="num hide-sm">HTTP</th><th className="num hide-sm">Response</th><th className="num">Uptime 24h</th><th className="hide-sm">Checked</th></tr></thead>
             <tbody>{services.map(s => (
               <tr key={s.id} className="link" onClick={() => go(`services/${s.id}`)}>
                 <td><div className="name">{s.name}{s.public && <> <span className="tag">public</span></>}<small>{s.url}</small></div></td>
                 <td><StatusPill status={s.last_status} /></td><td className="num hide-sm">{s.last_http_status ?? '–'}</td>
-                <td className="num">{ms(s.last_latency_ms)}</td><td className={`num ${uptimeClass(s.uptime_24h)}`}>{pct(s.uptime_24h, 2)}</td><td className="hide-sm muted">{timeAgo(s.last_checked_at)}</td>
+                <td className="num hide-sm">{ms(s.last_latency_ms)}</td><td className={`num ${uptimeClass(s.uptime_24h)}`}>{pct(s.uptime_24h, 2)}</td><td className="hide-sm muted">{timeAgo(s.last_checked_at)}</td>
               </tr>))}</tbody></table>
         )}
       </div>

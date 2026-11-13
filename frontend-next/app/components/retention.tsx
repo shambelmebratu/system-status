@@ -77,11 +77,11 @@ export function RetentionCard() {
         <tbody>{ORDER.map(k => (
           <tr key={k}>
             <td><input type="checkbox" checked={!!picked[k]} onChange={e => setPicked({ ...picked, [k]: e.target.checked })} aria-label={`Select ${stats[k].label} for purge`} /></td>
-            <td><div className="name">{stats[k].label}<small>{HINT[k]}</small></div></td>
+            <td><div className="name">{stats[k].label}<small className="hide-sm">{HINT[k]}</small></div></td>
             <td className="num">{stats[k].rows.toLocaleString()}</td>
             <td className="hide-sm sm muted">{stats[k].oldest ? timeAgo(stats[k].oldest) : '–'}</td>
             <td className="num hide-sm sm muted">{size(stats[k].bytes)}</td>
-            <td>{k === 'transient' ? <span className="muted sm">{lim.logTtl} minutes</span> : <span style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}><input type="number" style={{ width: 80 }} min={k === 'audit' ? value.audit_min_days : 1} max={3650} value={days[k] ?? ''} onChange={e => setDays({ ...days, [k]: e.target.value })} aria-label={`Days to keep ${stats[k].label}`} /> days</span>}</td>
+            <td>{k === 'transient' ? <span className="muted sm">{lim.logTtl} minutes</span> : <span style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}><input type="number" style={{ width: 76 }} min={k === 'audit' ? value.audit_min_days : 1} max={3650} value={days[k] ?? ''} onChange={e => setDays({ ...days, [k]: e.target.value })} aria-label={`Days to keep ${stats[k].label}`} /> days</span>}</td>
           </tr>))}
         </tbody></table></div>
 

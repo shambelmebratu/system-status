@@ -11,6 +11,7 @@
 #   ... | sudo SMWATCH_LOGS=off bash         the dashboard cannot read any logs from this server
 #
 # Other commands:
+#   curl -fsSL https://CONTROL_PLANE/api/agent/install.sh | sudo bash -s -- update      update this agent in place (no link or token needed)
 #   curl -fsSL https://CONTROL_PLANE/api/agent/install.sh | sudo bash -s -- status      service state + connection test
 #   curl -fsSL https://CONTROL_PLANE/api/agent/install.sh | sudo bash -s -- uninstall   remove the agent completely
 #
@@ -75,13 +76,23 @@ case "${1:-install}" in
     [ -x "$INSTALL_DIR/venv/bin/python" ] && (set -a; . "$ENV_FILE"; set +a; "$INSTALL_DIR/venv/bin/python" "$INSTALL_DIR/agent.py" --check) || true
     exit 0 ;;
   install) ;;
-  *) die "unknown command '$1' (use: install | status | uninstall)" ;;
+  update)
+    # Update this agent in place. It keeps its identity and settings: no install link or token is needed.
+    if [ -z "${SMWATCH_URL:-}" ]; then
+      SMWATCH_URL=$(sed -n 's/.*"url": *"\([^"]*\)".*/\1/p' "$STATE_FILE" 2>/dev/null | head -1)
+      [ -n "$SMWATCH_URL" ] || SMWATCH_URL=$(sed -n 's/^SMWATCH_URL=//p' "$ENV_FILE" 2>/dev/null | head -1)
+    fi
+    [ -n "$SMWATCH_URL" ] || die "no agent is installed here (nothing to update). Use the install command from the dashboard."
+    export SMWATCH_URL ;;
+  *) die "unknown command '$1' (use: install | update | status | uninstall)" ;;
 esac
 
 : "${SMWATCH_URL:?set SMWATCH_URL, e.g. https://monitor.example.com}"
 SMWATCH_URL="${SMWATCH_URL%/}"
 SMWATCH_JOIN="${SMWATCH_JOIN:-}"
 SMWATCH_TOKEN="${SMWATCH_TOKEN:-}"
+# an update keeps the log-access mode this agent was installed with unless a new one is given
+SMWATCH_LOGS="${SMWATCH_LOGS:-$(sed -n 's/^AGENT_LOGS=//p' "$ENV_FILE" 2>/dev/null | head -1)}"
 SMWATCH_LOGS="${SMWATCH_LOGS:-on}"
 case "$SMWATCH_LOGS" in on|nodocker|off) ;; *) die "SMWATCH_LOGS must be on, nodocker or off" ;; esac
 if [ -n "$SMWATCH_TOKEN" ] && [ "${#SMWATCH_TOKEN}" -lt 32 ]; then die "SMWATCH_TOKEN looks too short; copy the whole command from the dashboard"; fi

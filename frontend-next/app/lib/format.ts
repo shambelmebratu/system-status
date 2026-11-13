@@ -30,3 +30,12 @@ export const clock = (iso: string, withDate = false) => {
   return withDate ? d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 };
 export const uptimeClass = (value: number | null | undefined) => (value == null ? 'none' : value >= 99.9 ? 'good' : value >= 99 ? 'warn' : 'bad');
+
+/** True when `current` is an older release than `latest` (numeric compare: 2.10.0 > 2.9.9). */
+export function isOlder(current: string | null | undefined, latest: string | null | undefined): boolean {
+  const parse = (v?: string | null) => (v ?? '').match(/\d+/g)?.slice(0, 4).map(Number) ?? [];
+  const a = parse(current), b = parse(latest);
+  if (!a.length || !b.length) return false;
+  for (let i = 0; i < Math.max(a.length, b.length); i++) { if ((a[i] ?? 0) !== (b[i] ?? 0)) return (a[i] ?? 0) < (b[i] ?? 0); }
+  return false;
+}

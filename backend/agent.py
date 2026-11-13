@@ -38,7 +38,7 @@ from typing import Any
 
 import psutil
 
-AGENT_VERSION = "2.7.0"
+AGENT_VERSION = "2.8.0"
 _ENV_TOKEN = os.getenv("AGENT_TOKEN", "")                      # the token supplied by configuration; a rotation may supersede it (see _load_state)
 AGENT_TOKEN = ""                                                # the token in use: resolved by ensure_token() (saved state first, then configuration)
 AGENT_ALLOW_INSECURE = os.getenv("AGENT_ALLOW_INSECURE", "") == "1"   # permit http:// to a public address (not recommended)
@@ -120,8 +120,60 @@ def collect() -> dict[str, Any]:
         "net_tx_bps": tx,
         "processes": processes[:AGENT_PROCESS_TOP_N],
         "capabilities": ["logs"] if AGENT_LOGS != "off" else [],
+        "ips": local_addresses(),
+        "public_ip": public_address(),
+        "install": install_kind(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+
+
+_SKIP_IFACES = ("lo", "docker", "br-", "veth", "cni", "flannel", "cali", "vxlan", "kube", "virbr", "cilium", "weave", "podman")
+AGENT_PUBLIC_IP = os.getenv("AGENT_PUBLIC_IP", "").strip()              # optional: tell the dashboard this server's public address
+AGENT_PUBLIC_IP_URL = os.getenv("AGENT_PUBLIC_IP_URL", "").strip()      # optional: a URL that returns the caller's address (off by default: no outside calls)
+_public_cache: dict = {"at": 0.0, "ip": ""}
+
+
+def local_addresses() -> list[dict]:
+    """This machine's own (private) IPv4 addresses, without loopback, link-local and container-network interfaces."""
+    found = []
+    try:
+        for name, addrs in psutil.net_if_addrs().items():
+            if name.lower().startswith(_SKIP_IFACES):
+                continue
+            for addr in addrs:
+                if addr.family != socket.AF_INET:
+                    continue
+                ip = ipaddress.ip_address(addr.address)
+                if ip.is_loopback or ip.is_link_local or ip.is_unspecified:
+                    continue
+                found.append({"iface": name[:30], "ip": str(ip)})
+    except Exception:   # never let an address lookup break a report
+        return []
+    return found[:10]
+
+
+def public_address() -> str:
+    """Only reported when the admin configured it (AGENT_PUBLIC_IP, or AGENT_PUBLIC_IP_URL fetched at most hourly)."""
+    if AGENT_PUBLIC_IP:
+        return AGENT_PUBLIC_IP
+    if AGENT_PUBLIC_IP_URL and time.time() - _public_cache["at"] > 3600:
+        _public_cache["at"] = time.time()
+        try:
+            with urllib.request.urlopen(AGENT_PUBLIC_IP_URL, timeout=5) as response:
+                candidate = response.read(100).decode().strip()
+            _public_cache["ip"] = str(ipaddress.ip_address(candidate))
+        except Exception:
+            _public_cache["ip"] = ""
+    return _public_cache["ip"]
+
+
+def install_kind() -> str:
+    """How this agent runs, so the dashboard can show the right update command."""
+    if os.getenv("SMWATCH_BUNDLED") == "1":
+        return "bundled"
+    if os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv"):
+        return "docker"
+    return "macos" if sys.platform == "darwin" else "systemd"
 
 
 def host_name() -> str:

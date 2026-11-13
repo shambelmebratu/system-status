@@ -299,6 +299,12 @@ Review the manifest first by running the `curl` alone. It creates a `smwatch` na
 
 **Images.** `sm-watch-k8s-agent` is published with the other images (override with `K8S_AGENT_IMAGE`). Live CPU/memory needs metrics-server in the cluster; without it everything else still works.
 
+## Agent addresses and updates
+
+Each server shows its **public IP** (the address the control plane sees it connect from, or `AGENT_PUBLIC_IP` / `AGENT_PUBLIC_IP_URL` if you set one on the agent; nothing contacts the outside by default) and its **private IPs** (its own LAN addresses, container networks excluded). Alerts and Telegram messages name the server with its host name and public IP, falling back to a private one.
+
+When a newer agent ships with your control plane, the server page shows **Agent update available** with the right command: `curl -fsSL <url>/api/agent/install.sh | sudo bash -s -- update` for systemd/macOS agents (keeps identity and settings, no link or token), `docker compose pull host-agent && docker compose up -d host-agent` for the bundled agent, and the Docker install command for standalone Docker agents. Clusters show `kubectl -n smwatch rollout restart deployment/smwatch-agent`.
+
 ## Configuration: nothing is hard-coded
 
 Alert limits are set **per server** (Edit the server) and per cluster log policy by admins; defaults for new servers come from `CPU_THRESHOLD`, `MEMORY_THRESHOLD`, `DISK_THRESHOLD`, `LOAD_THRESHOLD`, `SWAP_THRESHOLD` and `PROCESS_THRESHOLD`. Process CPU is per core (100 = one full core, so values above 100 are valid). All timing and size limits (agent heartbeat grace, Kubernetes report/offline times, log result lifetime, install-link lifetime, retention defaults, scheduled-message retries, usage-bar colours) are `.env` settings, listed with their defaults in `.env.example`, and the dashboard reads them from the API. Retention and purge schedules are edited by admins in Settings.

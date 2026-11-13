@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import Session
 
+from .agent_versions import is_outdated, latest_k8s_agent
 from .audit import audit
 from .config import get_settings, resolved_k8s_agent_image
 from .database import SessionLocal, get_db
@@ -129,7 +130,7 @@ def serialize_cluster(c: Cluster) -> dict:
         summary = None
     return {
         "id": c.id, "name": c.name, "enabled": c.enabled, "status": c.last_status, "last_error": c.last_error, "last_seen_at": iso(c.last_seen_at),
-        "k8s_version": c.k8s_version, "agent_version": c.agent_version, "summary": summary, "token_issued_at": iso(c.token_issued_at),
+        "k8s_version": c.k8s_version, "agent_version": c.agent_version, "agent_outdated": is_outdated(c.agent_version, latest_k8s_agent()), "latest_agent_version": latest_k8s_agent(), "summary": summary, "token_issued_at": iso(c.token_issued_at),
         "token_rotation_pending": bool(c.pending_token_hash), "last_agent_ip": c.last_agent_ip, "created_by": c.created_by, "created_at": iso(c.created_at),
         "log_policy": parse_policy(c.log_policy), "restricted": parse_policy(c.log_policy) != K8sLogPolicy().model_dump(),
     }

@@ -115,6 +115,7 @@ services:
       AGENT_PROCFS_PATH: /host/proc
       AGENT_DISK_PATH: /host
       AGENT_LOGS: ${HOST_AGENT_LOGS:-on}
+      SMWATCH_BUNDLED: "1"
     volumes:
       - /:/host:ro
       - /var/run/docker.sock:/var/run/docker.sock
