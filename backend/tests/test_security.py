@@ -63,3 +63,18 @@ def test_encryption_key_formats(monkeypatch):
         config.get_settings.cache_clear(); crypto._fernet.cache_clear()
         assert crypto.decrypt(crypto.encrypt("tok")) == "tok"
     config.get_settings.cache_clear(); crypto._fernet.cache_clear()
+
+
+def test_client_ip_behind_proxies():
+    from types import SimpleNamespace
+    from app.security import client_ip
+
+    def req(peer, xff=None):
+        return SimpleNamespace(client=SimpleNamespace(host=peer) if peer else None, headers={"x-forwarded-for": xff} if xff else {})
+    assert client_ip(req("172.18.0.5", "203.0.113.7")) == "203.0.113.7"                 # behind our proxy: the real visitor
+    assert client_ip(req("172.18.0.5", "6.6.6.6, 203.0.113.7")) == "203.0.113.7"        # a forged left part is ignored (right-most wins)
+    assert client_ip(req("127.0.0.1", "2001:db8::1")) == "2001:db8::1"                  # IPv6 works
+    assert client_ip(req("8.8.8.8", "6.6.6.6")) == "8.8.8.8"                  # public peer: header NOT trusted
+    assert client_ip(req("172.18.0.5", "not-an-ip")) == "172.18.0.5"                    # garbage falls back to the peer
+    assert client_ip(req("172.18.0.5")) == "172.18.0.5" and client_ip(req(None)) == "unknown"
+    assert client_ip(req("testclient", "1.2.3.4")) == "testclient"                      # non-IP peer (test client): unchanged

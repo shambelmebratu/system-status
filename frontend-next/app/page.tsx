@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { Icon } from './components/ui';
 import { api, post } from './lib/api';
 import { AppProvider, useApp } from './lib/app';
+import { Audit } from './views/Audit';
 import { Channels } from './views/Channels';
 import { Incidents } from './views/Incidents';
 import { Login } from './views/Login';
@@ -52,6 +53,7 @@ const NAV: { id: string; label: string; icon: string; min: Role }[] = [
   { id: 'alerts', label: 'Alerts', icon: 'bell', min: 'operator' },
   { id: 'schedules', label: 'Schedules', icon: 'clock', min: 'operator' },
   { id: 'users', label: 'Users', icon: 'users', min: 'admin' },
+  { id: 'audit', label: 'Audit log', icon: 'shield', min: 'admin' },
   { id: 'settings', label: 'Settings', icon: 'settings', min: 'viewer' },
 ];
 const RANK: Record<Role, number> = { viewer: 1, operator: 2, admin: 3 };
@@ -72,7 +74,7 @@ function Shell({ company, me, onSignOut }: { company: string; me: Me; onSignOut:
     try { localStorage.setItem('smw_theme', next); } catch { /* storage unavailable */ }
   };
 
-  const view = { overview: <Overview />, servers: <Servers />, services: <Services />, incidents: <Incidents />, alerts: <Channels />, schedules: <Schedules />, logs: <Logs />, users: <Users />, settings: <Settings /> }[page] ?? <Overview />;
+  const view = { overview: <Overview />, servers: <Servers />, services: <Services />, incidents: <Incidents />, alerts: <Channels />, schedules: <Schedules />, logs: <Logs />, users: <Users />, audit: <Audit />, settings: <Settings /> }[page] ?? <Overview />;
 
   return (
     <div className="shell">

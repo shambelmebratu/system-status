@@ -29,6 +29,23 @@ say()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "run as root (put sudo before 'bash')"
+# --- the agent runs code and ships logs for the control plane: never over an unencrypted link to a public address
+is_internal_host() {
+  case "$1" in
+    10.*|127.*|192.168.*|169.254.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|localhost|"[::1]"|::1) return 0 ;;
+    *.local|*.lan|*.internal|*.home.arpa|*.localdomain) return 0 ;;
+    *.*) return 1 ;;
+    *) return 0 ;;   # single-label names (a LAN or Docker host name)
+  esac
+}
+require_secure_url() {
+  case "$1" in https://*) return 0 ;; esac
+  [ "${SMWATCH_ALLOW_HTTP:-}" = "1" ] && return 0
+  local rest host; rest=${1#http://}; host=${rest%%/*}; host=${host%%:*}
+  is_internal_host "$host" && return 0
+  die "$1 is not HTTPS and not a private address: credentials and logs would travel unencrypted and the downloaded agent could be tampered with. Use an https:// address (README: HTTPS with nginx), or set SMWATCH_ALLOW_HTTP=1 to override."
+}
+
 IS_MAC=0; [ "$(uname -s)" = "Darwin" ] && IS_MAC=1
 PLIST=/Library/LaunchDaemons/net.smwatch.agent.plist
 LABEL=net.smwatch.agent
@@ -71,6 +88,7 @@ if [ -n "$SMWATCH_TOKEN" ] && [ "${#SMWATCH_TOKEN}" -lt 32 ]; then die "SMWATCH_
 case "$SMWATCH_URL" in http://localhost*|http://127.*|https://localhost*) die "SMWATCH_URL points at localhost, which is this server itself. Use the control plane's real address." ;; esac
 if [ "$IS_MAC" = 0 ]; then command -v systemctl >/dev/null 2>&1 || die "systemd was not found. Use the Docker command instead (dashboard: Install agent -> Docker)."; fi
 command -v curl >/dev/null 2>&1 || die "curl is required"
+require_secure_url "$SMWATCH_URL"
 
 # --- registration: exchange the short-lived join link for this server's own private token (needs only curl)
 register() {
@@ -102,6 +120,7 @@ register() {
 }
 
 HAVE_STATE=no
+if [ -n "$SMWATCH_TOKEN" ]; then rm -f "$STATE_FILE"; fi   # an explicit token always wins over an older saved identity
 if [ -z "$SMWATCH_TOKEN" ]; then
   if [ -s "$STATE_FILE" ] && grep -q "\"url\": *\"$SMWATCH_URL\"" "$STATE_FILE"; then
     HAVE_STATE=yes   # already registered: this run is an update, the join link is not needed
@@ -147,6 +166,15 @@ mkdir -p "$INSTALL_DIR"
 "$INSTALL_DIR/venv/bin/pip" install --quiet --disable-pip-version-check --upgrade pip psutil
 curl -fsSL "$SMWATCH_URL/api/agent/agent.py" -o "$INSTALL_DIR/agent.py.new" \
   || die "could not download the agent from $SMWATCH_URL (is the URL reachable from this server?)"
+# The control plane announces the SHA-256 of the agent it serves (inside this script); refuse anything else.
+if [ -n "${SMWATCH_AGENT_SHA256:-}" ]; then
+  got=$( (sha256sum "$INSTALL_DIR/agent.py.new" 2>/dev/null || shasum -a 256 "$INSTALL_DIR/agent.py.new") | awk '{print $1}')
+  if [ "$got" != "$SMWATCH_AGENT_SHA256" ]; then
+    rm -f "$INSTALL_DIR/agent.py.new"
+    die "the downloaded agent does not match the checksum announced by the control plane (corrupted or tampered download). Nothing was installed."
+  fi
+  say "Agent verified (SHA-256 ${got:0:12}...)"
+fi
 mv "$INSTALL_DIR/agent.py.new" "$INSTALL_DIR/agent.py"
 
 if [ "$IS_MAC" = 0 ]; then

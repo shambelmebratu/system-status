@@ -1,6 +1,6 @@
 import os
 
-os.environ.update(ENVIRONMENT="test", JWT_SECRET="x" * 40, ADMIN_PASSWORD="correct-horse-battery", DATABASE_URL="sqlite://")
+os.environ.update(ENVIRONMENT="test", JWT_SECRET="x" * 40, ADMIN_PASSWORD="correct-horse-battery", DATABASE_URL="sqlite://", AGENT_MIN_REPORT_SECONDS="0")
 
 import pytest
 from fastapi.testclient import TestClient
@@ -109,7 +109,7 @@ def test_push_agent_lifecycle(client):
     assert srv["last_status"] == "up" and srv["last_metrics"]["hostname"] == "box" and srv["uptime_24h"] == 100.0
 
     # rotating invalidates the old token
-    new = client.post(f"/api/servers/{sid}/rotate-token", headers=CSRF).json()["install_token"]
+    new = client.post(f"/api/servers/{sid}/rotate-token?immediate=true", headers=CSRF).json()["install_token"]
     assert anon.post("/api/agent/report", json=report(), headers=auth).status_code == 401
     assert anon.post("/api/agent/report", json=report(), headers={"Authorization": f"Bearer {new}"}).status_code == 200
 
@@ -725,3 +725,231 @@ def test_profile_update(client):
     ok = frank.put("/api/auth/profile", headers=CSRF, json={"name": "F", "email": "Frank2@Example.com", "current_password": "frank-own-password-1"})
     assert ok.status_code == 200 and ok.json()["email"] == "frank2@example.com"
     assert TestClient(main.app).post("/api/auth/login", json={"email": "frank2@example.com", "password": "frank-own-password-1"}).status_code == 200
+
+
+# =================================================================== security hardening
+def audit_rows(client, **params):
+    q = "&".join(f"{k}={v}" for k, v in params.items())
+    r = client.get(f"/api/audit?limit=500&{q}")
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_seamless_token_rotation(client):
+    """Rotation is delivered to the agent over its own authenticated channel; the old token dies only once the agent has switched."""
+    sign_in(client)
+    anon = TestClient(main.app)
+    sid, auth = _push_server(client, anon)
+    old = auth["Authorization"].split()[1]
+    before = anon.get("/api/dashboard", headers={}) if False else None
+
+    rotate = client.post(f"/api/servers/{sid}/rotate-token", headers=CSRF).json()
+    assert rotate["mode"] == "managed" and "install_token" not in rotate                      # the admin never sees (or has to copy) the new token
+    srv = next(s for s in client.get("/api/dashboard").json()["servers"] if s["id"] == sid)
+    assert srv["token_rotation_pending"] is True and "pending_token" not in srv and "pending_token_hash" not in srv
+
+    # the agent keeps working with the old token and is handed the new one
+    r = anon.post("/api/agent/report", json=report(), headers=auth)
+    assert r.status_code == 200 and len(r.json()["rotate_token"]) >= 32
+    new = r.json()["rotate_token"]
+    assert new != old
+    # using the new token completes the rotation: it is promoted and the old one is revoked
+    assert anon.post("/api/agent/report", json=report(), headers={"Authorization": f"Bearer {new}"}).status_code == 200
+    assert anon.post("/api/agent/report", json=report(), headers=auth).status_code == 401                     # old token is dead
+    assert "rotate_token" not in anon.post("/api/agent/report", json=report(), headers={"Authorization": f"Bearer {new}"}).json()
+    srv = next(s for s in client.get("/api/dashboard").json()["servers"] if s["id"] == sid)
+    assert srv["token_rotation_pending"] is False and srv["token_issued_at"]
+    actions = [e["action"] for e in audit_rows(client)]
+    assert "server.token_rotate" in actions and "agent.token_rotated" in actions
+
+
+def test_immediate_revoke_kills_the_old_token_at_once(client):
+    sign_in(client)
+    anon = TestClient(main.app)
+    sid, auth = _push_server(client, anon)
+    r = client.post(f"/api/servers/{sid}/rotate-token?immediate=true", headers=CSRF).json()
+    assert r["mode"] == "immediate" and len(r["install_token"]) >= 32
+    assert anon.post("/api/agent/report", json=report(), headers=auth).status_code == 401                      # a stolen token is useless immediately
+    assert anon.post("/api/agent/report", json=report(), headers={"Authorization": f"Bearer {r['install_token']}"}).status_code == 200
+    assert any(e["action"] == "server.token_revoke" for e in audit_rows(client))
+
+
+def test_agent_ip_change_is_recorded(client, monkeypatch):
+    from app import routes_agent
+    sign_in(client)
+    anon = TestClient(main.app)
+    sid, auth = _push_server(client, anon)
+    for ip in ("203.0.113.10", "203.0.113.10", "198.51.100.77"):                                  # same address twice, then a different one
+        monkeypatch.setattr(routes_agent, "client_ip", lambda request, ip=ip: ip)
+        assert anon.post("/api/agent/report", json=report(), headers=auth).status_code == 200
+    changes = [e for e in audit_rows(client, category="agent") if e["action"] == "agent.ip_changed"]
+    assert len(changes) >= 1 and "203.0.113.10 -> 198.51.100.77" in changes[0]["detail"]
+    assert next(s for s in client.get("/api/dashboard").json()["servers"] if s["id"] == sid)["last_agent_ip"] == "198.51.100.77"
+
+
+def test_token_guessing_is_throttled_on_every_agent_endpoint(client):
+    """Guessing = presenting many DIFFERENT wrong credentials. After 5 distinct misses an address is locked out."""
+    from app.security import login_limiter
+    sign_in(client)
+    anon = TestClient(main.app)
+    sid, auth = _push_server(client, anon)
+    seq = iter(range(10_000))
+    guess = lambda: {"Authorization": f"Bearer guess-{next(seq):040d}"}  # noqa: E731
+    for path, send in [("tasks", lambda: anon.get("/api/agent/tasks", headers=guess())),
+                       ("result", lambda: anon.post("/api/agent/tasks/1/result", json={"ok": True}, headers=guess())),
+                       ("report", lambda: anon.post("/api/agent/report", json=report(), headers=guess())),
+                       ("join link", lambda: anon.get(f"/api/agent/join/smwj_guess_{next(seq)}")),
+                       ("enroll", lambda: anon.post("/api/agent/enroll", json={"hostname": "h"}, headers=guess()))]:
+        login_limiter._hits.clear(); login_limiter._seen.clear()
+        codes = [send().status_code for _ in range(7)]
+        assert codes[:5].count(429) == 0 and 429 in codes[5:], (path, codes)                       # 5 free misses, then locked out
+    login_limiter._hits.clear(); login_limiter._seen.clear()
+    assert anon.post("/api/agent/report", json=report(), headers=auth).status_code == 200          # the legitimate agent is unaffected
+    assert any(e["action"] == "agent.auth_failed" and not e["success"] for e in audit_rows(client))
+
+
+def test_a_stale_agent_cannot_lock_out_its_neighbours(client):
+    """One agent repeating its old (rotated/revoked) token must not lock out healthy agents behind the same address."""
+    from app.security import login_limiter
+    sign_in(client)
+    anon = TestClient(main.app)
+    sid, good = _push_server(client, anon)
+    stale = {"Authorization": "Bearer " + "s" * 43}
+    login_limiter._hits.clear(); login_limiter._seen.clear()
+    for _ in range(60):                                                                             # a misconfigured agent hammering, on every endpoint
+        assert anon.post("/api/agent/report", json=report(), headers=stale).status_code == 401
+        assert anon.get("/api/agent/tasks", headers=stale).status_code == 401
+    assert anon.post("/api/agent/report", json=report(), headers=good).status_code == 200           # still never 429 for anyone
+    assert anon.get("/api/agent/tasks", headers=good).status_code == 200
+
+
+def test_report_flood_is_capped(client, monkeypatch):
+    from app.config import get_settings
+    sign_in(client)
+    anon = TestClient(main.app)
+    sid, auth = _push_server(client, anon)
+    monkeypatch.setattr(get_settings(), "agent_min_report_seconds", 60.0)
+    r = anon.post("/api/agent/report", json=report(), headers=auth)
+    assert r.status_code == 429 and r.headers["retry-after"]                                       # right after a report, another is refused
+    monkeypatch.setattr(get_settings(), "agent_min_report_seconds", 0.0)
+    assert anon.post("/api/agent/report", json=report(), headers=auth).status_code == 200
+
+
+def test_audit_trail_is_complete_admin_only_and_secret_free(client):
+    sign_in(client)
+    secret_pw = "audit-secret-password-999"
+    u = make_user(client, "gina@example.com", "operator", password=secret_pw)
+    # failed and successful sign-ins, wrong current password, role change, log request, install link, server + channel + deletion
+    TestClient(main.app).post("/api/auth/login", json={"email": "gina@example.com", "password": "wrong-guess-123456"})
+    TestClient(main.app).post("/api/auth/login", json={"email": "nobody@example.com", "password": "wrong-guess-123456"})
+    gina = session_for("gina@example.com", password=secret_pw, new_password="gina-own-password-12")
+    gina.post("/api/auth/password", headers=CSRF, json={"current_password": "not-my-password", "new_password": "another-new-password-1"})
+    link = gina.post("/api/enrollments", headers=CSRF, json={"label": "audit-link"}).json()
+    gina.delete(f"/api/enrollments/{link['id']}", headers=CSRF)
+    srv = gina.post("/api/servers", headers=CSRF, json={"name": "audited", "host": "93.184.216.60", "monitor_mode": "ping"}).json()["id"]
+    gina.delete(f"/api/servers/{srv}", headers=CSRF)
+    anon = TestClient(main.app)
+    sid, auth = _push_server(client, anon)
+    client.post(f"/api/servers/{sid}/logs", headers=CSRF, json={"source": "docker", "target": "nginx", "grep": "needle"})
+    client.put(f"/api/users/{u['id']}", headers=CSRF, json={"role": "viewer"})
+
+    rows = audit_rows(client)
+    actions = {(e["action"], e["success"]) for e in rows}
+    for expected in [("auth.login", True), ("auth.login", False), ("auth.password_change", False), ("user.create", True), ("user.update", True), ("enroll.link_create", True),
+                     ("enroll.link_revoke", True), ("server.create", True), ("server.delete", True), ("logs.read", True), ("agent.enroll", True)]:
+        assert expected in actions, expected
+    unknown = next(e for e in rows if e["action"] == "auth.login" and e["actor"] == "nobody@example.com")
+    assert unknown["success"] is False and unknown["detail"] == "unknown user"
+    read = next(e for e in rows if e["action"] == "logs.read")
+    assert read["actor"] == "admin@example.com" and read["actor_role"] == "admin" and "docker:nginx" in read["detail"] and "needle" in read["detail"]
+    # NOTHING secret is ever stored in the trail
+    blob = json.dumps(rows) if (json := __import__("json")) else ""
+    for secret in (secret_pw, "gina-own-password-12", "another-new-password-1", "wrong-guess-123456", auth["Authorization"].split()[1], link["token"]):
+        assert secret not in blob, "a secret leaked into the audit log"
+    # filters
+    assert all(not e["success"] for e in audit_rows(client, failures="true"))
+    assert all(e["action"].startswith("user.") for e in audit_rows(client, category="user"))
+    assert audit_rows(client, q="gina@example.com")
+    # only admins can read it; nobody can change it
+    for who in (gina, TestClient(main.app)):
+        assert who.get("/api/audit").status_code in (401, 403)
+    for method in ("put", "post", "delete", "patch"):
+        assert getattr(client, method)("/api/audit", headers=CSRF).status_code in (404, 405)
+
+
+def test_password_hashing_upgrade_and_no_timing_oracle(client, monkeypatch):
+    import hashlib
+    from app import security
+    from app.models import User
+    h = security.hash_password("a-long-test-password")
+    assert h.startswith("scrypt2$131072$8$1$") and security.verify_password("a-long-test-password", h)
+    assert not security.verify_password("a-long-test-password!", h) and not security.verify_password("x", "scrypt2$bad") and not security.verify_password("x", "")
+    assert not security.needs_rehash(h)
+    # a legacy (weak) hash still works, and is silently upgraded at the next sign-in
+    sign_in(client)
+    make_user(client, "hank@example.com", "viewer", password="legacy-password-123")
+    salt = bytes.fromhex("00112233445566778899aabbccddeeff")
+    legacy = f"scrypt${salt.hex()}${hashlib.scrypt(b'legacy-password-123', salt=salt, n=16384, r=8, p=1).hex()}"
+    with database.SessionLocal() as db:
+        db.query(User).filter(User.email == "hank@example.com").update({"password_hash": legacy}); db.commit()
+    assert security.needs_rehash(legacy) and security.verify_password("legacy-password-123", legacy)
+    assert TestClient(main.app).post("/api/auth/login", json={"email": "hank@example.com", "password": "legacy-password-123"}).status_code == 200
+    with database.SessionLocal() as db:
+        upgraded = db.query(User).filter(User.email == "hank@example.com").one().password_hash
+    assert upgraded.startswith("scrypt2$") and upgraded != legacy and security.verify_password("legacy-password-123", upgraded)
+    # an unknown email costs the same work as a wrong password (no account enumeration by response time)
+    calls = []
+    real = main.verify_password
+    monkeypatch.setattr(main, "verify_password", lambda p, h: (calls.append(h), real(p, h))[1])
+    TestClient(main.app).post("/api/auth/login", json={"email": "ghost@example.com", "password": "whatever-123456"})
+    assert len(calls) == 1 and calls[0].startswith("scrypt2$")
+
+
+def test_change_password_cannot_be_brute_forced_with_a_stolen_session(client):
+    from app.security import login_limiter
+    sign_in(client)
+    login_limiter._hits.clear()
+    codes = [client.post("/api/auth/password", headers=CSRF, json={"current_password": f"guess-{i}-aaaaaaaa", "new_password": "brand-new-password-1"}).status_code for i in range(7)]
+    assert codes[:5] == [403] * 5 and 429 in codes[5:]
+
+
+def test_install_scripts_are_integrity_checked_and_download_no_code(client):
+    import hashlib
+    sign_in(client)
+    anon = TestClient(main.app)
+    token = client.post("/api/enrollments", headers=CSRF, json={}).json()["token"]
+    agent_bytes = anon.get("/api/agent/agent.py").content
+    sh = anon.get(f"/api/agent/join/{token}").text
+    assert f"SMWATCH_AGENT_SHA256={hashlib.sha256(agent_bytes).hexdigest()}" in sh               # announced hash == the exact bytes served
+    assert "require_secure_url" in sh and "does not match the checksum" in sh
+    dk = anon.get(f"/api/agent/join/{token}/docker").text
+    assert "SMWATCH_AGENT_IMAGE='shambi21/sm-watch-host-agent:latest'" in dk
+    assert "urlretrieve" not in dk and "pip install" not in dk and "apt-get" not in dk           # nothing is fetched or executed at container start
+    assert "--cap-drop ALL" in dk and "no-new-privileges" in dk and "--read-only" in dk and "require_secure_url" in dk
+
+
+def test_docker_image_name_is_configurable(client, monkeypatch):
+    from app.config import get_settings
+    sign_in(client)
+    token = client.post("/api/enrollments", headers=CSRF, json={}).json()["token"]
+    monkeypatch.setattr(get_settings(), "agent_image", "registry.example.org/team/agent:1.2.3")
+    assert "SMWATCH_AGENT_IMAGE='registry.example.org/team/agent:1.2.3'" in TestClient(main.app).get(f"/api/agent/join/{token}/docker").text
+
+
+def test_account_lockout_is_tolerant_but_address_lockout_is_strict(client, monkeypatch):
+    """Anyone who knows an admin's email must not be able to lock that admin out by failing a few times from elsewhere."""
+    from app.security import login_limiter
+    login_limiter._hits.clear(); login_limiter._seen.clear()
+    wrong = {"email": "admin@example.com", "password": "wrong-password-123"}
+    right = {"email": "admin@example.com", "password": "correct-horse-battery"}
+    addresses = iter(f"203.0.113.{i}" for i in range(1, 200))
+    monkeypatch.setattr(main, "client_ip", lambda request: next(addresses))
+    assert all(TestClient(main.app).post("/api/auth/login", json=wrong).status_code == 401 for _ in range(12))       # 12 misses from 12 addresses
+    monkeypatch.setattr(main, "client_ip", lambda request: "198.51.100.1")                                            # the real admin, elsewhere
+    assert TestClient(main.app).post("/api/auth/login", json=right).status_code == 200                                # is NOT locked out
+    login_limiter._hits.clear(); login_limiter._seen.clear()
+    fresh = iter(f"192.0.2.{i}" for i in range(1, 250))
+    monkeypatch.setattr(main, "client_ip", lambda request: next(fresh))                                               # every attempt from a NEW address
+    codes = [TestClient(main.app).post("/api/auth/login", json=wrong).status_code for _ in range(24)]
+    assert codes[:20] == [401] * 20 and 429 in codes[20:], codes                                                      # a sustained distributed attack DOES lock the account
+    login_limiter._hits.clear(); login_limiter._seen.clear()

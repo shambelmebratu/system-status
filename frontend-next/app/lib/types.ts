@@ -14,6 +14,7 @@ export type Server = {
   load_threshold: number; swap_threshold: number; process_names: string; process_threshold: number;
   last_status: Status; last_checked_at: string | null; last_seen_at: string | null; last_error: string | null;
   last_metrics: Metrics | null; uptime_24h: number | null; public: boolean; install_token?: string;
+  token_issued_at?: string | null; token_rotation_pending?: boolean; last_agent_ip?: string | null;
 };
 export type Service = {
   id: number; name: string; url: string; expected_status: number; interval_seconds: number; enabled: boolean; public: boolean;
@@ -46,7 +47,7 @@ export type Range = '1h' | '6h' | '24h' | '7d' | '30d';
 
 export type Enrollment = {
   id: number; label: string; token: string; uses: number; max_uses: number | null; created_at: string; expires_at: string | null;
-  last_used_at: string | null; revoked: boolean; active: boolean; state: 'active' | 'expired' | 'revoked' | 'used up';
+  last_used_at: string | null; created_by?: string | null; revoked: boolean; active: boolean; state: 'active' | 'expired' | 'revoked' | 'used up';
 };
 
 export type ScheduledMessage = {
@@ -62,3 +63,5 @@ export const ROLE_INFO: Record<Role, { label: string; blurb: string }> = {
   operator: { label: 'Operator', blurb: 'Manage servers, services, alerts, schedules, logs and agent install links. Cannot manage users.' },
   viewer: { label: 'Viewer', blurb: 'Read-only: dashboards, uptime and incidents. No logs, no changes.' },
 };
+
+export type AuditEvent = { id: number; ts: string; actor: string; actor_role: string | null; action: string; target: string; detail: string | null; ip: string | null; success: boolean };

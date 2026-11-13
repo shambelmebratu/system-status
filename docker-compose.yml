@@ -7,6 +7,11 @@
 # The images come from Docker Hub account "shambi21" unless DOCKERHUB_USERNAME says otherwise in .env (SMWATCH_VERSION picks the tag).
 x-api-image: &api-image ${DOCKERHUB_USERNAME:-shambi21}/sm-watch-api:${SMWATCH_VERSION:-latest}
 x-host-agent-image: &host-agent-image ${DOCKERHUB_USERNAME:-shambi21}/sm-watch-host-agent:${SMWATCH_VERSION:-latest}
+# Containers get no new privileges and no Linux capabilities beyond what they need.
+x-hardening: &hardening
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
+
 x-frontend-image: &frontend-image ${DOCKERHUB_USERNAME:-shambi21}/sm-watch-frontend:${SMWATCH_VERSION:-latest}
 
 services:
@@ -26,6 +31,7 @@ services:
     restart: unless-stopped
 
   migrate:
+    <<: *hardening
     image: *api-image
     command: ["alembic", "-c", "alembic.ini", "upgrade", "head"]
     environment:
@@ -40,6 +46,7 @@ services:
     restart: "no"
 
   api:
+    <<: *hardening
     image: *api-image
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
     environment:
@@ -52,6 +59,9 @@ services:
       CHECK_INTERVAL_SECONDS: ${CHECK_INTERVAL_SECONDS:-60}
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
       HOST_AGENT_TOKEN_FILE: /shared/agent.token
+      DOCKERHUB_USERNAME: ${DOCKERHUB_USERNAME:-shambi21}
+      SMWATCH_VERSION: ${SMWATCH_VERSION:-latest}
+      AGENT_IMAGE: ${AGENT_IMAGE:-}
     env_file:
       - path: .env
         required: false
@@ -68,6 +78,7 @@ services:
     restart: unless-stopped
 
   worker:
+    <<: *hardening
     image: *api-image
     command: ["python", "-m", "app.worker"]
     cap_add:
@@ -91,6 +102,9 @@ services:
   # It appears in the dashboard as "This server (control plane)". It mounts the host read-only and the Docker
   # socket (root-equivalent access); set HOST_AGENT_LOGS=nodocker or off in .env to reduce that, or delete this service.
   host-agent:
+    <<: *hardening
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=16m"]
     image: *host-agent-image
     command: ["python", "agent.py"]
     pid: host
@@ -111,6 +125,9 @@ services:
     restart: unless-stopped
 
   frontend:
+    <<: *hardening
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=64m"]
     image: *frontend-image
     environment:
       BACKEND_URL: http://api:8000
@@ -118,7 +135,7 @@ services:
       api:
         condition: service_healthy
     ports:
-      - "8000:3000"
+      - "${FRONTEND_BIND:-0.0.0.0}:8000:3000"   # FRONTEND_BIND=127.0.0.1 when a reverse proxy (nginx) is in front
     restart: unless-stopped
 
 volumes:

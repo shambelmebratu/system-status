@@ -18,6 +18,7 @@ import fnmatch
 import glob
 import hashlib
 import http.client
+import ipaddress
 import json
 import logging
 import os
@@ -30,14 +31,17 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from typing import Any
 
 import psutil
 
-AGENT_VERSION = "2.5.0"
-AGENT_TOKEN = os.getenv("AGENT_TOKEN", "")
+AGENT_VERSION = "2.6.0"
+_ENV_TOKEN = os.getenv("AGENT_TOKEN", "")                      # the token supplied by configuration; a rotation may supersede it (see _load_state)
+AGENT_TOKEN = ""                                                # the token in use: resolved by ensure_token() (saved state first, then configuration)
+AGENT_ALLOW_INSECURE = os.getenv("AGENT_ALLOW_INSECURE", "") == "1"   # permit http:// to a public address (not recommended)
 SMWATCH_JOIN = os.getenv("SMWATCH_JOIN", "")
 SMWATCH_URL = os.getenv("SMWATCH_URL", "").rstrip("/")
 AGENT_STATE_DIR = os.getenv("AGENT_STATE_DIR", "/var/lib/sm-watch-agent")
@@ -155,8 +159,12 @@ def machine_id() -> str:
     return hashlib.sha256(f"{host_name()}|{platform.node()}|{platform.machine()}".encode()).hexdigest()  # Windows/other fallback
 
 
+def _state_dirs() -> tuple[str, str]:
+    return (AGENT_STATE_DIR, os.path.join(os.path.expanduser("~"), ".sm-watch-agent"))
+
+
 def _state_file() -> str | None:
-    for directory in (AGENT_STATE_DIR, os.path.join(os.path.expanduser("~"), ".sm-watch-agent")):
+    for directory in _state_dirs():
         try:
             os.makedirs(directory, mode=0o700, exist_ok=True)
             if os.access(directory, os.W_OK):
@@ -166,16 +174,48 @@ def _state_file() -> str | None:
     return None
 
 
-def _load_state() -> dict:
-    for directory in (AGENT_STATE_DIR, os.path.join(os.path.expanduser("~"), ".sm-watch-agent")):
+def _fingerprint(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest() if value else ""
+
+
+def _configured_token() -> str:
+    """The token handed to the agent by configuration: AGENT_TOKEN, or the contents of AGENT_TOKEN_FILE."""
+    if _ENV_TOKEN:
+        return _ENV_TOKEN
+    if AGENT_TOKEN_FILE:
+        with open(AGENT_TOKEN_FILE) as handle:   # raises until the control plane has written it; the caller retries
+            return handle.read().strip()
+    return ""
+
+
+def _load_state(configured: str = "") -> dict:
+    """The agent's saved identity. A saved token (from registration or from a rotation) is only trusted while the configured
+    token is the one it was saved next to, so deliberately installing a different token always takes effect."""
+    for directory in _state_dirs():
         try:
             with open(os.path.join(directory, "agent.json")) as handle:
                 state = json.load(handle)
-            if state.get("url") == SMWATCH_URL and len(state.get("token", "")) >= 32:
+            if state.get("url") == SMWATCH_URL and len(state.get("token", "")) >= 32 and (not configured or state.get("env_ref") == _fingerprint(configured)):
                 return state
         except (OSError, ValueError):
             continue
     return {}
+
+
+def _save_state(token: str, server_id: int | None, name: str | None) -> None:
+    path = _state_file()
+    if not path:
+        log.warning("could not save the agent token (no writable state directory); the agent will re-register on restart")
+        return
+    try:
+        env_ref = _fingerprint(_configured_token())
+    except OSError:
+        env_ref = ""
+    payload = {"url": SMWATCH_URL, "token": token, "server_id": server_id, "name": name, "env_ref": env_ref}
+    temporary = path + ".tmp"
+    with open(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as handle:   # never world-readable, replaced atomically
+        json.dump(payload, handle)
+    os.replace(temporary, path)
 
 
 def enroll() -> str:
@@ -187,28 +227,34 @@ def enroll() -> str:
     )
     with urllib.request.urlopen(request, timeout=20) as response:
         reply = json.loads(response.read().decode())
-    path = _state_file()
-    if path:
-        with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as handle:
-            json.dump({"url": SMWATCH_URL, "token": reply["agent_token"], "server_id": reply["server_id"], "name": reply["name"]}, handle)
-    else:
-        log.warning("could not save the agent token (no writable state directory); the agent will re-register on restart")
+    _save_state(reply["agent_token"], reply["server_id"], reply["name"])
     log.info("registered with the control plane as %r (server id %s)", reply["name"], reply["server_id"])
     return reply["agent_token"]
 
 
+def adopt_rotated_token(new_token: str) -> None:
+    """The control plane staged a new token for us (rotation). Switch to it; the old one stops working once we use the new one."""
+    global AGENT_TOKEN
+    if len(new_token) < 32 or new_token == AGENT_TOKEN:
+        return
+    saved = _load_state(_ENV_TOKEN) or {}
+    AGENT_TOKEN = new_token
+    _save_state(new_token, saved.get("server_id"), saved.get("name"))
+    log.info("agent token rotated by the control plane")
+
+
 def ensure_token() -> bool:
-    """Sets the global AGENT_TOKEN from the environment, saved state, or a fresh enrollment. False when none is possible."""
+    """Sets the global AGENT_TOKEN from saved state, configuration, or a fresh enrollment. False when none is possible."""
     global AGENT_TOKEN
     if len(AGENT_TOKEN) >= 32:
         return True
-    if AGENT_TOKEN_FILE:
-        with open(AGENT_TOKEN_FILE) as handle:   # raises until the control plane has written it; the caller retries
-            AGENT_TOKEN = handle.read().strip()
-        return len(AGENT_TOKEN) >= 32
-    saved = _load_state()
+    configured = _configured_token()
+    saved = _load_state(configured)
     if saved:
         AGENT_TOKEN = saved["token"]
+        return True
+    if len(configured) >= 32:
+        AGENT_TOKEN = configured
         return True
     if SMWATCH_JOIN:
         AGENT_TOKEN = enroll()
@@ -220,7 +266,7 @@ def forget_token() -> None:
     """The control plane rejected our token (server deleted/rotated): drop it so we can re-enroll."""
     global AGENT_TOKEN
     AGENT_TOKEN = ""
-    for directory in (AGENT_STATE_DIR, os.path.join(os.path.expanduser("~"), ".sm-watch-agent")):
+    for directory in _state_dirs():
         try:
             os.remove(os.path.join(directory, "agent.json"))
         except OSError:
@@ -567,6 +613,33 @@ def task_loop() -> None:
             time.sleep(min(15, 2 * failures))
 
 
+# Networks where unencrypted HTTP is acceptable. An explicit list (not ipaddress.is_private, which also counts documentation
+# ranges such as 203.0.113.0/24) so the agent applies exactly the same policy as the installer scripts.
+_PRIVATE_NETWORKS = [ipaddress.ip_network(n) for n in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16", "::1/128", "fc00::/7", "fe80::/10")]
+
+
+def _is_internal_host(host: str) -> bool:
+    """True for addresses where unencrypted HTTP is acceptable: private/loopback/link-local IPs and internal-looking names."""
+    host = host.strip("[]").lower()
+    try:
+        address = ipaddress.ip_address(host)
+        return any(address in network for network in _PRIVATE_NETWORKS if network.version == address.version)
+    except ValueError:
+        return "." not in host or host.endswith((".local", ".lan", ".internal", ".home.arpa", ".localdomain", ".docker"))
+
+
+def insecure_url_problem() -> str | None:
+    """The agent runs code and ships logs on behalf of the control plane: refuse to talk to a public server in clear text."""
+    parsed = urllib.parse.urlsplit(SMWATCH_URL)
+    if parsed.scheme == "https" or AGENT_ALLOW_INSECURE:
+        return None
+    if parsed.scheme == "http" and parsed.hostname and _is_internal_host(parsed.hostname):
+        return None   # LAN / VPN / Docker network
+    return (f"{SMWATCH_URL} is not HTTPS and is not a private address. Credentials and logs would cross the network unencrypted "
+            "and could be read or altered. Use an https:// address (see the README: HTTPS with nginx), or set AGENT_ALLOW_INSECURE=1 to override.")
+
+
 def push_once() -> int:
     """Sends one report. Returns the interval (seconds) the control plane wants next."""
     body = json.dumps(collect()).encode()
@@ -576,6 +649,8 @@ def push_once() -> int:
     )
     with urllib.request.urlopen(request, timeout=15) as response:
         reply = json.loads(response.read().decode() or "{}")
+    if reply.get("rotate_token"):
+        adopt_rotated_token(str(reply["rotate_token"]))
     return max(5, int(reply.get("interval_seconds", AGENT_PUSH_INTERVAL)))
 
 
@@ -583,7 +658,14 @@ def check() -> int:
     """One-shot connectivity test used by the installer and for troubleshooting: python agent.py --check"""
     if not SMWATCH_URL:
         print("FAIL: SMWATCH_URL is not set"); return 1
-    if len(AGENT_TOKEN) < 32 and not SMWATCH_JOIN and not _load_state():
+    problem = insecure_url_problem()
+    if problem:
+        print(f"FAIL: {problem}"); return 1
+    try:
+        configured = _configured_token()
+    except OSError:
+        configured = ""
+    if len(configured) < 32 and not SMWATCH_JOIN and not _load_state(configured):
         print("FAIL: set SMWATCH_JOIN (a join token from the dashboard) or AGENT_TOKEN"); return 1
     try:
         ensure_token()
@@ -678,10 +760,19 @@ def main() -> None:
     if "--check" in sys.argv:
         psutil.cpu_percent(interval=None); _network_rates()
         sys.exit(check())
+    problem = insecure_url_problem() if SMWATCH_URL else None
+    if problem:
+        sys.exit(problem)
     pull = AGENT_MODE in ("pull", "both")
-    if pull and len(AGENT_TOKEN) < 32:
+    try:
+        configured = _configured_token()
+    except OSError:
+        configured = ""   # the token file may not exist yet; the registration loop keeps retrying
+    if pull and len(configured) < 32:
         sys.exit("AGENT_TOKEN (32+ characters) is required in pull mode")
-    if not pull and len(AGENT_TOKEN) < 32 and not SMWATCH_JOIN and not AGENT_TOKEN_FILE and not _load_state():
+    if pull:
+        globals()["AGENT_TOKEN"] = configured   # the pull server authenticates the control plane with this token
+    if not pull and len(configured) < 32 and not SMWATCH_JOIN and not AGENT_TOKEN_FILE and not _load_state():
         sys.exit("Set SMWATCH_JOIN (join token from the dashboard) or AGENT_TOKEN")
     psutil.cpu_percent(interval=None)
     _network_rates()

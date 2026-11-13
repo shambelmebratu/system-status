@@ -73,8 +73,12 @@ function ServerDetail({ server }: { server: Server }) {
     try { await del(`/servers/${server.id}`); toast('Server removed'); await refresh(); go('servers'); } catch (e) { toast((e as Error).message, true); }
   }
   async function rotate() {
-    if (!window.confirm('Issue a new agent token? The installed agent stops reporting until reconfigured.')) return;
-    try { setRotated((await post<{ install_token: string }>(`/servers/${server.id}/rotate-token`)).install_token); } catch (e) { toast((e as Error).message, true); }
+    if (!window.confirm('Rotate this server’s agent token?\n\nA new token is delivered to the agent automatically at its next report, and the old one stops working as soon as the agent has switched. Nothing needs to be reinstalled.')) return;
+    try { toast((await post<{ detail?: string }>(`/servers/${server.id}/rotate-token`)).detail ?? 'Token rotation started'); await refresh(); } catch (e) { toast((e as Error).message, true); }
+  }
+  async function revokeNow() {
+    if (!window.confirm('Revoke this token NOW?\n\nUse this if the token may be stolen. The old token stops working immediately and the agent goes offline until you install the new token on the server.')) return;
+    try { setRotated((await post<{ install_token: string }>(`/servers/${server.id}/rotate-token?immediate=true`)).install_token); await refresh(); } catch (e) { toast((e as Error).message, true); }
   }
 
   return (
@@ -83,7 +87,8 @@ function ServerDetail({ server }: { server: Server }) {
         <button className="btn ghost sm" onClick={() => go('servers')}><Icon name="back" size={15} />Servers</button>
         <h1>{server.name}</h1><StatusPill status={server.last_status} /><span className="tag">{MODE_LABEL[server.monitor_mode]}</span>
         <span className="grow" />
-        {canOperate && server.monitor_mode !== 'ping' && <button className="btn sm" onClick={rotate}>Rotate token</button>}
+        {canOperate && server.monitor_mode !== 'ping' && <button className="btn sm" onClick={rotate} disabled={!!server.token_rotation_pending} title="Delivered to the agent automatically; nothing to reinstall">{server.token_rotation_pending ? 'Rotation pending…' : 'Rotate token'}</button>}
+        {canOperate && server.monitor_mode !== 'ping' && <button className="btn sm danger" onClick={revokeNow} title="Invalidate the current token immediately (if it may be stolen)">Revoke now</button>}
         {canOperate && <button className="btn sm" onClick={() => setEditing(true)}>Edit</button>}
         {canOperate && <button className="btn sm danger" onClick={remove}>Remove</button>}
       </div>
@@ -157,6 +162,10 @@ function ServerDetail({ server }: { server: Server }) {
                 <tr><td className="muted">Uptime</td><td>{m?.uptime_seconds != null ? duration(m.uptime_seconds) : '–'}</td></tr>
                 <tr><td className="muted">Network</td><td>↓ {bytesPerSecond(m?.net_rx_bps)} · ↑ {bytesPerSecond(m?.net_tx_bps)}</td></tr>
                 <tr><td className="muted">Agent</td><td>{m?.agent_version ? `v${m.agent_version}` : '–'}</td></tr>
+              </>}
+              {server.monitor_mode !== 'ping' && <>
+                <tr><td className="muted">Agent token</td><td>{server.token_issued_at ? `issued ${timeAgo(server.token_issued_at)}` : 'age unknown'}{server.token_rotation_pending && <> · <span className="warn">rotation pending</span></>}</td></tr>
+                {server.last_agent_ip && <tr><td className="muted">Last seen from</td><td className="mono">{server.last_agent_ip}</td></tr>}
               </>}
               <tr><td className="muted">Status page</td><td>{server.public ? 'Public' : 'Private'}</td></tr>
               <tr><td className="muted">Interval</td><td>{server.check_interval_seconds}s</td></tr>

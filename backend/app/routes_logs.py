@@ -4,16 +4,17 @@ import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
+from .audit import audit
 from .database import SessionLocal, get_db
 from .models import LogRequest, Server
 from .routes_agent import hash_token
 from .schemas import LogQuery, LogResult
-from .security import require_operator
+from .security import agent_gate, login_limiter, require_operator
 from .stats import aware
 
 router = APIRouter(tags=["logs"])
@@ -76,7 +77,7 @@ def supports_logs(server: Server) -> bool:
 
 # ------------------------------------------------------------------ dashboard side
 @router.post("/api/servers/{server_id}/logs")
-def request_logs(server_id: int, payload: LogQuery, _: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+def request_logs(server_id: int, payload: LogQuery, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
     server = db.get(Server, server_id)
     if not server:
         raise HTTPException(404, "Server not found")
@@ -92,7 +93,10 @@ def request_logs(server_id: int, payload: LogQuery, _: dict = Depends(require_op
     if pending >= MAX_PENDING_PER_SERVER:
         raise HTTPException(429, "Too many log requests are already waiting for this server")
     item = LogRequest(server_id=server_id, query=payload.model_dump_json())
-    db.add(item); db.commit(); db.refresh(item)
+    db.add(item)
+    # Logs can contain secrets: record who looked at what (never the content itself).
+    audit(db, request, "logs.read", user=user, target=f"server:{server_id}", detail=f"{payload.source}:{payload.target or '-'} lines={payload.lines}" + (f" filter={payload.grep!r}" if payload.grep else ""))
+    db.commit(); db.refresh(item)
     _wake(_task_waiters, server_id)   # the agent's open long-poll returns immediately
     return {"id": item.id, "status": item.status}
 
@@ -143,11 +147,17 @@ def _claim(authorization: str | None) -> tuple[int, list[dict]]:
 
 
 @router.get("/api/agent/tasks")
-async def agent_tasks(wait: int = Query(0, ge=0, le=25), authorization: str | None = Header(default=None)) -> dict:
+async def agent_tasks(request: Request, wait: int = Query(0, ge=0, le=25), authorization: str | None = Header(default=None)) -> dict:
     """Polled by agents. With ?wait=N the request is held open (no DB connection is held) until work arrives or N seconds pass."""
+    gate = agent_gate(request, "agent")                                       # refuse callers that keep presenting wrong tokens
     loop = asyncio.get_running_loop()
     deadline = loop.time() + wait
-    server_id, tasks = await run_in_threadpool(_claim, authorization)        # raises 401 for a bad token
+    try:
+        server_id, tasks = await run_in_threadpool(_claim, authorization)    # raises 401 for a bad token
+    except HTTPException as error:
+        if error.status_code == 401:
+            login_limiter.fail_unique(gate, authorization or "")
+        raise
     if tasks or wait == 0:
         return {"tasks": tasks}
     with _Waiter(_task_waiters, server_id) as event:
@@ -164,8 +174,13 @@ async def agent_tasks(wait: int = Query(0, ge=0, le=25), authorization: str | No
 
 
 @router.post("/api/agent/tasks/{request_id}/result")
-def agent_task_result(request_id: int, payload: LogResult, authorization: str | None = Header(default=None), db: Session = Depends(get_db)) -> dict:
-    server = agent_server(authorization, db)
+def agent_task_result(request_id: int, payload: LogResult, request: Request, authorization: str | None = Header(default=None), db: Session = Depends(get_db)) -> dict:
+    gate = agent_gate(request, "agent")
+    try:
+        server = agent_server(authorization, db)
+    except HTTPException:
+        login_limiter.fail_unique(gate, authorization or "")
+        raise
     item = db.get(LogRequest, request_id)
     if not item or item.server_id != server.id or item.status != "running":   # an agent can only answer its own, handed-out requests
         raise HTTPException(404, "Unknown task")

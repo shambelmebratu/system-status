@@ -2,7 +2,25 @@
   "name": "sm-watch",
   "private": true,
   "version": "4.0.0",
-  "scripts": { "dev": "next dev", "build": "next build", "start": "next start", "typecheck": "tsc --noEmit" },
-  "dependencies": { "next": "15.5.9", "react": "19.0.0", "react-dom": "19.0.0" },
-  "devDependencies": { "@types/node": "22.10.5", "@types/react": "19.0.3", "@types/react-dom": "19.0.2", "typescript": "5.7.2" }
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "next": "15.5.29",
+    "react": "19.0.0",
+    "react-dom": "19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.10.5",
+    "@types/react": "19.0.3",
+    "@types/react-dom": "19.0.2",
+    "typescript": "5.7.2"
+  },
+  "overrides": {
+    "postcss": "8.5.23",
+    "source-map-js": "1.2.2"
+  }
 }

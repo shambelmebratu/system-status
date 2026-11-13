@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from pydantic import ValidationError
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, Response
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, Response
 from sqlalchemy import delete, desc, func, select
 from sqlalchemy.orm import Session
 
@@ -16,6 +16,7 @@ from .database import Base, engine, get_db
 from .models import AlertEvent, Channel, CheckResult, Incident, Server, Service, User
 from .monitoring import check_service, discover_telegram_chats, run_once, send_channel_test
 from .routes_agent import hash_token, router as agent_router
+from .routes_audit import router as audit_router
 from .routes_enroll import router as enroll_router
 from .routes_logs import router as logs_router
 from .routes_schedule import router as schedule_router
@@ -24,7 +25,8 @@ from .schemas import ChannelCreate, ChannelUpdate, LoginRequest, PasswordChange,
 from .stats import uptime_by_target
 from .netguard import BlockedTargetError, validate_host, validate_url
 from .routes_users import router as users_router, serialize_user
-from .security import COOKIE_NAME, create_token, hash_password, login_limiter, require_operator, require_user, verify_password
+from .audit import audit
+from .security import COOKIE_NAME, client_ip, create_token, hash_password, login_limiter, needs_rehash, require_operator, require_user, verify_password
 
 settings = get_settings()
 
@@ -76,6 +78,7 @@ app.include_router(enroll_router)
 app.include_router(schedule_router)
 app.include_router(logs_router)
 app.include_router(users_router)
+app.include_router(audit_router)
 app.include_router(stats_router)
 
 
@@ -85,8 +88,12 @@ def purge_history(db: Session, kind: str, target_id: int) -> None:
 
 
 def set_token(item: Server, token: str | None) -> None:
+    changed = (token or None) != item.agent_token
     item.agent_token = token or None
     item.token_hash = hash_token(token) if token else None
+    if changed:
+        item.token_issued_at = datetime.now(timezone.utc) if token else None
+        item.pending_token = item.pending_token_hash = item.pending_token_at = None   # any staged rotation is now moot
 
 
 def guard_target(check, value: str, label: str) -> None:
@@ -101,6 +108,13 @@ def serialize(item):
     for key in ("created_at", "last_checked_at", "last_seen_at"):
         if result.get(key): result[key] = result[key].isoformat()
     result.pop("token_hash", None)
+    if "pending_token_hash" in result:   # never expose a staged token; just whether a rotation is waiting for the agent
+        result["token_rotation_pending"] = bool(result.pop("pending_token_hash"))
+        result.pop("pending_token", None)
+        if result.get("pending_token_at"):
+            result["pending_token_at"] = result["pending_token_at"].isoformat()
+        if result.get("token_issued_at"):
+            result["token_issued_at"] = result["token_issued_at"].isoformat()
     for secret in ("agent_token", "token"):
         if secret in result: result[secret] = "configured" if result[secret] else ""
     if "endpoint" in result and result.get("type") in ("slack", "webhook"):
@@ -128,20 +142,38 @@ def branding() -> dict[str, str]:
     }
 
 
+_DUMMY_HASH: str | None = None
+
+
+def dummy_hash() -> str:
+    """Checked when the email is unknown, so an unknown user costs the same time as a wrong password (no account enumeration by timing)."""
+    global _DUMMY_HASH
+    if _DUMMY_HASH is None:
+        _DUMMY_HASH = hash_password("not-a-real-password")
+    return _DUMMY_HASH
+
+
 @app.post("/api/auth/login")
 def login(payload: LoginRequest, request: Request, response: Response, db: Session = Depends(get_db)) -> dict[str, str]:
     email = payload.email.lower()
-    keys = (f"ip:{request.client.host if request.client else 'unknown'}", f"email:{email}")
-    login_limiter.check(*keys)
+    keys = (f"ip:{client_ip(request)}", f"email:{email}")
+    try:
+        login_limiter.check(keys[0])                                                                                            # this address: 5 misses / 5 min
+        login_limiter.check(keys[1], limit=settings.login_account_max_attempts, window=settings.login_account_window_seconds)  # this account: 20 / 15 min
+    except HTTPException:
+        audit(db, request, "auth.login", actor=email, success=False, detail="blocked: too many failed attempts", commit=True)
+        raise
     user = db.scalar(select(User).where(User.email == email))
-    if not user or not verify_password(payload.password, user.password_hash):
-        login_limiter.fail(*keys)
-        raise HTTPException(401, "Invalid email or password")
-    if not user.active:   # same message and same failure counting as a wrong password: do not reveal which accounts exist
-        login_limiter.fail(*keys)
+    password_ok = verify_password(payload.password, user.password_hash if user else dummy_hash())
+    if not user or not password_ok or not user.active:
+        login_limiter.fail(*keys)   # the same message and counting for every reason: nothing reveals which accounts exist
+        audit(db, request, "auth.login", actor=email, success=False, detail="unknown user" if not user else "wrong password" if not password_ok else "account disabled", commit=True)
         raise HTTPException(401, "Invalid email or password")
     login_limiter.reset(*keys)
     user.last_login_at = datetime.now(timezone.utc)
+    if needs_rehash(user.password_hash):   # silently upgrade an older, weaker hash now that we hold the password
+        user.password_hash = hash_password(payload.password)
+    audit(db, request, "auth.login", actor=user.email, user={"email": user.email, "role": user.role}, target=f"user:{user.id}")
     db.commit()
     response.set_cookie(
         COOKIE_NAME,
@@ -156,26 +188,32 @@ def login(payload: LoginRequest, request: Request, response: Response, db: Sessi
 
 
 @app.post("/api/auth/logout")
-def logout(response: Response, claims: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict[str, bool]:
+def logout(request: Request, response: Response, claims: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict[str, bool]:
     """Revokes every session for this user (bumps the token version) and clears the cookie."""
     account = db.get(User, int(claims["sub"]))
     if account:
         account.token_version += 1
+        audit(db, request, "auth.logout", user=claims, target=f"user:{account.id}")
         db.commit()
     response.delete_cookie(COOKIE_NAME, path="/api")
     return {"ok": True}
 
 
 @app.post("/api/auth/password")
-def change_password(payload: PasswordChange, response: Response, claims: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict[str, bool]:
+def change_password(payload: PasswordChange, request: Request, response: Response, claims: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict[str, bool]:
     account = db.get(User, int(claims["sub"]))
+    key = f"pw:{account.id}"
+    login_limiter.check(key)   # a stolen session must not be usable to guess the current password
     if not verify_password(payload.current_password, account.password_hash):
+        login_limiter.fail(key)
+        audit(db, request, "auth.password_change", user=claims, target=f"user:{account.id}", success=False, detail="wrong current password", commit=True)
         raise HTTPException(403, "Current password is incorrect")
     if verify_password(payload.new_password, account.password_hash):
         raise HTTPException(422, "Choose a password different from the current one")
     account.password_hash = hash_password(payload.new_password)
     account.must_change_password = False
     account.token_version += 1  # signs out every other session
+    audit(db, request, "auth.password_change", user=claims, target=f"user:{account.id}")
     db.commit()
     response.set_cookie(COOKIE_NAME, create_token(account.id, account.email, account.token_version), max_age=settings.session_hours * 3600, httponly=True, secure=settings.cookie_secure, samesite="strict", path="/api")
     return {"ok": True}
@@ -188,7 +226,7 @@ def me(user: dict = Depends(require_user), db: Session = Depends(get_db)) -> dic
 
 
 @app.put("/api/auth/profile")
-def update_profile(payload: ProfileUpdate, user: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
+def update_profile(payload: ProfileUpdate, request: Request, user: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
     """Edit your own name and email. Changing the email needs the current password."""
     account = db.get(User, user["uid"])
     account.name = payload.name.strip()
@@ -197,10 +235,12 @@ def update_profile(payload: ProfileUpdate, user: dict = Depends(require_user), d
         login_limiter.check(key)
         if not verify_password(payload.current_password, account.password_hash):
             login_limiter.fail(key)
+            audit(db, request, "auth.email_change", user=user, target=f"user:{account.id}", success=False, detail="wrong current password", commit=True)
             raise HTTPException(403, "Enter your current password to change your email")
         email = payload.email.strip().lower()
         if db.scalar(select(User.id).where(User.email == email, User.id != account.id)) is not None:
             raise HTTPException(409, "That email is already in use")
+        audit(db, request, "auth.email_change", user=user, target=f"user:{account.id}", detail=f"{account.email} -> {email}")
         account.email = email
     db.commit(); db.refresh(account)
     return serialize_user(account)
@@ -253,14 +293,16 @@ def telegram_discover(payload: TokenBody, _: dict = Depends(require_operator)) -
 
 
 @app.post("/api/channels")
-def create_channel(payload: ChannelCreate, _: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+def create_channel(payload: ChannelCreate, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
     if payload.type in ("slack", "webhook"):
         guard_target(validate_url, payload.endpoint, "Endpoint")
-    item = Channel(**payload.model_dump()); db.add(item); db.commit(); db.refresh(item); return serialize(item)
+    item = Channel(**payload.model_dump()); db.add(item); db.flush()
+    audit(db, request, "channel.create", user=user, target=f"channel:{item.id}", detail=f"{item.name} ({item.type})")
+    db.commit(); db.refresh(item); return serialize(item)
 
 
 @app.put("/api/channels/{item_id}")
-def update_channel(item_id: int, payload: ChannelUpdate, _: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+def update_channel(item_id: int, payload: ChannelUpdate, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
     item = db.get(Channel, item_id)
     if not item:
         raise HTTPException(404, "Notification channel not found")
@@ -277,6 +319,7 @@ def update_channel(item_id: int, payload: ChannelUpdate, _: dict = Depends(requi
         guard_target(validate_url, values["endpoint"], "Endpoint")
     for key, value in values.items():
         setattr(item, key, value)
+    audit(db, request, "channel.update", user=user, target=f"channel:{item.id}", detail=item.name)
     db.commit(); db.refresh(item)
     return serialize(item)
 
@@ -293,9 +336,11 @@ def test_channel(item_id: int, _: dict = Depends(require_operator), db: Session 
 
 
 @app.delete("/api/channels/{item_id}")
-def delete_channel(item_id: int, _: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict[str, bool]:
+def delete_channel(item_id: int, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict[str, bool]:
     item = db.get(Channel, item_id)
-    if item: db.delete(item); db.commit()
+    if item:
+        audit(db, request, "channel.delete", user=user, target=f"channel:{item.id}", detail=item.name)
+        db.delete(item); db.commit()
     return {"deleted": True}
 
 
@@ -309,7 +354,7 @@ def validate_server_targets(payload: ServerCreate) -> None:
 
 
 @app.post("/api/servers")
-def create_server(payload: ServerCreate, _: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+def create_server(payload: ServerCreate, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
     values = payload.model_dump()
     token = values.pop("agent_token")
     if payload.monitor_mode == "push":
@@ -320,7 +365,9 @@ def create_server(payload: ServerCreate, _: dict = Depends(require_operator), db
     validate_server_targets(payload)
     item = Server(**values)
     set_token(item, token if payload.monitor_mode != "ping" else None)
-    db.add(item); db.commit(); db.refresh(item)
+    db.add(item); db.flush()
+    audit(db, request, "server.create", user=user, target=f"server:{item.id}", detail=f"{item.name} ({item.monitor_mode})")
+    db.commit(); db.refresh(item)
     result = serialize(item)
     if payload.monitor_mode == "push":
         result["install_token"] = token
@@ -328,7 +375,7 @@ def create_server(payload: ServerCreate, _: dict = Depends(require_operator), db
 
 
 @app.put("/api/servers/{item_id}")
-def update_server(item_id: int, payload: ServerCreate, _: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+def update_server(item_id: int, payload: ServerCreate, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
     item = db.get(Server, item_id)
     if not item:
         raise HTTPException(404, "Server not found")
@@ -349,29 +396,42 @@ def update_server(item_id: int, payload: ServerCreate, _: dict = Depends(require
     item.last_seen_at = None
     item.last_status = "unknown"
     item.last_error = None
+    audit(db, request, "server.update", user=user, target=f"server:{item.id}", detail=f"{item.name} ({item.monitor_mode})")
     db.commit()
     db.refresh(item)
     return serialize(item)
 
 
 @app.post("/api/servers/{item_id}/rotate-token")
-def rotate_server_token(item_id: int, _: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
-    """Issues a new agent token (shown once). The old token stops working immediately."""
+def rotate_server_token(item_id: int, request: Request, immediate: bool = Query(False), user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+    """Replaces the server's agent token.
+
+    Default (agents that have connected): the new token is staged and delivered to the agent over its own authenticated
+    connection at its next report; the old token stays valid only until the agent has switched, so nothing is interrupted.
+    immediate=true (a token is stolen/leaked): the old token stops working NOW and the new one is returned once, to be
+    installed by hand. Pull/never-connected agents always use the immediate form."""
     item = db.get(Server, item_id)
     if not item:
         raise HTTPException(404, "Server not found")
     if item.monitor_mode == "ping":
         raise HTTPException(422, "Ping-only monitors do not use an agent token")
     token = secrets.token_urlsafe(32)
+    if item.monitor_mode == "push" and item.last_seen_at and not immediate:
+        item.pending_token, item.pending_token_hash, item.pending_token_at = token, hash_token(token), datetime.now(timezone.utc)
+        audit(db, request, "server.token_rotate", user=user, target=f"server:{item.id}", detail=f"{item.name}: staged for delivery to the agent")
+        db.commit()
+        return {"mode": "managed", "detail": "The new token will be delivered to the agent at its next report. Nothing needs to be installed."}
     set_token(item, token)
+    audit(db, request, "server.token_revoke", user=user, target=f"server:{item.id}", detail=f"{item.name}: old token invalidated immediately")
     db.commit()
-    return {"install_token": token}
+    return {"mode": "immediate", "install_token": token}
 
 
 @app.delete("/api/servers/{item_id}")
-def delete_server(item_id: int, _: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict[str, bool]:
+def delete_server(item_id: int, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict[str, bool]:
     item = db.get(Server, item_id)
     if item:
+        audit(db, request, "server.delete", user=user, target=f"server:{item.id}", detail=item.name)
         purge_history(db, "server", item.id)
         db.delete(item); db.commit()
     return {"deleted": True}

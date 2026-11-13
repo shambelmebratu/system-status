@@ -17,7 +17,7 @@ from sqlalchemy import delete, select
 
 from .config import get_settings
 from .database import SessionLocal
-from .models import AlertEvent, Channel, CheckResult, Incident, LogRequest, MetricSample, Server, Service
+from .models import AlertEvent, AuditEvent, Channel, CheckResult, Incident, LogRequest, MetricSample, Server, Service
 from .netguard import safe_urlopen, validate_host
 
 logger = logging.getLogger(__name__)
@@ -512,6 +512,7 @@ def prune_history() -> None:
         session.execute(delete(CheckResult).where(CheckResult.checked_at < now - timedelta(days=settings.check_retention_days)))
         session.execute(delete(MetricSample).where(MetricSample.ts < now - timedelta(days=settings.metric_retention_days)))
         session.execute(delete(LogRequest).where(LogRequest.created_at < now - timedelta(minutes=15)))  # fetched logs are never archived
+        session.execute(delete(AuditEvent).where(AuditEvent.ts < now - timedelta(days=settings.audit_retention_days)))
         session.commit()
     finally:
         session.close()

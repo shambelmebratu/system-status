@@ -47,6 +47,11 @@ class Server(Base):
     token_hash: Mapped[str | None] = mapped_column(String(64), index=True)
     machine_id: Mapped[str | None] = mapped_column(String(64), index=True)
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_agent_ip: Mapped[str | None] = mapped_column(String(64))
+    token_issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    pending_token: Mapped[str | None] = mapped_column(EncryptedText)      # new token waiting for the agent to pick it up
+    pending_token_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    pending_token_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     services: Mapped[list["Service"]] = relationship(passive_deletes=True)
 
@@ -159,6 +164,7 @@ class Enrollment(Base):
     max_uses: Mapped[int | None] = mapped_column(Integer)
     uses: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     revoked: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    created_by: Mapped[str | None] = mapped_column(String(320))
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
@@ -197,3 +203,17 @@ class LogRequest(Base):
     truncated: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class AuditEvent(Base):
+    """Append-only record of security-relevant actions: who did what, to what, from where, and whether it worked."""
+    __tablename__ = "audit_events"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    actor: Mapped[str] = mapped_column(String(320), default="")          # user email, "agent:<name>", or "system"
+    actor_role: Mapped[str | None] = mapped_column(String(20))
+    action: Mapped[str] = mapped_column(String(60), index=True)          # e.g. auth.login, user.create, logs.read
+    target: Mapped[str] = mapped_column(String(200), default="")
+    detail: Mapped[str | None] = mapped_column(Text)
+    ip: Mapped[str | None] = mapped_column(String(64))
+    success: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")

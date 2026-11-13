@@ -64,6 +64,16 @@ jobs:
           bash -n backend/agent_install.sh
           bash -n backend/agent_install_docker.sh
 
+      # Known-vulnerable dependencies fail the build, so images with a published CVE are never pushed.
+      - name: Dependency audit (Python)
+        working-directory: backend
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt --strict
+      - name: Dependency audit (dashboard)
+        working-directory: frontend-next
+        run: npm audit --omit=dev --audit-level=high
+
   images:
     name: Image ${{ matrix.image }}
     needs: test

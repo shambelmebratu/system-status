@@ -96,7 +96,7 @@ function JoinTokens() {
           {enrollment.items.map(t => (
             <Fragment key={t.id}>
               <tr>
-                <td><div className="name">{t.label || 'Untitled'}<small className="mono">{t.token.slice(0, 8)}…</small></div></td>
+                <td><div className="name">{t.label || 'Untitled'}<small>{t.created_by ? `by ${t.created_by} · ` : ''}<span className="mono">{t.token.slice(0, 8)}…</span></small></div></td>
                 <td><span className={`pill ${t.active ? 'up' : 'unknown'}`}><i />{expiryText(t)}</span></td>
                 <td>{t.uses}{t.max_uses ? ` / ${t.max_uses}` : ''}</td><td className="hide-sm muted">{t.last_used_at ? timeAgo(t.last_used_at) : 'never'}</td>
                 <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>{t.active && <><button className="btn sm" onClick={() => setOpenId(openId === t.id ? null : t.id)}>{openId === t.id ? 'Hide command' : 'Show command'}</button> <button className="btn sm danger" onClick={() => enrollment.revoke(t.id)}>Revoke</button></>}</td>

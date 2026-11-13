@@ -157,3 +157,122 @@ def test_docker_desktop_vm_is_explained(tmp_path, monkeypatch):
     assert "inside Docker on a Mac or Windows PC" in inv["notes"][0] and "install the agent directly" in inv["notes"][0]
     assert any("no systemd journal" in n for n in inv["notes"]) and any("No standard log files" in n for n in inv["notes"])
     sys.modules.pop("agent", None)
+
+
+# ---------------------------------------------------------------- agent credentials: rotation, state, HTTPS
+@pytest.fixture()
+def cred_agent(tmp_path, monkeypatch):
+    """A fresh agent module with an isolated state directory and a configured per-server token."""
+    token = "t" * 20 + "o" * 20 + "k" * 4
+    monkeypatch.setenv("SMWATCH_URL", "https://monitor.example.com"); monkeypatch.setenv("AGENT_TOKEN", token)
+    monkeypatch.setenv("AGENT_STATE_DIR", str(tmp_path / "state")); monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("AGENT_DOCKER_SOCKET", str(tmp_path / "none")); monkeypatch.delenv("AGENT_TOKEN_FILE", raising=False)
+    sys.path.insert(0, ROOT); sys.modules.pop("agent", None)
+    mod = importlib.import_module("agent")
+    mod.configured = token
+    yield mod
+    sys.modules.pop("agent", None)
+
+
+def _restart(mod):
+    mod.AGENT_TOKEN = ""     # a fresh process starts without a token in memory
+
+
+def test_rotated_token_survives_restart_and_is_stored_privately(cred_agent):
+    a = cred_agent
+    assert a.ensure_token() and a.AGENT_TOKEN == a.configured
+    new = "N" * 43
+    a.adopt_rotated_token(new)
+    assert a.AGENT_TOKEN == new
+    path = a._state_file()
+    assert oct(os.stat(path).st_mode & 0o777) == "0o600"                              # only the agent's own user can read it
+    assert not os.path.exists(path + ".tmp")                                          # written atomically
+    _restart(a)
+    assert a.ensure_token() and a.AGENT_TOKEN == new                                  # the rotated token wins over the old configured one
+    # ...but if an administrator deliberately installs a different token, stale saved state must NOT override it
+    a._ENV_TOKEN = "X" * 43; _restart(a)
+    assert a.ensure_token() and a.AGENT_TOKEN == "X" * 43
+
+
+def test_malformed_or_repeated_rotation_messages_are_ignored(cred_agent):
+    a = cred_agent
+    a.ensure_token()
+    for bad in ("", "short", a.configured, "a" * 31):
+        a.adopt_rotated_token(bad)
+        assert a.AGENT_TOKEN == a.configured, bad
+
+
+def test_state_for_another_control_plane_is_not_trusted(cred_agent, monkeypatch):
+    a = cred_agent
+    a.ensure_token(); a.adopt_rotated_token("R" * 43)
+    monkeypatch.setattr(a, "SMWATCH_URL", "https://other.example.org"); _restart(a)
+    assert a.ensure_token() and a.AGENT_TOKEN == a.configured                         # a token saved for one server is never sent to another
+
+
+def test_push_once_adopts_a_rotated_token_from_the_reply(cred_agent, monkeypatch):
+    a = cred_agent
+    a.ensure_token()
+    monkeypatch.setattr(a, "collect", lambda: {"cpu": 1})
+    sent = []
+
+    class Reply:
+        def __init__(self, body): self.body = body
+        def __enter__(self): return self
+        def __exit__(self, *x): return False
+        def read(self): return json.dumps(self.body).encode()
+    replies = [{"ok": True, "interval_seconds": 30, "rotate_token": "Z" * 43}, {"ok": True, "interval_seconds": 30}]
+    monkeypatch.setattr(a.urllib.request, "urlopen", lambda req, timeout=0: (sent.append(req.get_header("Authorization")), Reply(replies.pop(0)))[1])
+    a.push_once(); a.push_once()
+    assert sent == [f"Bearer {a.configured}", "Bearer " + "Z" * 43]                    # the very next report already uses the new token
+
+
+@pytest.mark.parametrize("url, ok", [
+    ("https://watchstatus.ashewa.com", True), ("http://watchstatus.ashewa.com", False), ("http://203.0.113.9:8000", False), ("ftp://x.example.com", False),
+    ("http://192.168.1.10:8000", True), ("http://10.1.2.3", True), ("http://172.16.5.5", True), ("http://172.40.0.1", False), ("http://169.254.1.1", True),
+    ("http://127.0.0.1:8000", True), ("http://api:8000", True), ("http://monitor.lan", True), ("http://monitor.internal:8000", True),
+    ("http://evil.local.attacker.io", False), ("http://[::1]:8000", True),
+])
+def test_plain_http_is_only_allowed_on_private_networks(cred_agent, monkeypatch, url, ok):
+    monkeypatch.setattr(cred_agent, "SMWATCH_URL", url)
+    assert (cred_agent.insecure_url_problem() is None) is ok, url
+
+
+def test_insecure_override_and_check_command_refuse(cred_agent, monkeypatch, capsys):
+    a = cred_agent
+    monkeypatch.setattr(a, "SMWATCH_URL", "http://203.0.113.9:8000")
+    assert a.check() == 1 and "not HTTPS" in capsys.readouterr().out                   # the connectivity test fails fast with the reason
+    monkeypatch.setattr(a, "AGENT_ALLOW_INSECURE", True)
+    assert a.insecure_url_problem() is None                                            # an explicit, deliberate opt-out exists
+
+
+def test_real_process_restart_uses_the_rotated_token_not_the_environment_token(cred_agent, monkeypatch):
+    """The bug that unit tests with a hand-reset token missed: a genuinely fresh process starts with the OLD token still in its
+    environment (Docker keeps env vars forever) and must still prefer the rotated token saved on disk."""
+    a = cred_agent
+    old = a.configured
+    a.ensure_token(); a.adopt_rotated_token("R" * 43)
+    sys.modules.pop("agent", None)                                   # a new process: nothing in memory, same environment
+    fresh = importlib.import_module("agent")
+    assert fresh.AGENT_TOKEN == "" and fresh._ENV_TOKEN == old       # it does NOT start out with the environment token in use
+    assert fresh.ensure_token() and fresh.AGENT_TOKEN == "R" * 43
+    sys.modules.pop("agent", None)
+
+
+def test_pull_mode_still_authenticates_with_the_configured_token(cred_agent, monkeypatch):
+    a = cred_agent
+    monkeypatch.setattr(a, "AGENT_MODE", "pull"); monkeypatch.setattr(a, "SMWATCH_URL", "")
+    monkeypatch.setattr(sys, "argv", ["agent.py"]); monkeypatch.setattr(a.psutil, "cpu_percent", lambda interval=None: 0)
+    started = {}
+    import types
+    monkeypatch.setitem(sys.modules, "uvicorn", types.SimpleNamespace(run=lambda app, host, port: started.update(app=app)))
+    a.main()
+    assert a.AGENT_TOKEN == a.configured and "app" in started          # /metrics checks this token: it must not be empty in pull mode
+
+
+def test_check_command_accepts_a_configured_token(cred_agent, monkeypatch, capsys):
+    """`agent.py --check` is what the installer runs before starting the service: it must work with a supplied token."""
+    a = cred_agent
+    monkeypatch.setattr(a, "push_once", lambda: 30)
+    assert a.check() == 0 and "OK: report accepted" in capsys.readouterr().out
+    monkeypatch.setattr(a, "_ENV_TOKEN", "")
+    assert a.check() == 1 and "set SMWATCH_JOIN" in capsys.readouterr().out          # with nothing configured it still says so

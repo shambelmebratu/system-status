@@ -1,11 +1,11 @@
-fastapi==0.115.6
+fastapi==0.162.6
 uvicorn[standard]==0.34.0
 sqlalchemy==2.0.36
 psycopg[binary]==3.2.3
 pydantic-settings==2.7.1
-PyJWT==2.10.1
+PyJWT==2.15.1
 psutil==6.1.1
 httpx==0.28.1
 alembic==1.14.0
-cryptography==44.0.0
+cryptography==50.0.2
 tzdata==2024.2

@@ -29,11 +29,20 @@ class Settings(BaseSettings):
     reminder_minutes: int = 30         # minimum gap between repeat alerts while a target stays down
     alert_retry_minutes: int = 60      # undelivered alerts older than this are expired, not retried
     public_status_enabled: bool = True
+    audit_retention_days: int = 365
+    agent_min_report_seconds: float = 2   # an agent may not report more often than this (flood protection)
+    dockerhub_username: str = "shambi21"  # where the published agent image lives (used by the Docker install command)
+    smwatch_version: str = "latest"
+    agent_image: str = ""                  # full override, e.g. registry.example.com/sm-watch-host-agent:1.2.3
     host_agent_token_file: str = ""  # when set, the API provisions a server entry + token for the bundled host agent
     public_url: str = ""  # externally reachable control-plane URL shown in agent install commands (e.g. https://monitor.example.com)
     cookie_secure: bool = False  # set true when served over HTTPS
     login_max_attempts: int = 5
     login_window_seconds: int = 300
+    # A single account is locked far less eagerly than a single address: otherwise anyone who knows an admin's email could keep
+    # that admin locked out. (Each guess also costs ~0.25 s of server time because of the password hash.)
+    login_account_max_attempts: int = 20
+    login_account_window_seconds: int = 900
     # Extra hostnames the monitor must never contact (internal compose services).
     blocked_hosts: str = "postgres,api,worker,migrate,frontend,localhost,metadata.google.internal"
     # When true, RFC1918/ULA private ranges are blocked too (off: monitoring LAN hosts is the point).
@@ -60,6 +69,11 @@ class Settings(BaseSettings):
         if problems:
             raise ValueError("Refusing to start with insecure configuration: " + "; ".join(problems) + ". Set ENVIRONMENT=development to bypass for local use only.")
         return self
+
+
+def resolved_agent_image(settings: "Settings") -> str:
+    """The image the Docker install command runs. The agent code is baked into it: nothing is downloaded at start-up."""
+    return settings.agent_image or f"{settings.dockerhub_username}/sm-watch-host-agent:{settings.smwatch_version}"
 
 
 @lru_cache

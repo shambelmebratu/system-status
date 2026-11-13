@@ -1,10 +1,11 @@
 """User administration (admin only). Roles: admin (everything), operator (manage monitoring), viewer (read-only)."""
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from .audit import audit
 from .database import get_db
 from .models import User
 from .schemas import UserCreate, UserUpdate
@@ -33,17 +34,19 @@ def list_users(_: dict = Depends(require_admin), db: Session = Depends(get_db)) 
 
 
 @router.post("")
-def create_user(payload: UserCreate, _: dict = Depends(require_admin), db: Session = Depends(get_db)) -> dict:
+def create_user(payload: UserCreate, request: Request, me: dict = Depends(require_admin), db: Session = Depends(get_db)) -> dict:
     email = payload.email.strip().lower()
     if db.scalar(select(User.id).where(User.email == email)) is not None:
         raise HTTPException(409, "A user with that email already exists")
     user = User(email=email, name=payload.name.strip(), role=payload.role, password_hash=hash_password(payload.password), must_change_password=True)
-    db.add(user); db.commit(); db.refresh(user)
+    db.add(user); db.flush()
+    audit(db, request, "user.create", user=me, target=f"user:{user.id}", detail=f"{user.email} as {user.role}")
+    db.commit(); db.refresh(user)
     return serialize_user(user)
 
 
 @router.put("/{user_id}")
-def update_user(user_id: int, payload: UserUpdate, me: dict = Depends(require_admin), db: Session = Depends(get_db)) -> dict:
+def update_user(user_id: int, payload: UserUpdate, request: Request, me: dict = Depends(require_admin), db: Session = Depends(get_db)) -> dict:
     user = db.get(User, user_id)
     if not user:
         raise HTTPException(404, "User not found")
@@ -54,24 +57,30 @@ def update_user(user_id: int, payload: UserUpdate, me: dict = Depends(require_ad
     if losing_admin and other_active_admins(db, user) == 0:
         raise HTTPException(409, "There must always be at least one active admin")
     revoke = False
+    changes = []
     if payload.name is not None:
         user.name = payload.name.strip()
     if payload.role is not None and payload.role != user.role:
+        changes.append(f"role {user.role} -> {payload.role}")
         user.role, revoke = payload.role, True
     if payload.active is not None and payload.active != user.active:
+        changes.append("enabled" if payload.active else "disabled")
         user.active, revoke = payload.active, True
     if payload.password:
+        changes.append("password reset")
         user.password_hash = hash_password(payload.password)
         user.must_change_password = not is_self      # a reset by an admin is temporary; the person picks their own
         revoke = True
     if revoke and not is_self:
         user.token_version += 1                      # sign the person out everywhere so the change applies at once
+    if changes:
+        audit(db, request, "user.update", user=me, target=f"user:{user.id}", detail=f"{user.email}: " + ", ".join(changes))
     db.commit(); db.refresh(user)
     return serialize_user(user)
 
 
 @router.delete("/{user_id}")
-def delete_user(user_id: int, me: dict = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, bool]:
+def delete_user(user_id: int, request: Request, me: dict = Depends(require_admin), db: Session = Depends(get_db)) -> dict[str, bool]:
     user = db.get(User, user_id)
     if not user:
         return {"deleted": True}
@@ -79,5 +88,6 @@ def delete_user(user_id: int, me: dict = Depends(require_admin), db: Session = D
         raise HTTPException(409, "You cannot delete your own account")
     if user.role == "admin" and user.active and other_active_admins(db, user) == 0:
         raise HTTPException(409, "There must always be at least one active admin")
+    audit(db, request, "user.delete", user=me, target=f"user:{user.id}", detail=user.email)
     db.delete(user); db.commit()
     return {"deleted": True}

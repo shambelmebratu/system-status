@@ -23,14 +23,57 @@ The supported environment settings include `POSTGRES_DB`, `POSTGRES_USER`, `POST
 - **Public status page** at `/status` for services marked public (name and uptime only; set `PUBLIC_STATUS_ENABLED=false` to disable).
 - **Concurrent worker:** due checks run in parallel (`WORKER_CONCURRENCY`, default 16).
 
-## Security notes
+## Security model
 
-- The API and worker **refuse to start** unless `JWT_SECRET` is 32+ characters and `ADMIN_PASSWORD` is 12+ characters and not a known default (`ENVIRONMENT=development` bypasses this for local experiments only). Docker Compose also requires both to be set.
-- Sessions use an `httpOnly`, `SameSite=Strict` cookie (set `COOKIE_SECURE=true` behind HTTPS), expire after `SESSION_HOURS` (default 8), and are revoked server-side on sign-out. State-changing cookie requests must send `X-Requested-With: smwatch`. Bearer tokens in the `Authorization` header are still accepted for scripts.
-- Failed sign-ins are rate limited per IP and per email (`LOGIN_MAX_ATTEMPTS` per `LOGIN_WINDOW_SECONDS`; in-memory, per API process).
-- Agent tokens, bot tokens and webhook URLs are encrypted at rest (Fernet). Set a dedicated `ENCRYPTION_KEY`; otherwise it is derived from `JWT_SECRET`, and **changing that secret makes stored secrets unreadable**. Migration `0009` encrypts existing rows.
-- Outbound requests (service URLs, agent endpoints, webhooks, ping hosts) block loopback, link-local/cloud-metadata addresses, and the stack's own service names (`BLOCKED_HOSTS`), and re-validate every redirect. Private LAN ranges are allowed so internal hosts can be monitored; set `BLOCK_PRIVATE_TARGETS=true` to block them.
-- Telegram's API requires the bot token in the request URL; the app redacts it from stored and returned error text.
+SM-Watch holds credentials that reach every server you monitor, so this section says what each credential can do, how it can be abused, and how to respond. Short version: sign in over **HTTPS only**, keep agent install links short-lived, read the **Audit log**, and rotate or revoke an agent token the moment you doubt it.
+
+### What each credential can do
+
+| Credential | Lives where | Lifetime | What a thief could do | What they cannot do |
+| --- | --- | --- | --- | --- |
+| **Install link** (`/api/agent/join/<token>`) | the command you paste; stored encrypted on the control plane | **15 minutes** by default (10 min to 24 h), optional server limit, revocable | register new servers under their own hostname (until it expires) | read anything, change anything, or touch servers that already joined |
+| **Agent token** (one per server) | the monitored server (`/var/lib/sm-watch-agent`, mode 0600, owned by the agent's user); stored encrypted on the control plane | until rotated | send fake metrics for **that one** server (e.g. hide an outage); see the log requests sent to it | read other servers' data, read logs from the control plane, reach the dashboard, or register servers |
+| **Dashboard session** | `HttpOnly`, `SameSite=Strict` cookie; CSRF header required | 8 hours, revoked on password change, role change, disable or sign-out | whatever that user's role allows (see *Users and roles*) | outlive a demotion or deactivation: the role is re-read on every request |
+
+An agent can only read from a **fixed allow-list** of log sources; it never runs commands or reads arbitrary paths (see *Logs*). The control plane can ask it for logs, but it cannot make it run anything else.
+
+### How agent tokens are protected
+
+- **Random and unguessable**: 256 bits from the operating system's secure generator. Stored **encrypted** (Fernet) in the database; only a SHA-256 hash is used to look them up.
+- **Wrong tokens are throttled** on every agent endpoint (reports, log polling, results, registration and install links): after 5 misses an address is locked out for 5 minutes, and every miss is audited. A valid agent is never affected.
+- **A compromised agent cannot flood the database**: reports faster than every 2 seconds are refused.
+- **Rotate without downtime.** *Server page → Rotate token*: the control plane stages a new token and hands it to the agent **over the agent's own authenticated connection** at its next report. The old token stays valid only until the agent has switched; nothing is reinstalled and nobody copies a secret. Do this on a schedule (for example every 90 days).
+- **Revoke immediately.** If a token may be stolen: *Server page → Revoke now* (or the Audit log shows an unexpected change). The old token stops working at once; install the new one shown on screen, or re-run the install command.
+- **Spotting theft.** The control plane records the address each agent connects from and writes an **`agent.ip_changed`** audit event when it changes; the server page shows the last address. A token suddenly used from somewhere unexpected is the signal to revoke it.
+- Removing a server in the dashboard, or disabling its monitor, cuts its token off immediately.
+
+### Installing agents safely
+
+- The agent runs code on your server and ships its logs. **Never install over unencrypted HTTP to a public address**: the installers, and the agent itself, **refuse** it. Plain `http://` is accepted only on private networks (10.x, 172.16-31.x, 192.168.x, loopback, link-local, `.lan`/`.local`/`.internal` or single-word host names). Use HTTPS (see *HTTPS with nginx*). Overrides exist for VPN/overlay networks you trust (`SMWATCH_ALLOW_HTTP=1` for the installer, `AGENT_ALLOW_INSECURE=1` for the agent), but they are deliberate and not recommended.
+- The shell installer **verifies the SHA-256** of the agent it downloads against the hash announced in the install command, and refuses a mismatch. The agent is installed once and is **never auto-updated** from the network; you update it by re-running the command.
+- The **Docker agent runs a published image** (`<user>/sm-watch-host-agent:<version>`): the agent code is inside the image, nothing is downloaded when the container starts. The container runs with all capabilities dropped, `no-new-privileges`, and a read-only filesystem. Pin a version (`SMWATCH_VERSION=1.2.3`) so updates are deliberate.
+- The Linux service runs as an unprivileged user with `NoNewPrivileges`, a read-only system and no access to home directories. **Log access is optional**: joining the `docker` group is root-equivalent on that server, so choose `SMWATCH_LOGS=nodocker` or `off` unless you need container logs.
+- Install links contain a secret in the URL. Treat the command like a password until it expires, and keep it out of chat logs and tickets. The provided nginx config masks it in its access log.
+
+### Audit log
+
+**Audit log** (admins only) records, append-only and for a year: sign-ins (including failures, blocked attempts and unknown users), password and email changes, user creation, role changes, resets and deletion, install links created and revoked, agents registering, token rotation and revocation, agent address changes, rejected agent tokens, server and channel changes, and **every time someone opens a log** (who, which server, which source). Details never contain secrets (passwords, tokens and log contents are never written), and events cannot be edited or deleted through the application.
+
+### Passwords and sessions
+
+Passwords are hashed with scrypt at the OWASP-recommended cost (N=2^17, r=8, p=1) and older hashes are upgraded automatically at the next sign-in. Sign-in takes the same time for an unknown email as for a wrong password, so accounts cannot be discovered by timing, and failures return one generic message. Wrong passwords are rate limited per address (5 misses per 5 minutes) and, more tolerantly, per account (20 per 15 minutes, so knowing an admin's email is not enough to keep them locked out); the same applies when changing a password or email. Minimum length is 12 characters, temporary passwords must be replaced at first sign-in, and the app refuses to start with a default `JWT_SECRET` or `ADMIN_PASSWORD`.
+
+### Platform hardening
+
+Outbound requests the control plane makes on your behalf (service checks, webhooks, agent endpoints, ping targets) cannot reach loopback, link-local or cloud-metadata addresses or the stack's own internal services, and every redirect is re-validated (`BLOCK_PRIVATE_TARGETS=true` also blocks LAN ranges). Notification tokens are redacted from error messages. All containers run with no new privileges and no extra capabilities (the worker keeps only `NET_RAW` for ping); the dashboard runs as an unprivileged user on a read-only filesystem; the API and database are not exposed to the network (bind the dashboard to `127.0.0.1` behind nginx with `FRONTEND_BIND`). The dashboard sends `X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy`, `Permissions-Policy` and `Cross-Origin-Opener-Policy`. Dependencies had no known vulnerabilities when this was written, and it stays that way by construction: the GitHub Action runs `pip-audit` and `npm audit` **before** it builds images, so a vulnerable dependency fails the build (nothing is pushed), and `.github/dependabot.yml` opens weekly update pull requests for Python, npm, Docker base images and Actions.
+
+### Known limits (read these)
+
+- Anyone who can read the control plane's database **and** `.env` (`JWT_SECRET`/`ENCRYPTION_KEY`) can decrypt stored tokens. Protect `.env`, back it up separately from database dumps, and rotate tokens after any suspected breach.
+- A **compromised control plane** is a compromise of the agents' *log* and *metric* confidentiality, but it cannot make an installed agent run new code (no auto-update, fixed allow-list). The Docker agent runs whatever image you point it at: pin versions.
+- Login lockouts are per address (strict) and per account (tolerant). A determined, distributed attacker can still make a known account refuse sign-ins for up to 15 minutes at a time by exceeding 20 failures; the audit log shows it happening. Each guess also costs the server about a quarter of a second, which limits guessing speed.
+- The API container runs as root inside its (capability-less) container, because the worker's raw ping socket needs it. Everything it reads and writes is the database or its own volume.
+- Log contents can contain secrets. Operators and admins can read logs from every connected server: grant those roles carefully, and watch the audit log.
 
 ## Run with Docker Compose
 
@@ -231,6 +274,31 @@ The same one-line install command works on a Mac. It detects macOS and sets up a
 - **When:** every day, on selected weekdays (e.g. Mon-Fri 08:58), or once at a date and time, in any IANA time zone (daylight saving handled).
 - **Reliability:** a failed channel is retried twice, one minute apart, and only the failed channels are retried. If the worker was down and the planned time is more than 15 minutes in the past, the run is skipped and marked `missed` rather than sent late. **Send now** tests a message immediately; **Pause**/**Resume** keeps it without sending.
 - WhatsApp template messages cannot contain line breaks, so they are joined with ` | `.
+
+## HTTPS with nginx and Let's Encrypt
+
+`deploy/nginx/watchstatus.ashewa.com.conf` is a ready-to-use nginx site for `watchstatus.ashewa.com` (change the name for another domain). It redirects HTTP to HTTPS, keeps the certbot challenge path on HTTP, serves TLS 1.2/1.3 with HTTP/2 and security headers (HSTS, `nosniff`, frame and referrer policies), and proxies everything to the dashboard on `127.0.0.1:8000`, which forwards `/api/*` to the API. It was tested end to end (redirect, challenge path, TLS 1.3, HTTP/2, header forwarding, a 28 s long-poll) in an isolated Docker setup with a self-signed certificate.
+
+1. **DNS:** point `watchstatus.ashewa.com` at the server and open ports 80 and 443.
+2. **`.env`**, then `docker compose up -d`:
+   ```
+   PUBLIC_URL=https://watchstatus.ashewa.com   # agent install commands use this address
+   COOKIE_SECURE=true                          # session cookie only travels over HTTPS
+   FRONTEND_BIND=127.0.0.1                     # port 8000 reachable only by nginx, not the internet
+   ```
+   (Do not set `COOKIE_SECURE=true` while you still open the app over plain `http://`; sign-in would not stick.)
+3. **nginx + certificate:**
+   ```sh
+   sudo cp deploy/nginx/watchstatus.ashewa.com.conf /etc/nginx/conf.d/
+   # comment out the "listen 443" server block for now, then:
+   sudo mkdir -p /var/www/certbot && sudo nginx -t && sudo systemctl reload nginx
+   sudo certbot certonly --webroot -w /var/www/certbot -d watchstatus.ashewa.com --deploy-hook "systemctl reload nginx"
+   # un-comment the 443 block, then:
+   sudo nginx -t && sudo systemctl reload nginx
+   ```
+   Renewal is automatic (certbot's timer) and the deploy hook reloads nginx after each renewal.
+
+Notes: on nginx older than 1.25.1 replace `http2 on;` with `listen 443 ssl http2;`. The config **overwrites** `X-Forwarded-For` with the real client address, which the app uses for its login rate limit, so keep that line. Long requests are expected: agents and the Logs page hold a request open for up to 25 s, hence the 90 s proxy timeouts.
 
 ## Publishing images to Docker Hub (GitHub Actions)
 

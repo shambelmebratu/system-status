@@ -9,10 +9,28 @@ NAME=sm-watch-agent
 say() { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
-: "${SMWATCH_URL:?missing SMWATCH_URL}" "${SMWATCH_JOIN:?missing SMWATCH_JOIN}"
+# --- the agent runs code and ships logs for the control plane: never over an unencrypted link to a public address
+is_internal_host() {
+  case "$1" in
+    10.*|127.*|192.168.*|169.254.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|localhost|"[::1]"|::1) return 0 ;;
+    *.local|*.lan|*.internal|*.home.arpa|*.localdomain) return 0 ;;
+    *.*) return 1 ;;
+    *) return 0 ;;   # single-label names (a LAN or Docker host name)
+  esac
+}
+require_secure_url() {
+  case "$1" in https://*) return 0 ;; esac
+  [ "${SMWATCH_ALLOW_HTTP:-}" = "1" ] && return 0
+  local rest host; rest=${1#http://}; host=${rest%%/*}; host=${host%%:*}
+  is_internal_host "$host" && return 0
+  die "$1 is not HTTPS and not a private address: credentials and logs would travel unencrypted and the downloaded agent could be tampered with. Use an https:// address (README: HTTPS with nginx), or set SMWATCH_ALLOW_HTTP=1 to override."
+}
+
+: "${SMWATCH_URL:?missing SMWATCH_URL}" "${SMWATCH_JOIN:?missing SMWATCH_JOIN}" "${SMWATCH_AGENT_IMAGE:?missing SMWATCH_AGENT_IMAGE}"
 SMWATCH_URL="${SMWATCH_URL%/}"
 case "$SMWATCH_URL" in http://localhost*|http://127.*|https://localhost*) die "the control plane address is localhost, which a container cannot reach. Set PUBLIC_URL in the control plane's .env (or open the dashboard by its real address) and copy the command again." ;; esac
 command -v curl >/dev/null 2>&1 || die "curl is required"
+require_secure_url "$SMWATCH_URL"
 command -v docker >/dev/null 2>&1 || die "Docker is not installed on this server. Install Docker, or use the shell command instead."
 docker info >/dev/null 2>&1 || die "cannot talk to Docker (is it running, and are you root / in the docker group?)"
 
@@ -48,23 +66,18 @@ if [ "$SMWATCH_LOGS" = "on" ]; then
   [ -n "$sock" ] && SOCKET_MOUNT="-v $sock:/var/run/docker.sock"
 fi
 
-# System journal: the slim Python image has no journalctl. If this host keeps a systemd journal, install it inside the
-# container on first start (about 20 s) so the dashboard can read the HOST's journal. Otherwise skip the extra download.
-PREP=""
-if [ "$SMWATCH_LOGS" != "off" ] && { [ -d /var/log/journal ] || [ -d /run/log/journal ]; }; then
-  PREP="apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq --no-install-recommends systemd >/dev/null 2>&1; "
-  say "This host has a systemd journal: the container will install journalctl to read it"
-fi
-
 say "Starting the agent container"
 docker rm -f "$NAME" >/dev/null 2>&1 || true
-docker run -d --name "$NAME" --restart unless-stopped --pid host --hostname "$(hostname)" \
+# The agent code is INSIDE the published image: nothing is downloaded or executed from the network when the container starts.
+# Hardened: no extra privileges, read-only root filesystem (only the state volume is writable).
+docker run -d --name "$NAME" --restart unless-stopped --pull "${SMWATCH_PULL:-always}" --pid host --hostname "$(hostname)" \
+  --cap-drop ALL --security-opt no-new-privileges:true --read-only --tmpfs /tmp:rw,noexec,nosuid,size=16m \
   -v /:/host:ro -v sm-watch-agent-data:/var/lib/sm-watch-agent $SOCKET_MOUNT \
   -e SMWATCH_URL="$SMWATCH_URL" -e AGENT_TOKEN="$AGENT_TOKEN" -e AGENT_LOGS="$SMWATCH_LOGS" \
   -e AGENT_HOST_ROOT=/host -e AGENT_PROCFS_PATH=/host/proc -e AGENT_DISK_PATH=/host \
-  python:3.12-slim sh -c "${PREP}pip install -q --disable-pip-version-check psutil && python -c \"import urllib.request as u; u.urlretrieve('$SMWATCH_URL/api/agent/agent.py','/agent.py')\" && exec python /agent.py" >/dev/null
+  "$SMWATCH_AGENT_IMAGE" >/dev/null || die "could not start $SMWATCH_AGENT_IMAGE (can this server pull it from the registry?)"
 
-say "Waiting for the agent to start reporting (the first start downloads psutil)"
+say "Waiting for the agent to start reporting"
 for _ in $(seq 1 60); do
   logs=$(docker logs "$NAME" 2>&1 || true)
   if printf '%s' "$logs" | grep -q "push mode: reporting"; then
