@@ -7,7 +7,7 @@ name: Build and push Docker images
 #   DOCKERHUB_USERNAME   your Docker Hub username (or organisation namespace owner)
 #   DOCKERHUB_TOKEN      a Docker Hub access token with "Read & Write" permission
 #
-# Images:  <user>/sm-watch-api  <user>/sm-watch-frontend  <user>/sm-watch-agent  <user>/sm-watch-host-agent
+# Images:  <user>/sm-watch-api  <user>/sm-watch-frontend  <user>/sm-watch-agent  <user>/sm-watch-host-agent  <user>/sm-watch-k8s-agent
 # Tags:    latest + sha-<short> on main;  1.2.3, 1.2 and sha-<short> on a v1.2.3 tag.
 
 on:
@@ -45,7 +45,7 @@ jobs:
       - name: Backend tests
         working-directory: backend
         run: |
-          pip install -r requirements.txt pytest
+          pip install -r requirements.txt pytest pyyaml
           python -m pytest -q tests
 
       - uses: actions/setup-node@v4
@@ -94,6 +94,9 @@ jobs:
           - image: sm-watch-host-agent     # agent for the machine running SM-Watch (includes journalctl)
             context: .
             file: backend/Dockerfile.host-agent
+          - image: sm-watch-k8s-agent      # in-cluster agent for Kubernetes monitoring (read-only)
+            context: .
+            file: backend/Dockerfile.k8s-agent
     env:
       # Pull requests and manual dry runs build the images but never push.
       PUSH: ${{ github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.push) }}

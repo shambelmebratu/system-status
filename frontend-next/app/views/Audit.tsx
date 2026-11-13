@@ -7,7 +7,7 @@ import { usePoll } from '../lib/app';
 import { timeAgo } from '../lib/format';
 import { ROLE_INFO, type AuditEvent, type Role } from '../lib/types';
 
-const CATEGORIES = [['', 'Everything'], ['auth', 'Sign-ins & passwords'], ['user', 'Users & roles'], ['agent', 'Agents'], ['enroll', 'Install links'], ['server', 'Servers & tokens'], ['logs', 'Log access'], ['channel', 'Alert channels']];
+const CATEGORIES = [['', 'Everything'], ['auth', 'Sign-ins & passwords'], ['user', 'Users & roles'], ['agent', 'Agents'], ['enroll', 'Install links'], ['server', 'Servers & tokens'], ['logs', 'Log access'], ['k8s', 'Kubernetes'], ['channel', 'Alert channels']];
 
 const LABELS: Record<string, string> = {
   'auth.login': 'Sign-in', 'auth.logout': 'Sign-out', 'auth.password_change': 'Password change', 'auth.email_change': 'Email change',
@@ -15,7 +15,9 @@ const LABELS: Record<string, string> = {
   'server.create': 'Server added', 'server.update': 'Server edited', 'server.delete': 'Server removed',
   'server.token_rotate': 'Token rotation started', 'server.token_revoke': 'Token revoked',
   'agent.enroll': 'Agent registered', 'agent.token_rotated': 'Agent switched token', 'agent.ip_changed': 'Agent address changed', 'agent.auth_failed': 'Agent rejected',
-  'enroll.link_create': 'Install link created', 'enroll.link_revoke': 'Install link revoked', 'logs.read': 'Logs viewed',
+  'enroll.link_create': 'Install link created', 'enroll.link_revoke': 'Install link revoked', 'logs.read': 'Logs viewed', 'logs.denied': 'Log access blocked', 'server.log_policy': 'Log policy changed',
+  'k8s.register': 'Cluster registered', 'k8s.cluster_update': 'Cluster edited', 'k8s.cluster_delete': 'Cluster removed', 'k8s.token_rotate': 'Cluster token rotation', 'k8s.token_revoke': 'Cluster token revoked',
+  'k8s.logs.read': 'Pod logs viewed', 'k8s.logs.denied': 'Pod logs blocked', 'k8s.log_policy': 'Cluster log policy changed',
   'channel.create': 'Channel added', 'channel.update': 'Channel edited', 'channel.delete': 'Channel removed',
 };
 

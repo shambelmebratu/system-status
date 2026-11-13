@@ -24,6 +24,7 @@ const ICONS: Record<string, string> = {
   logs: 'M4 5h16M4 10h16M4 15h10M4 20h7',
   clock: 'M12 2a10 10 0 100 20 10 10 0 000-20zm0 5v5l3 2',
   star: 'M12 2l3 7 7 .6-5.3 4.7 1.6 7.2L12 17.8 5.7 21.5l1.6-7.2L2 9.6 9 9l3-7z',
+  k8s: 'M12 2l9 5v10l-9 5-9-5V7l9-5zm0 6a4 4 0 100 8 4 4 0 000-8zm0-6v6m0 8v6M3 7l6 3m6 4l6 3M21 7l-6 3m-6 4l-6 3',
   external: 'M14 4h6v6m0-6L10 14M20 14v6H4V4h6',
 };
 

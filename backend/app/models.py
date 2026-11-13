@@ -48,6 +48,7 @@ class Server(Base):
     machine_id: Mapped[str | None] = mapped_column(String(64), index=True)
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_agent_ip: Mapped[str | None] = mapped_column(String(64))
+    log_policy: Mapped[str | None] = mapped_column(Text)                  # JSON, see log_policy.py (NULL = unrestricted)
     token_issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     pending_token: Mapped[str | None] = mapped_column(EncryptedText)      # new token waiting for the agent to pick it up
     pending_token_hash: Mapped[str | None] = mapped_column(String(64), index=True)
@@ -217,3 +218,61 @@ class AuditEvent(Base):
     detail: Mapped[str | None] = mapped_column(Text)
     ip: Mapped[str | None] = mapped_column(String(64))
     success: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+
+
+class Cluster(Base):
+    """A Kubernetes cluster observed by an in-cluster agent (read-only; the agent only makes outbound connections)."""
+    __tablename__ = "clusters"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100), unique=True, index=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    token_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    agent_token: Mapped[str | None] = mapped_column(EncryptedText)
+    token_issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    pending_token: Mapped[str | None] = mapped_column(EncryptedText)
+    pending_token_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    pending_token_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_agent_ip: Mapped[str | None] = mapped_column(String(64))
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_status: Mapped[str] = mapped_column(String(20), default="unknown")
+    last_error: Mapped[str | None] = mapped_column(Text)
+    k8s_version: Mapped[str | None] = mapped_column(String(40))
+    agent_version: Mapped[str | None] = mapped_column(String(32))
+    summary: Mapped[str | None] = mapped_column(Text)            # JSON of the latest report
+    log_policy: Mapped[str | None] = mapped_column(Text)         # JSON, see k8s.py (NULL = unrestricted)
+    created_by: Mapped[str | None] = mapped_column(String(320))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ClusterSample(Base):
+    """Small time series per report (counts and usage totals); the detailed objects are never stored."""
+    __tablename__ = "cluster_samples"
+    __table_args__ = (Index("ix_cluster_samples_cluster_time", "cluster_id", "ts"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    cluster_id: Mapped[int] = mapped_column(ForeignKey("clusters.id", ondelete="CASCADE"))
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    nodes_ready: Mapped[int] = mapped_column(Integer, default=0)
+    nodes_total: Mapped[int] = mapped_column(Integer, default=0)
+    pods_running: Mapped[int] = mapped_column(Integer, default=0)
+    pods_total: Mapped[int] = mapped_column(Integer, default=0)
+    pods_failing: Mapped[int] = mapped_column(Integer, default=0)
+    cpu_m: Mapped[float | None] = mapped_column(Float)
+    cpu_alloc_m: Mapped[float | None] = mapped_column(Float)
+    mem_mib: Mapped[float | None] = mapped_column(Float)
+    mem_alloc_mib: Mapped[float | None] = mapped_column(Float)
+
+
+class K8sRequest(Base):
+    """An on-demand question for a cluster agent (list pods, read logs, ...). Short-lived, like LogRequest."""
+    __tablename__ = "k8s_requests"
+    __table_args__ = (Index("ix_k8s_requests_cluster_status", "cluster_id", "status"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    cluster_id: Mapped[int] = mapped_column(ForeignKey("clusters.id", ondelete="CASCADE"))
+    query: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(10), default="pending")
+    output: Mapped[str | None] = mapped_column(Text)
+    error: Mapped[str | None] = mapped_column(Text)
+    truncated: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

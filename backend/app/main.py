@@ -18,6 +18,7 @@ from .monitoring import check_service, discover_telegram_chats, run_once, send_c
 from .routes_agent import hash_token, router as agent_router
 from .routes_audit import router as audit_router
 from .routes_enroll import router as enroll_router
+from .routes_k8s import router as k8s_router
 from .routes_logs import router as logs_router
 from .routes_schedule import router as schedule_router
 from .routes_stats import router as stats_router
@@ -77,6 +78,7 @@ app.include_router(agent_router)
 app.include_router(enroll_router)
 app.include_router(schedule_router)
 app.include_router(logs_router)
+app.include_router(k8s_router)
 app.include_router(users_router)
 app.include_router(audit_router)
 app.include_router(stats_router)

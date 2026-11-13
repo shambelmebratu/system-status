@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from .config import get_settings
 from .database import get_db
-from .models import Incident, Server, Service
+from .models import Cluster, Incident, Server, Service
 from .security import require_user
 from .stats import AVAILABILITY_RANGES, aware, availability, daily_uptime, server_history, service_history, uptime_by_target
 
@@ -51,7 +51,7 @@ def service_history_endpoint(item_id: int, range: str = Query("24h", pattern="^(
 @router.get("/{kind}/{item_id}/availability")
 def availability_endpoint(kind: str, item_id: int, range: str = Query("1d", pattern="^(1m|5m|15m|30m|1h|4h|12h|1d|1mo|3mo|1y)$"), _: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
     """Status-bar data for one server or service over a selectable window (1 minute to 1 year)."""
-    model = {"servers": Server, "services": Service}.get(kind)
+    model = {"servers": Server, "services": Service, "clusters": Cluster}.get(kind)
     if model is None:
         raise HTTPException(404, "Unknown target type")
     if not db.get(model, item_id):

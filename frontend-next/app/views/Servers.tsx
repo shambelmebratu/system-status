@@ -5,6 +5,7 @@ import { AvailabilityPanel } from '../components/availability';
 import { AreaChart, Ring } from '../components/charts';
 import { JoinCommands, expiryText, useActiveEnrollment, useControlPlaneUrl } from '../components/join';
 import { LogsPanel } from '../components/logs';
+import { LogPolicyCard } from '../components/logpolicy';
 import { CodeBox, Empty, Field, Icon, Meter, Modal, StatusPill } from '../components/ui';
 import { api, del, post, put } from '../lib/api';
 import { useApp, usePoll } from '../lib/app';
@@ -178,6 +179,7 @@ function ServerDetail({ server }: { server: Server }) {
               {m.processes.slice(0, 8).map(p => <tr key={`${p.pid}-${p.name}`}><td><div className="name">{p.name}<small>PID {p.pid}</small></div></td><td className="num">{pct(p.cpu, 1)}</td><td className="num">{p.memory != null ? pct(p.memory, 1) : '–'}</td></tr>)}
             </tbody></table> : <p className="muted sm">No process data.</p>}
           </section>}
+          {canLogs && <LogPolicyCard serverId={server.id} />}
           <section className="card"><div className="card-head"><h2>Incidents</h2></div>{mine.length ? <IncidentList items={mine} onSelect={() => undefined} /> : <p className="muted sm">No incidents recorded.</p>}</section>
         </div>
       </div>

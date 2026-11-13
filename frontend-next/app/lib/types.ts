@@ -65,3 +65,16 @@ export const ROLE_INFO: Record<Role, { label: string; blurb: string }> = {
 };
 
 export type AuditEvent = { id: number; ts: string; actor: string; actor_role: string | null; action: string; target: string; detail: string | null; ip: string | null; success: boolean };
+
+export type ClusterSummary = {
+  agent_version: string; k8s_version: string; error: string; nodes_total: number; nodes_ready: number; not_ready_nodes: string[]; namespaces: number;
+  pods_total: number; pods_running: number; pods_pending: number; pods_failed: number; pods_succeeded: number; pods_crashloop: number; restarts: number; pods_truncated: boolean;
+  deployments_total: number; deployments_unavailable: number; statefulsets_total: number; statefulsets_unavailable: number; daemonsets_total: number; daemonsets_unavailable: number;
+  hpa_total: number; usage_available: boolean; cpu_m: number | null; cpu_alloc_m: number | null; mem_mib: number | null; mem_alloc_mib: number | null; problems: string[];
+};
+export type K8sLogPolicy = { enabled: boolean; include: string[]; exclude: string[] };
+export type Cluster = {
+  id: number; name: string; enabled: boolean; status: Status; last_error: string | null; last_seen_at: string | null; k8s_version: string | null; agent_version: string | null;
+  summary: ClusterSummary | null; token_issued_at: string | null; token_rotation_pending: boolean; last_agent_ip: string | null; created_by: string | null; created_at: string;
+  log_policy: K8sLogPolicy; restricted: boolean;
+};

@@ -9,12 +9,13 @@ from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
+from . import log_policy as policy_lib
 from .audit import audit
 from .database import SessionLocal, get_db
 from .models import LogRequest, Server
 from .routes_agent import hash_token
 from .schemas import LogQuery, LogResult
-from .security import agent_gate, login_limiter, require_operator
+from .security import agent_gate, login_limiter, require_admin, require_operator
 from .stats import aware
 
 router = APIRouter(tags=["logs"])
@@ -87,6 +88,10 @@ def request_logs(server_id: int, payload: LogQuery, request: Request, user: dict
         raise HTTPException(422, "This server's agent has log access turned off or is too old. Re-run the install command to update it.")
     if payload.source != "inventory" and not payload.target:
         raise HTTPException(422, "Choose what to read (a container, a unit or a file)")
+    compiled = policy_lib.compile_for_agent(policy_lib.parse(server.log_policy))
+    if not policy_lib.query_allowed(compiled, payload.source, payload.target):
+        audit(db, request, "logs.denied", user=user, target=f"server:{server_id}", success=False, detail=f"{payload.source}:{payload.target} blocked by the server's log policy", commit=True)
+        raise HTTPException(403, f"This server's log policy does not allow reading {payload.source} '{payload.target}'. An admin can change it under Server page → Log access.")
     now = datetime.now(timezone.utc)
     db.execute(delete(LogRequest).where(LogRequest.created_at < now - REQUEST_TTL))
     pending = db.scalar(select(func.count()).select_from(LogRequest).where(LogRequest.server_id == server_id, LogRequest.status.in_(("pending", "running")), LogRequest.created_at >= now - PICKUP_TIMEOUT)) or 0
@@ -109,7 +114,12 @@ def _read(server_id: int, request_id: int) -> dict:
         status, error = item.status, item.error
         if status in ("pending", "running") and datetime.now(timezone.utc) - aware(item.created_at) > PICKUP_TIMEOUT:
             status, error = "error", "The agent did not answer in time. Is the server online and the agent running?"
-        return {"id": item.id, "status": status, "output": item.output or "", "error": error, "truncated": item.truncated, "query": json.loads(item.query)}
+        query = json.loads(item.query)
+        output = item.output or ""
+        if query.get("source") == "inventory" and status == "done":   # never show what the policy forbids, even if the agent listed it
+            server = db.get(Server, server_id)
+            output = policy_lib.filter_inventory(output, policy_lib.compile_for_agent(policy_lib.parse(server.log_policy if server else None)))
+        return {"id": item.id, "status": status, "output": output, "error": error, "truncated": item.truncated, "query": query}
 
 
 @router.get("/api/servers/{server_id}/logs/{request_id}")
@@ -128,6 +138,37 @@ async def read_logs(server_id: int, request_id: int, wait: int = Query(0, ge=0, 
                 await asyncio.wait_for(event.wait(), timeout=min(remaining, 2.0))
             except asyncio.TimeoutError:
                 pass
+
+
+# ------------------------------------------------------------------ log access policy (what an agent may expose)
+@router.get("/api/log-policy/catalog")
+def policy_catalog(_: dict = Depends(require_operator)) -> dict:
+    return {"file_categories": [{"id": k, "label": v["label"], "hint": v["hint"]} for k, v in policy_lib.FILE_CATEGORIES.items()]}
+
+
+@router.get("/api/servers/{server_id}/log-policy")
+def get_policy(server_id: int, _: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+    server = db.get(Server, server_id)
+    if not server:
+        raise HTTPException(404, "Server not found")
+    policy = policy_lib.parse(server.log_policy)
+    return {"policy": policy.model_dump(), "restricted": policy_lib.is_restricted(policy_lib.compile_for_agent(policy))}
+
+
+@router.put("/api/servers/{server_id}/log-policy")
+def set_policy(server_id: int, policy: policy_lib.LogPolicy, request: Request, user: dict = Depends(require_admin), db: Session = Depends(get_db)) -> dict:
+    """Which logs this server's agent may expose. Admin only: it is security configuration. Takes effect at the agent's next report."""
+    server = db.get(Server, server_id)
+    if not server:
+        raise HTTPException(404, "Server not found")
+    compiled = policy_lib.compile_for_agent(policy)
+    server.log_policy = None if not policy_lib.is_restricted(compiled) else policy.model_dump_json()
+    d, j, f = policy.docker, policy.journal, policy.files
+    summary = (f"docker {'off' if not d.enabled else ','.join(d.include)}{' except ' + ','.join(d.exclude) if d.exclude else ''}; "
+               f"journal {'off' if not j.enabled else ','.join(j.units)}; files {'off' if not f.enabled else f.mode + (':' + ','.join(f.categories) if f.mode == 'selected' else '')}")
+    audit(db, request, "server.log_policy", user=user, target=f"server:{server.id}", detail=f"{server.name}: {summary}")
+    db.commit()
+    return {"policy": policy.model_dump(), "restricted": policy_lib.is_restricted(compiled)}
 
 
 # ------------------------------------------------------------------ agent side

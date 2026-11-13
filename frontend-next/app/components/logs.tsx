@@ -4,11 +4,11 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'rea
 import { api, post } from '../lib/api';
 import { Icon } from './ui';
 
-type Inventory = { files: string[]; journal: boolean; journal_label?: string; platform?: string; units: string[]; docker: boolean; containers: { name: string; state: string; image: string }[]; notes: string[] };
+type Inventory = { files: string[]; journal: boolean; journal_all?: boolean; journal_label?: string; platform?: string; units: string[]; docker: boolean; containers: { name: string; state: string; image: string }[]; notes: string[] };
 type Source = 'docker' | 'journal' | 'file';
 type LogResponse = { id: number; status: 'pending' | 'running' | 'done' | 'error'; output: string; error: string | null; truncated: boolean };
-type Level = 'error' | 'warn' | 'info' | 'debug' | '';
-type Row = { n: number; ts: string; tsTitle: string; level: Level; msg: string };
+export type Level = 'error' | 'warn' | 'info' | 'debug' | '';
+export type Row = { n: number; ts: string; tsTitle: string; level: Level; msg: string };
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -60,7 +60,7 @@ function when(raw: string): { ts: string; title: string } {
   return { ts: raw, title: raw };
 }
 
-function parse(output: string): Row[] {
+export function parse(output: string): Row[] {
   return output.split('\n').filter(l => l.length).map((line, i) => {
     let ts = '', title = '', msg = line;
     for (const rx of TS_PREFIX) {
@@ -83,13 +83,13 @@ function parse(output: string): Row[] {
 }
 
 const escapeRx = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-function Highlight({ text, term }: { text: string; term: string }) {
+export function Highlight({ text, term }: { text: string; term: string }) {
   if (!term) return <>{text}</>;
   const parts = text.split(new RegExp(`(${escapeRx(term)})`, 'ig'));
   return <>{parts.map((p, i) => (i % 2 ? <mark key={i}>{p}</mark> : <Fragment key={i}>{p}</Fragment>))}</>;
 }
 
-const LEVEL_LABEL: Record<string, string> = { error: 'ERR', warn: 'WARN', info: 'INFO', debug: 'DBG' };
+export const LEVEL_LABEL: Record<string, string> = { error: 'ERR', warn: 'WARN', info: 'INFO', debug: 'DBG' };
 const SOURCES: { id: Source; label: string; icon: string }[] = [{ id: 'docker', label: 'Containers', icon: 'server' }, { id: 'journal', label: 'System journal', icon: 'logs' }, { id: 'file', label: 'Log files', icon: 'overview' }];
 const isMac = (inv: { platform?: string }) => inv.platform === 'macos';
 
@@ -184,13 +184,21 @@ export function LogsPanel({ serverId }: { serverId: number }) {
   const targets = useMemo(() => {
     if (!shell) return [] as { value: string; label: string; dot?: string }[];
     if (source === 'docker') return [...shell.containers].sort((a, b) => Number(b.state === 'running') - Number(a.state === 'running')).map(c => ({ value: c.name, label: c.name, dot: c.state }));   // running containers first
-    if (source === 'journal') return [{ value: 'all', label: isMac(shell) ? 'Whole system log (last hour by default)' : 'Whole journal (all units)' }, ...shell.units.map(u => ({ value: u, label: u }))];
+    if (source === 'journal') return [...(shell.journal_all === false ? [] : [{ value: 'all', label: isMac(shell) ? 'Whole system log (last hour by default)' : 'Whole journal (all units)' }]), ...shell.units.map(u => ({ value: u, label: u }))];
     return shell.files.map(f => ({ value: f, label: f }));
   }, [shell, source]);
+
+  useEffect(() => {
+    if (source === 'journal' && !target && unitsState === 'done' && inventory && inventory.units.length) { setTarget(inventory.units[0]); void fetchLogs({ src: 'journal', tgt: inventory.units[0] }); }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [unitsState, source, target]);
 
   const pick = (next: Source) => {
     if (next === source) return;
     const tgt = next === 'docker' ? (inventory?.containers.find(c => c.state === 'running') ?? inventory?.containers[0])?.name ?? '' : next === 'journal' ? 'all' : inventory?.files[0] ?? '';
+    if (next === 'journal' && inventory?.journal_all === false) {   // the policy forbids the whole journal: choose a unit once the list is loaded
+      setSource(next); setTarget(''); setOutput(null); setLive(false); loadUnits(); return;
+    }
     setSource(next); setTarget(tgt); setOutput(null); setLive(false);
     void fetchLogs({ src: next, tgt });
     if (next === 'journal') loadUnits();

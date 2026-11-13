@@ -19,6 +19,7 @@ The supported environment settings include `POSTGRES_DB`, `POSTGRES_USER`, `POST
 - **Status bars** for any server or service over a selectable window: 1m, 5m, 15m, 30m, 1h, 4h, 12h, 1d, 1 month, 3 months, 1 year.
 - **Users and roles** (admin, operator, viewer), profiles, temporary passwords and account disabling.
 - **Logs on demand** from any agent server (Linux and macOS): Docker containers, the system journal / macOS log, and the standard `/var/log` files such as nginx, syslog, auth and databases, with filters.
+- **Kubernetes tab:** read-only cluster monitoring (nodes, pods and usage, workloads, HPAs, services, events) and on-demand pod logs via an outbound-only in-cluster agent; per-server and per-cluster **log access policies** instead of shipping logs.
 - **Scheduled messages** to chosen alert channels (daily/weekly/one-time, any time zone).
 - **Public status page** at `/status` for services marked public (name and uptime only; set `PUBLIC_STATUS_ENABLED=false` to disable).
 - **Concurrent worker:** due checks run in parallel (`WORKER_CONCURRENCY`, default 16).
@@ -264,6 +265,39 @@ The same one-line install command works on a Mac. It detects macOS and sets up a
 - **Access the agent needs:** the Linux installer adds the agent's service user to `systemd-journal` (journal), `adm` (files under `/var/log`) and, when Docker is installed, `docker` (container logs). **Membership of the `docker` group is root-equivalent on that server.** If you do not want that, install with `... | sudo SMWATCH_LOGS=nodocker bash` (journal and files only) or `SMWATCH_LOGS=off` (the dashboard cannot read any logs from that server). The Docker-variant agent mounts the Docker socket for the same purpose and honours the same variable.
 - **The machine running SM-Watch itself** is covered by the stack's `host-agent` service, which registers it as *This server (control plane)* (on a Linux host this gives you the host journal and files plus every container's logs). That service mounts the host read-only plus the Docker socket; set `HOST_AGENT_LOGS=nodocker` or `off` in `.env`, or delete the service from `docker-compose.yml`, if you prefer not to have it.
 - Anyone with the operator or admin role can read these logs, so treat those roles accordingly. Logs often contain IP addresses, usernames and sometimes secrets.
+
+## Choosing which logs are available (log access policy)
+
+SM-Watch never ships or stores logs. Logs are read **on demand** by the agent, shown once, and the result is deleted after 15 minutes, so there is nothing to grow. To limit *what* an agent may expose at all, an admin opens a server and edits **Log access** (Server page, push agents):
+
+- **Containers**: all, or include/exclude patterns by container name (`*`, `?`).
+- **System journal**: all, or only listed units.
+- **Files**: all discovered logs, or only chosen types (web, apps, databases, system, auth, packages...) plus custom paths.
+- Presets: *Everything*, *Containers only*, *Web & applications*, *Nothing*.
+
+The policy is enforced twice: by the control plane (blocked requests return 403 and are audited as `logs.denied`) and by the agent itself, which keeps the policy it last received in `policy.json` (mode 0600), so a compromised or misconfigured control plane cannot widen it. Changes are audited (`server.log_policy`).
+
+## Kubernetes monitoring
+
+**Kubernetes** in the sidebar shows every connected cluster: nodes, namespaces, pods (status, restarts, CPU/memory usage), Deployments / StatefulSets / DaemonSets / Jobs / CronJobs, HPAs, Services, Ingresses, PVCs, quotas and events, plus on-demand pod logs. Cluster health (nodes not ready, crash-looping pods, unavailable workloads, a silent agent) opens incidents and sends alerts like any other monitor.
+
+**Install** (Kubernetes → Add cluster; run with a kubeconfig that may create cluster roles):
+
+```bash
+curl -fsSL -X POST "https://watch.example.com/api/agent/k8s/<install-link>?name=prod-eu" | kubectl apply -f -
+```
+
+Review the manifest first by running the `curl` alone. It creates a `smwatch` namespace (Pod Security `restricted`) with one non-root, read-only-filesystem pod that **only makes outbound HTTPS calls** to SM-Watch. Nothing in the cluster has to be exposed.
+
+**Least privilege.** The agent's ClusterRole allows only `get/list/watch` on namespaces, nodes, pods, pods/log, services, endpoints, events, PVCs, resourcequotas, Deployments, StatefulSets, DaemonSets, ReplicaSets, Jobs, CronJobs, HPAs, Ingresses and `metrics.k8s.io`. It has **no access to Secrets or ConfigMaps, no exec/attach, and no write verbs**. The one exception is a namespaced Role that lets it `get`/`patch` its *own* token Secret (`smwatch-agent`), so a rotated token survives restarts. "Describe" output has env values, `managedFields` and the last-applied annotation removed.
+
+**Storage.** Only small counters (nodes, pods, CPU/memory totals) are kept as a time series, pruned with the other history. Object lists and logs are never stored.
+
+**Pod log policy.** Cluster → Settings → *Pod log access* (admin): allow or deny namespaces by pattern, e.g. exclude `kube-system` and `payments-*`. Enforced by both the control plane and the agent. Reading pod logs needs the operator role; every read is audited (`k8s.logs.read`, who and which pod, never the content). Viewers can see the cluster but not logs.
+
+**Tokens.** Rotate from Settings (delivered to the agent automatically and written to its Secret) or *Revoke now* (shows a `kubectl patch` command). Re-using a cluster name while that cluster is connected is refused, so an install link cannot hijack a live cluster.
+
+**Images.** `sm-watch-k8s-agent` is published with the other images (override with `K8S_AGENT_IMAGE`). Live CPU/memory needs metrics-server in the cluster; without it everything else still works.
 
 ## Scheduled messages
 

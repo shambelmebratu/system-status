@@ -12,6 +12,7 @@ from .database import get_db
 from .models import Server
 from .monitoring import apply_server_result, evaluate_metrics
 from .schemas import AgentReport
+from . import log_policy as policy_lib
 from .audit import audit
 from .config import get_settings
 from .security import agent_gate, client_ip, login_limiter
@@ -65,6 +66,7 @@ def report(payload: AgentReport, request: Request, authorization: str | None = H
     # deliver=False: alerts are queued and sent by the worker so ingest stays fast.
     apply_server_result(db, server, status, failures, metrics, deliver=False)
     db.commit()
+    reply["log_policy"] = policy_lib.compile_for_agent(policy_lib.parse(server.log_policy))   # the agent enforces this too
     return {**reply, "status": status, "interval_seconds": server.check_interval_seconds}
 
 

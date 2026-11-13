@@ -38,7 +38,7 @@ from typing import Any
 
 import psutil
 
-AGENT_VERSION = "2.6.0"
+AGENT_VERSION = "2.7.0"
 _ENV_TOKEN = os.getenv("AGENT_TOKEN", "")                      # the token supplied by configuration; a rotation may supersede it (see _load_state)
 AGENT_TOKEN = ""                                                # the token in use: resolved by ensure_token() (saved state first, then configuration)
 AGENT_ALLOW_INSECURE = os.getenv("AGENT_ALLOW_INSECURE", "") == "1"   # permit http:// to a public address (not recommended)
@@ -274,6 +274,108 @@ def forget_token() -> None:
 
 
 # ---------------------------------------------------------------------------------------------------------------
+# Log access policy: which logs this agent may expose. Set by an administrator on the control plane, delivered with each
+# report reply, remembered on disk, and enforced HERE as well as on the control plane. It can only narrow what the agent's
+# local settings allow, so a compromised control plane cannot make the agent expose more.
+# ---------------------------------------------------------------------------------------------------------------
+_policy: dict | None = None
+_policy_loaded = False
+
+
+def _policy_path() -> str | None:
+    for directory in _state_dirs():
+        try:
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+            if os.access(directory, os.W_OK):
+                return os.path.join(directory, "policy.json")
+        except OSError:
+            continue
+    return None
+
+
+def _valid_policy(value) -> bool:
+    try:
+        d, j, f = value["docker"], value["journal"], value["files"]
+        return (isinstance(d["enabled"], bool) and isinstance(d["include"], list) and isinstance(d["exclude"], list) and isinstance(j["enabled"], bool)
+                and isinstance(j["units"], list) and isinstance(f["enabled"], bool) and (f["allow"] is None or isinstance(f["allow"], list))
+                and all(isinstance(x, str) for x in d["include"] + d["exclude"] + j["units"] + (f["allow"] or [])))
+    except (KeyError, TypeError):
+        return False
+
+
+def current_policy() -> dict | None:
+    global _policy, _policy_loaded
+    if not _policy_loaded:
+        _policy_loaded = True
+        for directory in _state_dirs():
+            try:
+                with open(os.path.join(directory, "policy.json")) as handle:
+                    candidate = json.load(handle)
+                if _valid_policy(candidate):
+                    _policy = candidate
+                    break
+            except (OSError, ValueError):
+                continue
+    return _policy
+
+
+def apply_policy(candidate) -> None:
+    """Adopts a policy from the control plane (ignored if malformed) and remembers it across restarts."""
+    global _policy, _policy_loaded
+    if not _valid_policy(candidate):
+        return
+    _policy_loaded = True
+    if candidate == _policy:
+        return
+    _policy = candidate
+    path = _policy_path()
+    if path:
+        try:
+            temporary = path + ".tmp"
+            with open(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as handle:
+                json.dump(candidate, handle)
+            os.replace(temporary, path)
+        except OSError:
+            log.warning("could not save the log policy; it applies until restart")
+    log.info("log access policy updated by the control plane")
+
+
+def _matches(name: str, patterns: list[str]) -> bool:
+    return any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns)
+
+
+def policy_allows(source: str, target: str) -> bool:
+    policy = current_policy()
+    if policy is None or source == "inventory":
+        return True
+    if source == "docker":
+        d = policy["docker"]
+        return d["enabled"] and _matches(target, d["include"]) and not _matches(target, d["exclude"])
+    if source == "journal":
+        j = policy["journal"]
+        return j["enabled"] and ("*" in j["units"] if target == "all" else _matches(target, j["units"]))
+    if source == "file":
+        f = policy["files"]
+        return f["enabled"] and (f["allow"] is None or _matches(target, f["allow"]))
+    return False
+
+
+def apply_policy_to_inventory(inventory: dict) -> dict:
+    policy = current_policy()
+    if policy is None:
+        return inventory
+    if "files" in inventory:
+        inventory["files"] = [path for path in inventory["files"] if policy_allows("file", path)]
+        inventory["containers"] = [c for c in inventory.get("containers", []) if policy_allows("docker", c["name"])]
+        inventory["docker"] = bool(inventory.get("docker")) and policy["docker"]["enabled"] and bool(inventory["containers"])
+        inventory["journal"] = bool(inventory.get("journal")) and policy["journal"]["enabled"]
+        inventory["journal_all"] = policy["journal"]["enabled"] and "*" in policy["journal"]["units"]
+    if "units" in inventory:
+        inventory["units"] = [u for u in inventory["units"] if policy_allows("journal", u)]
+    return inventory
+
+
+# ---------------------------------------------------------------------------------------------------------------
 # Logs. The dashboard can ask for logs, but only from this fixed set of sources. Nothing here runs a shell, accepts
 # a command, or reads a path outside the allow-list; every request field is validated again on this side.
 # ---------------------------------------------------------------------------------------------------------------
@@ -505,9 +607,11 @@ def fetch_logs(task: dict) -> tuple[str, bool]:
     needle = str(task.get("grep") or "")[:200].lower()
     priority = task.get("priority") or ""
     if source == "inventory":
-        return json.dumps(log_inventory(units=target == "units")), False
+        return json.dumps(apply_policy_to_inventory(dict(log_inventory(units=target == "units")))), False
     if not TARGET_RE.match(target) or ".." in target:
         raise ValueError("Invalid log target")
+    if not policy_allows(str(source), target):
+        raise ValueError("Blocked by this server's log access policy")
     scan = 20000 if needle else lines   # with a filter, look further back and keep the last matches
 
     if source == "docker":
@@ -651,6 +755,8 @@ def push_once() -> int:
         reply = json.loads(response.read().decode() or "{}")
     if reply.get("rotate_token"):
         adopt_rotated_token(str(reply["rotate_token"]))
+    if "log_policy" in reply:
+        apply_policy(reply["log_policy"])
     return max(5, int(reply.get("interval_seconds", AGENT_PUSH_INTERVAL)))
 
 

@@ -276,3 +276,69 @@ def test_check_command_accepts_a_configured_token(cred_agent, monkeypatch, capsy
     assert a.check() == 0 and "OK: report accepted" in capsys.readouterr().out
     monkeypatch.setattr(a, "_ENV_TOKEN", "")
     assert a.check() == 1 and "set SMWATCH_JOIN" in capsys.readouterr().out          # with nothing configured it still says so
+
+
+# ---------------------------------------------------------------- log access policy (agent side)
+FULL = {"docker": {"enabled": True, "include": ["*"], "exclude": []}, "journal": {"enabled": True, "units": ["*"]}, "files": {"enabled": True, "allow": None}}
+NARROW = {"docker": {"enabled": True, "include": ["web-*"], "exclude": ["web-secret"]}, "journal": {"enabled": True, "units": ["nginx*"]},
+          "files": {"enabled": True, "allow": ["/var/log/nginx/*", "/srv/app/*.log"]}}
+
+
+def test_agent_enforces_the_policy_it_receives(cred_agent, tmp_path, monkeypatch):
+    a = cred_agent
+    assert a.policy_allows("docker", "anything") and a.policy_allows("file", "/var/log/auth.log")     # no policy yet: only local limits apply
+    a.apply_policy(NARROW)
+    assert a.policy_allows("docker", "web-1") and not a.policy_allows("docker", "web-secret") and not a.policy_allows("docker", "db")
+    assert a.policy_allows("journal", "nginx.service") and not a.policy_allows("journal", "all") and not a.policy_allows("journal", "cron.service")
+    assert a.policy_allows("file", "/var/log/nginx/error.log") and not a.policy_allows("file", "/var/log/auth.log")
+    assert a.policy_allows("inventory", "") is True
+    with pytest.raises(ValueError, match="log access policy"):
+        a.fetch_logs({"source": "docker", "target": "db"})
+    with pytest.raises(ValueError, match="log access policy"):
+        a.fetch_logs({"source": "file", "target": "/var/log/auth.log"})
+    a.apply_policy({"docker": {"enabled": False, "include": [], "exclude": []}, "journal": {"enabled": False, "units": []}, "files": {"enabled": False, "allow": []}})
+    assert not any(a.policy_allows(s, t) for s, t in [("docker", "web-1"), ("journal", "all"), ("file", "/var/log/nginx/error.log")])
+
+
+def test_agent_policy_survives_restart_and_ignores_garbage(cred_agent):
+    a = cred_agent
+    a.apply_policy(NARROW)
+    path = a._policy_path()
+    assert oct(os.stat(path).st_mode & 0o777) == "0o600"
+    for junk in (None, "allow everything", {}, {"docker": 1}, {"docker": {"enabled": "yes"}}, {**NARROW, "files": {"enabled": True, "allow": [1, 2]}}):
+        a.apply_policy(junk)
+        assert a._policy == NARROW, junk                                                          # a malformed message can never loosen the policy
+    sys.modules.pop("agent", None)                                                                # restart
+    fresh = importlib.import_module("agent")
+    assert fresh._policy is None and fresh.current_policy() == NARROW                             # remembered from disk before the first report
+    assert not fresh.policy_allows("docker", "db")
+    sys.modules.pop("agent", None)
+
+
+def test_agent_filters_its_own_inventory(cred_agent, monkeypatch):
+    a = cred_agent
+    inv = {"files": ["/var/log/nginx/a.log", "/var/log/auth.log"], "containers": [{"name": "web-1"}, {"name": "db"}], "docker": True, "journal": True, "units": ["nginx.service", "cron.service"], "notes": []}
+    monkeypatch.setattr(a, "log_inventory", lambda units=False: dict(inv) if not units else {"units": list(inv["units"])})
+    a.apply_policy(NARROW)
+    seen = json.loads(a.fetch_logs({"source": "inventory"})[0])
+    assert seen["files"] == ["/var/log/nginx/a.log"] and [c["name"] for c in seen["containers"]] == ["web-1"] and seen["journal_all"] is False
+    assert json.loads(a.fetch_logs({"source": "inventory", "target": "units"})[0])["units"] == ["nginx.service"]
+
+
+def test_agent_and_control_plane_make_identical_decisions(cred_agent):
+    """The two enforcement points must never disagree: compile a range of policies and compare every decision."""
+    import itertools
+    from app import log_policy as lp
+    a = cred_agent
+    policies = [{}, {"docker": {"include": ["web-*", "api"], "exclude": ["web-x*"]}}, {"docker": {"enabled": False}}, {"journal": {"units": ["nginx*", "ssh.service"]}},
+                {"journal": {"enabled": False}}, {"files": {"mode": "selected", "categories": ["web", "auth"], "custom": ["/srv/*/logs/*.log"]}},
+                {"files": {"mode": "selected", "categories": []}}, {"files": {"enabled": False}},
+                {"docker": {"include": ["a?c", "[xy]-1"]}, "journal": {"units": ["*"]}, "files": {"mode": "all"}}]
+    targets = {"docker": ["web-1", "web-x1", "api", "db", "abc", "x-1", "z-1"], "journal": ["all", "nginx.service", "nginx", "ssh.service", "cron.service"],
+               "file": ["/var/log/nginx/a.log", "/var/log/auth.log", "/srv/app/logs/x.log", "/var/log/mysql/e.log", "/var/log/syslog"]}
+    for raw in policies:
+        compiled = lp.compile_for_agent(lp.LogPolicy.model_validate(raw))
+        a._policy, a._policy_loaded = compiled, True
+        for source, names in targets.items():
+            for name in names:
+                assert a.policy_allows(source, name) == lp.query_allowed(compiled, source, name), (raw, source, name)

@@ -1,3 +1,4 @@
+import json
 import os
 
 os.environ.update(ENVIRONMENT="test", JWT_SECRET="x" * 40, ADMIN_PASSWORD="correct-horse-battery", DATABASE_URL="sqlite://", AGENT_MIN_REPORT_SECONDS="0")
@@ -953,3 +954,211 @@ def test_account_lockout_is_tolerant_but_address_lockout_is_strict(client, monke
     codes = [TestClient(main.app).post("/api/auth/login", json=wrong).status_code for _ in range(24)]
     assert codes[:20] == [401] * 20 and 429 in codes[20:], codes                                                      # a sustained distributed attack DOES lock the account
     login_limiter._hits.clear(); login_limiter._seen.clear()
+
+
+# =================================================================== log access policy
+def test_log_policy_api_permissions_and_validation(client):
+    sign_in(client)
+    anon = TestClient(main.app)
+    sid, auth = _push_server(client, anon)
+    make_user(client, "pol-op@example.com", "operator"); make_user(client, "pol-view@example.com", "viewer")
+    op = session_for("pol-op@example.com", new_password="operator-pass-12345"); viewer = session_for("pol-view@example.com", new_password="viewer-pass-123456")
+    default = client.get(f"/api/servers/{sid}/log-policy").json()
+    assert default["restricted"] is False and default["policy"]["docker"]["include"] == ["*"]                # default: unrestricted
+    assert op.get(f"/api/servers/{sid}/log-policy").status_code == 200                                       # operators can see it...
+    assert op.put(f"/api/servers/{sid}/log-policy", headers=CSRF, json={}).status_code == 403                # ...but only admins change it
+    assert viewer.get(f"/api/servers/{sid}/log-policy").status_code == 403
+    cat = op.get("/api/log-policy/catalog").json()["file_categories"]
+    assert {"system", "auth", "web", "database", "packages", "mail", "apps"} <= {c["id"] for c in cat}
+    for bad in [{"files": {"custom": ["../etc/passwd"]}}, {"files": {"custom": ["relative.log"]}}, {"docker": {"include": ["a;rm -rf /"]}}, {"files": {"categories": ["bogus"]}}, {"files": {"mode": "weird"}}]:
+        assert client.put(f"/api/servers/{sid}/log-policy", headers=CSRF, json=bad).status_code == 422, bad
+    assert client.put("/api/servers/99999/log-policy", headers=CSRF, json={}).status_code == 404
+
+
+def test_log_policy_is_enforced_filtered_audited_and_delivered(client):
+    import json as _json
+    sign_in(client)
+    anon = TestClient(main.app)
+    sid, auth = _push_server(client, anon)
+    policy = {"docker": {"enabled": True, "include": ["web-*"], "exclude": ["web-secret"]}, "journal": {"enabled": True, "units": ["nginx*"]},
+              "files": {"enabled": True, "mode": "selected", "categories": ["web"], "custom": ["/srv/app/*.log"]}}
+    r = client.put(f"/api/servers/{sid}/log-policy", headers=CSRF, json=policy)
+    assert r.status_code == 200 and r.json()["restricted"] is True
+    ask = lambda **q: client.post(f"/api/servers/{sid}/logs", headers=CSRF, json=q)                       # noqa: E731
+    # allowed
+    assert ask(source="docker", target="web-1").status_code == 200
+    assert ask(source="journal", target="nginx.service").status_code == 200
+    assert ask(source="file", target="/var/log/nginx/access.log").status_code == 200
+    assert ask(source="file", target="/srv/app/worker.log").status_code == 200
+    assert ask(source="inventory").status_code == 200
+    # blocked, with a clear message, and the attempt is audited as a failure
+    for q in [dict(source="docker", target="db"), dict(source="docker", target="web-secret"), dict(source="journal", target="all"), dict(source="journal", target="cron.service"),
+              dict(source="file", target="/var/log/auth.log"), dict(source="file", target="/var/log/mysql/error.log")]:
+        blocked = ask(**q)
+        assert blocked.status_code == 403 and "log policy" in blocked.json()["detail"], q
+    denied = [e for e in audit_rows(client) if e["action"] == "logs.denied"]
+    assert len(denied) >= 6 and not denied[0]["success"] and "blocked by the server's log policy" in denied[0]["detail"]
+    assert any(e["action"] == "server.log_policy" for e in audit_rows(client))
+    # the agent's inventory answer is filtered before it reaches the dashboard, even if the agent listed everything
+    from app.models import LogRequest
+    with database.SessionLocal() as db:                                                                   # clear the per-server pending-request cap used up above
+        db.query(LogRequest).delete(); db.commit()
+    rid = ask(source="inventory").json()["id"]
+    assert anon.get("/api/agent/tasks", headers=auth).json()["tasks"]
+    full = {"files": ["/var/log/nginx/access.log", "/var/log/auth.log", "/srv/app/worker.log", "/var/log/mysql/error.log"], "journal": True, "units": [], "docker": True, "notes": [],
+            "containers": [{"name": "web-1", "state": "running", "image": "x"}, {"name": "db", "state": "running", "image": "x"}, {"name": "web-secret", "state": "running", "image": "x"}]}
+    anon.post(f"/api/agent/tasks/{rid}/result", headers=auth, json={"ok": True, "output": _json.dumps(full)})
+    seen = _json.loads(client.get(f"/api/servers/{sid}/logs/{rid}").json()["output"])
+    assert seen["files"] == ["/var/log/nginx/access.log", "/srv/app/worker.log"] and [c["name"] for c in seen["containers"]] == ["web-1"]
+    assert seen["journal"] is True and seen["journal_all"] is False and any("restricted by an administrator" in n for n in seen["notes"])
+    # the agent receives the compiled policy with its next report (and it can only narrow, never widen)
+    reply = anon.post("/api/agent/report", json=report(capabilities=["logs"]), headers=auth).json()
+    assert reply["log_policy"]["docker"] == {"enabled": True, "include": ["web-*"], "exclude": ["web-secret"]}
+    assert "/var/log/nginx/*" in reply["log_policy"]["files"]["allow"] and "/srv/app/*.log" in reply["log_policy"]["files"]["allow"] and "/var/log/auth.log*" not in reply["log_policy"]["files"]["allow"]
+    # switching everything off blocks all sources; resetting to the default stores nothing and unblocks
+    off = {"docker": {"enabled": False}, "journal": {"enabled": False}, "files": {"enabled": False}}
+    assert client.put(f"/api/servers/{sid}/log-policy", headers=CSRF, json=off).status_code == 200
+    statuses = [ask(**q).status_code for q in [dict(source="docker", target="web-1"), dict(source="journal", target="all"), dict(source="file", target="/var/log/nginx/access.log")]]
+    assert statuses == [403, 403, 403], statuses
+    client.put(f"/api/servers/{sid}/log-policy", headers=CSRF, json={})
+    assert client.get(f"/api/servers/{sid}/log-policy").json()["restricted"] is False and ask(source="docker", target="db").status_code == 200
+
+
+# =================================================================== kubernetes
+def _k8s_register(client, anon, name="prod"):
+    token = client.post("/api/enrollments", headers=CSRF, json={"label": "k8s"}).json()["token"]
+    r = anon.post(f"/api/agent/k8s/{token}?name={name}")
+    return token, r
+
+
+def _k8s_token(manifest: str) -> str:
+    import re
+    return re.search(r'token: "([^"]+)"', manifest).group(1)
+
+
+HEALTHY = {"agent_version": "1.0.0", "k8s_version": "v1.34.1", "nodes_total": 2, "nodes_ready": 2, "pods_total": 10, "pods_running": 10, "cpu_m": 400, "cpu_alloc_m": 4000, "mem_mib": 900, "mem_alloc_mib": 8000}
+
+
+def test_k8s_manifest_is_valid_least_privilege_yaml(client):
+    import yaml
+    sign_in(client)
+    anon = TestClient(main.app)
+    _, r = _k8s_register(client, anon, "yaml-test")
+    assert r.status_code == 200, r.text
+    docs = list(yaml.safe_load_all(r.text))
+    kinds = [d["kind"] for d in docs]
+    assert kinds == ["Namespace", "ServiceAccount", "ClusterRole", "ClusterRoleBinding", "Role", "RoleBinding", "Secret", "Deployment"]
+    cluster_role = docs[2]
+    verbs = {v for rule in cluster_role["rules"] for v in rule["verbs"]}
+    resources = {x for rule in cluster_role["rules"] for x in rule["resources"]}
+    assert verbs <= {"get", "list", "watch"}
+    assert not resources & {"secrets", "configmaps", "pods/exec", "pods/attach"}
+    role = docs[4]["rules"][0]
+    assert role["resources"] == ["secrets"] and role["resourceNames"] == ["smwatch-agent"] and set(role["verbs"]) == {"get", "patch"}
+    sec = docs[7]["spec"]["template"]["spec"]["containers"][0]["securityContext"]
+    assert sec["readOnlyRootFilesystem"] and sec["allowPrivilegeEscalation"] is False
+
+
+def test_k8s_registration_guards(client):
+    sign_in(client)
+    anon = TestClient(main.app)
+    assert anon.post("/api/agent/k8s/smwj_wrong?name=x").status_code == 401
+    token, r = _k8s_register(client, anon, "guarded")
+    agent_token = _k8s_token(r.text)
+    assert anon.post(f"/api/k8s-agent/report", json=HEALTHY, headers={"Authorization": f"Bearer {agent_token}"}).status_code == 200
+    # a live cluster cannot be taken over by registering the same name again
+    assert anon.post(f"/api/agent/k8s/{token}?name=guarded").status_code == 409
+    assert anon.post(f"/api/agent/k8s/{token}?name=bad%20name!").status_code == 422
+
+
+def test_k8s_report_status_incident_and_permissions(client):
+    sign_in(client)
+    anon = TestClient(main.app)
+    _, r = _k8s_register(client, anon, "status-test")
+    auth = {"Authorization": f"Bearer {_k8s_token(r.text)}"}
+    cid = next(c["id"] for c in client.get("/api/clusters").json() if c["name"] == "status-test")
+    assert anon.post("/api/k8s-agent/report", json=HEALTHY, headers={"Authorization": "Bearer nope"}).status_code == 401
+    assert anon.post("/api/k8s-agent/report", json={**HEALTHY, "nodes_total": -1}, headers=auth).status_code == 422
+    assert anon.post("/api/k8s-agent/report", json=HEALTHY, headers=auth).json()["log_policy"]["include"] == ["*"]
+    assert client.get(f"/api/clusters/{cid}").json()["status"] == "up"
+    bad = {**HEALTHY, "nodes_ready": 1, "pods_crashloop": 2, "problems": ["node worker-2 NotReady", "pod demo/crasher CrashLoopBackOff"]}
+    anon.post("/api/k8s-agent/report", json=bad, headers=auth)
+    assert client.get(f"/api/clusters/{cid}").json()["status"] == "alert"
+    anon.post("/api/k8s-agent/report", json=HEALTHY, headers=auth)
+    assert client.get(f"/api/clusters/{cid}").json()["status"] == "up"
+    assert client.get(f"/api/clusters/{cid}/history").json()["samples"] >= 2
+    assert client.get(f"/api/clusters/{cid}/history?range=1h").status_code == 200
+    assert client.get(f"/api/clusters/{cid}/availability").status_code in (200, 404)
+    # heartbeat loss -> down
+    from datetime import datetime, timedelta, timezone
+    from app.models import Cluster
+    from app.routes_k8s import check_cluster_heartbeats
+    with database.SessionLocal() as db:
+        db.get(Cluster, cid).last_seen_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+        db.commit()
+        check_cluster_heartbeats(db); db.commit()
+    assert client.get(f"/api/clusters/{cid}").json()["status"] == "down"
+    # roles
+    make_user(client, "k8s-op@example.com", "operator"); make_user(client, "k8s-view@example.com", "viewer")
+    op = session_for("k8s-op@example.com", new_password="operator-pass-12345"); viewer = session_for("k8s-view@example.com", new_password="viewer-pass-123456")
+    assert viewer.get("/api/clusters").status_code == 200
+    assert viewer.put(f"/api/clusters/{cid}", headers=CSRF, json={"enabled": False}).status_code == 403
+    assert viewer.get(f"/api/clusters/{cid}/log-policy").status_code == 403
+    assert op.put(f"/api/clusters/{cid}/log-policy", headers=CSRF, json={}).status_code == 403
+    assert anon.get("/api/clusters").status_code == 401
+
+
+def test_k8s_queries_policy_and_results(client):
+    sign_in(client)
+    anon = TestClient(main.app)
+    _, r = _k8s_register(client, anon, "query-test")
+    auth = {"Authorization": f"Bearer {_k8s_token(r.text)}"}
+    cid = next(c["id"] for c in client.get("/api/clusters").json() if c["name"] == "query-test")
+    q = f"/api/clusters/{cid}/query"
+    assert client.post(q, headers=CSRF, json={"kind": "pods"}).status_code == 503      # agent never reported -> offline
+    anon.post("/api/k8s-agent/report", json=HEALTHY, headers=auth)
+    make_user(client, "q-op@example.com", "operator"); make_user(client, "q-view@example.com", "viewer")
+    op = session_for("q-op@example.com", new_password="operator-pass-12345"); viewer = session_for("q-view@example.com", new_password="viewer-pass-123456")
+    assert client.post(q, headers=CSRF, json={"kind": "bogus"}).status_code == 422
+    assert client.post(q, headers=CSRF, json={"kind": "pods", "namespace": "a;b"}).status_code == 422
+    assert viewer.post(q, headers=CSRF, json={"kind": "logs", "namespace": "demo", "name": "web-1"}).status_code == 403   # viewers read no logs
+    rid = viewer.post(q, headers=CSRF, json={"kind": "pods"}).json()["id"]                                                  # ...but may list pods
+    tasks = anon.get("/api/k8s-agent/tasks", headers=auth).json()["tasks"]
+    assert [t["id"] for t in tasks] == [rid] and tasks[0]["kind"] == "pods"
+    assert anon.get("/api/k8s-agent/tasks", headers={"Authorization": "Bearer nope"}).status_code == 401
+    assert anon.post(f"/api/k8s-agent/tasks/{rid}/result", headers=auth, json={"ok": True, "output": json.dumps({"items": [{"name": "web-1"}]})}).status_code == 200
+    got = viewer.get(f"{q}/{rid}").json()
+    assert got["status"] == "done" and got["data"]["items"][0]["name"] == "web-1"
+    assert anon.post(f"/api/k8s-agent/tasks/{rid}/result", headers=auth, json={"ok": True}).status_code == 404   # one answer per task
+    # log policy: restrict to non-kube namespaces
+    assert client.put(f"/api/clusters/{cid}/log-policy", headers=CSRF, json={"include": ["*"], "exclude": ["kube-*", "smwatch"]}).status_code == 200
+    assert client.put(f"/api/clusters/{cid}/log-policy", headers=CSRF, json={"include": ["bad ns"]}).status_code == 422
+    assert op.post(q, headers=CSRF, json={"kind": "logs", "namespace": "kube-system", "name": "coredns"}).status_code == 403
+    ok = op.post(q, headers=CSRF, json={"kind": "logs", "namespace": "demo", "name": "web-1", "grep": "secret-term"})
+    assert ok.status_code == 200
+    events = client.get("/api/audit?limit=200").json()
+    items = events["items"] if isinstance(events, dict) else events
+    actions = {e["action"] for e in items}
+    assert {"k8s.logs.denied", "k8s.logs.read", "k8s.log_policy", "k8s.register"} <= actions
+    assert all(smwatch_secret not in json.dumps(items) for smwatch_secret in [_k8s_token(r.text)])
+    # policy is also delivered to the agent in the report reply
+    assert anon.post("/api/k8s-agent/report", json=HEALTHY, headers=auth).json()["log_policy"]["exclude"] == ["kube-*", "smwatch"]
+
+
+def test_k8s_token_rotation_and_revoke(client):
+    sign_in(client)
+    anon = TestClient(main.app)
+    _, r = _k8s_register(client, anon, "rotate-test")
+    old = _k8s_token(r.text)
+    cid = next(c["id"] for c in client.get("/api/clusters").json() if c["name"] == "rotate-test")
+    h = lambda t: {"Authorization": f"Bearer {t}"}  # noqa: E731
+    anon.post("/api/k8s-agent/report", json=HEALTHY, headers=h(old))
+    assert client.post(f"/api/clusters/{cid}/rotate-token", headers=CSRF).json()["mode"] == "managed"
+    delivered = anon.post("/api/k8s-agent/report", json=HEALTHY, headers=h(old)).json()["rotate_token"]
+    assert anon.post("/api/k8s-agent/report", json=HEALTHY, headers=h(delivered)).status_code == 200   # agent switched
+    assert anon.post("/api/k8s-agent/report", json=HEALTHY, headers=h(old)).status_code == 401           # old one is dead
+    fresh = client.post(f"/api/clusters/{cid}/rotate-token?immediate=true", headers=CSRF).json()["install_token"]
+    assert anon.post("/api/k8s-agent/report", json=HEALTHY, headers=h(delivered)).status_code == 401
+    assert anon.post("/api/k8s-agent/report", json=HEALTHY, headers=h(fresh)).status_code == 200
+    assert client.delete(f"/api/clusters/{cid}", headers=CSRF).json()["deleted"] is True
+    assert client.get(f"/api/clusters/{cid}").status_code == 404

@@ -17,7 +17,7 @@ from sqlalchemy import delete, select
 
 from .config import get_settings
 from .database import SessionLocal
-from .models import AlertEvent, AuditEvent, Channel, CheckResult, Incident, LogRequest, MetricSample, Server, Service
+from .models import AlertEvent, AuditEvent, Channel, CheckResult, ClusterSample, Incident, K8sRequest, LogRequest, MetricSample, Server, Service
 from .netguard import safe_urlopen, validate_host
 
 logger = logging.getLogger(__name__)
@@ -294,7 +294,7 @@ def record_result(session, target_type: str, target_id: int, status: str, latenc
     session.add(CheckResult(target_type=target_type, target_id=target_id, status=status, latency_ms=latency_ms, http_status=http_status, error=(error or None) and error[:1000]))
 
 
-def sync_incident(session, target_type: str, target, status: str, detail: str | None) -> None:
+def sync_incident(session, target_type: str, target, status: str, detail: str | None, alert_title: str | None = None) -> None:
     """Keeps exactly one open incident per target while it is failing; resolves it on recovery."""
     open_incident = session.scalar(
         select(Incident).where(Incident.target_type == target_type, Incident.target_id == target.id, Incident.resolved_at.is_(None))
@@ -302,7 +302,7 @@ def sync_incident(session, target_type: str, target, status: str, detail: str | 
     if status in ("down", "alert"):
         severity = "critical" if status == "down" else "warning"
         noun = "service" if target_type == "service" else "server"
-        title = f"{target.name} is down" if status == "down" else f"{target.name} is over its resource thresholds"
+        title = f"{target.name} is down" if status == "down" else (alert_title or f"{target.name} is over its resource thresholds")
         if open_incident is None:
             session.add(Incident(target_type=target_type, target_id=target.id, target_name=target.name, severity=severity, title=title, detail=(detail or "")[:1000], started_at=datetime.now(timezone.utc)))
         else:
@@ -496,6 +496,9 @@ def run_once() -> None:
             if silent_for > heartbeat_grace(server.check_interval_seconds) and is_due(server.last_checked_at, server.check_interval_seconds):
                 apply_server_result(session, server, "down", error=f"No agent heartbeat for {int(silent_for)}s", debounce=False)
         session.commit()
+        from .routes_k8s import check_cluster_heartbeats
+        check_cluster_heartbeats(session)
+        session.commit()
         retry_pending_alerts(session)
         session.commit()
         from .scheduler import run_due_schedules
@@ -513,6 +516,8 @@ def prune_history() -> None:
         session.execute(delete(MetricSample).where(MetricSample.ts < now - timedelta(days=settings.metric_retention_days)))
         session.execute(delete(LogRequest).where(LogRequest.created_at < now - timedelta(minutes=15)))  # fetched logs are never archived
         session.execute(delete(AuditEvent).where(AuditEvent.ts < now - timedelta(days=settings.audit_retention_days)))
+        session.execute(delete(ClusterSample).where(ClusterSample.ts < now - timedelta(days=settings.metric_retention_days)))
+        session.execute(delete(K8sRequest).where(K8sRequest.created_at < now - timedelta(minutes=15)))
         session.commit()
     finally:
         session.close()

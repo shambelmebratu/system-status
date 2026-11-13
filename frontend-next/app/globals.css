@@ -267,3 +267,5 @@ code,.mono{font-family:var(--mono);font-size:.92em}
   .tbl .hide-sm{display:none}
 }
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+.tbl-wrap{overflow-x:auto}
+.tbl tr.click{cursor:pointer}.tbl tr.click:hover td{background:color-mix(in srgb,var(--surface-2) 60%,transparent)}
