@@ -1,6 +1,7 @@
 'use client';
 
 import { FormEvent, useState } from 'react';
+import { MonitorAlertSettings, alertsOf, type MonitorAlerts } from '../components/alertpick';
 import { AvailabilityPanel } from '../components/availability';
 import { AreaChart } from '../components/charts';
 import { Empty, Field, Icon, Modal, StatusPill } from '../components/ui';
@@ -106,13 +107,14 @@ function ServiceForm({ existing, onClose }: { existing?: Service; onClose: () =>
   const [expected, setExpected] = useState(String(existing?.expected_status ?? 200));
   const [interval, setIntervalValue] = useState(String(existing?.interval_seconds ?? 60));
   const [isPublic, setPublic] = useState(existing?.public ?? false);
+  const [alerts, setAlerts] = useState<MonitorAlerts>(alertsOf(existing));
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
     setBusy(true); setError('');
-    const body = { name, url, expected_status: Number(expected), interval_seconds: Number(interval), public: isPublic };
+    const body = { name, url, expected_status: Number(expected), interval_seconds: Number(interval), public: isPublic, ...alerts };
     try {
       if (existing) await put(`/services/${existing.id}`, body); else await post('/services', body);
       toast(existing ? 'Service updated' : 'Service added'); await refresh(); onClose();
@@ -128,6 +130,7 @@ function ServiceForm({ existing, onClose }: { existing?: Service; onClose: () =>
           <Field label="Expected HTTP status"><input type="number" min={100} max={599} value={expected} onChange={e => setExpected(e.target.value)} required /></Field>
           <Field label="Interval (seconds)"><input type="number" min={15} max={86400} value={interval} onChange={e => setIntervalValue(e.target.value)} required /></Field>
         </div>
+        <MonitorAlertSettings kind="service" value={alerts} onChange={setAlerts} />
         <label className="check"><input type="checkbox" checked={isPublic} onChange={e => setPublic(e.target.checked)} />Show on the public status page <span className="muted">(name and uptime only; the URL stays private)</span></label>
         {error && <div className="err" role="alert">{error}</div>}
         <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}><button type="button" className="btn ghost" onClick={onClose}>Cancel</button><button className="btn primary" disabled={busy}>{busy ? 'Saving…' : 'Save'}</button></div>

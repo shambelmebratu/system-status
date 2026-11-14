@@ -16,7 +16,7 @@ from .database import Base, engine, get_db
 from .models import AlertEvent, Channel, CheckResult, Incident, Server, Service, User
 from .bodylimit import BodyLimitMiddleware
 from .agent_versions import latest_k8s_agent, latest_server_agent
-from .monitoring import server_addresses, check_service, discover_telegram_chats, run_once, send_channel_test
+from .monitoring import alert_columns, server_addresses, check_service, discover_telegram_chats, run_once, send_channel_test
 from .routes_agent import hash_token, router as agent_router
 from .routes_audit import router as audit_router
 from .routes_enroll import router as enroll_router
@@ -162,9 +162,11 @@ def serialize(item):
             result["pending_token_at"] = result["pending_token_at"].isoformat()
         if result.get("token_issued_at"):
             result["token_issued_at"] = result["token_issued_at"].isoformat()
-    for key in ("notify_kinds", "notify_events"):
+    for key in ("notify_kinds", "notify_events", "alert_events"):
         if key in result:
             result[key] = [v for v in (result[key] or "").split(",") if v]
+    if "alert_channels" in result:
+        result["alert_channels"] = [int(v) for v in (result["alert_channels"] or "").split(",") if v.isdigit()]
     for secret in ("agent_token", "token"):
         if secret in result: result[secret] = "configured" if result[secret] else ""
     if "endpoint" in result and result.get("type") in ("slack", "webhook"):
@@ -328,11 +330,21 @@ def dashboard(_: dict = Depends(require_user), db: Session = Depends(get_db)) ->
         },
         "agents": {"latest": latest_server_agent(), "latest_k8s": latest_k8s_agent()},
         "limits": {
-            "usage_warn_percent": settings.usage_warn_percent, "usage_bad_percent": settings.usage_bad_percent, "k8s_offline_seconds": settings.k8s_offline_seconds,
+            "reminder_minutes": settings.reminder_minutes, "usage_warn_percent": settings.usage_warn_percent, "usage_bad_percent": settings.usage_bad_percent, "k8s_offline_seconds": settings.k8s_offline_seconds,
             "enrollment_default_minutes": settings.enrollment_default_minutes, "enrollment_max_minutes": settings.enrollment_max_minutes, "log_result_ttl_minutes": settings.log_result_ttl_minutes,
         },
         "summary": {"servers": len(servers), "services": len(services), "up": statuses.count("up"), "alerts": sum(value in ("alert", "down", "degraded") for value in statuses), "open_incidents": open_incidents},
     }
+
+
+def alert_settings(values: dict, target_type: str, db: Session) -> dict:
+    """Validates and converts the per-monitor alert settings of a server / service payload."""
+    wanted = values.get("alert_channels") or []
+    if wanted:
+        known = set(db.scalars(select(Channel.id).where(Channel.id.in_(wanted))).all())
+        if known != set(wanted):
+            raise HTTPException(422, "One of the chosen notification channels does not exist")
+    return alert_columns(values, target_type)
 
 
 def routing_columns(values: dict) -> dict:
@@ -431,7 +443,7 @@ def create_server(payload: ServerCreate, request: Request, user: dict = Depends(
     if payload.monitor_mode in ("agent", "push") and len(token) < 32:
         raise HTTPException(422, "Agent token must be at least 32 characters")
     validate_server_targets(payload)
-    item = Server(**values)
+    item = Server(**alert_settings(values, "server", db))
     set_token(item, token if payload.monitor_mode != "ping" else None)
     db.add(item); db.flush()
     audit(db, request, "server.create", user=user, target=f"server:{item.id}", detail=f"{item.name} ({item.monitor_mode})")
@@ -457,7 +469,7 @@ def update_server(item_id: int, payload: ServerCreate, request: Request, user: d
         values["endpoint"] = ""
     if values["monitor_mode"] in ("agent", "push") and len(token or "") < 32:
         raise HTTPException(422, "Agent token must be at least 32 characters")
-    for key, value in values.items():
+    for key, value in alert_settings(values, "server", db).items():
         setattr(item, key, value)
     set_token(item, token)
     item.last_checked_at = None
@@ -509,7 +521,7 @@ def delete_server(item_id: int, request: Request, user: dict = Depends(require_o
 def create_service(payload: ServiceCreate, _: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
     guard_target(validate_url, payload.url, "URL")
     if payload.server_id is not None and not db.get(Server, payload.server_id): raise HTTPException(404, "Server not found")
-    item = Service(**payload.model_dump()); db.add(item); db.commit(); db.refresh(item); return serialize(item)
+    item = Service(**alert_settings(payload.model_dump(), "service", db)); db.add(item); db.commit(); db.refresh(item); return serialize(item)
 
 
 @app.put("/api/services/{item_id}")
@@ -521,7 +533,7 @@ def update_service(item_id: int, payload: ServiceCreate, _: dict = Depends(requi
     guard_target(validate_url, payload.url, "URL")
     if values["server_id"] is not None and not db.get(Server, values["server_id"]):
         raise HTTPException(404, "Server not found")
-    for key, value in values.items():
+    for key, value in alert_settings(values, "service", db).items():
         setattr(item, key, value)
     item.last_checked_at = None
     item.last_status = "unknown"

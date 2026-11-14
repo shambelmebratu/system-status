@@ -6,6 +6,7 @@ import { AreaChart, Ring } from '../components/charts';
 import { JoinCommands, expiryText, useActiveEnrollment, useControlPlaneUrl } from '../components/join';
 import { LogsPanel } from '../components/logs';
 import { AgentUpdate } from '../components/agentupdate';
+import { MonitorAlertSettings, alertSummary, alertsOf, type MonitorAlerts } from '../components/alertpick';
 import { LogPolicyCard } from '../components/logpolicy';
 import { CodeBox, Empty, Field, Icon, Meter, Modal, StatusPill } from '../components/ui';
 import { api, del, post, put } from '../lib/api';
@@ -57,7 +58,8 @@ function ServerList() {
 }
 
 function ServerDetail({ server }: { server: Server }) {
-  const { data, go, toast, refresh, canOperate, confirm } = useApp();
+  const lim = useLimits();
+  const { channels, data, go, toast, refresh, canOperate, confirm } = useApp();
   const [range, setRange] = useState<Range>('24h');
   const [editing, setEditing] = useState(false);
   const [rotated, setRotated] = useState<string | null>(null);
@@ -181,6 +183,7 @@ function ServerDetail({ server }: { server: Server }) {
                 <tr><td className="muted">Public IP</td><td className="mono">{server.public_ip || <span className="muted">not reported</span>}</td></tr>
                 <tr><td className="muted">Private IP</td><td className="mono">{server.private_ips?.length ? server.private_ips.join(', ') : <span className="muted">not reported</span>}</td></tr>
               </>}
+              <tr><td className="muted">Alerts</td><td className="sm">{alertSummary(server, new Map(channels.map(c => [c.id, c.name])), lim.reminder)}</td></tr>
               <tr><td className="muted">Status page</td><td>{server.public ? 'Public' : 'Private'}</td></tr>
               <tr><td className="muted">Interval</td><td>{server.check_interval_seconds}s</td></tr>
               <tr><td className="muted">Availability 24h</td><td>{pct(server.uptime_24h, 2)}</td></tr>
@@ -221,6 +224,7 @@ function ServerWizard({ existing, onClose }: { existing?: Server; onClose: () =>
   const [token, setToken] = useState('');
   const [processNames, setProcessNames] = useState(existing?.process_names ?? '');
   const [isPublic, setPublic] = useState(existing?.public ?? false);
+  const [alerts, setAlerts] = useState<MonitorAlerts>(alertsOf(existing));
   const [th, setTh] = useState<Thresholds>({
     cpu: String(existing?.cpu_threshold ?? defaults.cpu), memory: String(existing?.memory_threshold ?? defaults.memory), disk: String(existing?.disk_threshold ?? defaults.disk),
     load: String(existing?.load_threshold ?? defaults.load), swap: String(existing?.swap_threshold ?? defaults.swap), process: String(existing?.process_threshold ?? defaults.process),
@@ -235,7 +239,7 @@ function ServerWizard({ existing, onClose }: { existing?: Server; onClose: () =>
     setBusy(true); setError('');
     const body = {
       name, host, monitor_mode: mode, check_interval_seconds: Number(interval), endpoint: mode === 'agent' ? endpoint : '', agent_token: mode === 'agent' ? token : '',
-      public: isPublic, process_names: processNames, cpu_threshold: Number(th.cpu), memory_threshold: Number(th.memory), disk_threshold: Number(th.disk),
+      public: isPublic, ...alerts, process_names: processNames, cpu_threshold: Number(th.cpu), memory_threshold: Number(th.memory), disk_threshold: Number(th.disk),
       load_threshold: Number(th.load), swap_threshold: Number(th.swap), process_threshold: Number(th.process),
     };
     try {
@@ -288,6 +292,7 @@ function ServerWizard({ existing, onClose }: { existing?: Server; onClose: () =>
             </div>
           </>
         )}
+        <MonitorAlertSettings kind="server" pingOnly={mode === 'ping'} value={alerts} onChange={setAlerts} />
         <label className="check"><input type="checkbox" checked={isPublic} onChange={e => setPublic(e.target.checked)} />Show on the public status page <span className="muted">(name, status and uptime only)</span></label>
         {error && <div className="err" role="alert">{error}</div>}
         <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>

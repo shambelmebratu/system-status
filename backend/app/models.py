@@ -44,6 +44,10 @@ class Server(Base):
     last_metrics: Mapped[str | None] = mapped_column(Text)
     fail_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     public: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    # Per-monitor alert settings (NULL = inherit): which alert types are sent, to which channels, and how often to repeat.
+    alert_events: Mapped[str | None] = mapped_column(String(100))      # down,alert,recovered,reminder
+    alert_channels: Mapped[str | None] = mapped_column(String(200))    # channel ids; NULL = every channel
+    alert_reminder_minutes: Mapped[int | None] = mapped_column(Integer)  # NULL = REMINDER_MINUTES; 0 = never repeat
     token_hash: Mapped[str | None] = mapped_column(String(64), index=True)
     machine_id: Mapped[str | None] = mapped_column(String(64), index=True)
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -67,6 +71,10 @@ class Service(Base):
     interval_seconds: Mapped[int] = mapped_column(Integer, default=60)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     public: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    # Per-monitor alert settings (NULL = inherit): which alert types are sent, to which channels, and how often to repeat.
+    alert_events: Mapped[str | None] = mapped_column(String(100))      # down,alert,recovered,reminder
+    alert_channels: Mapped[str | None] = mapped_column(String(200))    # channel ids; NULL = every channel
+    alert_reminder_minutes: Mapped[int | None] = mapped_column(Integer)  # NULL = REMINDER_MINUTES; 0 = never repeat
     fail_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     last_status: Mapped[str] = mapped_column(String(20), default="unknown")
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -265,6 +273,10 @@ class Cluster(Base):
     agent_version: Mapped[str | None] = mapped_column(String(32))
     summary: Mapped[str | None] = mapped_column(Text)            # JSON of the latest report
     log_policy: Mapped[str | None] = mapped_column(Text)         # JSON, see k8s.py (NULL = unrestricted)
+    # Per-monitor alert settings (NULL = inherit): which alert types are sent, to which channels, and how often to repeat.
+    alert_events: Mapped[str | None] = mapped_column(String(100))      # down,alert,recovered,reminder
+    alert_channels: Mapped[str | None] = mapped_column(String(200))    # channel ids; NULL = every channel
+    alert_reminder_minutes: Mapped[int | None] = mapped_column(Integer)  # NULL = REMINDER_MINUTES; 0 = never repeat
     created_by: Mapped[str | None] = mapped_column(String(320))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 

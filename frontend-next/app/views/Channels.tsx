@@ -1,6 +1,7 @@
 'use client';
 
 import { FormEvent, useState } from 'react';
+import { EVENTS } from '../components/alertpick';
 import { Empty, Field, Icon, Modal } from '../components/ui';
 import { del, post, put } from '../lib/api';
 import { useApp } from '../lib/app';
@@ -15,12 +16,6 @@ const HELP: Record<ChannelType, string> = {
   whatsapp: 'Uses the Meta WhatsApp Cloud API with an approved Utility template that has one body variable.',
 };
 
-const EVENTS: { id: string; label: string; hint: string }[] = [
-  { id: 'down', label: 'Down', hint: 'A server, service or cluster stopped responding' },
-  { id: 'alert', label: 'Over a limit', hint: 'CPU, memory, disk, a process or a cluster problem crossed its threshold' },
-  { id: 'recovered', label: 'Recovered', hint: 'It is healthy again' },
-  { id: 'reminder', label: 'Reminders', hint: 'Repeats while something is still failing' },
-];
 const KINDS: { id: string; label: string }[] = [{ id: 'server', label: 'Servers' }, { id: 'service', label: 'Services' }, { id: 'cluster', label: 'Kubernetes clusters' }];
 /** An empty selection means "everything", which is also how the form shows it (all ticked). */
 const allOr = (chosen: string[] | undefined, all: string[]) => (chosen && chosen.length ? chosen : all);

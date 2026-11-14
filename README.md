@@ -343,6 +343,16 @@ Alert limits are set **per server** (Edit the server) and per cluster log policy
 
 Alerts → add or edit a channel → **Send to this channel**. Tick the alert types (*Down*, *Over a limit*, *Recovered*, *Reminders* while something is still failing) and the sources (*Servers*, *Services*, *Kubernetes clusters*). A channel with everything ticked receives everything, which is the default. Example: an on-call channel that only gets *Down* and *Recovered* for servers, next to a team channel that gets everything. An alert that no channel is set to receive is recorded in the delivery log as "not sent" and is not retried.
 
+### Alert settings per server, service and cluster
+
+Every server, service and Kubernetes cluster has its own **Alerts** section (Edit the server or service; cluster → Settings), which overrides the defaults for that monitor only:
+
+- **Alert types**: Down, Over a limit (servers and clusters), Recovered, Reminders. Example: a staging server that only sends *Down*.
+- **Channels**: all channels (default), or only the ones you tick, for example the on-call channel for production and the team channel for staging.
+- **Remind again after**: how many minutes before an alert is repeated while the monitor is still failing. Blank uses the default (`REMINDER_MINUTES`, 30), `0` never repeats (you are alerted once when it goes down and once when it recovers).
+
+The channel's own filter (Alerts page) still applies on top. An alert that a monitor is set not to send is shown in the delivery log as "not sent" and is not retried.
+
 ## Data retention and purging
 
 Settings → **Data retention & purge** (admins) controls how long each kind of data is kept: uptime history, server/cluster metrics, alert messages, resolved incidents, the audit log (minimum 30 days) and expired install links. Anything older is deleted automatically **hourly, daily or weekly** (daily/weekly at a time you choose, UTC). You can also tick data kinds and **purge now** (older than N days, or everything). Open incidents are never purged, every settings change and purge is written to the audit log, and the table shows row counts, oldest entry and (PostgreSQL) disk size. Defaults come from `CHECK_RETENTION_DAYS`, `METRIC_RETENTION_DAYS` and `AUDIT_RETENTION_DAYS`; alerts default to 90 days. Fetched logs are never archived (deleted after 15 minutes).

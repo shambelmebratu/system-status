@@ -10,7 +10,26 @@ class LoginRequest(BaseModel):
     password: str
 
 
-class ServerCreate(BaseModel):
+class AlertPrefs(BaseModel):
+    """Per-monitor alert settings. Empty / null = inherit (every alert type, every channel, REMINDER_MINUTES)."""
+    alert_events: list[str] = Field(default_factory=list, max_length=4)           # down, alert, recovered, reminder
+    alert_channels: list[int] = Field(default_factory=list, max_length=100)       # channel ids; empty = every channel
+    alert_reminder_minutes: int | None = Field(default=None, ge=0, le=60 * 24 * 14)   # None = default; 0 = never repeat
+
+    @field_validator("alert_events")
+    @classmethod
+    def known_events(cls, v: list[str]) -> list[str]:
+        if any(e not in ("down", "alert", "recovered", "reminder") for e in v):
+            raise ValueError("Unknown alert type")
+        return list(dict.fromkeys(v))
+
+    @field_validator("alert_channels")
+    @classmethod
+    def unique_channels(cls, v: list[int]) -> list[int]:
+        return list(dict.fromkeys(v))
+
+
+class ServerCreate(AlertPrefs):
     name: str = Field(min_length=1, max_length=100)
     host: str = Field(default="", max_length=255)
     monitor_mode: str = Field(default="agent", pattern="^(ping|agent|push)$")
@@ -36,7 +55,7 @@ class ServerCreate(BaseModel):
         return self
 
 
-class ServiceCreate(BaseModel):
+class ServiceCreate(AlertPrefs):
     name: str = Field(min_length=1, max_length=100)
     url: str = Field(min_length=8, max_length=500)
     expected_status: int = Field(200, ge=100, le=599)

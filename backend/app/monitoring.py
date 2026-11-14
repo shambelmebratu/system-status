@@ -254,12 +254,61 @@ def channel_wants(channel: Channel, target_type: str | None, state: str | None) 
 
 
 NOT_ROUTED = "Not sent: no channel is set to receive this kind of alert"
+MONITOR_MUTED = "Not sent: this monitor is set not to send this kind of alert"
+
+# Which alert types each kind of monitor can produce (a service has no "over a limit"; a ping-only host cannot go over a limit either).
+APPLICABLE_EVENTS = {"server": ("down", "alert", "recovered", "reminder"), "service": ("down", "recovered", "reminder"), "cluster": ("down", "alert", "recovered", "reminder")}
 
 
-def send_alert(message: str, session, target_type: str | None = None, state: str | None = None) -> tuple[bool, str | None]:
+def csv_list(value: str | None) -> list[str]:
+    return [v for v in (value or "").split(",") if v]
+
+
+def alert_columns(values: dict, target_type: str) -> dict:
+    """alert_events / alert_channels travel as lists and are stored comma-separated. Selecting everything (or nothing) is stored as
+    NULL = inherit, so a later new channel or alert type is picked up automatically."""
+    events = values.get("alert_events") or []
+    everything = APPLICABLE_EVENTS[target_type]
+    values["alert_events"] = ",".join(e for e in events if e in everything) if events and set(everything) - set(events) else None
+    values["alert_events"] = values["alert_events"] or None
+    channels = values.get("alert_channels") or []
+    values["alert_channels"] = ",".join(str(c) for c in channels) if channels else None
+    return values
+
+
+def reminder_minutes(target) -> int:
+    """How long to wait before repeating an alert for this monitor: its own setting, else REMINDER_MINUTES. 0 = never repeat."""
+    own = getattr(target, "alert_reminder_minutes", None)
+    return get_settings().reminder_minutes if own is None else own
+
+
+def target_allows(target, state: str | None) -> bool:
+    events = csv_list(getattr(target, "alert_events", None))
+    category = event_category(state)
+    return not (events and category and category not in events)
+
+
+def target_channel_ids(target) -> set[int] | None:
+    ids = {int(c) for c in csv_list(getattr(target, "alert_channels", None)) if c.isdigit()}
+    return ids or None
+
+
+def target_of(session, target_type: str, target_id: int):
+    model = {"server": Server, "service": Service}.get(target_type)
+    if target_type == "cluster":
+        from .models import Cluster
+        model = Cluster
+    return session.get(model, target_id) if model else None
+
+
+def send_alert(message: str, session, target_type: str | None = None, state: str | None = None, only_channels: set[int] | None = None) -> tuple[bool, str | None]:
     channels = session.scalars(select(Channel).where(Channel.enabled.is_(True))).all()
     if not channels:
         return False, "No enabled notification channels are configured"
+    if only_channels:   # this monitor sends to specific channels only
+        channels = [c for c in channels if c.id in only_channels]
+        if not channels:
+            return False, "Not sent: none of the channels chosen for this monitor is enabled"
     channels = [c for c in channels if channel_wants(c, target_type, state)]
     if not channels:
         return False, NOT_ROUTED
@@ -392,8 +441,12 @@ def deliver_channel(channel: Channel, text: str, rich: bool = False) -> tuple[bo
 def deliver_event(event: AlertEvent, session) -> None:
     event.delivery_attempts = (event.delivery_attempts or 0) + 1
     event.last_attempt_at = datetime.now(timezone.utc)
-    event.sent, event.delivery_error = send_alert(event.message, session, event.target_type, event.state)
-    if event.delivery_error == NOT_ROUTED:
+    target = target_of(session, event.target_type, event.target_id)
+    if target is not None and not target_allows(target, event.state):
+        event.sent, event.delivery_error, event.delivery_attempts = False, MONITOR_MUTED, 10   # a choice made on the monitor, never retried
+        return
+    event.sent, event.delivery_error = send_alert(event.message, session, event.target_type, event.state, target_channel_ids(target) if target is not None else None)
+    if (event.delivery_error or "").startswith("Not sent:"):
         event.delivery_attempts = 10   # a deliberate choice, not a failure: never retried
         return
     if event.sent:
@@ -485,15 +538,18 @@ def settle_status(target, raw_status: str) -> str:
     return "down"
 
 
-def should_notify_again(session, target_type: str, target_id: int) -> bool:
-    """Repeat alerts for a still-failing target at most once per reminder window."""
+def should_notify_again(session, target_type: str, target_id: int, minutes: int | None = None) -> bool:
+    """Repeat alerts for a still-failing target at most once per reminder window (the monitor's own, else REMINDER_MINUTES; 0 = never)."""
+    minutes = get_settings().reminder_minutes if minutes is None else minutes
     latest = session.scalar(
         select(AlertEvent.created_at).where(AlertEvent.target_type == target_type, AlertEvent.target_id == target_id, AlertEvent.severity == "critical").order_by(AlertEvent.id.desc()).limit(1)
     )
     if latest is None:
         return True
+    if minutes <= 0:
+        return False
     latest = latest if latest.tzinfo else latest.replace(tzinfo=timezone.utc)
-    return datetime.now(timezone.utc) - latest >= timedelta(minutes=get_settings().reminder_minutes)
+    return datetime.now(timezone.utc) - latest >= timedelta(minutes=minutes)
 
 
 def apply_service_result(session, service: Service, result: dict) -> dict:
@@ -513,7 +569,7 @@ def apply_service_result(session, service: Service, result: dict) -> dict:
     service.last_error = result["error"]
     resolved = sync_incident(session, "service", service, status, service.last_error)
     if status == "down":
-        if previous_status != "down" or should_notify_again(session, "service", service.id):
+        if previous_status != "down" or should_notify_again(session, "service", service.id, reminder_minutes(service)):
             queue_event(session, "service", service, "critical", format_alert("Service", "down" if previous_status != "down" else "still_down", service.name, service.last_error, at=now, link=service.url), deliver=True, state="down" if previous_status != "down" else "still_down")
     elif previous_status == "down":
         queue_event(session, "service", service, "info", format_alert("Service", "recovered", service.name, f"Responding again: HTTP {service.last_http_status} in {round(service.last_latency_ms or 0)} ms", at=now, link=service.url, duration=outage_seconds(resolved)), deliver=True, state="recovered")
@@ -555,10 +611,10 @@ def apply_server_result(session, server: Server, status: str, failures: list[str
             session.add(MetricSample(server_id=server.id, ts=now, cpu=metrics["cpu"], memory=metrics["memory"], disk=metrics["disk"], load=metrics["load"], swap=metrics["swap"], net_rx_bps=metrics.get("net_rx_bps"), net_tx_bps=metrics.get("net_tx_bps")))
     resolved = sync_incident(session, "server", server, status, detail)
     if status == "down":
-        if previous != "down" or should_notify_again(session, "server", server.id):
+        if previous != "down" or should_notify_again(session, "server", server.id, reminder_minutes(server)):
             queue_event(session, "server", server, "critical", format_alert("Server", "down" if previous != "down" else "still_down", server.name, error, at=now, where=server_where(server)), deliver, state="down" if previous != "down" else "still_down")
     elif status == "alert":
-        if previous != "alert" or should_notify_again(session, "server", server.id):
+        if previous != "alert" or should_notify_again(session, "server", server.id, reminder_minutes(server)):
             queue_event(session, "server", server, "critical", format_alert("Server", "alert" if previous != "alert" else "still_alert", server.name, failures, at=now, where=server_where(server)), deliver, state="alert" if previous != "alert" else "still_alert")
     elif previous in ("down", "alert"):
         queue_event(session, "server", server, "info", format_alert("Server", "recovered", server.name, "Host reachable and all resource checks are within their thresholds.", at=now, duration=outage_seconds(resolved), where=server_where(server)), deliver, state="recovered")

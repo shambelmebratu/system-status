@@ -20,8 +20,9 @@ from .agent_versions import is_outdated, latest_k8s_agent
 from .audit import audit
 from .config import get_settings, resolved_k8s_agent_image
 from .database import SessionLocal, get_db
-from .models import CheckResult, Cluster, ClusterSample, Incident, K8sRequest
-from .monitoring import format_alert, outage_seconds, queue_event, record_result, should_notify_again, sync_incident
+from .schemas import AlertPrefs
+from .models import Channel, CheckResult, Cluster, ClusterSample, Incident, K8sRequest
+from .monitoring import alert_columns, csv_list, format_alert, reminder_minutes, outage_seconds, queue_event, record_result, should_notify_again, sync_incident
 from .routes_agent import hash_token
 from .routes_enroll import control_plane_url, find_enrollment
 from .routes_logs import _Waiter, _wake, pickup_timeout, request_ttl
@@ -99,9 +100,10 @@ class K8sReport(BaseModel):
         return " ".join("".join(ch if ch.isprintable() else " " for ch in v).split())
 
 
-class ClusterUpdate(BaseModel):
+class ClusterUpdate(AlertPrefs):
     name: str | None = Field(default=None, pattern=NAME_PATTERN)
     enabled: bool | None = None
+    alert_settings: bool = False      # true when the alert_* fields in this request are meant to be saved (a rename alone must not reset them)
 
 
 class K8sLogPolicy(BaseModel):
@@ -142,6 +144,7 @@ def serialize_cluster(c: Cluster) -> dict:
         "id": c.id, "name": c.name, "enabled": c.enabled, "status": c.last_status, "last_error": c.last_error, "last_seen_at": iso(c.last_seen_at),
         "k8s_version": c.k8s_version, "agent_version": c.agent_version, "agent_outdated": is_outdated(c.agent_version, latest_k8s_agent()), "latest_agent_version": latest_k8s_agent(), "summary": summary, "token_issued_at": iso(c.token_issued_at),
         "token_rotation_pending": bool(c.pending_token_hash), "last_agent_ip": c.last_agent_ip, "created_by": c.created_by, "created_at": iso(c.created_at),
+        "alert_events": csv_list(c.alert_events), "alert_channels": [int(v) for v in csv_list(c.alert_channels) if v.isdigit()], "alert_reminder_minutes": c.alert_reminder_minutes,
         "log_policy": parse_policy(c.log_policy), "restricted": parse_policy(c.log_policy) != K8sLogPolicy().model_dump(),
     }
 
@@ -177,7 +180,7 @@ def apply_cluster_status(db: Session, cluster: Cluster, status: str, detail: str
     cluster.last_status, cluster.last_error, cluster.last_checked_at = status, detail if status != "up" else None, now
     resolved = sync_incident(db, "cluster", cluster, status, detail, alert_title=f"{cluster.name} has problems")
     if status in ("down", "alert"):
-        if previous != status or should_notify_again(db, "cluster", cluster.id):
+        if previous != status or should_notify_again(db, "cluster", cluster.id, reminder_minutes(cluster)):
             problems = (json.loads(cluster.summary).get("problems") if cluster.summary else None) if status == "alert" else None
             state = status if previous != status else f"still_{status}"
             queue_event(db, "cluster", cluster, "critical", format_alert("Cluster", state, cluster.name, problems or detail, at=now, where=cluster_where(cluster)), deliver, state=state)
@@ -508,6 +511,13 @@ def update_cluster(cluster_id: int, payload: ClusterUpdate, request: Request, us
     if payload.enabled is not None and payload.enabled != cluster.enabled:
         cluster.enabled = payload.enabled
         changes.append("enabled" if payload.enabled else "disabled")
+    if payload.alert_settings:
+        values = alert_columns({"alert_events": payload.alert_events, "alert_channels": payload.alert_channels}, "cluster")
+        wanted = payload.alert_channels
+        if wanted and set(db.scalars(select(Channel.id).where(Channel.id.in_(wanted))).all()) != set(wanted):
+            raise HTTPException(422, "One of the chosen notification channels does not exist")
+        cluster.alert_events, cluster.alert_channels, cluster.alert_reminder_minutes = values["alert_events"], values["alert_channels"], payload.alert_reminder_minutes
+        changes.append("alert settings")
     if changes:
         audit(db, request, "k8s.cluster_update", user=user, target=f"cluster:{cluster.id}", detail="; ".join(changes))
     db.commit(); db.refresh(cluster)

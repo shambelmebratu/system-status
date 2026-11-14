@@ -3,6 +3,7 @@
 import { FormEvent, ReactNode, useCallback, useEffect, useRef, useState } from 'react';
 import { AreaChart } from '../components/charts';
 import { ClusterAgentUpdate } from '../components/agentupdate';
+import { MonitorAlertSettings, alertsOf, type MonitorAlerts } from '../components/alertpick';
 import { useActiveEnrollment, useControlPlaneUrl } from '../components/join';
 import { Highlight, LEVEL_LABEL, parse } from '../components/logs';
 import { CodeBox, Empty, Field, Icon, Meter, Modal, StatusPill } from '../components/ui';
@@ -638,6 +639,7 @@ function ClusterSettings({ cluster, isAdmin, reload }: { cluster: Cluster; isAdm
   const [include, setInclude] = useState(cluster.log_policy.include.join('\n'));
   const [exclude, setExclude] = useState(cluster.log_policy.exclude.join('\n'));
   const lines = (v: string) => v.split('\n').map(x => x.trim()).filter(Boolean);
+  const [alerts, setAlerts] = useState<MonitorAlerts>(alertsOf(cluster));
 
   async function run(fn: () => Promise<unknown>, ok: string) { try { await fn(); toast(ok); await reload(); } catch (e) { toast((e as Error).message, true); } }
   async function revokeNow() {
@@ -671,6 +673,11 @@ function ClusterSettings({ cluster, isAdmin, reload }: { cluster: Cluster; isAdm
           <button className="btn primary sm" disabled={!isAdmin} onClick={() => void run(() => put(`/clusters/${cluster.id}/log-policy`, { enabled: policy.enabled, include: lines(include), exclude: lines(exclude) }), 'Log policy saved')}>Save policy</button>
           <button className="btn sm" disabled={!isAdmin} onClick={() => { setPolicy({ enabled: true, include: ['*'], exclude: [] }); setInclude('*'); setExclude(''); }}>Reset to default</button>
         </div>
+      </section>
+      <section className="card" style={{ gridColumn: '1 / -1' }}>
+        <div className="card-head"><h2>Alerts</h2></div>
+        <MonitorAlertSettings kind="cluster" value={alerts} onChange={setAlerts} />
+        <div style={{ marginTop: 12 }}><button className="btn primary sm" onClick={() => void run(() => put(`/clusters/${cluster.id}`, { alert_settings: true, ...alerts }), 'Alert settings saved')}>Save alert settings</button></div>
       </section>
       {rotated && <Modal title="New agent token" onClose={() => setRotated(null)}>
         <p className="sm">Shown once. Patch it into the agent’s Secret, then restart the pod:</p>

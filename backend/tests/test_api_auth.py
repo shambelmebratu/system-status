@@ -1672,3 +1672,86 @@ def test_what_the_real_agent_produces_is_accepted_and_summarised(client, tmp_pat
         assert 190 <= s["p50"] <= 250 and 340 <= s["p95"] <= 420 and s["p99"] >= s["p95"]       # true values: ~209 / ~390 / ~404 ms, within one bucket
     finally:
         sys.modules.pop("agent", None)
+
+
+# =================================================================== per-monitor alert settings
+def test_each_monitor_chooses_its_alert_types_channels_and_reminder_interval(client, monkeypatch):
+    from datetime import timedelta
+    from app import monitoring as m
+    from app.models import AlertEvent, Channel, Server, Service
+    sign_in(client)
+    with database.SessionLocal() as db:
+        db.query(Channel).delete(); db.commit()
+    tg = {"type": "telegram", "token": "1234567890:abcdefghij", "chat_id": "42"}
+    team = client.post("/api/channels", headers=CSRF, json={"name": "team", **tg}).json()
+    oncall = client.post("/api/channels", headers=CSRF, json={"name": "oncall", **tg}).json()
+
+    # --- create / edit / serialise, with validation
+    svc = client.post("/api/services", headers=CSRF, json={"name": "alert-svc", "url": "https://example.com", "alert_events": ["down"], "alert_channels": [oncall["id"]], "alert_reminder_minutes": 5}).json()
+    assert svc["alert_events"] == ["down"] and svc["alert_channels"] == [oncall["id"]] and svc["alert_reminder_minutes"] == 5
+    assert client.post("/api/services", headers=CSRF, json={"name": "x", "url": "https://example.com", "alert_channels": [99999]}).status_code == 422
+    assert client.post("/api/services", headers=CSRF, json={"name": "x", "url": "https://example.com", "alert_events": ["nope"]}).status_code == 422
+    assert client.post("/api/services", headers=CSRF, json={"name": "x", "url": "https://example.com", "alert_reminder_minutes": -1}).status_code == 422
+    all_types = client.post("/api/services", headers=CSRF, json={"name": "all-svc", "url": "https://example.com", "alert_events": ["down", "recovered", "reminder"]}).json()
+    assert all_types["alert_events"] == [] and all_types["alert_reminder_minutes"] is None              # every applicable type ticked = inherit
+    srv = client.post("/api/servers", headers=CSRF, json={"name": "alert-srv", "host": "10.1.1.1", "monitor_mode": "ping", "alert_events": ["down", "recovered"], "alert_reminder_minutes": 0}).json()
+    assert srv["alert_events"] == ["down", "recovered"] and srv["alert_reminder_minutes"] == 0 and srv["alert_channels"] == []
+
+    # --- delivery rules
+    sent = []
+    monkeypatch.setattr(m, "deliver_channel", lambda channel, text, rich=False: (sent.append(channel.name), (True, "Delivered"))[1])
+    def deliver(target_type, target_id, state):
+        sent.clear()
+        with database.SessionLocal() as db:
+            event = AlertEvent(target_type=target_type, target_id=target_id, severity="critical", state=state, message="x"); db.add(event); db.flush()
+            _real_deliver_event(event, db); db.commit()
+            return sorted(sent), event.sent, event.delivery_error, event.delivery_attempts
+    assert deliver("service", svc["id"], "down")[:2] == (["oncall"], True)                               # only the chosen channel
+    names, ok, error, attempts = deliver("service", svc["id"], "recovered")
+    assert names == [] and not ok and error == m.MONITOR_MUTED and attempts == 10                        # this service is set to "down" only
+    assert deliver("service", svc["id"], "still_down")[0] == []
+    assert deliver("service", all_types["id"], "recovered")[0] == ["oncall", "team"]                      # inherit: every channel
+    assert deliver("server", srv["id"], "down")[0] == ["oncall", "team"]
+    assert deliver("server", srv["id"], "alert")[2] == m.MONITOR_MUTED                                    # thresholds muted for this server only
+    # a channel's own filter still applies on top
+    client.put(f"/api/channels/{oncall['id']}", headers=CSRF, json={"name": "oncall", **tg, "token": "", "notify_events": ["recovered"]})
+    assert deliver("service", svc["id"], "down")[:3] == ([], False, "Not sent: no channel is set to receive this kind of alert")
+    client.put(f"/api/channels/{oncall['id']}", headers=CSRF, json={"name": "oncall", **tg, "token": ""})
+    # a disabled chosen channel is explained
+    client.put(f"/api/channels/{oncall['id']}", headers=CSRF, json={"name": "oncall", **tg, "token": "", "enabled": False})
+    assert deliver("service", svc["id"], "down")[2].startswith("Not sent: none of the channels chosen")
+    client.put(f"/api/channels/{oncall['id']}", headers=CSRF, json={"name": "oncall", **tg, "token": "", "enabled": True})
+
+    # --- reminder interval: per monitor, else the global default; 0 = never
+    now = datetime.now(timezone.utc)
+    with database.SessionLocal() as db:
+        db.add(AlertEvent(target_type="service", target_id=svc["id"], severity="critical", state="down", message="x", created_at=now - timedelta(minutes=10)))
+        db.add(AlertEvent(target_type="server", target_id=srv["id"], severity="critical", state="down", message="x", created_at=now - timedelta(days=3)))
+        db.commit()
+        service, server = db.get(Service, svc["id"]), db.get(Server, srv["id"])
+        assert m.reminder_minutes(service) == 5 and m.reminder_minutes(server) == 0
+        assert m.should_notify_again(db, "service", svc["id"], m.reminder_minutes(service)) is True       # 10 min since the last alert > its own 5 min
+        assert m.should_notify_again(db, "service", svc["id"], 30) is False                                # the default of 30 min would still be waiting
+        assert m.should_notify_again(db, "server", srv["id"], m.reminder_minutes(server)) is False         # never repeat, even after 3 days
+        assert m.should_notify_again(db, "server", 987654, 0) is True                                       # but the first alert is never suppressed
+        assert m.reminder_minutes(db.get(Service, all_types["id"])) == m.get_settings().reminder_minutes
+
+    # --- editing keeps / changes the settings; clearing returns to inherit
+    edited = client.put(f"/api/services/{svc['id']}", headers=CSRF, json={"name": "alert-svc", "url": "https://example.com", "alert_events": [], "alert_channels": [], "alert_reminder_minutes": None}).json()
+    assert edited["alert_events"] == [] and edited["alert_channels"] == [] and edited["alert_reminder_minutes"] is None
+
+
+def test_clusters_have_the_same_alert_settings(client):
+    sign_in(client)
+    anon = TestClient(main.app)
+    _, r = _k8s_register(client, anon, "alert-cluster")
+    cid = next(c["id"] for c in client.get("/api/clusters").json() if c["name"] == "alert-cluster")
+    base = client.get(f"/api/clusters/{cid}").json()
+    assert base["alert_events"] == [] and base["alert_reminder_minutes"] is None
+    saved = client.put(f"/api/clusters/{cid}", headers=CSRF, json={"alert_settings": True, "alert_events": ["down", "recovered"], "alert_reminder_minutes": 120}).json()
+    assert saved["alert_events"] == ["down", "recovered"] and saved["alert_reminder_minutes"] == 120
+    renamed = client.put(f"/api/clusters/{cid}", headers=CSRF, json={"name": "alert-cluster-2"}).json()      # a rename alone must not reset them
+    assert renamed["name"] == "alert-cluster-2" and renamed["alert_events"] == ["down", "recovered"] and renamed["alert_reminder_minutes"] == 120
+    assert client.put(f"/api/clusters/{cid}", headers=CSRF, json={"alert_settings": True, "alert_channels": [424242]}).status_code == 422
+    cleared = client.put(f"/api/clusters/{cid}", headers=CSRF, json={"alert_settings": True}).json()
+    assert cleared["alert_events"] == [] and cleared["alert_reminder_minutes"] is None

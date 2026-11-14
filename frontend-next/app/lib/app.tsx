@@ -73,7 +73,7 @@ export function useLimits() {
   const l = data?.limits;
   return {
     warn: l?.usage_warn_percent ?? 70, bad: l?.usage_bad_percent ?? 90, offlineMs: (l?.k8s_offline_seconds ?? 120) * 1000,
-    enrollDefault: l?.enrollment_default_minutes ?? 15, enrollMax: l?.enrollment_max_minutes ?? 1440, logTtl: l?.log_result_ttl_minutes ?? 15,
+    reminder: l?.reminder_minutes ?? 30, enrollDefault: l?.enrollment_default_minutes ?? 15, enrollMax: l?.enrollment_max_minutes ?? 1440, logTtl: l?.log_result_ttl_minutes ?? 15,
   };
 }
 

@@ -14,12 +14,13 @@ export type Server = {
   load_threshold: number; swap_threshold: number; process_names: string; process_threshold: number;
   last_status: Status; last_checked_at: string | null; last_seen_at: string | null; last_error: string | null;
   last_metrics: Metrics | null; uptime_24h: number | null; public: boolean; install_token?: string;
-  token_issued_at?: string | null; token_rotation_pending?: boolean; last_agent_ip?: string | null; public_ip?: string | null; private_ips?: string[]; same_machine_as?: { id: number; name: string }[];
+  token_issued_at?: string | null; token_rotation_pending?: boolean; last_agent_ip?: string | null; public_ip?: string | null; private_ips?: string[]; alert_events?: string[]; alert_channels?: number[]; alert_reminder_minutes?: number | null; same_machine_as?: { id: number; name: string }[];
 };
 export type Service = {
   id: number; name: string; url: string; expected_status: number; interval_seconds: number; enabled: boolean; public: boolean;
   server_id: number | null; last_status: Status; last_checked_at: string | null; last_latency_ms: number | null;
   last_http_status: number | null; last_error: string | null; uptime_24h: number | null;
+  alert_events?: string[]; alert_channels?: number[]; alert_reminder_minutes?: number | null;
 };
 export type ChannelType = 'telegram' | 'webhook' | 'slack' | 'whatsapp';
 export type Channel = { id: number; name: string; type: ChannelType; token: string; chat_id?: string; endpoint?: string; phone_number_id?: string; template_name?: string; enabled: boolean; notify_kinds?: string[]; notify_events?: string[] };
@@ -32,7 +33,7 @@ export type Dashboard = {
   servers: Server[]; services: Service[]; events: AlertEvent[];
   threshold_defaults: { cpu: number; memory: number; disk: number; load: number; swap: number; process: number; server_interval_seconds: number };
   agents?: { latest: string; latest_k8s: string };
-  limits?: { usage_warn_percent: number; usage_bad_percent: number; k8s_offline_seconds: number; enrollment_default_minutes: number; enrollment_max_minutes: number; log_result_ttl_minutes: number };
+  limits?: { reminder_minutes: number; usage_warn_percent: number; usage_bad_percent: number; k8s_offline_seconds: number; enrollment_default_minutes: number; enrollment_max_minutes: number; log_result_ttl_minutes: number };
   summary: { servers: number; services: number; up: number; alerts: number; open_incidents: number };
 };
 export type Point = { t: string; [key: string]: number | string | undefined };
@@ -80,4 +81,5 @@ export type Cluster = {
   agent_outdated?: boolean; latest_agent_version?: string;
   summary: ClusterSummary | null; token_issued_at: string | null; token_rotation_pending: boolean; last_agent_ip: string | null; created_by: string | null; created_at: string;
   log_policy: K8sLogPolicy; restricted: boolean;
+  alert_events?: string[]; alert_channels?: number[]; alert_reminder_minutes?: number | null;
 };
