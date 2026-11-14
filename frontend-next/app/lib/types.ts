@@ -22,10 +22,10 @@ export type Service = {
   last_http_status: number | null; last_error: string | null; uptime_24h: number | null;
 };
 export type ChannelType = 'telegram' | 'webhook' | 'slack' | 'whatsapp';
-export type Channel = { id: number; name: string; type: ChannelType; token: string; chat_id?: string; endpoint?: string; phone_number_id?: string; template_name?: string; enabled: boolean };
+export type Channel = { id: number; name: string; type: ChannelType; token: string; chat_id?: string; endpoint?: string; phone_number_id?: string; template_name?: string; enabled: boolean; notify_kinds?: string[]; notify_events?: string[] };
 export type AlertEvent = { id: number; target_type: string; severity: string; message: string; sent: boolean; delivery_error: string | null; delivery_attempts: number; created_at: string };
 export type Incident = {
-  id: number; target_type: 'server' | 'service'; target_id: number; target_name: string; severity: 'critical' | 'warning';
+  id: number; target_type: 'server' | 'service' | 'cluster'; target_id: number; target_name: string; severity: 'critical' | 'warning';
   title: string; detail: string | null; started_at: string; resolved_at: string | null; duration_seconds: number;
 };
 export type Dashboard = {

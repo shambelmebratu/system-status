@@ -160,6 +160,9 @@ def serialize(item):
             result["pending_token_at"] = result["pending_token_at"].isoformat()
         if result.get("token_issued_at"):
             result["token_issued_at"] = result["token_issued_at"].isoformat()
+    for key in ("notify_kinds", "notify_events"):
+        if key in result:
+            result[key] = [v for v in (result[key] or "").split(",") if v]
     for secret in ("agent_token", "token"):
         if secret in result: result[secret] = "configured" if result[secret] else ""
     if "endpoint" in result and result.get("type") in ("slack", "webhook"):
@@ -330,6 +333,14 @@ def dashboard(_: dict = Depends(require_user), db: Session = Depends(get_db)) ->
     }
 
 
+def routing_columns(values: dict) -> dict:
+    """notify_kinds / notify_events travel as lists and are stored comma-separated (NULL = everything, also when all are ticked)."""
+    for key, everything in (("notify_kinds", 3), ("notify_events", 4)):
+        chosen = values.get(key) or []
+        values[key] = ",".join(chosen) if chosen and len(chosen) < everything else None
+    return values
+
+
 @app.get("/api/channels")
 def channels(user: dict = Depends(require_user), db: Session = Depends(get_db)) -> list[dict]:
     items = [serialize(item) for item in db.scalars(select(Channel).order_by(Channel.name)).all()]
@@ -351,7 +362,7 @@ def telegram_discover(payload: TokenBody, _: dict = Depends(require_operator)) -
 def create_channel(payload: ChannelCreate, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
     if payload.type in ("slack", "webhook"):
         guard_target(validate_url, payload.endpoint, "Endpoint")
-    item = Channel(**payload.model_dump()); db.add(item); db.flush()
+    item = Channel(**routing_columns(payload.model_dump())); db.add(item); db.flush()
     audit(db, request, "channel.create", user=user, target=f"channel:{item.id}", detail=f"{item.name} ({item.type})")
     db.commit(); db.refresh(item); return serialize(item)
 
@@ -372,7 +383,7 @@ def update_channel(item_id: int, payload: ChannelUpdate, request: Request, user:
         raise HTTPException(422, "; ".join(e["msg"].removeprefix("Value error, ") for e in error.errors())) from error
     if values["type"] in ("slack", "webhook"):
         guard_target(validate_url, values["endpoint"], "Endpoint")
-    for key, value in values.items():
+    for key, value in routing_columns(values).items():
         setattr(item, key, value)
     audit(db, request, "channel.update", user=user, target=f"channel:{item.id}", detail=item.name)
     db.commit(); db.refresh(item)

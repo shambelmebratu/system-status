@@ -15,6 +15,21 @@ const HELP: Record<ChannelType, string> = {
   whatsapp: 'Uses the Meta WhatsApp Cloud API with an approved Utility template that has one body variable.',
 };
 
+const EVENTS: { id: string; label: string; hint: string }[] = [
+  { id: 'down', label: 'Down', hint: 'A server, service or cluster stopped responding' },
+  { id: 'alert', label: 'Over a limit', hint: 'CPU, memory, disk, a process or a cluster problem crossed its threshold' },
+  { id: 'recovered', label: 'Recovered', hint: 'It is healthy again' },
+  { id: 'reminder', label: 'Reminders', hint: 'Repeats while something is still failing' },
+];
+const KINDS: { id: string; label: string }[] = [{ id: 'server', label: 'Servers' }, { id: 'service', label: 'Services' }, { id: 'cluster', label: 'Kubernetes clusters' }];
+/** An empty selection means "everything", which is also how the form shows it (all ticked). */
+const allOr = (chosen: string[] | undefined, all: string[]) => (chosen && chosen.length ? chosen : all);
+function routingSummary(c: Channel): string {
+  const events = c.notify_events?.length ? c.notify_events.map(e => EVENTS.find(x => x.id === e)?.label ?? e).join(', ') : 'All alerts';
+  const kinds = c.notify_kinds?.length ? c.notify_kinds.map(k => KINDS.find(x => x.id === k)?.label ?? k).join(', ') : 'everything';
+  return `${events} · ${kinds.toLowerCase()}`;
+}
+
 const plainAlert = (m: string) => m.replace(/<\/?b>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
 
 export function Channels() {
@@ -39,7 +54,7 @@ export function Channels() {
         <section className="card"><div className="card-head"><h2>Notification channels</h2></div>
           {channels.length === 0 ? <Empty title="No channels">Alerts are recorded but not delivered until you add a channel.</Empty> : (
             <table className="tbl"><tbody>{channels.map(c => (
-              <tr key={c.id}><td><div className="name">{c.name}<small>{LABEL[c.type]}{c.chat_id ? ` · ${c.chat_id}` : ''}{!c.enabled && ' · disabled'}</small></div></td>
+              <tr key={c.id}><td><div className="name">{c.name}<small>{LABEL[c.type]}{c.chat_id ? ` · ${c.chat_id}` : ''}{!c.enabled && ' · disabled'}</small><small>Receives: {routingSummary(c)}</small></div></td>
                 <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}><button className="btn sm" disabled={busy === c.id} onClick={() => test(c.id)}>{busy === c.id ? 'Sending…' : 'Send test'}</button> <button className="btn sm" onClick={() => setEditing(c)}>Edit</button> <button className="btn sm danger" onClick={() => remove(c.id, c.name)}>Remove</button></td></tr>))}</tbody></table>
           )}
         </section>
@@ -47,7 +62,7 @@ export function Channels() {
           {!data?.events.length ? <p className="muted sm">No alerts yet.</p> : <div className="timeline">{data.events.map(e => (
             <div key={e.id} className="tl-item"><span className={`tl-dot ${e.severity === 'critical' ? 'critical' : 'resolved'}`} />
               <div className="tl-body"><div className="sm" style={{ whiteSpace: 'pre-line' }}>{plainAlert(e.message)}</div>
-                <div className="tl-meta">{timeAgo(e.created_at)} · {e.sent ? <span className="good">delivered</span> : <span className="bad">not delivered{e.delivery_error ? ` (${e.delivery_error})` : ''} · {e.delivery_attempts} attempts</span>}</div></div></div>))}</div>}
+                <div className="tl-meta">{timeAgo(e.created_at)} · {e.sent ? <span className="good">delivered</span> : e.delivery_error?.startsWith('Not sent:') ? <span className="muted">not sent (no channel is set to receive this kind)</span> : <span className="bad">not delivered{e.delivery_error ? ` (${e.delivery_error})` : ''} · {e.delivery_attempts} attempts</span>}</div></div></div>))}</div>}
         </section>
       </div>
       {adding && <ChannelForm onClose={() => setAdding(false)} />}
@@ -62,6 +77,9 @@ function ChannelForm({ existing, onClose }: { existing?: Channel; onClose: () =>
   const [enabled, setEnabled] = useState(existing?.enabled ?? true);
   const keep = existing && existing.type === type ? 'Leave blank to keep the saved value' : undefined;
   const [f, setF] = useState({ name: existing?.name ?? '', token: '', chat_id: existing?.chat_id ?? '', endpoint: '', phone_number_id: existing?.phone_number_id ?? '', template_name: existing?.template_name ?? 'smwatch_alert', template_language: 'en_US' });
+  const [events, setEvents] = useState<string[]>(allOr(existing?.notify_events, EVENTS.map(e => e.id)));
+  const [kinds, setKinds] = useState<string[]>(allOr(existing?.notify_kinds, KINDS.map(k => k.id)));
+  const toggle = (list: string[], set: (v: string[]) => void, id: string) => set(list.includes(id) ? list.filter(x => x !== id) : [...list, id]);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [found, setFound] = useState<{ bot: string; chats: { id: number; type: string; title: string }[] } | null>(null);
@@ -74,9 +92,11 @@ function ChannelForm({ existing, onClose }: { existing?: Channel; onClose: () =>
 
   async function submit(event: FormEvent) {
     event.preventDefault();
+    if (!events.length || !kinds.length) { setError('Tick at least one alert type and one source, or disable the channel instead.'); return; }
     setBusy(true); setError('');
+    const body = { ...f, type, enabled, notify_events: events, notify_kinds: kinds };
     try {
-      if (existing) await put(`/channels/${existing.id}`, { ...f, type, enabled }); else await post('/channels', { ...f, type, enabled });
+      if (existing) await put(`/channels/${existing.id}`, body); else await post('/channels', body);
       toast(existing ? 'Channel updated. Use “Send test” to verify.' : `${LABEL[type]} channel saved. Use “Send test” to verify.`); await refresh(); onClose();
     }
     catch (caught) { setError((caught as Error).message); } finally { setBusy(false); }
@@ -99,6 +119,13 @@ function ChannelForm({ existing, onClose }: { existing?: Channel; onClose: () =>
             <Field label="Template name"><input value={f.template_name} onChange={set('template_name')} required /></Field>
             <Field label="Template language"><input value={f.template_language} onChange={set('template_language')} /></Field></>}
         </div>
+        <fieldset className="pick">
+          <legend>Send to this channel</legend>
+          <div className="pick-grid">{EVENTS.map(e => (
+            <label key={e.id} className={`pick-item ${events.includes(e.id) ? 'on' : ''}`}><input type="checkbox" checked={events.includes(e.id)} onChange={() => toggle(events, setEvents, e.id)} /><span><b>{e.label}</b><small>{e.hint}</small></span></label>))}</div>
+          <div className="pick-row"><span className="sm muted">From</span>{KINDS.map(k => (
+            <label key={k.id} className="check"><input type="checkbox" checked={kinds.includes(k.id)} onChange={() => toggle(kinds, setKinds, k.id)} />{k.label}</label>))}</div>
+        </fieldset>
         <label className="check"><input type="checkbox" checked={enabled} onChange={e => setEnabled(e.target.checked)} />Enabled (disabled channels receive no alerts)</label>
         {type === 'telegram' && (
           <div className="card" style={{ background: 'var(--bg)', boxShadow: 'none' }}>

@@ -230,10 +230,39 @@ def slack_text(message: str) -> str:
     return html.unescape(re.sub(r"</?b>", "*", message))
 
 
-def send_alert(message: str, session) -> tuple[bool, str | None]:
+ALERT_KINDS = ("server", "service", "cluster")
+ALERT_EVENTS = ("down", "alert", "recovered", "reminder")
+
+
+def event_category(state: str | None) -> str | None:
+    """down / alert / recovered / reminder (a repeat while something is still failing). None for events from before routing existed."""
+    if not state:
+        return None
+    return "reminder" if state.startswith("still_") else state
+
+
+def channel_wants(channel: Channel, target_type: str | None, state: str | None) -> bool:
+    """A channel with no selection receives everything; otherwise only the kinds and events ticked for it."""
+    kinds = [k for k in (channel.notify_kinds or "").split(",") if k]
+    events = [e for e in (channel.notify_events or "").split(",") if e]
+    category = event_category(state)
+    if kinds and target_type and target_type not in kinds:
+        return False
+    if events and category and category not in events:
+        return False
+    return True
+
+
+NOT_ROUTED = "Not sent: no channel is set to receive this kind of alert"
+
+
+def send_alert(message: str, session, target_type: str | None = None, state: str | None = None) -> tuple[bool, str | None]:
     channels = session.scalars(select(Channel).where(Channel.enabled.is_(True))).all()
     if not channels:
         return False, "No enabled notification channels are configured"
+    channels = [c for c in channels if channel_wants(c, target_type, state)]
+    if not channels:
+        return False, NOT_ROUTED
 
     errors = []
     sent = False
@@ -363,7 +392,10 @@ def deliver_channel(channel: Channel, text: str, rich: bool = False) -> tuple[bo
 def deliver_event(event: AlertEvent, session) -> None:
     event.delivery_attempts = (event.delivery_attempts or 0) + 1
     event.last_attempt_at = datetime.now(timezone.utc)
-    event.sent, event.delivery_error = send_alert(event.message, session)
+    event.sent, event.delivery_error = send_alert(event.message, session, event.target_type, event.state)
+    if event.delivery_error == NOT_ROUTED:
+        event.delivery_attempts = 10   # a deliberate choice, not a failure: never retried
+        return
     if event.sent:
         logger.info("alert delivered event_id=%s target=%s:%s attempt=%s", event.id, event.target_type, event.target_id, event.delivery_attempts)
     else:
@@ -434,8 +466,8 @@ def outage_seconds(incident) -> float | None:
     return (incident.resolved_at - started).total_seconds()
 
 
-def queue_event(session, target_type: str, target, severity: str, message: str, deliver: bool) -> None:
-    event = AlertEvent(target_type=target_type, target_id=target.id, severity=severity, message=message)
+def queue_event(session, target_type: str, target, severity: str, message: str, deliver: bool, state: str | None = None) -> None:
+    event = AlertEvent(target_type=target_type, target_id=target.id, severity=severity, message=message, state=state)
     session.add(event)
     session.flush()
     if deliver:
@@ -482,9 +514,9 @@ def apply_service_result(session, service: Service, result: dict) -> dict:
     resolved = sync_incident(session, "service", service, status, service.last_error)
     if status == "down":
         if previous_status != "down" or should_notify_again(session, "service", service.id):
-            queue_event(session, "service", service, "critical", format_alert("Service", "down" if previous_status != "down" else "still_down", service.name, service.last_error, at=now, link=service.url), deliver=True)
+            queue_event(session, "service", service, "critical", format_alert("Service", "down" if previous_status != "down" else "still_down", service.name, service.last_error, at=now, link=service.url), deliver=True, state="down" if previous_status != "down" else "still_down")
     elif previous_status == "down":
-        queue_event(session, "service", service, "info", format_alert("Service", "recovered", service.name, f"Responding again: HTTP {service.last_http_status} in {round(service.last_latency_ms or 0)} ms", at=now, link=service.url, duration=outage_seconds(resolved)), deliver=True)
+        queue_event(session, "service", service, "info", format_alert("Service", "recovered", service.name, f"Responding again: HTTP {service.last_http_status} in {round(service.last_latency_ms or 0)} ms", at=now, link=service.url, duration=outage_seconds(resolved)), deliver=True, state="recovered")
     session.commit()
     return _service_payload(service, status, result, now)
 
@@ -524,12 +556,12 @@ def apply_server_result(session, server: Server, status: str, failures: list[str
     resolved = sync_incident(session, "server", server, status, detail)
     if status == "down":
         if previous != "down" or should_notify_again(session, "server", server.id):
-            queue_event(session, "server", server, "critical", format_alert("Server", "down" if previous != "down" else "still_down", server.name, error, at=now, where=server_where(server)), deliver)
+            queue_event(session, "server", server, "critical", format_alert("Server", "down" if previous != "down" else "still_down", server.name, error, at=now, where=server_where(server)), deliver, state="down" if previous != "down" else "still_down")
     elif status == "alert":
         if previous != "alert" or should_notify_again(session, "server", server.id):
-            queue_event(session, "server", server, "critical", format_alert("Server", "alert" if previous != "alert" else "still_alert", server.name, failures, at=now, where=server_where(server)), deliver)
+            queue_event(session, "server", server, "critical", format_alert("Server", "alert" if previous != "alert" else "still_alert", server.name, failures, at=now, where=server_where(server)), deliver, state="alert" if previous != "alert" else "still_alert")
     elif previous in ("down", "alert"):
-        queue_event(session, "server", server, "info", format_alert("Server", "recovered", server.name, "Host reachable and all resource checks are within their thresholds.", at=now, duration=outage_seconds(resolved), where=server_where(server)), deliver)
+        queue_event(session, "server", server, "info", format_alert("Server", "recovered", server.name, "Host reachable and all resource checks are within their thresholds.", at=now, duration=outage_seconds(resolved), where=server_where(server)), deliver, state="recovered")
 
 
 def is_due(last_checked_at, interval_seconds: int) -> bool:

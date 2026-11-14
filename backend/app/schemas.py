@@ -56,6 +56,22 @@ class ChannelCreate(BaseModel):
     template_name: str = ""
     template_language: str = "en_US"
     enabled: bool = True
+    notify_kinds: list[str] = Field(default_factory=list, max_length=3)     # empty = every kind (server, service, cluster)
+    notify_events: list[str] = Field(default_factory=list, max_length=4)    # empty = every event (down, alert, recovered, reminder)
+
+    @field_validator("notify_kinds")
+    @classmethod
+    def known_kinds(cls, v: list[str]) -> list[str]:
+        if any(k not in ("server", "service", "cluster") for k in v):
+            raise ValueError("Unknown alert kind")
+        return list(dict.fromkeys(v))
+
+    @field_validator("notify_events")
+    @classmethod
+    def known_events(cls, v: list[str]) -> list[str]:
+        if any(e not in ("down", "alert", "recovered", "reminder") for e in v):
+            raise ValueError("Unknown alert event")
+        return list(dict.fromkeys(v))
 
     @model_validator(mode="after")
     def validate_provider_fields(self):
@@ -216,6 +232,22 @@ class ChannelUpdate(BaseModel):
     template_name: str = ""
     template_language: str = "en_US"
     enabled: bool = True
+    notify_kinds: list[str] = Field(default_factory=list, max_length=3)     # empty = every kind (server, service, cluster)
+    notify_events: list[str] = Field(default_factory=list, max_length=4)    # empty = every event (down, alert, recovered, reminder)
+
+    @field_validator("notify_kinds")
+    @classmethod
+    def known_kinds(cls, v: list[str]) -> list[str]:
+        if any(k not in ("server", "service", "cluster") for k in v):
+            raise ValueError("Unknown alert kind")
+        return list(dict.fromkeys(v))
+
+    @field_validator("notify_events")
+    @classmethod
+    def known_events(cls, v: list[str]) -> list[str]:
+        if any(e not in ("down", "alert", "recovered", "reminder") for e in v):
+            raise ValueError("Unknown alert event")
+        return list(dict.fromkeys(v))
 
 
 class ORMModel(BaseModel):

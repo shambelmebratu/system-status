@@ -315,6 +315,10 @@ When a newer agent ships with your control plane, the server page shows **Agent 
 
 Alert limits are set **per server** (Edit the server) and per cluster log policy by admins; defaults for new servers come from `CPU_THRESHOLD`, `MEMORY_THRESHOLD`, `DISK_THRESHOLD`, `LOAD_THRESHOLD`, `SWAP_THRESHOLD` and `PROCESS_THRESHOLD`. Process CPU is per core (100 = one full core, so values above 100 are valid). All timing and size limits (agent heartbeat grace, Kubernetes report/offline times, log result lifetime, install-link lifetime, retention defaults, scheduled-message retries, usage-bar colours) are `.env` settings, listed with their defaults in `.env.example`, and the dashboard reads them from the API. Retention and purge schedules are edited by admins in Settings.
 
+## Choosing which alerts a channel receives
+
+Alerts → add or edit a channel → **Send to this channel**. Tick the alert types (*Down*, *Over a limit*, *Recovered*, *Reminders* while something is still failing) and the sources (*Servers*, *Services*, *Kubernetes clusters*). A channel with everything ticked receives everything, which is the default. Example: an on-call channel that only gets *Down* and *Recovered* for servers, next to a team channel that gets everything. An alert that no channel is set to receive is recorded in the delivery log as "not sent" and is not retried.
+
 ## Data retention and purging
 
 Settings → **Data retention & purge** (admins) controls how long each kind of data is kept: uptime history, server/cluster metrics, alert messages, resolved incidents, the audit log (minimum 30 days) and expired install links. Anything older is deleted automatically **hourly, daily or weekly** (daily/weekly at a time you choose, UTC). You can also tick data kinds and **purge now** (older than N days, or everything). Open incidents are never purged, every settings change and purge is written to the audit log, and the table shows row counts, oldest entry and (PostgreSQL) disk size. Defaults come from `CHECK_RETENTION_DAYS`, `METRIC_RETENTION_DAYS` and `AUDIT_RETENTION_DAYS`; alerts default to 90 days. Fetched logs are never archived (deleted after 15 minutes).

@@ -1526,3 +1526,48 @@ def test_one_machine_monitored_twice_is_pointed_out(client):
     send(b, hostname="server1", uptime_seconds=500010, machine="")
     rows = {s["id"]: s for s in client.get("/api/dashboard").json()["servers"]}
     assert [t["id"] for t in rows[a["server_id"]]["same_machine_as"]] == [b["server_id"]]
+
+
+# =================================================================== alert routing
+from app.monitoring import deliver_event as _real_deliver_event   # captured at import: older tests replace monitoring.deliver_event
+
+
+def test_channels_only_receive_the_alerts_they_are_set_to(client, monkeypatch):
+    from app import monitoring as m
+    from app.models import AlertEvent, Channel
+    sign_in(client)
+    with database.SessionLocal() as db:
+        db.query(Channel).delete(); db.commit()
+    tg = {"type": "telegram", "token": "1234567890:abcdefghij", "chat_id": "42"}
+    everything = client.post("/api/channels", headers=CSRF, json={"name": "all", **tg}).json()
+    assert everything["notify_kinds"] == [] and everything["notify_events"] == []                      # empty = everything
+    oncall = client.post("/api/channels", headers=CSRF, json={"name": "oncall", **tg, "notify_kinds": ["server"], "notify_events": ["down", "recovered"]}).json()
+    assert oncall["notify_kinds"] == ["server"] and oncall["notify_events"] == ["down", "recovered"]
+    assert client.post("/api/channels", headers=CSRF, json={"name": "x", **tg, "notify_events": ["bogus"]}).status_code == 422
+    full = client.put(f"/api/channels/{oncall['id']}", headers=CSRF, json={"name": "oncall", **tg, "token": "", "notify_kinds": ["server", "service", "cluster"], "notify_events": ["down"]}).json()
+    assert full["notify_kinds"] == [] and full["notify_events"] == ["down"]                             # all ticked is stored as "everything"
+    client.put(f"/api/channels/{oncall['id']}", headers=CSRF, json={"name": "oncall", **tg, "token": "", "notify_kinds": ["server"], "notify_events": ["down", "recovered"]})
+
+    got = []
+    monkeypatch.setattr(m, "deliver_channel", lambda channel, text, rich=False: (got.append(channel.name), (True, "Delivered"))[1])
+    def send(target_type, state):
+        got.clear()
+        with database.SessionLocal() as db:
+            result = m.send_alert("msg", db, target_type, state)
+        return sorted(got), result
+    assert send("server", "down")[0] == ["all", "oncall"]
+    assert send("server", "recovered")[0] == ["all", "oncall"]
+    assert send("server", "alert")[0] == ["all"]                                                       # threshold alerts are not for on-call
+    assert send("server", "still_down")[0] == ["all"]                                                  # nor reminders
+    assert send("service", "down")[0] == ["all"] and send("cluster", "down")[0] == ["all"]            # nor other kinds
+    assert send(None, None)[0] == ["all", "oncall"]                                                    # an event from before routing existed goes everywhere
+    # nobody wants it: recorded as a choice, never retried
+    client.put(f"/api/channels/{everything['id']}", headers=CSRF, json={"name": "all", **tg, "token": "", "notify_events": ["down"]})
+    names, (sent, reason) = send("service", "recovered")
+    assert names == [] and sent is False and reason == m.NOT_ROUTED
+    with database.SessionLocal() as db:
+        event = AlertEvent(target_type="service", target_id=1, severity="info", state="recovered", message="x"); db.add(event); db.flush()
+        _real_deliver_event(event, db); db.commit()
+        assert event.sent is False and event.delivery_attempts == 10 and event.delivery_error == m.NOT_ROUTED
+    with database.SessionLocal() as db:
+        db.query(Channel).delete(); db.commit()

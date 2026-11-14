@@ -180,9 +180,9 @@ def apply_cluster_status(db: Session, cluster: Cluster, status: str, detail: str
         if previous != status or should_notify_again(db, "cluster", cluster.id):
             problems = (json.loads(cluster.summary).get("problems") if cluster.summary else None) if status == "alert" else None
             state = status if previous != status else f"still_{status}"
-            queue_event(db, "cluster", cluster, "critical", format_alert("Cluster", state, cluster.name, problems or detail, at=now, where=cluster_where(cluster)), deliver)
+            queue_event(db, "cluster", cluster, "critical", format_alert("Cluster", state, cluster.name, problems or detail, at=now, where=cluster_where(cluster)), deliver, state=state)
     elif previous in ("down", "alert"):
-        queue_event(db, "cluster", cluster, "info", format_alert("Cluster", "recovered", cluster.name, "All nodes are ready and workloads are healthy.", at=now, duration=outage_seconds(resolved), where=cluster_where(cluster)), deliver)
+        queue_event(db, "cluster", cluster, "info", format_alert("Cluster", "recovered", cluster.name, "All nodes are ready and workloads are healthy.", at=now, duration=outage_seconds(resolved), where=cluster_where(cluster)), deliver, state="recovered")
 
 
 def check_cluster_heartbeats(session: Session) -> None:

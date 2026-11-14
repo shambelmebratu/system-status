@@ -94,7 +94,7 @@ export function IncidentList({ items, onSelect }: { items: Incident[]; onSelect?
   return (
     <div className="timeline">
       {items.map(i => (
-        <div key={i.id} className="tl-item" style={{ cursor: 'pointer' }} onClick={() => (onSelect ? onSelect(i) : go(`${i.target_type}s/${i.target_id}`))}>
+        <div key={i.id} className="tl-item" style={{ cursor: 'pointer' }} onClick={() => (onSelect ? onSelect(i) : go(i.target_type === 'cluster' ? `kubernetes/${i.target_id}` : `${i.target_type}s/${i.target_id}`))}>
           <span className={`tl-dot ${i.resolved_at ? 'resolved' : i.severity}`} />
           <div className="tl-body">
             <b>{i.title}</b>

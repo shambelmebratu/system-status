@@ -87,6 +87,9 @@ class Channel(Base):
     template_name: Mapped[str | None] = mapped_column(String(100))
     template_language: Mapped[str | None] = mapped_column(String(20), default="en_US")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Which alerts this channel receives (comma-separated; NULL = everything). See alert routing in monitoring.py.
+    notify_kinds: Mapped[str | None] = mapped_column(String(100))     # server,service,cluster
+    notify_events: Mapped[str | None] = mapped_column(String(100))    # down,alert,recovered,reminder
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -96,6 +99,7 @@ class AlertEvent(Base):
     target_type: Mapped[str] = mapped_column(String(30))
     target_id: Mapped[int] = mapped_column(Integer)
     severity: Mapped[str] = mapped_column(String(20))
+    state: Mapped[str | None] = mapped_column(String(20))            # down | still_down | alert | still_alert | recovered
     message: Mapped[str] = mapped_column(Text)
     sent: Mapped[bool] = mapped_column(Boolean, default=False)
     delivery_error: Mapped[str | None] = mapped_column(Text)

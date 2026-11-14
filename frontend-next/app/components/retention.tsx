@@ -4,7 +4,6 @@ import { useEffect, useState } from 'react';
 import { api, post, put } from '../lib/api';
 import { useApp, useLimits, usePoll } from '../lib/app';
 import { timeAgo } from '../lib/format';
-import { Field } from './ui';
 
 type Stat = { label: string; rows: number; oldest: string | null; bytes: number | null };
 type Settings = {
@@ -44,7 +43,7 @@ export function RetentionCard() {
     setAuto(s.auto); setFrequency(s.frequency); setTime(s.time); setWeekday(s.weekday); setLoaded(true);
   }, [value, loaded]);
 
-  if (!value) return <section className="card" style={{ marginTop: 16 }}><div className="card-head"><h2>Data retention & purge</h2></div><p className="muted sm">Loading…</p></section>;
+  if (!value) return <section className="card" style={{ marginTop: 16 }}><div className="card-head"><h2>Data retention</h2></div><p className="muted sm">Loading…</p></section>;
   const { stats, settings } = value;
 
   async function save() {
@@ -56,7 +55,7 @@ export function RetentionCard() {
   }
   async function purge() {
     const chosen = ORDER.filter(k => picked[k]);
-    if (!chosen.length) { toast('Tick the kinds of data to purge first', true); return; }
+    if (!chosen.length) return;
     const scope = Number(olderThan) === 0 ? 'EVERYTHING' : `everything older than ${olderThan} days`;
     const rows = chosen.reduce((n, k) => n + stats[k].rows, 0);
     if (!(await confirm(`Permanently delete ${scope} in:\n\n${chosen.map(k => `• ${stats[k].label}`).join('\n')}\n\nUp to ${rows.toLocaleString()} rows. This cannot be undone.`))) return;
@@ -68,43 +67,58 @@ export function RetentionCard() {
   }
 
   const last = settings.last_result;
+  const totalRows = ORDER.reduce((n, k) => n + stats[k].rows, 0);
+  const totalBytes = ORDER.reduce((n, k) => n + (stats[k].bytes ?? 0), 0);
+  const when = !auto ? 'Automatic cleanup is off: nothing is deleted until you turn it on or delete by hand.'
+    : frequency === 'hourly' ? 'Every hour, anything older than its limit is deleted.'
+    : frequency === 'daily' ? `Every day at ${time} UTC, anything older than its limit is deleted.`
+    : `Every ${WEEKDAYS[weekday]} at ${time} UTC, anything older than its limit is deleted.`;
+  const chosen = ORDER.filter(k => picked[k]);
   return (
-    <section className="card" style={{ marginTop: 16 }}>
-      <div className="card-head"><h2>Data retention & purge</h2></div>
-      <p className="muted sm" style={{ marginBottom: 14 }}>Choose how long each kind of data is kept. Anything older is deleted automatically on the schedule below, or you can purge by hand. Logs from your servers and clusters are never stored here: they are read on demand and dropped after {lim.logTtl} minutes.</p>
-      <div className="tbl-wrap"><table className="tbl">
-        <thead><tr><th style={{ width: 28 }} /><th>Data</th><th className="num">Rows</th><th className="hide-sm">Oldest</th><th className="num hide-sm">Size</th><th style={{ width: 150 }}>Keep for</th></tr></thead>
-        <tbody>{ORDER.map(k => (
-          <tr key={k}>
-            <td><input type="checkbox" checked={!!picked[k]} onChange={e => setPicked({ ...picked, [k]: e.target.checked })} aria-label={`Select ${stats[k].label} for purge`} /></td>
-            <td><div className="name">{stats[k].label}<small className="hide-sm">{HINT[k]}</small></div></td>
-            <td className="num">{stats[k].rows.toLocaleString()}</td>
-            <td className="hide-sm sm muted">{stats[k].oldest ? timeAgo(stats[k].oldest) : '–'}</td>
-            <td className="num hide-sm sm muted">{size(stats[k].bytes)}</td>
-            <td>{k === 'transient' ? <span className="muted sm">{lim.logTtl} minutes</span> : <span style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}><input type="number" style={{ width: 76 }} min={k === 'audit' ? value.audit_min_days : 1} max={3650} value={days[k] ?? ''} onChange={e => setDays({ ...days, [k]: e.target.value })} aria-label={`Days to keep ${stats[k].label}`} /> days</span>}</td>
-          </tr>))}
-        </tbody></table></div>
+    <>
+      <section className="card" style={{ marginTop: 16 }}>
+        <div className="card-head"><h2>Data retention</h2><span className="grow" /><span className="sm muted">{totalRows.toLocaleString()} rows stored{totalBytes ? ` · ${size(totalBytes)}` : ''}</span></div>
+        <p className="muted sm" style={{ marginBottom: 6 }}>How long SM-Watch keeps its own history. Logs from your servers and clusters are not part of this: they are read on demand and dropped after {lim.logTtl} minutes.</p>
 
-      <div className="form-grid" style={{ marginTop: 16, alignItems: 'end' }}>
-        <label className="check" style={{ alignSelf: 'center' }}><input type="checkbox" checked={auto} onChange={e => setAuto(e.target.checked)} />Purge automatically</label>
-        <Field label="How often"><select value={frequency} onChange={e => setFrequency(e.target.value as Settings['frequency'])} disabled={!auto}><option value="hourly">Every hour</option><option value="daily">Every day</option><option value="weekly">Every week</option></select></Field>
-        {frequency === 'weekly' && <Field label="On"><select value={weekday} onChange={e => setWeekday(Number(e.target.value))} disabled={!auto}>{WEEKDAYS.map((d, i) => <option key={d} value={i}>{d}</option>)}</select></Field>}
-        {frequency !== 'hourly' && <Field label="At (UTC)"><input type="time" value={time} onChange={e => setTime(e.target.value)} disabled={!auto} /></Field>}
-        <button className="btn primary" onClick={() => void save()} disabled={busy}>Save retention</button>
-      </div>
-      <p className="sm muted" style={{ marginTop: 8 }}>{settings.last_run_at ? `Last automatic purge ${timeAgo(settings.last_run_at)}.` : 'No automatic purge has run yet.'}{last && ` Last purge by ${last.by} (${timeAgo(last.at)}): ${Object.entries(last.deleted).filter(([, n]) => n).map(([k, n]) => `${stats[k]?.label ?? k} ${n.toLocaleString()}`).join(', ') || 'nothing to delete'}.`}</p>
-
-      <div className="card" style={{ background: 'var(--bg)', marginTop: 14 }}>
-        <b className="sm">Purge now</b>
-        <p className="sm muted" style={{ margin: '4px 0 10px' }}>Tick the data kinds in the table, then choose what to delete.</p>
-        <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-          <select value={olderThan} onChange={e => setOlderThan(e.target.value)} aria-label="Purge scope">
-            <option value="1">Older than 1 day</option><option value="7">Older than 7 days</option><option value="30">Older than 30 days</option><option value="90">Older than 90 days</option><option value="365">Older than 1 year</option><option value="0">Everything</option>
-          </select>
-          <button className="btn danger" onClick={() => void purge()} disabled={busy}>Purge selected…</button>
-          <span className="sm muted">The audit log can only be purged for entries older than {value.audit_min_days} days. Every purge is recorded in the audit log.</span>
+        <div className="ret-list">
+          {ORDER.filter(k => k !== 'transient').map(k => (
+            <div key={k} className="ret-row">
+              <div className="ret-name"><b>{stats[k].label}</b><small>{HINT[k]}</small></div>
+              <div className="ret-stored"><b>{stats[k].rows.toLocaleString()}</b> {stats[k].rows === 1 ? 'row' : 'rows'}{stats[k].bytes != null ? ` · ${size(stats[k].bytes)}` : ''}<small>{stats[k].oldest ? `oldest ${timeAgo(stats[k].oldest)}` : 'nothing stored'}</small></div>
+              <label className="ret-keep"><span>Keep for</span><input type="number" min={k === 'audit' ? value.audit_min_days : 1} max={3650} value={days[k] ?? ''} onChange={e => setDays({ ...days, [k]: e.target.value })} aria-label={`Days to keep ${stats[k].label}`} /><span>days</span></label>
+            </div>))}
         </div>
-      </div>
-    </section>
+
+        <div className="ret-auto">
+          <label className="switch"><input type="checkbox" checked={auto} onChange={e => setAuto(e.target.checked)} /><span>Delete old data automatically</span></label>
+          {auto && <div className="ret-when">
+            <select value={frequency} onChange={e => setFrequency(e.target.value as Settings['frequency'])} aria-label="How often"><option value="hourly">Every hour</option><option value="daily">Once a day</option><option value="weekly">Once a week</option></select>
+            {frequency === 'weekly' && <select value={weekday} onChange={e => setWeekday(Number(e.target.value))} aria-label="Day of the week">{WEEKDAYS.map((d, i) => <option key={d} value={i}>on {d}</option>)}</select>}
+            {frequency !== 'hourly' && <label className="ret-time">at <input type="time" value={time} onChange={e => setTime(e.target.value)} aria-label="Time (UTC)" /> UTC</label>}
+          </div>}
+        </div>
+        <p className="sm" style={{ margin: '10px 0 14px' }}>{when}</p>
+        <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+          <button className="btn primary" onClick={() => void save()} disabled={busy}>Save settings</button>
+          <span className="sm muted">{settings.last_run_at ? `Last automatic cleanup ${timeAgo(settings.last_run_at)}.` : 'No automatic cleanup has run yet.'}</span>
+        </div>
+      </section>
+
+      <section className="card danger-zone" style={{ marginTop: 16 }}>
+        <div className="card-head"><h2>Delete data now</h2></div>
+        <p className="muted sm" style={{ marginBottom: 12 }}>A one-off cleanup. It does not change the settings above, and it cannot be undone.</p>
+        <div className="sm" style={{ fontWeight: 600, marginBottom: 8 }}>1. What to delete</div>
+        <div className="pick-grid">{ORDER.map(k => (
+          <label key={k} className={`pick-item ${picked[k] ? 'on' : ''}`}><input type="checkbox" checked={!!picked[k]} onChange={e => setPicked({ ...picked, [k]: e.target.checked })} /><span><b>{stats[k].label}</b><small>{stats[k].rows.toLocaleString()} {stats[k].rows === 1 ? 'row' : 'rows'}{stats[k].bytes != null ? ` · ${size(stats[k].bytes)}` : ''}</small></span></label>))}</div>
+        <div className="sm" style={{ fontWeight: 600, margin: '14px 0 8px' }}>2. How much</div>
+        <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+          <select value={olderThan} onChange={e => setOlderThan(e.target.value)} aria-label="How much to delete">
+            <option value="1">Everything older than 1 day</option><option value="7">Everything older than 7 days</option><option value="30">Everything older than 30 days</option><option value="90">Everything older than 90 days</option><option value="365">Everything older than 1 year</option><option value="0">Everything, including today</option>
+          </select>
+          <button className="btn danger" onClick={() => void purge()} disabled={busy || !chosen.length}>{chosen.length ? `Delete from ${chosen.length} selected…` : 'Select something first'}</button>
+        </div>
+        <p className="sm muted" style={{ marginTop: 10 }}>Open incidents are never deleted. Audit log entries newer than {value.audit_min_days} days are always kept. Every deletion is recorded in the audit log.{last && ` Last deletion by ${last.by} (${timeAgo(last.at)}): ${Object.entries(last.deleted).filter(([, n]) => n).map(([k, n]) => `${stats[k]?.label ?? k} ${n.toLocaleString()}`).join(', ') || 'nothing to delete'}.`}</p>
+      </section>
+    </>
   );
 }
