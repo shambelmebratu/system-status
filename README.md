@@ -245,7 +245,8 @@ The **Logs** page (servers) and the **Logs** tab of a Kubernetes cluster share o
 
 - **Time range:** 15s, 1m, 5m, 15m, 30m, 1h, 6h, 12h, 1d, 7d or 1 month. It applies to containers, the journal, Kubernetes pods and log files (for files, the timestamps inside the lines are used).
 - **Volume histogram** by level (click a bar to zoom in on that moment), level filters with counts, search (searched on the server) and an *exclude* filter.
-- **Live tail** (every 2, 3, 5 or 10 s) with new lines highlighted, newest-first and compact modes, and JSON logs shown as a message plus tags (click a row for the full line or pretty JSON; *± 30 s* zooms to the surrounding minute).
+- **Live tail** (every 2, 3, 5 or 10 s) with new lines highlighted, newest-first and compact modes, and JSON logs shown as a message plus tags (click a row to open the **inspector** side panel: parsed fields, copy line/JSON, *± 30 s* context, ↑/↓ to step through lines, Esc to close).
+- **Group similar** folds runs of lines that differ only in numbers/IDs into one `N× similar` row you can expand. Addresses, paths and quoted strings in messages are **click-to-filter chips** (shown in an *Filters* bar with *Clear all*). The `.*` button treats the search as a **regular expression** (applied to the fetched lines). A **spike** badge over the histogram marks an unusually busy moment; click it to zoom. The inspector shows a pattern-based **hint** for common failures (redirect loops, upstream timeouts, connection refused, OOM, permission denied, disk full, …). **⌘K / Ctrl+K** opens a palette to jump to any container, journal unit or log file.
 - A **searchable picker** for containers, units, pods and files, so a server with a thousand log files is still easy to navigate.
 
 **Logs** in the sidebar (or the *Logs* tab on a server) shows a server's logs on demand, with filters. Three sources:

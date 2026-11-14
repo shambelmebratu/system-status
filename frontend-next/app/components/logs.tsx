@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, post } from '../lib/api';
 import { Icon } from './ui';
-import { LogViewer, TargetPicker, type LogFetch, type PickerOption } from './logviewer';
+import { LogViewer, LogPalette, TargetPicker, type LogFetch, type PickerOption, type PaletteGroup } from './logviewer';
 
 type Inventory = { files: string[]; journal: boolean; journal_all?: boolean; journal_label?: string; platform?: string; units: string[]; docker: boolean; containers: { name: string; state: string; image: string }[]; notes: string[] };
 type Source = 'docker' | 'journal' | 'file';
@@ -49,6 +49,8 @@ export function LogsPanel({ serverId }: { serverId: number }) {
   const [target, setTarget] = useState('');
   const [error, setError] = useState('');
   const invRun = useRef(0);    // newest inventory request
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  useEffect(() => { const k = (e: KeyboardEvent) => { if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); setPaletteOpen(o => !o); } }; window.addEventListener('keydown', k); return () => window.removeEventListener('keydown', k); }, []);
 
   // What can this server's agent read? A remembered last view is shown at once, in parallel with the inventory request.
   useEffect(() => {
@@ -115,6 +117,12 @@ export function LogsPanel({ serverId }: { serverId: number }) {
     <div className="lg"><div className="lg-skel">{Array.from({ length: 9 }, (_, i) => <i key={i} style={{ width: `${40 + ((i * 37) % 55)}%` }} />)}</div>
       <div className="lg-foot"><span className="spinner" /> Asking the agent which logs it can read…</div></div>);
 
+  const switchTo = (src: Source) => (value: string) => { setSource(src); setTarget(value); if (src === 'journal') loadUnits(); };
+  const groups: PaletteGroup[] = [
+    { label: 'Containers', icon: 'server', onPick: switchTo('docker'), options: shell.containers.map(c => ({ value: c.name, label: c.name, dot: c.state, hint: c.state !== 'running' ? c.state : c.image.split('/').pop() })) },
+    { label: shell.journal_label || 'System journal', icon: 'logs', onPick: switchTo('journal'), options: shell.journal ? [...(shell.journal_all === false ? [] : [{ value: 'all', label: 'Whole journal' }]), ...shell.units.map(u => ({ value: u, label: u }))] : [] },
+    { label: 'Log files', icon: 'overview', onPick: switchTo('file'), options: shell.files.map(f => ({ value: f, label: f.replace(/^\/var\/log\//, '') })) },
+  ].filter(g => g.options.length > 0);
   const available: Record<Source, boolean> = { docker: shell.docker && shell.containers.length > 0, journal: shell.journal, file: shell.files.length > 0 };
   const total: Record<Source, string> = { docker: String(shell.containers.length), journal: unitsState === 'done' ? String(shell.units.length) : '–', file: String(shell.files.length) };
   const noteFor = (id: Source) => (id === 'journal' ? shell.notes.find(n => /journal|systemd|macOS/i.test(n)) : id === 'file' ? shell.notes.find(n => /log files/i.test(n)) : shell.notes.find(n => /docker/i.test(n))) ?? shell.notes[0] ?? 'Not available on this server';
@@ -128,8 +136,9 @@ export function LogsPanel({ serverId }: { serverId: number }) {
       </div>
       <TargetPicker value={target} options={targets} onChange={setTarget} icon={source === 'docker' ? 'server' : source === 'journal' ? 'logs' : 'overview'} width={340}
         placeholder={source === 'journal' && unitsState !== 'done' ? 'Loading units…' : 'Nothing available'} disabled={targets.length === 0} />
+      <button type="button" className="btn ghost sm" onClick={() => setPaletteOpen(true)} title="Switch to any container, unit or file"><kbd>⌘K</kbd> Switch log</button>
     </>
   );
   const banner = shell.notes.length > 0 ? <div className="lv-note">{shell.notes.map((n, i) => <p key={i}><Icon name="alert" size={14} />{n}</p>)}</div> : null;
-  return <LogViewer fetcher={fetcher} fetchKey={`${serverId}|${source}|${target}`} canFetch={!!target} controls={controls} banner={banner} storageKey={`server-${serverId}`} downloadName={target || 'logs'} />;
+  return <><LogPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} groups={groups} title="Switch log: container, unit or file…" /><LogViewer fetcher={fetcher} fetchKey={`${serverId}|${source}|${target}`} canFetch={!!target} controls={controls} banner={banner} storageKey={`server-${serverId}`} downloadName={target || 'logs'} /></>;
 }

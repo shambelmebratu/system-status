@@ -95,11 +95,58 @@ export function parse(output: string): LogRow[] {
 }
 
 const escapeRx = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-export function Highlight({ text, term }: { text: string; term: string }) {
+export function tryRegex(source: string): RegExp | null { try { return source ? new RegExp(source, 'i') : null; } catch { return null; } }
+export function Highlight({ text, term, regex }: { text: string; term: string; regex?: boolean }) {
   if (!term) return <>{text}</>;
-  const parts = text.split(new RegExp(`(${escapeRx(term)})`, 'ig'));
+  let rx: RegExp;
+  try { rx = new RegExp(`(${regex ? term : escapeRx(term)})`, 'ig'); } catch { return <>{text}</>; }
+  if (rx.test('')) return <>{text}</>;   // a pattern that matches nothing at all would split every character
+  const parts = text.split(rx);
   return <>{parts.map((p, i) => (i % 2 ? <mark key={i}>{p}</mark> : <Fragment key={i}>{p}</Fragment>))}</>;
 }
+
+/* ---- clickable pieces of a line: quoted strings, IP addresses, paths, UUIDs ---- */
+export type Segment = { text: string; kind?: 'ip' | 'path' | 'str' | 'id'; value?: string };
+const TOKEN_RX = /("[^"\n]{3,}")|(\b\d{1,3}(?:\.\d{1,3}){3}(?::\d{2,5})?\b)|(\/[\w.\-@%+~]{2,}(?:\/[\w.\-@%+~]+)*)|(\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b)/gi;
+export function segments(text: string): Segment[] {
+  const out: Segment[] = [];
+  let last = 0;
+  TOKEN_RX.lastIndex = 0;
+  for (let m = TOKEN_RX.exec(text); m; m = TOKEN_RX.exec(text)) {
+    if (m[3] && m.index > 0 && /[\w:.]/.test(text[m.index - 1])) continue;   // "host:/x" or "a.b/c" is not a path of its own
+    if (m.index > last) out.push({ text: text.slice(last, m.index) });
+    const kind = m[1] ? 'str' : m[2] ? 'ip' : m[3] ? 'path' : 'id';
+    out.push({ text: m[0], kind, value: kind === 'str' ? m[0].slice(1, -1) : m[0] });
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) out.push({ text: text.slice(last) });
+  return out;
+}
+
+/** Lines that say the same thing with different numbers (ids, durations, addresses) share a signature, so they can be folded together. */
+export const signature = (r: LogRow) => `${r.level}|${r.msg.replace(/\b[0-9a-f]{8,}\b/gi, '?').replace(/\d+/g, '#').slice(0, 240)}`;
+
+/* ---- what common errors usually mean (pattern based, not a diagnosis) ---- */
+export const HINTS: { test: RegExp; title: string; text: string; fix?: string }[] = [
+  { test: /rewrite or internal redirection cycle/i, title: 'nginx is redirecting to itself', text: 'try_files / rewrite keeps sending the request back to the same location, usually because the fallback file (often /index.html) does not exist under the root or is not readable by the nginx worker.', fix: 'location / {\n  root /var/www/app/dist;          # must contain index.html\n  try_files $uri $uri/ /index.html;\n}' },
+  { test: /upstream prematurely closed/i, title: 'The backend hung up mid-response', text: 'The upstream application closed the connection before it finished answering: it crashed, was restarted, or hit its own timeout. Check the application logs at the same minute.', fix: 'proxy_read_timeout 60s;     # and look for a crash or OOM kill of the upstream around this time' },
+  { test: /upstream timed out|ETIMEDOUT|timed out|context deadline exceeded|i\/o timeout/i, title: 'A call took too long', text: 'Something did not answer in time: a slow or overloaded upstream/database, a firewall dropping packets, or a timeout set too low.' },
+  { test: /connection refused|ECONNREFUSED/i, title: 'Nothing is listening there', text: 'The target address answered, but no process accepts connections on that port: the service is down, still starting, or listening on a different address/port.' },
+  { test: /connection reset by peer|ECONNRESET|broken pipe|EPIPE/i, title: 'The other side dropped the connection', text: 'The peer closed the connection abruptly: often a crash/restart, a proxy idle timeout, or a client that gave up.' },
+  { test: /No such file or directory|ENOENT/i, title: 'A file or directory is missing', text: 'The path in the message does not exist on that machine. Check the spelling, a missing mount/volume, or a deploy that did not copy the file.' },
+  { test: /Permission denied|EACCES|Forbidden|not permitted/i, title: 'Permission problem', text: 'The process is not allowed to read, write or run that. Check ownership and mode of the path and the user the service runs as (and SELinux/AppArmor).' },
+  { test: /OOMKilled|out of memory|oom-kill|Cannot allocate memory/i, title: 'Out of memory', text: 'The process was killed (or could not start) because memory ran out. Raise the memory limit or find the leak; compare with the Memory chart of this server.' },
+  { test: /CrashLoopBackOff/i, title: 'Container keeps crashing', text: 'Kubernetes restarts the container, it exits again, and the wait between restarts grows. Read the previous container\'s logs ("Previous (crashed) container") for the real error.' },
+  { test: /ImagePullBackOff|ErrImagePull/i, title: 'Image cannot be pulled', text: 'The image name/tag is wrong, does not exist, or the registry needs credentials (imagePullSecrets).' },
+  { test: /no space left on device|ENOSPC/i, title: 'Disk is full', text: 'A filesystem (or inode table) is full. Check the Disk chart; clear old logs/backups or grow the volume.' },
+  { test: /too many open files|EMFILE|ENFILE/i, title: 'File descriptor limit reached', text: 'The process opened more files/sockets than allowed. Raise the limit (ulimit -n / LimitNOFILE) or fix a descriptor leak.' },
+  { test: /address already in use|EADDRINUSE/i, title: 'Port already taken', text: 'Another process (often a previous instance) is already bound to that port.' },
+  { test: /limiting requests|limit_req|rate.?limit|429/i, title: 'Rate limit hit', text: 'Requests were throttled by a rate limit. Fine if it targets abusive clients; otherwise raise the limit or find the client that is hammering the endpoint.' },
+  { test: /deadlock|lock wait timeout/i, title: 'Database lock contention', text: 'Two transactions are waiting on each other, or one waited too long for a lock. Look for long-running transactions around this time.' },
+  { test: /certificate|x509|SSL|TLS handshake/i, title: 'TLS / certificate problem', text: 'The certificate is expired, not trusted, or for another name; or the two sides cannot agree on a protocol.' },
+];
+export const hintFor = (raw: string) => HINTS.find(h => h.test.test(raw));
+
 export const LEVEL_LABEL: Record<string, string> = { error: 'ERR', warn: 'WARN', info: 'INFO', debug: 'DBG' };
 const LEVELS: { id: Exclude<Level, ''>; label: string }[] = [{ id: 'error', label: 'Errors' }, { id: 'warn', label: 'Warnings' }, { id: 'info', label: 'Info' }, { id: 'debug', label: 'Debug' }];
 
@@ -120,6 +167,11 @@ function Histogram({ rows, zoom, onZoom }: { rows: LogRow[]; zoom: [number, numb
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rows]);
   if (buckets.length === 0 || timed.length < rows.length / 2) return null;
+  const totals = buckets.map(b => b.error + b.warn + b.other);
+  const mean = totals.reduce((x, y) => x + y, 0) / totals.length;
+  const sd = Math.sqrt(totals.reduce((x, y) => x + (y - mean) ** 2, 0) / totals.length);
+  const peakIdx = totals.indexOf(Math.max(...totals));
+  const spike = totals[peakIdx] >= Math.max(6, mean + 2 * sd) && totals[peakIdx] >= mean * 2 ? buckets[peakIdx] : null;
   const max = Math.max(1, ...buckets.map(b => b.error + b.warn + b.other));
   const h = hover != null ? buckets[hover] : null;
   const fmt = (t: number) => new Date(t).toLocaleTimeString([], { hour12: false });
@@ -137,6 +189,7 @@ function Histogram({ rows, zoom, onZoom }: { rows: LogRow[]; zoom: [number, numb
             </button>);
         })}
       </div>
+      {spike && <button type="button" className="lg-spike" onClick={() => onZoom([spike.from, spike.to])} title="Zoom in on the busiest moment"><Icon name="zap" size={13} />Spike at {fmt(spike.from)}: {spike.error + spike.warn + spike.other} lines{spike.error ? `, ${spike.error} errors` : ''} ({(totals[peakIdx] / Math.max(1, mean)).toFixed(1)}× the usual)</button>}
       <div className="lg-hist-axis"><span>{fmt(buckets[0].from)}</span>
         <span className="lg-hist-tip">{h ? `${fmt(h.from)} · ${h.error + h.warn + h.other} lines${h.error ? ` · ${h.error} errors` : ''}${h.warn ? ` · ${h.warn} warnings` : ''}` : zoom ? `Zoomed to ${fmt(zoom[0])} – ${fmt(zoom[1])}` : 'Click a bar to zoom in'}</span>
         <span>{fmt(buckets[buckets.length - 1].to)}</span></div>
@@ -189,10 +242,89 @@ export function TargetPicker({ value, options, onChange, placeholder = 'Choose�
   );
 }
 
+/* ================================================================================================ palette (⌘K) */
+export type PaletteGroup = { label: string; icon: string; options: PickerOption[]; onPick: (value: string) => void };
+/** One search box over every log a server can show (containers, journal units, files): switch with the keyboard. */
+export function LogPalette({ open, onClose, groups, title }: { open: boolean; onClose: () => void; groups: PaletteGroup[]; title: string }) {
+  const [q, setQ] = useState('');
+  const [cursor, setCursor] = useState(0);
+  useEffect(() => { if (open) { setQ(''); setCursor(0); } }, [open]);
+  const flat = useMemo(() => {
+    const n = q.trim().toLowerCase();
+    return groups.flatMap(g => g.options.filter(o => !n || `${o.label} ${o.hint ?? ''} ${g.label}`.toLowerCase().includes(n)).slice(0, 60).map(o => ({ g, o })));
+  }, [groups, q]);
+  if (!open) return null;
+  const choose = (i: number) => { const x = flat[i]; if (x) { x.g.onPick(x.o.value); onClose(); } };
+  let lastGroup = '';
+  return (
+    <div className="overlay" style={{ placeItems: 'start center', paddingTop: '12vh' }} onMouseDown={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal palette" role="dialog" aria-modal="true" aria-label="Switch log" style={{ maxWidth: 600, padding: 0, gap: 0 }}>
+        <div className="palette-head"><Icon name="logs" size={16} /><input autoFocus value={q} onChange={e => { setQ(e.target.value); setCursor(0); }} placeholder={title}
+          onKeyDown={e => { if (e.key === 'ArrowDown') { e.preventDefault(); setCursor(c => Math.min(flat.length - 1, c + 1)); } else if (e.key === 'ArrowUp') { e.preventDefault(); setCursor(c => Math.max(0, c - 1)); } else if (e.key === 'Enter') { e.preventDefault(); choose(cursor); } else if (e.key === 'Escape') onClose(); }} /><kbd>esc</kbd></div>
+        <div className="palette-list">
+          {flat.length === 0 ? <div className="pick-none">Nothing matches “{q}”</div> : flat.map((x, i) => {
+            const head = x.g.label !== lastGroup ? (lastGroup = x.g.label, <div key={`h-${x.g.label}`} className="palette-group"><Icon name={x.g.icon} size={12} />{x.g.label}</div>) : null;
+            return <Fragment key={`${x.g.label}-${x.o.value}`}>{head}<button type="button" className={`pick-opt ${i === cursor ? 'cur' : ''}`} onMouseEnter={() => setCursor(i)} onClick={() => choose(i)}>
+              {x.o.dot !== undefined && <i className="lv-dot" data-state={x.o.dot} />}<span className="pick-label">{x.o.label}</span>{x.o.hint && <small>{x.o.hint}</small>}</button></Fragment>;
+          })}
+        </div>
+        <div className="palette-foot"><span><kbd>↑</kbd><kbd>↓</kbd> move</span><span><kbd>↵</kbd> open</span><span><kbd>esc</kbd> close</span></div>
+      </div>
+    </div>
+  );
+}
+
+/* ================================================================================================ inspector */
+function LogInspector({ row, index, total, onClose, onNav, onToken, tokens, onZoom }: { row: LogRow; index: number; total: number; onClose: () => void; onNav: (d: number) => void; onToken: (t: string) => void; tokens: Set<string>; onZoom: (z: [number, number]) => void }) {
+  const [copied, setCopied] = useState('');
+  const copy = (what: string, value: string) => { void navigator.clipboard?.writeText(value); setCopied(what); setTimeout(() => setCopied(''), 1500); };
+  const hint = hintFor(row.raw);
+  const found = useMemo(() => {
+    const seen = new Set<string>(); const out: { kind: string; value: string }[] = [];
+    for (const sg of segments(row.msg)) if (sg.kind && sg.value && !seen.has(sg.value)) { seen.add(sg.value); out.push({ kind: sg.kind, value: sg.value }); }
+    return out.slice(0, 12);
+  }, [row.msg]);
+  const KIND: Record<string, string> = { ip: 'Address', path: 'Path', str: 'Quoted', id: 'ID' };
+  return (
+    <div className="drawer-overlay lg-insp-overlay" onMouseDown={e => e.target === e.currentTarget && onClose()}>
+      <aside className="drawer" role="dialog" aria-modal="true" aria-label="Log line">
+        <div className="drawer-head">
+          <div style={{ minWidth: 0, display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+            {row.level && <em className={`lg-badge ${row.level}`}>{LEVEL_LABEL[row.level]}</em>}<b className="mono">Line #{row.n}</b><span className="muted sm mono">{row.tsTitle || 'no timestamp'}</span>
+          </div>
+          <span className="grow" />
+          <button className="btn ghost sm" onClick={() => onNav(-1)} disabled={index <= 0} aria-label="Previous line" title="Previous (↑)">↑</button>
+          <button className="btn ghost sm" onClick={() => onNav(1)} disabled={index >= total - 1} aria-label="Next line" title="Next (↓)">↓</button>
+          <button className="btn ghost sm" onClick={onClose} aria-label="Close"><Icon name="x" /></button>
+        </div>
+        <div className="drawer-actions">
+          <button className="btn sm" onClick={() => copy('raw', row.raw)}>{copied === 'raw' ? 'Copied' : 'Copy line'}</button>
+          {row.json !== undefined && <button className="btn sm" onClick={() => copy('json', JSON.stringify(row.json, null, 2))}>{copied === 'json' ? 'Copied' : 'Copy JSON'}</button>}
+          {row.t != null && <button className="btn sm" onClick={() => { onZoom([row.t! - 30000, row.t! + 30000]); onClose(); }} title="Show only the surrounding minute">Context ± 30 s</button>}
+        </div>
+        <div className="drawer-body">
+          {hint && (
+            <div className="lg-hint"><div className="lg-hint-head"><Icon name="zap" size={14} /><b>{hint.title}</b><span className="muted sm">pattern-based hint</span></div>
+              <p>{hint.text}</p>{hint.fix && <pre>{hint.fix}</pre>}</div>)}
+          {found.length > 0 && <>
+            <h3 className="drawer-h">Found in this line <span className="muted" style={{ textTransform: 'none', letterSpacing: 0 }}>· click to filter</span></h3>
+            <div className="lg-found">{found.map(f => <button key={f.value} className={`lg-tok ${f.kind} ${tokens.has(f.value) ? 'on' : ''}`} onClick={() => onToken(f.value)} title={`Filter lines containing ${f.value}`}><i>{KIND[f.kind]}</i>{f.value}</button>)}</div></>}
+          {row.fields.length > 0 && <>
+            <h3 className="drawer-h">Fields</h3>
+            <div className="facts">{Object.entries((row.json ?? {}) as Record<string, unknown>).slice(0, 24).map(([k, v]) => <div key={k}><small>{k}</small><b title={typeof v === 'object' ? JSON.stringify(v) : String(v)}>{typeof v === 'object' ? JSON.stringify(v) : String(v)}</b></div>)}</div></>}
+          <h3 className="drawer-h">{row.json !== undefined ? 'JSON' : 'Raw line'}</h3>
+          <pre className="lg-raw">{row.json !== undefined ? JSON.stringify(row.json, null, 2) : row.raw}</pre>
+        </div>
+      </aside>
+    </div>
+  );
+}
+
 /* ================================================================================================ the viewer */
 export type LogFetch = (q: { sinceSeconds: number; lines: number; grep: string }, isCancelled: () => boolean) => Promise<{ text: string; truncated: boolean }>;
-type Prefs = { range: string; lines: string; wrap: boolean; dense: boolean; newest: boolean };
-const DEFAULT_PREFS: Prefs = { range: '1h', lines: '500', wrap: true, dense: false, newest: false };
+type Prefs = { range: string; lines: string; wrap: boolean; dense: boolean; newest: boolean; group: boolean };
+const DEFAULT_PREFS: Prefs = { range: '1h', lines: '500', wrap: true, dense: false, newest: false, group: true };
+type Entry = { key: string; row: LogRow; items: LogRow[] };
 
 export function LogViewer({ fetcher, fetchKey, canFetch, controls, storageKey, downloadName, emptyHint, banner }: {
   fetcher: LogFetch; fetchKey: string; canFetch: boolean; controls?: ReactNode; storageKey: string; downloadName: string; emptyHint?: ReactNode; banner?: ReactNode;
@@ -210,12 +342,15 @@ export function LogViewer({ fetcher, fetchKey, canFetch, controls, storageKey, d
   const [took, setTook] = useState(0);
   const [search, setSearch] = useState('');
   const [applied, setApplied] = useState('');
+  const [useRegex, setUseRegex] = useState(false);
   const [exclude, setExclude] = useState('');
   const [levels, setLevels] = useState<Set<string>>(new Set());
+  const [tokens, setTokens] = useState<Set<string>>(new Set());
   const [zoom, setZoom] = useState<[number, number] | null>(null);
   const [live, setLive] = useState(false);
   const [liveMs, setLiveMs] = useState(3000);
-  const [open, setOpen] = useState<number | null>(null);
+  const [selected, setSelected] = useState<number | null>(null);
+  const [folded, setFolded] = useState<Set<string>>(new Set());
   const [stuck, setStuck] = useState(true);
   const [fresh, setFresh] = useState<Set<string>>(new Set());
   const run = useRef(0);
@@ -224,6 +359,7 @@ export function LogViewer({ fetcher, fetchKey, canFetch, controls, storageKey, d
   const prevKeys = useRef<Set<string>>(new Set());
   const scroller = useRef<HTMLDivElement>(null);
   const searchBox = useRef<HTMLInputElement>(null);
+  const serverGrep = useRegex ? '' : applied;   // a regular expression is applied here on the fetched lines; plain text is searched by the agent too
 
   const doFetch = useCallback(async (quiet = false) => {
     if (!canFetch) return;
@@ -232,23 +368,22 @@ export function LogViewer({ fetcher, fetchKey, canFetch, controls, storageKey, d
     if (!quiet) setBusy(true);
     setError('');
     try {
-      const r = await fetcherRef.current({ sinceSeconds: range.seconds, lines: Number(prefs.lines), grep: applied }, () => run.current !== mine);
+      const r = await fetcherRef.current({ sinceSeconds: range.seconds, lines: Number(prefs.lines), grep: serverGrep }, () => run.current !== mine);
       if (run.current !== mine) return;
       setText(r.text); setTruncated(r.truncated); setFetchedAt(new Date()); setTook((performance.now() - started) / 1000);
     } catch (e) { if ((e as Error).message !== 'cancelled' && run.current === mine) setError((e as Error).message); }
     finally { if (run.current === mine) setBusy(false); }
-  }, [canFetch, range.seconds, prefs.lines, applied]);
+  }, [canFetch, range.seconds, prefs.lines, serverGrep]);
 
   // A different log, time range, line limit or search starts a fresh fetch.
-  useEffect(() => { setText(null); setOpen(null); setZoom(null); prevKeys.current = new Set(); setFresh(new Set()); void doFetch(); return () => { run.current++; };
+  useEffect(() => { setText(null); setSelected(null); setZoom(null); prevKeys.current = new Set(); setFresh(new Set()); void doFetch(); return () => { run.current++; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fetchKey, range.seconds, prefs.lines, applied, canFetch]);
-  useEffect(() => { setLive(false); setSearch(''); setApplied(''); setExclude(''); setLevels(new Set()); }, [fetchKey]);
+  }, [fetchKey, range.seconds, prefs.lines, serverGrep, canFetch]);
+  useEffect(() => { setLive(false); setSearch(''); setApplied(''); setExclude(''); setLevels(new Set()); setTokens(new Set()); setFolded(new Set()); }, [fetchKey]);
   useEffect(() => { if (!live) return; const t = setInterval(() => { if (!document.hidden) void doFetch(true); }, liveMs); return () => clearInterval(t); }, [live, liveMs, doFetch]);
-  useEffect(() => { const k = (e: KeyboardEvent) => { if (e.key === '/' && document.activeElement?.tagName !== 'INPUT' && document.activeElement?.tagName !== 'TEXTAREA') { e.preventDefault(); searchBox.current?.focus(); } }; window.addEventListener('keydown', k); return () => window.removeEventListener('keydown', k); }, []);
+  useEffect(() => { const k = (e: KeyboardEvent) => { if (e.key === '/' && !(e.metaKey || e.ctrlKey) && document.activeElement?.tagName !== 'INPUT' && document.activeElement?.tagName !== 'TEXTAREA' && document.activeElement?.tagName !== 'SELECT') { e.preventDefault(); searchBox.current?.focus(); } }; window.addEventListener('keydown', k); return () => window.removeEventListener('keydown', k); }, []);
 
   const rows = useMemo(() => (text ? parse(text) : []), [text]);
-  // Lines that were not there on the previous refresh get a brief highlight while tailing.
   useEffect(() => {
     const keys = new Set(rows.map(r => `${r.t ?? ''}|${r.raw}`));
     if (live && prevKeys.current.size) setFresh(new Set([...keys].filter(k => !prevKeys.current.has(k))));
@@ -258,22 +393,54 @@ export function LogViewer({ fetcher, fetchKey, canFetch, controls, storageKey, d
 
   const counts = useMemo(() => ({ error: rows.filter(r => r.level === 'error').length, warn: rows.filter(r => r.level === 'warn').length, info: rows.filter(r => r.level === 'info').length, debug: rows.filter(r => r.level === 'debug').length }), [rows]);
   const needle = exclude.trim().toLowerCase();
+  const rx = useMemo(() => (useRegex ? tryRegex(applied) : null), [useRegex, applied]);
+  const badRegex = useRegex && !!applied && !rx;
   const filtered = useMemo(() => rows.filter(r => (levels.size === 0 || levels.has(r.level || 'info'))
     && (!needle || !r.raw.toLowerCase().includes(needle))
-    && (!zoom || (r.t != null && r.t >= zoom[0] - 1 && r.t <= zoom[1] + 1))), [rows, levels, needle, zoom]);
-  const shown = useMemo(() => (prefs.newest ? [...filtered].reverse() : filtered), [filtered, prefs.newest]);
+    && (!zoom || (r.t != null && r.t >= zoom[0] - 1 && r.t <= zoom[1] + 1))
+    && [...tokens].every(t => r.raw.includes(t))
+    && (!rx || rx.test(r.raw))), [rows, levels, needle, zoom, tokens, rx]);
+  // Runs of lines that say the same thing are folded into one expandable row ("13× similar").
+  const entries = useMemo<Entry[]>(() => {
+    const list: Entry[] = [];
+    if (!prefs.group) filtered.forEach(r => list.push({ key: `r${r.n}`, row: r, items: [r] }));
+    else for (const r of filtered) { const last = list[list.length - 1]; if (last && signature(last.row) === signature(r)) last.items.push(r); else list.push({ key: `g${r.n}`, row: r, items: [r] }); }
+    return prefs.newest ? list.reverse() : list;
+  }, [filtered, prefs.group, prefs.newest]);
+  const saved = filtered.length - entries.length;
+  const flat = useMemo(() => entries.flatMap(e => (e.items.length > 1 && !folded.has(e.key) ? [e.row] : e.items)), [entries, folded]);   // what Up/Down in the inspector walks through
+  const selIndex = flat.findIndex(r => r.n === selected);
+  const selRow = selIndex >= 0 ? flat[selIndex] : rows.find(r => r.n === selected) ?? null;
 
-  useEffect(() => { const el = scroller.current; if (el && stuck) el.scrollTop = prefs.newest ? 0 : el.scrollHeight; }, [shown, stuck, prefs.newest]);
+  useEffect(() => { const el = scroller.current; if (el && stuck) el.scrollTop = prefs.newest ? 0 : el.scrollHeight; }, [entries, stuck, prefs.newest]);
   const onScroll = () => { const el = scroller.current; if (el) setStuck(prefs.newest ? el.scrollTop < 40 : el.scrollHeight - el.scrollTop - el.clientHeight < 40); };
+  useEffect(() => {
+    if (selected == null) return;
+    const k = (e: KeyboardEvent) => { if (e.key === 'Escape') setSelected(null); else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') { e.preventDefault(); const i = flat.findIndex(r => r.n === selected) + (e.key === 'ArrowDown' ? 1 : -1); if (flat[i]) setSelected(flat[i].n); } };
+    window.addEventListener('keydown', k);
+    return () => window.removeEventListener('keydown', k);
+  }, [selected, flat]);
 
   const toggleLevel = (id: string) => setLevels(s => { const n = new Set(s); if (n.has(id)) n.delete(id); else n.add(id); return n; });
+  const toggleToken = (t: string) => setTokens(s => { const n = new Set(s); if (n.has(t)) n.delete(t); else n.add(t); return n; });
+  const toggleFold = (key: string) => setFolded(s => { const n = new Set(s); if (n.has(key)) n.delete(key); else n.add(key); return n; });
   const copy = (value: string) => void navigator.clipboard?.writeText(value);
   const download = () => {
-    const url = URL.createObjectURL(new Blob([shown.map(r => r.raw).join('\n')], { type: 'text/plain' }));
+    const url = URL.createObjectURL(new Blob([filtered.map(r => r.raw).join('\n')], { type: 'text/plain' }));
     const a = document.createElement('a'); a.href = url; a.download = `${downloadName.replace(/[^A-Za-z0-9_.-]+/g, '_') || 'logs'}.log`; a.click(); URL.revokeObjectURL(url);
   };
   const nextRange = RANGES[Math.min(RANGES.length - 1, RANGES.findIndex(r => r.id === range.id) + 3)];
-  const filtersOn = levels.size > 0 || !!needle || !!zoom;
+  const filtersOn = levels.size > 0 || !!needle || !!zoom || tokens.size > 0;
+  const clearAll = () => { setLevels(new Set()); setExclude(''); setZoom(null); setTokens(new Set()); };
+  const fmtT = (t: number) => new Date(t).toLocaleTimeString([], { hour12: false });
+
+  /** A message with its addresses, paths and quoted strings turned into click-to-filter chips. */
+  const message = (r: LogRow) => (
+    <>{segments(r.msg).map((sg, i) => sg.kind
+      ? <button key={i} type="button" className={`lg-tok ${sg.kind} ${tokens.has(sg.value!) ? 'on' : ''}`} onClick={e => { e.stopPropagation(); toggleToken(sg.value!); }} title="Click to show only lines containing this">{sg.text}</button>
+      : <Highlight key={i} text={sg.text} term={applied} regex={useRegex} />)}
+      {r.fields.map(([k, v]) => <span key={k} className="lg-tag"><i>{k}</i>{v}</span>)}</>
+  );
 
   return (
     <div className="lg">
@@ -291,16 +458,18 @@ export function LogViewer({ fetcher, fetchKey, canFetch, controls, storageKey, d
       </div>
 
       <form className="lg-search" onSubmit={e => { e.preventDefault(); setApplied(search); }}>
-        <label className="lg-field grow"><Icon name="logs" size={15} /><input ref={searchBox} value={search} onChange={e => setSearch(e.target.value)} placeholder="Search the logs…   ( / )" maxLength={200} aria-label="Search" />
-          {(search || applied) && <button type="button" aria-label="Clear search" onClick={() => { setSearch(''); setApplied(''); }}><Icon name="x" size={14} /></button>}</label>
+        <label className={`lg-field grow ${badRegex ? 'bad' : ''}`}><Icon name="logs" size={15} /><input ref={searchBox} value={search} onChange={e => setSearch(e.target.value)} placeholder={useRegex ? 'Regular expression…   ( / )' : 'Search the logs…   ( / )'} maxLength={200} aria-label="Search" />
+          {(search || applied) && <button type="button" aria-label="Clear search" onClick={() => { setSearch(''); setApplied(''); }}><Icon name="x" size={14} /></button>}
+          <button type="button" className={`lg-rx ${useRegex ? 'on' : ''}`} onClick={() => setUseRegex(!useRegex)} aria-pressed={useRegex} title="Treat the search as a regular expression">.*</button></label>
         <label className="lg-field narrow"><span className="lg-minus">−</span><input value={exclude} onChange={e => setExclude(e.target.value)} placeholder="Exclude lines containing…" maxLength={100} aria-label="Exclude" />
           {exclude && <button type="button" aria-label="Clear exclude" onClick={() => setExclude('')}><Icon name="x" size={14} /></button>}</label>
         <button className="btn primary sm" disabled={busy || !canFetch}>Search</button>
       </form>
+      {badRegex && <div className="lg-rxerr">That is not a valid regular expression, so nothing is filtered yet.</div>}
 
       <div className="lg-levels2">
         {LEVELS.map(l => <button key={l.id} type="button" className={`lg-lvl ${l.id} ${levels.has(l.id) ? 'on' : ''}`} aria-pressed={levels.has(l.id)} onClick={() => toggleLevel(l.id)}><i />{l.label}<b>{counts[l.id].toLocaleString()}</b></button>)}
-        {filtersOn && <button type="button" className="lg-clear" onClick={() => { setLevels(new Set()); setExclude(''); setZoom(null); }}>Clear filters</button>}
+        <button type="button" className={`lg-lvl grp ${prefs.group ? 'on' : ''}`} aria-pressed={prefs.group} onClick={() => setPref('group', !prefs.group)} title="Fold runs of lines that say the same thing into one row"><Icon name="overview" size={13} />Group similar{prefs.group && saved > 0 && <b>{saved.toLocaleString()} folded</b>}</button>
         <span className="grow" />
         <label className="lg-opt"><input type="checkbox" checked={prefs.wrap} onChange={e => setPref('wrap', e.target.checked)} />Wrap</label>
         <label className="lg-opt"><input type="checkbox" checked={prefs.dense} onChange={e => setPref('dense', e.target.checked)} />Compact</label>
@@ -308,50 +477,63 @@ export function LogViewer({ fetcher, fetchKey, canFetch, controls, storageKey, d
         <select className="lg-mini" value={prefs.lines} onChange={e => setPref('lines', e.target.value)} aria-label="Lines to load">{['100', '200', '500', '1000', '2000'].map(n => <option key={n} value={n}>{n} lines</option>)}</select>
       </div>
 
+      {filtersOn && (
+        <div className="lg-active">
+          <span className="muted sm">Filters:</span>
+          {zoom && <button type="button" className="lg-chip" onClick={() => setZoom(null)}>time {fmtT(zoom[0])}–{fmtT(zoom[1])}<Icon name="x" size={12} /></button>}
+          {[...tokens].map(t => <button key={t} type="button" className="lg-chip" onClick={() => toggleToken(t)} title={t}>{t.length > 40 ? `${t.slice(0, 38)}…` : t}<Icon name="x" size={12} /></button>)}
+          {needle && <button type="button" className="lg-chip" onClick={() => setExclude('')}>− {exclude}<Icon name="x" size={12} /></button>}
+          {[...levels].map(l => <button key={l} type="button" className="lg-chip" onClick={() => toggleLevel(l)}>{l}<Icon name="x" size={12} /></button>)}
+          <button type="button" className="lg-clear" onClick={clearAll}>Clear all</button>
+        </div>)}
+
       <Histogram rows={rows} zoom={zoom} onZoom={setZoom} />
       {error && <div className="lg-error" role="alert"><Icon name="alert" size={15} /><span>{error}</span><button className="btn sm" onClick={() => void doFetch()}>Retry</button></div>}
 
       <div className={`lg-body ${prefs.dense ? 'dense' : ''} ${prefs.wrap ? 'wrap' : ''}`}>
         {text === null ? (
           <div className="lg-skel">{Array.from({ length: 12 }, (_, i) => <i key={i} style={{ width: `${30 + ((i * 53) % 62)}%` }} />)}</div>
-        ) : shown.length === 0 ? (
+        ) : entries.length === 0 ? (
           <div className="lg-empty"><Icon name="logs" size={28} /><h3>{rows.length ? 'No lines match your filters' : applied ? `Nothing contains “${applied}”` : `No log lines in the ${range.long.toLowerCase()}`}</h3>
-            <p>{rows.length ? 'Clear the level, exclude or zoom filters.' : applied ? 'Try a different search term or a wider time range.' : <>This log has been quiet. {range.id !== '1mo' && <button type="button" className="lg-link" onClick={() => setPref('range', nextRange.id)}>Look back further ({nextRange.long.toLowerCase()})</button>}</>}</p>
+            <p>{rows.length ? <>Clear the filters to see all {rows.length.toLocaleString()} lines. <button type="button" className="lg-link" onClick={() => { clearAll(); setSearch(''); setApplied(''); }}>Reset filters</button></> : applied ? 'Try a different search term or a wider time range.' : <>This log has been quiet. {range.id !== '1mo' && <button type="button" className="lg-link" onClick={() => setPref('range', nextRange.id)}>Look back further ({nextRange.long.toLowerCase()})</button>}</>}</p>
             {emptyHint}</div>
         ) : (
           <div className="lg-scroll" ref={scroller} onScroll={onScroll}>
-            {shown.map(r => {
-              const isOpen = open === r.n;
+            <div className="lg-head" aria-hidden="true"><span>#</span><span>Time</span><span>Level</span><span>Message</span></div>
+            {entries.map(en => {
+              const r = en.row, many = en.items.length > 1, open = many && !folded.has(en.key);   // groups start collapsed: `folded` holds the ones the user opened
               const isNew = fresh.has(`${r.t ?? ''}|${r.raw}`);
+              const last = en.items[en.items.length - 1];
               return (
-                <div key={r.n} className={`lg-item ${r.level} ${isOpen ? 'open' : ''} ${isNew ? 'new' : ''}`}>
-                  <div className="lg-row" onClick={() => setOpen(isOpen ? null : r.n)} role="button" tabIndex={0} onKeyDown={e => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), setOpen(isOpen ? null : r.n))} aria-expanded={isOpen}>
-                    <span className="lg-t" title={r.tsTitle}>{r.ts}</span>
-                    <span className="lg-l">{r.level ? <em className={r.level}>{LEVEL_LABEL[r.level]}</em> : null}</span>
-                    <span className="lg-m"><Highlight text={r.msg} term={applied} />{r.fields.map(([k, v]) => <span key={k} className="lg-tag"><i>{k}</i>{v}</span>)}</span>
+                <Fragment key={en.key}>
+                  <div className={`lg-item ${r.level} ${selected === r.n ? 'sel' : ''} ${isNew ? 'new' : ''}`}>
+                    <div className="lg-row" onClick={() => setSelected(r.n)} role="button" tabIndex={0} onKeyDown={e => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), setSelected(r.n))}>
+                      <span className="lg-n">{many ? `${r.n}–${last.n}` : r.n}</span>
+                      <span className="lg-t" title={r.tsTitle}>{r.ts}</span>
+                      <span className="lg-l">{r.level ? <em className={r.level}>{LEVEL_LABEL[r.level]}</em> : null}</span>
+                      <span className="lg-m">{many && <button type="button" className="lg-group" onClick={e => { e.stopPropagation(); toggleFold(en.key); }} aria-expanded={!open}>{open ? '▾' : '▸'} {en.items.length}× similar{r.t != null && last.t != null && last.t !== r.t ? <small>{fmtT(r.t)}–{fmtT(last.t)}</small> : null}</button>}{message(r)}</span>
+                    </div>
                   </div>
-                  {isOpen && (
-                    <div className="lg-detail">
-                      <div className="lg-detail-bar"><span className="muted sm">{r.tsTitle || 'no timestamp'}{r.level ? ` · ${r.level}` : ''}</span><span className="grow" />
-                        <button type="button" className="btn sm ghost" onClick={() => copy(r.raw)}>Copy line</button>
-                        {r.json !== undefined && <button type="button" className="btn sm ghost" onClick={() => copy(JSON.stringify(r.json, null, 2))}>Copy JSON</button>}
-                        {r.t != null && <button type="button" className="btn sm ghost" onClick={() => setZoom([r.t! - 30000, r.t! + 30000])} title="Show only the surrounding minute">± 30 s</button>}</div>
-                      <pre>{r.json !== undefined ? JSON.stringify(r.json, null, 2) : r.raw}</pre>
-                    </div>)}
-                </div>);
+                  {open && en.items.map(sub => (
+                    <div key={sub.n} className={`lg-item sub ${sub.level} ${selected === sub.n ? 'sel' : ''}`}>
+                      <div className="lg-row" onClick={() => setSelected(sub.n)} role="button" tabIndex={0}>
+                        <span className="lg-n">↳ {sub.n}</span><span className="lg-t" title={sub.tsTitle}>{sub.ts}</span><span className="lg-l" /><span className="lg-m">{message(sub)}</span></div>
+                    </div>))}
+                </Fragment>);
             })}
           </div>)}
-        {!stuck && shown.length > 0 && <button className="lg-jump" onClick={() => { setStuck(true); const el = scroller.current; if (el) el.scrollTop = prefs.newest ? 0 : el.scrollHeight; }}>{prefs.newest ? '↑ Jump to newest' : '↓ Jump to newest'}{fresh.size ? ` · ${fresh.size} new` : ''}</button>}
+        {!stuck && entries.length > 0 && <button className="lg-jump" onClick={() => { setStuck(true); const el = scroller.current; if (el) el.scrollTop = prefs.newest ? 0 : el.scrollHeight; }}>{prefs.newest ? '↑ Jump to newest' : '↓ Jump to newest'}{fresh.size ? ` · ${fresh.size} new` : ''}</button>}
       </div>
 
       <div className="lg-foot">
-        <span><b>{shown.length.toLocaleString()}</b>{shown.length !== rows.length ? ` of ${rows.length.toLocaleString()}` : ''} lines</span>
+        <span><b>{filtered.length.toLocaleString()}</b>{filtered.length !== rows.length ? ` of ${rows.length.toLocaleString()}` : ''} lines</span>
         {truncated && <span className="warn">showing the newest part only</span>}
         {fetchedAt && <span className="muted">{live ? 'live · ' : ''}updated {fetchedAt.toLocaleTimeString([], { hour12: false })} · {took.toFixed(1)}s</span>}
         <span className="grow" />
-        <button type="button" className="btn ghost sm" onClick={() => copy(shown.map(r => r.raw).join('\n'))} disabled={!shown.length}>Copy</button>
-        <button type="button" className="btn ghost sm" onClick={download} disabled={!shown.length}>Download</button>
+        <button type="button" className="btn ghost sm" onClick={() => copy(filtered.map(r => r.raw).join('\n'))} disabled={!filtered.length}>Copy</button>
+        <button type="button" className="btn ghost sm" onClick={download} disabled={!filtered.length}>Download</button>
       </div>
+      {selRow && <LogInspector row={selRow} index={selIndex} total={flat.length} onClose={() => setSelected(null)} onNav={d => { const n = flat[selIndex + d]; if (n) setSelected(n.n); }} onToken={toggleToken} tokens={tokens} onZoom={setZoom} />}
     </div>
   );
 }
