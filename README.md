@@ -241,6 +241,13 @@ The role is checked on the server for every request (hidden buttons are only a c
 
 ## Logs
 
+The **Logs** page (servers) and the **Logs** tab of a Kubernetes cluster share one log dashboard:
+
+- **Time range:** 15s, 1m, 5m, 15m, 30m, 1h, 6h, 12h, 1d, 7d or 1 month. It applies to containers, the journal, Kubernetes pods and log files (for files, the timestamps inside the lines are used).
+- **Volume histogram** by level (click a bar to zoom in on that moment), level filters with counts, search (searched on the server) and an *exclude* filter.
+- **Live tail** (every 2, 3, 5 or 10 s) with new lines highlighted, newest-first and compact modes, and JSON logs shown as a message plus tags (click a row for the full line or pretty JSON; *± 30 s* zooms to the surrounding minute).
+- A **searchable picker** for containers, units, pods and files, so a server with a thousand log files is still easy to navigate.
+
 **Logs** in the sidebar (or the *Logs* tab on a server) shows a server's logs on demand, with filters. Three sources:
 
 | Source | Linux | macOS |
@@ -336,6 +343,10 @@ The **Data sources** card on the Performance page says, per server, what the age
 ### Response-time targets
 
 On the Performance page, **Set a target** on a service (or on a server that reports real traffic): for example *p95 faster than 800 ms over the last 10 minutes*. When the percentile is slower than the target the monitor goes to *Over a limit*, an incident is opened and an alert is sent (to the channels and with the reminder interval set in that monitor's Alerts section); when it is back under, a recovery message follows. A monitor is not judged on too little data: `PERF_MIN_CHECK_SAMPLES` (5 probes) and `PERF_MIN_REQUESTS` (50 requests); the default window is `PERF_DEFAULT_WINDOW_MINUTES` (10).
+
+## Kubernetes dashboard
+
+The cluster page refreshes itself (**Live: every 5 s / 10 s / 30 s / 1 min / Off**, remembered in your browser; the header shows how long ago the data arrived). The overview shows capacity rings (CPU, memory, pod slots, nodes), a health summary, top consumers (switch CPU / memory / restarts and pods / namespaces), a namespace tile map, nodes and warnings. Click a pod anywhere to open a side panel with its containers, limits, why it is unhealthy, events and a *View logs* shortcut. The server page also shows how long ago its agent reported and whether that is on schedule.
 
 ## Graphs
 

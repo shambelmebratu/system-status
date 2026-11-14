@@ -242,6 +242,7 @@ class LogQuery(BaseModel):
     target: str = Field(default="", max_length=300, pattern=r"^[A-Za-z0-9@_.:/\-]*$")  # container name, systemd unit, or file path
     lines: int = Field(default=200, ge=1, le=2000)
     since_minutes: int = Field(default=0, ge=0, le=60 * 24 * 30)                     # 0 = no time limit
+    since_seconds: int = Field(default=0, ge=0, le=60 * 60 * 24 * 31)                # finer than minutes ("last 15 seconds"); the larger of the two wins
     grep: str = Field(default="", max_length=200)                                     # plain substring, case-insensitive (not a regex)
     priority: str = Field(default="", pattern="^(|emerg|alert|crit|err|warning|notice|info|debug)$")
 

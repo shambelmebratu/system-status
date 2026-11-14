@@ -10,7 +10,7 @@ import { MonitorAlertSettings, alertSummary, alertsOf, type MonitorAlerts } from
 import { LogPolicyCard } from '../components/logpolicy';
 import { CodeBox, Empty, Field, Icon, Meter, Modal, StatusPill } from '../components/ui';
 import { api, del, post, put } from '../lib/api';
-import { useApp, useLimits, usePoll } from '../lib/app';
+import { useApp, useLimits, useNow, usePoll } from '../lib/app';
 import { bytesPerSecond, duration, isOlder, ms, pct, timeAgo } from '../lib/format';
 import type { Incident, Mode, Point, Range, Server, ServerHistory } from '../lib/types';
 import { IncidentList } from './Overview';
@@ -65,13 +65,17 @@ function ServerDetail({ server }: { server: Server }) {
   const [rotated, setRotated] = useState<string | null>(null);
   const [tab, setTab] = useState<'overview' | 'logs'>('overview');
   const canLogs = canOperate && server.monitor_mode === 'push' && !!server.last_metrics?.capabilities?.includes('logs');
-  const history = usePoll(() => api<ServerHistory>(`/servers/${server.id}/history?range=${range}`), [server.id, range], 20000);
+  const history = usePoll(() => api<ServerHistory>(`/servers/${server.id}/history?range=${range}`), [server.id, range], 10000);
   const incidents = usePoll(() => api<Incident[]>('/incidents?limit=200'), [server.id], 30000);
   const m = server.last_metrics;
   const h = history.value;
   const showDate = range === '7d' || range === '30d';
   const mine = (incidents.value || []).filter(i => i.target_type === 'server' && i.target_id === server.id).slice(0, 6);
   const never = server.monitor_mode === 'push' && !server.last_seen_at;
+  const now = useNow();
+  const ago = (iso: string | null) => { if (!iso) return 'never'; const sec = Math.max(0, Math.round((now - new Date(iso).getTime()) / 1000)); return sec < 120 ? `${sec}s ago` : timeAgo(iso); };
+  const seenAt = server.monitor_mode === 'push' ? server.last_seen_at : server.last_checked_at;
+  const fresh = !!seenAt && now - new Date(seenAt).getTime() < server.check_interval_seconds * 2500;
   const latestAgent = data?.agents?.latest;
   const outdated = server.monitor_mode === 'push' && isOlder(m?.agent_version, latestAgent);
 
@@ -116,7 +120,7 @@ function ServerDetail({ server }: { server: Server }) {
       <div className="grid g-side" style={tab === 'logs' && canLogs ? { display: 'none' } : undefined}>
         <div className="grid">
           <section className="card">
-            <div className="card-head"><h2>Current</h2><span className="grow" /><span className="sm muted">{server.monitor_mode === 'push' ? `last report ${timeAgo(server.last_seen_at)}` : `checked ${timeAgo(server.last_checked_at)}`}</span></div>
+            <div className="card-head"><h2>Current</h2><span className="grow" /><span className={`liveflag ${fresh ? 'on' : ''}`} title={fresh ? 'The agent is reporting on schedule' : 'No report for a while'}><i />{server.monitor_mode === 'push' ? `${fresh ? 'live · ' : ''}last report ${ago(server.last_seen_at)}` : `checked ${ago(server.last_checked_at)}`}<span className="muted"> · every {server.check_interval_seconds}s</span></span></div>
             {m?.cpu != null ? (
               <div className="rings">
                 <Ring label="CPU" value={m.cpu} threshold={server.cpu_threshold} />

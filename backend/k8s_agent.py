@@ -472,8 +472,9 @@ def run_query(task: dict) -> tuple[str, bool]:
         params = {"tailLines": str(max(1, min(2000, int(task.get("lines") or 200)))) if not task.get("grep") else "20000", "timestamps": "true"}
         if task.get("container"):
             params["container"] = task["container"]
-        if int(task.get("since_minutes") or 0) > 0:
-            params["sinceSeconds"] = str(int(task["since_minutes"]) * 60)
+        window = max(int(task.get("since_seconds") or 0), int(task.get("since_minutes") or 0) * 60)
+        if window > 0:
+            params["sinceSeconds"] = str(min(window, 31 * 86400))
         if task.get("previous"):
             params["previous"] = "true"
         text = kapi(api_path("v1", "pods", namespace, name) + "/log", params, raw=True, max_bytes=40_000_000, timeout=30)

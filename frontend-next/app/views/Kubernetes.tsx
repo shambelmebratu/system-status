@@ -1,11 +1,11 @@
 'use client';
 
-import { FormEvent, ReactNode, useCallback, useEffect, useRef, useState } from 'react';
-import { AreaChart } from '../components/charts';
+import { FormEvent, ReactNode, createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import { AreaChart, Sparkline } from '../components/charts';
 import { ClusterAgentUpdate } from '../components/agentupdate';
 import { MonitorAlertSettings, alertsOf, type MonitorAlerts } from '../components/alertpick';
 import { useActiveEnrollment, useControlPlaneUrl } from '../components/join';
-import { Highlight, LEVEL_LABEL, parse } from '../components/logs';
+import { LogViewer, TargetPicker, type LogFetch } from '../components/logviewer';
 import { CodeBox, Empty, Field, Icon, Meter, Modal, StatusPill } from '../components/ui';
 import { api, del, post, put } from '../lib/api';
 import { useApp, useLimits, usePoll } from '../lib/app';
@@ -27,24 +27,29 @@ async function ask<T>(clusterId: number, query: Record<string, unknown>, cancell
   throw new Error('Timed out waiting for the cluster agent');
 }
 
-/** Fetches a list from the cluster when mounted (and when `deps` change). Nothing is stored on the control plane. */
+/** The page-wide "live" clock: every tick re-asks the cluster. `touch` records when fresh data last arrived. */
+type Live = { tick: number; ms: number; touch: () => void };
+const LiveCtx = createContext<Live>({ tick: 0, ms: 0, touch: () => undefined });
+/** What the page's pieces can ask the cluster detail to do: open a pod's side panel, show a namespace's pods. */
+type Nav = { openPod: (ns: string, name: string) => void; goPods: (ns: string) => void };
+const NavCtx = createContext<Nav>({ openPod: () => undefined, goPods: () => undefined });
+
+/** Fetches a list from the cluster when mounted (and when `deps` change). With refreshMs > 0 it follows the page's live clock and
+ *  refreshes in the background (the old rows stay on screen until the new ones arrive). Nothing is stored on the control plane. */
 function useCluster<T>(clusterId: number, query: Record<string, unknown> | null, deps: unknown[], refreshMs = 0) {
+  const live = useContext(LiveCtx);
   const [state, setState] = useState<{ data: Answer<T> | null; error: string; busy: boolean }>({ data: null, error: '', busy: false });
   const [tick, setTick] = useState(0);
+  const followLive = refreshMs > 0 ? live.tick : 0;
   useEffect(() => {
     if (!query) return;
     let stop = false;
     setState(s => ({ ...s, busy: true }));
-    ask<T>(clusterId, query, () => stop).then(data => !stop && setState({ data, error: '', busy: false }))
+    ask<T>(clusterId, query, () => stop).then(data => { if (!stop) { setState({ data, error: '', busy: false }); live.touch(); } })
       .catch(e => !stop && (e as Error).message !== 'cancelled' && setState(s => ({ ...s, error: (e as Error).message, busy: false })));
     return () => { stop = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [clusterId, tick, ...deps]);
-  useEffect(() => {
-    if (!refreshMs) return;
-    const t = window.setInterval(() => { if (!document.hidden) setTick(n => n + 1); }, refreshMs);
-    return () => window.clearInterval(t);
-  }, [refreshMs]);
+  }, [clusterId, tick, followLive, ...deps]);
   return { ...state, reload: () => setTick(n => n + 1) };
 }
 
@@ -142,11 +147,40 @@ function AddCluster({ onClose }: { onClose: () => void }) {
 
 /* ---------------------------------------------------------------- cluster detail */
 type TabId = 'overview' | 'workloads' | 'pods' | 'nodes' | 'scaling' | 'network' | 'events' | 'logs' | 'settings';
+const TAB_ICON: Record<TabId, string> = { overview: 'overview', workloads: 'server', pods: 'k8s', nodes: 'server', scaling: 'zap', network: 'globe', events: 'alert', logs: 'logs', settings: 'settings' };
+const LIVE_CHOICES: [number, string][] = [[5000, '5 s'], [10000, '10 s'], [30000, '30 s'], [60000, '1 min'], [0, 'Off']];
+
+function LivePill({ ms, setMs, updatedAt, now, onRefresh }: { ms: number; setMs: (v: number) => void; updatedAt: number | null; now: number; onRefresh: () => void }) {
+  const ago = updatedAt ? Math.max(0, Math.round((now - updatedAt) / 1000)) : null;
+  return (
+    <div className={`livepill ${ms ? 'on' : ''}`}>
+      <span className="livepill-dot" /><b>{ms ? 'Live' : 'Paused'}</b>
+      <select value={ms} onChange={e => setMs(Number(e.target.value))} aria-label="Refresh every">{LIVE_CHOICES.map(([v, l]) => <option key={v} value={v}>{v ? `every ${l}` : 'Off'}</option>)}</select>
+      <span className="livepill-ago">{ago == null ? 'loading…' : ago < 2 ? 'just updated' : `updated ${ago}s ago`}</span>
+      <button className="btn ghost sm" onClick={onRefresh} aria-label="Refresh now" title="Refresh now"><Icon name="refresh" size={14} /></button>
+    </div>
+  );
+}
 
 function ClusterDetail({ cluster, reload }: { cluster: Cluster; reload: () => Promise<void> }) {
   const lim = useLimits();
   const { go, toast, canOperate, isAdmin, confirm } = useApp();
   const [tab, setTab] = useState<TabId>('overview');
+  const [liveMs, setLiveMs] = useState(10000);
+  const [tick, setTick] = useState(0);
+  const [updatedAt, setUpdatedAt] = useState<number | null>(null);
+  const [now, setNow] = useState(() => Date.now());
+  const [podsNs, setPodsNs] = useState('');
+  const [drawer, setDrawer] = useState<{ ns: string; name: string } | null>(null);
+  const [logPreset, setLogPreset] = useState<{ ns: string; pod: string } | null>(null);
+  useEffect(() => { try { const v = Number(localStorage.getItem('smw_k8s_live')); if ([0, 5000, 10000, 30000, 60000].includes(v) && localStorage.getItem('smw_k8s_live') !== null) setLiveMs(v); } catch { /* storage unavailable */ } }, []);
+  const chooseLive = (v: number) => { setLiveMs(v); try { localStorage.setItem('smw_k8s_live', String(v)); } catch { /* ignore */ } };
+  useEffect(() => { if (!liveMs) return; const t = setInterval(() => { if (!document.hidden) setTick(n => n + 1); }, liveMs); return () => clearInterval(t); }, [liveMs]);
+  useEffect(() => { const t = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(t); }, []);
+  const touch = useCallback(() => setUpdatedAt(Date.now()), []);
+  const liveValue = useMemo(() => ({ tick, ms: liveMs, touch }), [tick, liveMs, touch]);
+  const nav = useMemo<Nav>(() => ({ openPod: (ns, name) => setDrawer({ ns, name }), goPods: ns => { setPodsNs(ns); setTab('pods'); } }), []);
+
   const tabs: [TabId, string][] = [['overview', 'Overview'], ['workloads', 'Workloads'], ['pods', 'Pods'], ['nodes', 'Nodes'], ['scaling', 'Autoscaling'], ['network', 'Network & storage'], ['events', 'Events']];
   if (canOperate) tabs.push(['logs', 'Logs'], ['settings', 'Settings']);
   const offline = !cluster.last_seen_at || Date.now() - new Date(cluster.last_seen_at).getTime() > lim.offlineMs;
@@ -156,31 +190,35 @@ function ClusterDetail({ cluster, reload }: { cluster: Cluster; reload: () => Pr
     try { await del(`/clusters/${cluster.id}`); toast('Cluster removed'); go('kubernetes'); } catch (e) { toast((e as Error).message, true); }
   }
   return (
-    <>
-      <div className="topbar">
-        <button className="btn ghost sm" onClick={() => go('kubernetes')}><Icon name="back" size={15} />Clusters</button>
-        <h1>{cluster.name}</h1><StatusPill status={cluster.status} /><span className="tag">{cluster.k8s_version || 'unknown version'}</span>
-        <span className="grow" />
-        <span className="sm muted">agent {cluster.agent_version ? `v${cluster.agent_version}` : '–'} · seen {timeAgo(cluster.last_seen_at)}</span>
-        {canOperate && <button className="btn sm danger" onClick={remove}>Remove</button>}
-      </div>
-      <div className="tabs" role="tablist">{tabs.map(([id, label]) => <button key={id} role="tab" aria-selected={tab === id} className={tab === id ? 'on' : ''} onClick={() => setTab(id)}>{label}</button>)}</div>
-      {cluster.agent_outdated && cluster.latest_agent_version && <div style={{ marginBottom: 16 }}><ClusterAgentUpdate current={cluster.agent_version} latest={cluster.latest_agent_version} /></div>}
-      {cluster.status !== 'up' && cluster.last_error && <div className="err" style={{ marginBottom: 16 }}>{cluster.last_error}</div>}
-      {offline && tab !== 'overview' && tab !== 'settings' ? <div className="card"><Empty title="The cluster agent is offline">It has not reported for over 2 minutes, so live data cannot be fetched. Check the <code>smwatch-agent</code> pod in the <code>smwatch</code> namespace.</Empty></div> : (
-        <>
-          {tab === 'overview' && <Overview cluster={cluster} />}
-          {tab === 'workloads' && <Workloads cluster={cluster} />}
-          {tab === 'pods' && <Pods cluster={cluster} />}
-          {tab === 'nodes' && <Nodes cluster={cluster} />}
-          {tab === 'scaling' && <Scaling cluster={cluster} />}
-          {tab === 'network' && <Network cluster={cluster} />}
-          {tab === 'events' && <Events cluster={cluster} />}
-          {tab === 'logs' && canOperate && <PodLogs cluster={cluster} />}
-          {tab === 'settings' && canOperate && <ClusterSettings cluster={cluster} isAdmin={isAdmin} reload={reload} />}
-        </>
-      )}
-    </>
+    <LiveCtx.Provider value={liveValue}>
+      <NavCtx.Provider value={nav}>
+        <header className="khead">
+          <button className="btn ghost sm" onClick={() => go('kubernetes')}><Icon name="back" size={15} />Clusters</button>
+          <span className="khead-ico"><Icon name="k8s" size={20} /></span>
+          <div className="khead-title"><h1>{cluster.name}</h1><div className="khead-sub"><StatusPill status={cluster.status} /><span className="tag">{cluster.k8s_version || 'unknown version'}</span><span className="muted sm">agent {cluster.agent_version ? `v${cluster.agent_version}` : '–'} · seen {timeAgo(cluster.last_seen_at)}</span></div></div>
+          <span className="grow" />
+          {!offline && <LivePill ms={liveMs} setMs={chooseLive} updatedAt={updatedAt} now={now} onRefresh={() => setTick(n => n + 1)} />}
+          {canOperate && <button className="btn sm danger" onClick={remove}>Remove</button>}
+        </header>
+        <div className="ktabs" role="tablist">{tabs.map(([id, label]) => <button key={id} role="tab" aria-selected={tab === id} className={tab === id ? 'on' : ''} onClick={() => setTab(id)}><Icon name={TAB_ICON[id]} size={15} />{label}</button>)}</div>
+        {cluster.agent_outdated && cluster.latest_agent_version && <div style={{ marginBottom: 16 }}><ClusterAgentUpdate current={cluster.agent_version} latest={cluster.latest_agent_version} /></div>}
+        {cluster.status !== 'up' && cluster.last_error && <div className="err" style={{ marginBottom: 16 }}>{cluster.last_error}</div>}
+        {offline && tab !== 'overview' && tab !== 'settings' ? <div className="card"><Empty title="The cluster agent is offline">It has not reported for over {Math.round(lim.offlineMs / 60000) || 1} minute(s), so live data cannot be fetched. Check the <code>smwatch-agent</code> pod in the <code>smwatch</code> namespace.</Empty></div> : (
+          <>
+            {tab === 'overview' && <Overview cluster={cluster} />}
+            {tab === 'workloads' && <Workloads cluster={cluster} />}
+            {tab === 'pods' && <Pods cluster={cluster} initialNs={podsNs} />}
+            {tab === 'nodes' && <Nodes cluster={cluster} />}
+            {tab === 'scaling' && <Scaling cluster={cluster} />}
+            {tab === 'network' && <Network cluster={cluster} />}
+            {tab === 'events' && <Events cluster={cluster} />}
+            {tab === 'logs' && canOperate && <PodLogs cluster={cluster} preset={logPreset} />}
+            {tab === 'settings' && canOperate && <ClusterSettings cluster={cluster} isAdmin={isAdmin} reload={reload} />}
+          </>
+        )}
+        {drawer && <PodDrawer cluster={cluster} ns={drawer.ns} name={drawer.name} canLogs={canOperate && cluster.log_policy.enabled} onClose={() => setDrawer(null)} onLogs={() => { setLogPreset({ ns: drawer.ns, pod: drawer.name }); setDrawer(null); setTab('logs'); }} />}
+      </NavCtx.Provider>
+    </LiveCtx.Provider>
   );
 }
 
@@ -225,17 +263,85 @@ function StackBar({ parts }: { parts: { label: string; value: number; color: str
   );
 }
 
-function TopList({ title, rows, format, color, hint }: { title: string; rows: { name: string; sub: string; value: number }[]; format: (v: number) => string; color: string; hint?: string }) {
+/** A ring gauge: the share of something used, coloured by how worried to be. */
+function Donut({ value, label, big, sub, tone }: { value: number | null; label: string; big: string; sub: string; tone: 'good' | 'warn' | 'bad' | 'info' }) {
+  const R = 40, C = 2 * Math.PI * R, v = Math.max(0, Math.min(100, value ?? 0));
+  return (
+    <div className="donut">
+      <svg viewBox="0 0 100 100" width="112" height="112" role="img" aria-label={`${label} ${big}`}>
+        <circle cx="50" cy="50" r={R} fill="none" stroke="var(--surface-2)" strokeWidth="10" />
+        {value != null && <circle cx="50" cy="50" r={R} fill="none" stroke={`var(--${tone === 'info' ? 'accent' : tone})`} strokeWidth="10" strokeLinecap="round" strokeDasharray={`${(v / 100) * C} ${C}`} transform="rotate(-90 50 50)" style={{ transition: 'stroke-dasharray .6s ease' }} />}
+        <text x="50" y="52" textAnchor="middle" className="donut-big">{big}</text>
+      </svg>
+      <div className="donut-label">{label}</div><div className="donut-sub">{sub}</div>
+    </div>
+  );
+}
+
+type Rank = { name: string; sub: string; value: number; share?: number; click: () => void };
+/** Top consumers: one card with switches instead of four lists. */
+function Leaderboard({ pods, usage }: { pods: Pod[]; usage: PodUsage[] }) {
+  const nav = useContext(NavCtx);
+  const [metric, setMetric] = useState<'cpu' | 'mem' | 'restarts'>('cpu');
+  const [group, setGroup] = useState<'pods' | 'namespaces'>('pods');
+  const fmt = metric === 'cpu' ? cores : metric === 'mem' ? mib : (v: number) => `${v}×`;
+  const color = metric === 'cpu' ? 'var(--c1)' : metric === 'mem' ? 'var(--c2)' : 'var(--warn)';
+  const rows = useMemo<Rank[]>(() => {
+    const use = new Map(usage.map(u => [`${u.ns}/${u.name}`, u]));
+    const pick = (p: Pod) => { const u = use.get(`${p.ns}/${p.name}`); return metric === 'cpu' ? u?.cpu_m ?? 0 : metric === 'mem' ? u?.mem_mib ?? 0 : p.restarts; };
+    if (group === 'pods') {
+      const all = pods.map(p => ({ p, v: pick(p) })).filter(x => x.v > 0).sort((x, y) => y.v - x.v);
+      const total = all.reduce((n, x) => n + x.v, 0) || 1;
+      return all.slice(0, 8).map(x => ({ name: x.p.name, sub: x.p.ns, value: x.v, share: (x.v / total) * 100, click: () => nav.openPod(x.p.ns, x.p.name) }));
+    }
+    const by = new Map<string, number>(); const count = new Map<string, number>();
+    for (const p of pods) { by.set(p.ns, (by.get(p.ns) ?? 0) + pick(p)); count.set(p.ns, (count.get(p.ns) ?? 0) + 1); }
+    const all = [...by.entries()].filter(([, v]) => v > 0).sort((x, y) => y[1] - x[1]);
+    const total = all.reduce((n, x) => n + x[1], 0) || 1;
+    return all.slice(0, 8).map(([ns, v]) => ({ name: ns, sub: `${count.get(ns)} pods`, value: v, share: (v / total) * 100, click: () => nav.goPods(ns) }));
+  }, [pods, usage, metric, group, nav]);
   const max = Math.max(1, ...rows.map(r => r.value));
   return (
     <section className="card">
-      <div className="card-head"><h2>{title}</h2>{hint && <><span className="grow" /><span className="sm muted">{hint}</span></>}</div>
-      {rows.length === 0 ? <p className="muted sm">No data.</p> : <div className="toplist">{rows.map(r => (
-        <div key={r.sub + r.name} className="toprow">
-          <div className="toprow-name" title={`${r.sub}/${r.name}`}><b>{r.name}</b><small>{r.sub}</small></div>
-          <div className="toprow-bar"><i style={{ width: `${(r.value / max) * 100}%`, background: color }} /></div>
-          <span className="toprow-val">{format(r.value)}</span>
-        </div>))}</div>}
+      <div className="card-head"><h2>Top consumers</h2><span className="grow" />
+        <div className="seg">{([['cpu', 'CPU'], ['mem', 'Memory'], ['restarts', 'Restarts']] as const).map(([id, l]) => <button key={id} className={metric === id ? 'on' : ''} onClick={() => setMetric(id)}>{l}</button>)}</div>
+        <div className="seg">{([['pods', 'Pods'], ['namespaces', 'Namespaces']] as const).map(([id, l]) => <button key={id} className={group === id ? 'on' : ''} onClick={() => setGroup(id)}>{l}</button>)}</div>
+      </div>
+      {rows.length === 0 ? <p className="muted sm">{metric === 'restarts' ? 'No restarts. Nice.' : 'No usage data yet (needs metrics-server).'}</p> : (
+        <ol className="rank">{rows.map((r, i) => (
+          <li key={r.sub + r.name}>
+            <button className="rank-row" onClick={r.click} title={`${r.sub}/${r.name}`}>
+              <span className="rank-n">{i + 1}</span>
+              <span className="rank-name"><b>{r.name}</b><small>{r.sub}</small></span>
+              <span className="rank-bar"><i style={{ width: `${(r.value / max) * 100}%`, background: color }} /></span>
+              <span className="rank-val">{fmt(r.value)}{r.share != null && metric !== 'restarts' && <small>{r.share.toFixed(0)}%</small>}</span>
+            </button>
+          </li>))}</ol>)}
+    </section>
+  );
+}
+
+/** Namespaces as tiles: bigger = more pods, warmer = more memory. */
+function NamespaceHeat({ pods, usage }: { pods: Pod[]; usage: PodUsage[] }) {
+  const nav = useContext(NavCtx);
+  const tiles = useMemo(() => {
+    const use = new Map(usage.map(u => [`${u.ns}/${u.name}`, u.mem_mib]));
+    const by = new Map<string, { pods: number; bad: number; mem: number }>();
+    for (const p of pods) { const t = by.get(p.ns) ?? { pods: 0, bad: 0, mem: 0 }; t.pods++; t.mem += use.get(`${p.ns}/${p.name}`) ?? 0; if (badPod(p.status)) t.bad++; by.set(p.ns, t); }
+    const all = [...by.entries()].sort((a, b) => b[1].pods - a[1].pods).slice(0, 30);
+    return { all, memMax: Math.max(1, ...all.map(([, t]) => t.mem)), podMax: Math.max(1, ...all.map(([, t]) => t.pods)) };
+  }, [pods, usage]);
+  if (tiles.all.length === 0) return null;
+  return (
+    <section className="card">
+      <div className="card-head"><h2>Namespaces</h2><span className="grow" /><span className="sm muted">size = pods · colour = memory</span></div>
+      <div className="heat">{tiles.all.map(([ns, t]) => {
+        const warm = tiles.memMax > 1 ? t.mem / tiles.memMax : t.pods / tiles.podMax;
+        return (
+          <button key={ns} className={`heat-tile ${t.bad ? 'bad' : ''}`} style={{ flexGrow: Math.max(1, t.pods), flexBasis: `${70 + (t.pods / tiles.podMax) * 90}px`, background: `color-mix(in srgb, var(--c2) ${Math.round(8 + warm * 52)}%, var(--surface-2))` }} onClick={() => nav.goPods(ns)} title={`${ns}: ${t.pods} pods${t.mem ? `, ${mib(t.mem)}` : ''}${t.bad ? `, ${t.bad} unhealthy` : ''}`}>
+            <b>{ns}</b><small>{t.pods} pod{t.pods === 1 ? '' : 's'}{t.mem ? ` · ${mib(t.mem)}` : ''}</small>{t.bad > 0 && <i className="heat-bad">{t.bad}</i>}
+          </button>);
+      })}</div>
     </section>
   );
 }
@@ -245,30 +351,39 @@ function Overview({ cluster }: { cluster: Cluster }) {
   const s = cluster.summary;
   const hist = usePoll(() => api<{ points: Point[]; samples: number }>(`/clusters/${cluster.id}/history?range=24h`), [cluster.id], 30000);
   const online = !!cluster.last_seen_at && Date.now() - new Date(cluster.last_seen_at).getTime() < lim.offlineMs;
-  const pods = useCluster<Items<Pod>>(online && s ? cluster.id : 0, online && s ? { kind: 'pods', limit: 500 } : null, [], 30000);
-  const podUse = useCluster<Items<PodUsage> & { available: boolean }>(online && s ? cluster.id : 0, online && s ? { kind: 'pod_metrics' } : null, [], 30000);
-  const nodes = useCluster<Items<NodeRow>>(online && s ? cluster.id : 0, online && s ? { kind: 'nodes' } : null, [], 30000);
-  const nodeUse = useCluster<Items<{ name: string; cpu_m: number; mem_mib: number }> & { available: boolean }>(online && s ? cluster.id : 0, online && s ? { kind: 'node_metrics' } : null, [], 30000);
-  const events = useCluster<Items<Ev>>(online && s ? cluster.id : 0, online && s ? { kind: 'events', warnings_only: true, limit: 8 } : null, [], 30000);
+  const go = online && !!s;
+  const pods = useCluster<Items<Pod>>(go ? cluster.id : 0, go ? { kind: 'pods', limit: 500 } : null, [], 1);
+  const podUse = useCluster<Items<PodUsage> & { available: boolean }>(go ? cluster.id : 0, go ? { kind: 'pod_metrics' } : null, [], 1);
+  const nodes = useCluster<Items<NodeRow>>(go ? cluster.id : 0, go ? { kind: 'nodes' } : null, [], 1);
+  const nodeUse = useCluster<Items<{ name: string; cpu_m: number; mem_mib: number }> & { available: boolean }>(go ? cluster.id : 0, go ? { kind: 'node_metrics' } : null, [], 1);
+  const events = useCluster<Items<Ev>>(go ? cluster.id : 0, go ? { kind: 'events', warnings_only: true, limit: 8 } : null, [], 1);
   if (!s) return <div className="card"><Empty title="Waiting for the agent">No report has been received yet. Run the install command on a machine with kubectl access.</Empty></div>;
 
-  const cpuPct = s.cpu_m != null && s.cpu_alloc_m ? (s.cpu_m / s.cpu_alloc_m) * 100 : null;
-  const memPct = s.mem_mib != null && s.mem_alloc_mib ? (s.mem_mib / s.mem_alloc_mib) * 100 : null;
-  const failing = s.pods_crashloop + s.pods_failed;
+  const podList = pods.data?.data?.items ?? [];
+  const nodeList = nodes.data?.data?.items ?? [];
+  const usage = podUse.data?.data?.items ?? [];
+  // Live numbers from the questions above when they have arrived; the agent's last report fills in until then.
+  const livePods = pods.data != null;
+  const phase = (p: Pod) => p.phase || (p.status === 'Running' ? 'Running' : '');
+  const L = {
+    nodesTotal: nodes.data ? nodeList.length : s.nodes_total, nodesReady: nodes.data ? nodeList.filter(n => n.ready).length : s.nodes_ready,
+    podsTotal: livePods ? podList.length : s.pods_total, running: livePods ? podList.filter(p => phase(p) === 'Running').length : s.pods_running,
+    pending: livePods ? podList.filter(p => phase(p) === 'Pending').length : s.pods_pending, failed: livePods ? podList.filter(p => phase(p) === 'Failed').length : s.pods_failed,
+    done: livePods ? podList.filter(p => phase(p) === 'Succeeded').length : s.pods_succeeded, crash: livePods ? podList.filter(p => /CrashLoop/i.test(p.status)).length : s.pods_crashloop,
+    restarts: livePods ? podList.reduce((n, p) => n + p.restarts, 0) : s.restarts,
+    cpu: nodeUse.data?.data?.available ? (nodeUse.data.data.items ?? []).reduce((n, x) => n + x.cpu_m, 0) : s.cpu_m, mem: nodeUse.data?.data?.available ? (nodeUse.data.data.items ?? []).reduce((n, x) => n + x.mem_mib, 0) : s.mem_mib,
+    cpuAlloc: nodes.data ? nodeList.reduce((n, x) => n + x.cpu_alloc_m, 0) : s.cpu_alloc_m, memAlloc: nodes.data ? nodeList.reduce((n, x) => n + x.mem_alloc_mib, 0) : s.mem_alloc_mib,
+    podCap: nodes.data ? nodeList.reduce((n, x) => n + x.pods_cap, 0) : null,
+  };
+  const cpuPct = L.cpu != null && L.cpuAlloc ? (L.cpu / L.cpuAlloc) * 100 : null;
+  const memPct = L.mem != null && L.memAlloc ? (L.mem / L.memAlloc) * 100 : null;
+  const podPct = L.podCap ? (L.podsTotal / L.podCap) * 100 : null;
+  const failing = L.crash + L.failed;
   const workloads = s.deployments_total + s.statefulsets_total + s.daemonsets_total;
   const unavailable = s.deployments_unavailable + s.statefulsets_unavailable + s.daemonsets_unavailable;
   const issues = s.problems.length;
   const points = hist.value?.points ?? [];
-
-  const podList = pods.data?.data?.items ?? [];
-  const usage = new Map((podUse.data?.data?.items ?? []).map(x => [`${x.ns}/${x.name}`, x]));
-  const topCpu = [...(podUse.data?.data?.items ?? [])].sort((a, b) => b.cpu_m - a.cpu_m).slice(0, 7).map(x => ({ name: x.name, sub: x.ns, value: x.cpu_m }));
-  const topMem = [...(podUse.data?.data?.items ?? [])].sort((a, b) => b.mem_mib - a.mem_mib).slice(0, 7).map(x => ({ name: x.name, sub: x.ns, value: x.mem_mib }));
-  const topRestarts = [...podList].filter(p => p.restarts > 0).sort((a, b) => b.restarts - a.restarts).slice(0, 7).map(p => ({ name: p.name, sub: p.ns, value: p.restarts }));
-  const byNs = new Map<string, { pods: number; mem: number; cpu: number }>();
-  for (const p of podList) { const r = byNs.get(p.ns) ?? { pods: 0, mem: 0, cpu: 0 }; const u = usage.get(`${p.ns}/${p.name}`); r.pods++; r.mem += u?.mem_mib ?? 0; r.cpu += u?.cpu_m ?? 0; byNs.set(p.ns, r); }
-  const topNs = [...byNs.entries()].sort((a, b) => (b[1].mem || b[1].pods) - (a[1].mem || a[1].pods)).slice(0, 7).map(([name, r]) => ({ name, sub: `${r.pods} pods`, value: r.mem || r.pods }));
-  const nsUsesMem = [...byNs.values()].some(r => r.mem > 0);
+  const spark = (key: string) => points.map(p => Number(p[key] ?? 0)).filter(v => !isNaN(v));
   const noReq = podList.filter(p => p.status === 'Running' && !p.cpu_req_m && !p.mem_req_mib && !p.ns.startsWith('kube-')).length;
   const noLimit = podList.filter(p => p.status === 'Running' && !p.mem_lim_mib && !p.ns.startsWith('kube-')).length;
 
@@ -278,57 +393,63 @@ function Overview({ cluster }: { cluster: Cluster }) {
         <span className="khero-ico"><Icon name={cluster.status === 'up' ? 'check' : 'alert'} size={22} /></span>
         <div style={{ minWidth: 0 }}>
           <div className="khero-title">{cluster.status === 'up' ? 'All systems healthy' : issues ? `${issues} issue${issues === 1 ? '' : 's'} need attention` : cluster.status === 'down' ? 'Agent is not reporting' : 'Degraded'}</div>
-          <div className="khero-sub">{s.nodes_ready}/{s.nodes_total} nodes ready · {s.pods_running}/{s.pods_total} pods running · {workloads} workloads · {s.namespaces} namespaces · Kubernetes {cluster.k8s_version}</div>
+          <div className="khero-sub">{L.nodesReady}/{L.nodesTotal} nodes ready · {L.running}/{L.podsTotal} pods running · {workloads} workloads · {s.namespaces} namespaces · Kubernetes {cluster.k8s_version}</div>
         </div>
       </section>
-      {s.problems.length > 0 && <section className="card" style={{ borderColor: 'color-mix(in srgb, var(--warn) 45%, var(--line))' }}><div className="card-head"><h2>Needs attention</h2></div><ul className="problems">{s.problems.map((p, i) => <li key={i}>{p}</li>)}</ul></section>}
+      {s.problems.length > 0 && <section className="card" style={{ borderColor: 'color-mix(in srgb, var(--warn) 45%, var(--line))' }}><div className="card-head"><h2>Needs attention</h2></div><ul className="problems">{s.problems.map((p, i) => <li key={i} className="sm">{p}</li>)}</ul></section>}
+
+      <div className="grid g-side">
+        <section className="card">
+          <div className="card-head"><h2>Capacity</h2><span className="grow" />{!nodeUse.data?.data?.available && nodeUse.data && <span className="sm muted">metrics-server not available: usage unknown</span>}</div>
+          <div className="donuts">
+            <Donut value={cpuPct} label="CPU" big={cpuPct != null ? pct(cpuPct, 0) : '–'} sub={L.cpu != null ? `${cores(L.cpu)} of ${cores(L.cpuAlloc ?? 0)}` : 'allocatable ' + cores(L.cpuAlloc ?? 0)} tone={cpuPct != null ? level(cpuPct, lim.warn, lim.bad) : 'info'} />
+            <Donut value={memPct} label="Memory" big={memPct != null ? pct(memPct, 0) : '–'} sub={L.mem != null ? `${mib(L.mem)} of ${mib(L.memAlloc ?? 0)}` : 'allocatable ' + mib(L.memAlloc ?? 0)} tone={memPct != null ? level(memPct, lim.warn, lim.bad) : 'info'} />
+            <Donut value={podPct} label="Pods" big={`${L.podsTotal}`} sub={L.podCap ? `of ${L.podCap} slots` : `${L.running} running`} tone={podPct != null ? level(podPct, 80, 95) : 'info'} />
+            <Donut value={L.nodesTotal ? (L.nodesReady / L.nodesTotal) * 100 : null} label="Nodes ready" big={`${L.nodesReady}/${L.nodesTotal}`} sub={s.not_ready_nodes.length ? s.not_ready_nodes.join(', ') : 'all ready'} tone={L.nodesReady < L.nodesTotal ? 'bad' : 'good'} />
+          </div>
+        </section>
+        <section className="card">
+          <div className="card-head"><h2>Health</h2></div>
+          <StackBar parts={[{ label: 'Running', value: L.running, color: 'var(--good)' }, { label: 'Pending', value: L.pending, color: 'var(--warn)' }, { label: 'Failed', value: L.failed, color: 'var(--bad)' }, { label: 'Completed', value: L.done, color: 'var(--info)' }]} />
+          <div className="hrow"><span>Crash-looping pods</span><span className="grow" /><b className={failing ? 'bad' : 'good'}>{L.crash}</b></div>
+          <div className="hrow"><span>Container restarts</span><span className="grow" /><b>{L.restarts.toLocaleString()}</b></div>
+          <div className="hrow"><span>Workloads available</span><span className="grow" /><b className={unavailable ? 'bad' : 'good'}>{workloads - unavailable}/{workloads}</b></div>
+          <div className="hrow"><span>Autoscalers (HPA)</span><span className="grow" /><b>{s.hpa_total}</b></div>
+          {livePods && <div className="chips" style={{ marginTop: 10 }}>
+            <span className={`chip ${noReq ? 'warn' : ''}`} title="Running pods with neither CPU nor memory requests">{noReq} without requests</span>
+            <span className={`chip ${noLimit ? 'warn' : ''}`} title="Running pods without a memory limit">{noLimit} without memory limit</span></div>}
+        </section>
+      </div>
 
       <div className="kpis">
-        <Kpi icon="server" label="Nodes" value={<>{s.nodes_ready}<small>/{s.nodes_total}</small></>} tone={s.nodes_ready < s.nodes_total ? 'bad' : 'good'} sub={s.not_ready_nodes.length ? `not ready: ${s.not_ready_nodes.join(', ')}` : 'all ready'} />
-        <Kpi icon="k8s" label="Pods" value={<>{s.pods_running}<small>/{s.pods_total}</small></>} tone={failing ? 'bad' : s.pods_pending ? 'warn' : 'good'} sub={`${s.pods_pending} pending · ${failing} failing · ${s.pods_succeeded} done`} />
-        <Kpi icon="overview" label="CPU" value={cpuPct != null ? pct(cpuPct, 0) : '–'} tone={cpuPct != null ? level(cpuPct, lim.warn, lim.bad) : undefined} sub={s.cpu_m != null ? `${cores(s.cpu_m)} of ${cores(s.cpu_alloc_m ?? 0)}` : 'metrics-server not installed'}>{cpuPct != null && <Meter value={cpuPct} warnAt={lim.warn} badAt={lim.bad} />}</Kpi>
-        <Kpi icon="logs" label="Memory" value={memPct != null ? pct(memPct, 0) : '–'} tone={memPct != null ? level(memPct, lim.warn, lim.bad) : undefined} sub={s.mem_mib != null ? `${mib(s.mem_mib)} of ${mib(s.mem_alloc_mib ?? 0)}` : 'metrics-server not installed'}>{memPct != null && <Meter value={memPct} warnAt={lim.warn} badAt={lim.bad} />}</Kpi>
-        <Kpi icon="alert" label="Restarts" value={s.restarts.toLocaleString()} tone={s.pods_crashloop ? 'bad' : undefined} sub={`${s.pods_crashloop} crash-looping now`} />
-        <Kpi icon="globe" label="Workloads" value={workloads} tone={unavailable ? 'bad' : 'good'} sub={`${s.deployments_total} deploy · ${s.statefulsets_total} sts · ${s.daemonsets_total} ds · ${s.hpa_total} HPA`} />
+        <Kpi icon="k8s" label="Pods running" value={<>{L.running}<small>/{L.podsTotal}</small></>} tone={failing ? 'bad' : L.pending ? 'warn' : 'good'} sub={`${L.pending} pending · ${failing} failing · ${L.done} done`}><Sparkline values={spark('pods_running')} color="var(--good)" height={30} /></Kpi>
+        <Kpi icon="overview" label="CPU used" value={L.cpu != null ? cores(L.cpu) : '–'} tone={cpuPct != null ? level(cpuPct, lim.warn, lim.bad) : undefined} sub={L.cpuAlloc ? `of ${cores(L.cpuAlloc)}` : undefined}><Sparkline values={spark('cpu_m')} color="var(--c1)" height={30} /></Kpi>
+        <Kpi icon="logs" label="Memory used" value={L.mem != null ? mib(L.mem) : '–'} tone={memPct != null ? level(memPct, lim.warn, lim.bad) : undefined} sub={L.memAlloc ? `of ${mib(L.memAlloc)}` : undefined}><Sparkline values={spark('mem_mib')} color="var(--c2)" height={30} /></Kpi>
+        <Kpi icon="alert" label="Recent warnings" value={events.data ? (events.data.data?.items ?? []).length : '–'} tone={(events.data?.data?.items ?? []).length ? 'warn' : 'good'} sub="newest warning events" />
       </div>
 
-      <div className="grid g2">
-        <section className="card"><div className="card-head"><h2>Pod status</h2></div>
-          <StackBar parts={[{ label: 'Running', value: s.pods_running, color: 'var(--good)' }, { label: 'Pending', value: s.pods_pending, color: 'var(--warn)' }, { label: 'Failed', value: s.pods_failed, color: 'var(--bad)' }, { label: 'Completed', value: s.pods_succeeded, color: 'var(--info)' }]} />
-          {pods.data && <div className="chips" style={{ marginTop: 14 }}>
-            <span className={`chip ${noReq ? 'warn' : ''}`} title="Running pods with neither CPU nor memory requests">{noReq} without requests</span>
-            <span className={`chip ${noLimit ? 'warn' : ''}`} title="Running pods without a memory limit">{noLimit} without memory limit</span>
-            {s.pods_truncated && <span className="chip warn">large cluster: partial list</span>}
-          </div>}
-        </section>
-        <section className="card"><div className="card-head"><h2>Workload health</h2></div>
-          {[['Deployments', s.deployments_total, s.deployments_unavailable], ['StatefulSets', s.statefulsets_total, s.statefulsets_unavailable], ['DaemonSets', s.daemonsets_total, s.daemonsets_unavailable]].map(([name, total, bad]) => (
-            <div key={name as string} className="hrow"><span>{name}</span><span className="grow" /><b className={(bad as number) ? 'bad' : 'good'}>{(total as number) - (bad as number)}/{total as number}</b><span className="sm muted">available</span></div>))}
-          <div className="hrow"><span>Autoscalers (HPA)</span><span className="grow" /><b>{s.hpa_total}</b></div>
-        </section>
-      </div>
+      <Leaderboard pods={podList} usage={usage} />
+      <NamespaceHeat pods={podList} usage={usage} />
 
       <div className="grid g2">
-        <section className="card"><div className="card-head"><h2>CPU, last 24 h</h2><span className="grow" />{s.cpu_m != null && <span className="sm muted">now {cores(s.cpu_m)}</span>}</div>
+        <section className="card"><div className="card-head"><h2>CPU, last 24 h</h2><span className="grow" />{L.cpu != null && <span className="sm muted">now {cores(L.cpu)}</span>}</div>
           <AreaChart points={points} height={150} series={[{ key: 'cpu_m', label: 'Used', color: 'var(--c1)', peakKey: 'cpu_m_max', format: v => cores(v) }]} />
-          {s.cpu_alloc_m != null && <div className="sm muted" style={{ marginTop: 6 }}>Capacity {cores(s.cpu_alloc_m)}</div>}</section>
-        <section className="card"><div className="card-head"><h2>Memory, last 24 h</h2><span className="grow" />{s.mem_mib != null && <span className="sm muted">now {mib(s.mem_mib)}</span>}</div>
+          {L.cpuAlloc != null && <div className="sm muted" style={{ marginTop: 6 }}>Capacity {cores(L.cpuAlloc)}</div>}</section>
+        <section className="card"><div className="card-head"><h2>Memory, last 24 h</h2><span className="grow" />{L.mem != null && <span className="sm muted">now {mib(L.mem)}</span>}</div>
           <AreaChart points={points} height={150} series={[{ key: 'mem_mib', label: 'Used', color: 'var(--c2)', peakKey: 'mem_mib_max', format: v => mib(v) }]} />
-          {s.mem_alloc_mib != null && <div className="sm muted" style={{ marginTop: 6 }}>Capacity {mib(s.mem_alloc_mib)}</div>}</section>
+          {L.memAlloc != null && <div className="sm muted" style={{ marginTop: 6 }}>Capacity {mib(L.memAlloc)}</div>}</section>
       </div>
-      <section className="card"><div className="card-head"><h2>Pods over time</h2></div>
-        <AreaChart points={points} height={130} series={[{ key: 'pods_running', label: 'Running', color: 'var(--good)' }, { key: 'pods_failing', label: 'Failing', color: 'var(--bad)' }]} /></section>
 
-      {nodes.data && (nodes.data.data?.items ?? []).length > 0 && (
+      {nodeList.length > 0 && (
         <section className="card"><div className="card-head"><h2>Nodes</h2></div>
-          <div className="nodegrid">{(nodes.data.data?.items ?? []).map(n => {
+          <div className="nodegrid">{nodeList.map(n => {
             const u = (nodeUse.data?.data?.items ?? []).find(x => x.name === n.name);
             const cp = u ? (u.cpu_m / n.cpu_alloc_m) * 100 : null, mp = u ? (u.mem_mib / n.mem_alloc_mib) * 100 : null;
-            const issues = n.conditions.filter(c => (c.type === 'Ready' ? c.status !== 'True' : c.status === 'True'));
+            const nodeIssues = n.conditions.filter(c => (c.type === 'Ready' ? c.status !== 'True' : c.status === 'True'));
             const podsHere = podList.filter(p => p.node === n.name).length;
             return (
               <div key={n.name} className="nodecard">
-                <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}><b className="trunc" title={n.name}>{n.name}</b><span className="grow" /><StatusPill status={n.ready && !issues.length ? 'up' : 'alert'} label={n.ready ? (issues.length ? issues.map(i => i.type).join(', ') : 'Ready') : 'Not ready'} /></div>
+                <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}><b className="trunc" title={n.name}>{n.name}</b><span className="grow" /><StatusPill status={n.ready && !nodeIssues.length ? 'up' : 'alert'} label={n.ready ? (nodeIssues.length ? nodeIssues.map(i => i.type).join(', ') : 'Ready') : 'Not ready'} /></div>
                 <div className="sm muted">{n.roles.join(', ')} · {n.version} · {n.ip}</div>
                 <div className="nrow"><span>CPU</span>{cp != null ? <><Meter value={cp} warnAt={lim.warn} badAt={lim.bad} /><b>{pct(cp, 0)}</b></> : <span className="muted sm">{cores(n.cpu_alloc_m)}</span>}</div>
                 <div className="nrow"><span>Memory</span>{mp != null ? <><Meter value={mp} warnAt={lim.warn} badAt={lim.bad} /><b>{pct(mp, 0)}</b></> : <span className="muted sm">{mib(n.mem_alloc_mib)}</span>}</div>
@@ -337,15 +458,8 @@ function Overview({ cluster }: { cluster: Cluster }) {
           })}</div>
         </section>)}
 
-      <div className="grid g2">
-        <TopList title="Top pods by CPU" rows={topCpu} format={cores} color="var(--c1)" hint={podUse.data?.data?.available === false ? 'needs metrics-server' : undefined} />
-        <TopList title="Top pods by memory" rows={topMem} format={mib} color="var(--c2)" hint={podUse.data?.data?.available === false ? 'needs metrics-server' : undefined} />
-        <TopList title={nsUsesMem ? 'Namespaces by memory' : 'Namespaces by pods'} rows={topNs} format={v => (nsUsesMem ? mib(v) : String(v))} color="var(--c4)" />
-        <TopList title="Most restarts" rows={topRestarts} format={v => `${v}×`} color="var(--warn)" />
-      </div>
-
       <section className="card"><div className="card-head"><h2>Recent warnings</h2></div>
-        {!events.data ? <p className="muted sm">{events.error || 'Loading…'}</p> : (events.data.data?.items ?? []).length === 0 ? <p className="muted sm">No warning events. 🎉</p> : (
+        {!events.data ? <p className="muted sm">{events.error || 'Loading…'}</p> : (events.data.data?.items ?? []).length === 0 ? <p className="muted sm">No warning events.</p> : (
           <div className="tbl-wrap"><table className="tbl"><tbody>{(events.data.data?.items ?? []).map((e, i) => <tr key={i}><td className="sm" style={{ whiteSpace: 'nowrap' }}>{timeAgo(e.last)}{e.count > 1 && <small> ×{e.count}</small>}</td><td className="warn"><b>{e.reason}</b></td><td className="sm mono">{e.ns ? `${e.ns}/` : ''}{e.object}</td><td className="sm">{e.message}</td></tr>)}</tbody></table></div>)}
       </section>
     </div>
@@ -388,44 +502,122 @@ function Workloads({ cluster }: { cluster: Cluster }) {
   );
 }
 
-type Pod = { ns: string; name: string; status: string; ready: string; restarts: number; node: string; ip: string; created: string | null; owner: string; qos: string;
+type Pod = { ns: string; name: string; status: string; phase?: string; ready: string; restarts: number; node: string; ip: string; created: string | null; owner: string; qos: string;
   containers: { name: string; image: string; ready: boolean; restarts: number; state: string; reason: string }[]; cpu_req_m: number; mem_req_mib: number; cpu_lim_m: number; mem_lim_mib: number };
 type PodUsage = { ns: string; name: string; cpu_m: number; mem_mib: number };
 const badPod = (s: string) => /CrashLoop|Error|ImagePull|ErrImage|Failed|OOMKilled|Evicted|Unknown|CreateContainer|Invalid/i.test(s);
 
-function Pods({ cluster }: { cluster: Cluster }) {
-  const [ns, setNs] = useState('');
+const podTone = (status: string) => (status === 'Running' ? 'ok' : /Completed|Succeeded/.test(status) ? 'muted' : badPod(status) ? 'bad' : 'warn');
+const ageOf = (iso: string | null) => (iso ? timeAgo(iso).replace(' ago', '') : '–');
+
+/** A usage bar against a limit (or just the number when there is no limit to compare to). */
+function UseBar({ value, limit, text }: { value: number | undefined; limit: number; text: string }) {
+  const lim = useLimits();
+  if (value == null) return <span className="muted">–</span>;
+  const p = limit ? (value / limit) * 100 : null;
+  return <span className="usebar"><span className="usebar-text">{text}</span>{p != null && <span className={`usebar-track ${p >= lim.bad ? 'bad' : p >= lim.warn ? 'warn' : ''}`}><i style={{ width: `${Math.min(100, p)}%` }} /></span>}</span>;
+}
+
+function Pods({ cluster, initialNs = '' }: { cluster: Cluster; initialNs?: string }) {
+  const nav = useContext(NavCtx);
+  const [ns, setNs] = useState(initialNs);
   const [filter, setFilter] = useState('');
-  const [problemsOnly, setProblemsOnly] = useState(false);
-  const pods = useCluster<Items<Pod>>(cluster.id, { kind: 'pods', namespace: ns, limit: 500 }, [ns], 15000);
-  const usage = useCluster<Items<PodUsage> & { available: boolean; reason?: string }>(cluster.id, { kind: 'pod_metrics', namespace: ns }, [ns], 15000);
-  const [describe, setDescribe] = useState<Pod | null>(null);
+  const [view, setView] = useState<'all' | 'problems' | 'restarts'>('all');
+  const pods = useCluster<Items<Pod>>(cluster.id, { kind: 'pods', namespace: ns, limit: 500 }, [ns], 1);
+  const usage = useCluster<Items<PodUsage> & { available: boolean; reason?: string }>(cluster.id, { kind: 'pod_metrics', namespace: ns }, [ns], 1);
   const u = new Map((usage.data?.data?.items ?? []).map(x => [`${x.ns}/${x.name}`, x]));
-  const rows = (pods.data?.data?.items ?? []).filter(p => (!filter || `${p.ns}/${p.name}`.toLowerCase().includes(filter.toLowerCase())) && (!problemsOnly || badPod(p.status)));
+  const all = pods.data?.data?.items ?? [];
+  const problems = all.filter(p => badPod(p.status)).length, restarted = all.filter(p => p.restarts > 5).length;
+  const rows = all.filter(p => (!filter || `${p.ns}/${p.name}`.toLowerCase().includes(filter.toLowerCase())) && (view === 'all' || (view === 'problems' ? badPod(p.status) : p.restarts > 5)))
+    .sort((a, b) => Number(badPod(b.status)) - Number(badPod(a.status)) || b.restarts - a.restarts);
   return (
     <div className="grid">
-      <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+      <div className="filterbar">
         <NamespaceSelect cluster={cluster} value={ns} onChange={setNs} />
-        <input className="lv-select" placeholder="Filter by name…" value={filter} onChange={e => setFilter(e.target.value)} aria-label="Filter pods" />
-        <label className="check"><input type="checkbox" checked={problemsOnly} onChange={e => setProblemsOnly(e.target.checked)} />Problems only</label>
+        <label className="lg-field grow" style={{ maxWidth: 360 }}><Icon name="logs" size={15} /><input placeholder="Filter pods by name…" value={filter} onChange={e => setFilter(e.target.value)} aria-label="Filter pods" />{filter && <button type="button" aria-label="Clear" onClick={() => setFilter('')}><Icon name="x" size={14} /></button>}</label>
+        <div className="seg">{([['all', `All ${all.length}`], ['problems', `Problems ${problems}`], ['restarts', `Restarting ${restarted}`]] as const).map(([id, l]) => <button key={id} className={view === id ? 'on' : ''} onClick={() => setView(id)}>{l}</button>)}</div>
         <span className="grow" /><button className="btn sm" onClick={() => { pods.reload(); usage.reload(); }}><Icon name="refresh" size={14} />Refresh</button>
       </div>
-      {usage.data && usage.data.data?.available === false && <p className="sm muted">{usage.data.data.reason} Pod usage columns are empty.</p>}
-      <section className="card">
+      {usage.data && usage.data.data?.available === false && <p className="sm muted">{usage.data.data.reason} Usage columns are empty.</p>}
+      <section className="card flush">
         <Loading busy={pods.busy && !pods.data} error={pods.error} retry={pods.reload} />
-        {pods.data && (rows.length === 0 ? <p className="muted sm">No pods match.</p> : (
-          <div className="tbl-wrap"><table className="tbl"><thead><tr><th>Pod</th><th>Status</th><th>Ready</th><th className="num">Restarts</th><th className="num">CPU</th><th className="num">Memory</th><th>Node</th><th>Age</th></tr></thead><tbody>
+        {pods.data && (rows.length === 0 ? <div style={{ padding: 18 }}><p className="muted sm">No pods match.</p></div> : (
+          <div className="tbl-wrap"><table className="tbl ktbl"><thead><tr><th>Pod</th><th>Status</th><th>Ready</th><th className="num">Restarts</th><th>CPU</th><th>Memory</th><th className="hide-sm">Node</th><th className="num hide-sm">Age</th></tr></thead><tbody>
             {rows.map(p => { const x = u.get(`${p.ns}/${p.name}`); return (
-              <tr key={p.ns + p.name} className="click" onClick={() => setDescribe(p)}>
-                <td><div className="name">{p.name}<small>{p.ns}</small></div></td>
-                <td className={badPod(p.status) ? 'bad' : ''}><b>{p.status}</b></td><td>{p.ready}</td><td className={`num ${p.restarts > 5 ? 'warn' : ''}`}>{p.restarts}</td>
-                <td className="num" title={p.cpu_req_m ? `requests ${p.cpu_req_m}m` : 'no CPU request'}>{x ? `${Math.round(x.cpu_m)}m` : '–'}</td>
-                <td className="num" title={p.mem_lim_mib ? `limit ${p.mem_lim_mib} MiB` : 'no memory limit'}>{x ? `${Math.round(x.mem_mib)} MiB` : '–'}</td>
-                <td className="sm">{p.node}</td><td className="sm">{timeAgo(p.created).replace(' ago', '')}</td></tr>); })}
+              <tr key={p.ns + p.name} className="click" onClick={() => nav.openPod(p.ns, p.name)}>
+                <td><div className="podname"><b title={p.name}>{p.name}</b><span className="nschip">{p.ns}</span></div></td>
+                <td><span className={`kstatus ${podTone(p.status)}`}><i />{p.status}</span></td>
+                <td className="sm">{p.ready}</td>
+                <td className="num">{p.restarts > 0 ? <span className={`rbadge ${p.restarts > 20 ? 'bad' : p.restarts > 5 ? 'warn' : ''}`}>{p.restarts}</span> : <span className="muted">0</span>}</td>
+                <td><UseBar value={x?.cpu_m} limit={p.cpu_lim_m} text={x ? `${Math.round(x.cpu_m)}m` : ''} /></td>
+                <td><UseBar value={x?.mem_mib} limit={p.mem_lim_mib} text={x ? mib(x.mem_mib) : ''} /></td>
+                <td className="sm hide-sm trunc" style={{ maxWidth: 160 }} title={p.node}>{p.node}</td><td className="num sm hide-sm">{ageOf(p.created)}</td></tr>); })}
           </tbody></table></div>))}
         <Trunc on={pods.data?.data?.truncated} />
       </section>
-      {describe && <Describe cluster={cluster} resource="pod" ns={describe.ns} name={describe.name} pod={describe} onClose={() => setDescribe(null)} />}
+    </div>
+  );
+}
+
+type PodObject = { metadata?: { labels?: Record<string, string>; ownerReferences?: { kind: string; name: string }[]; creationTimestamp?: string };
+  spec?: { nodeName?: string; containers?: { name: string; image: string; ports?: { containerPort: number; protocol?: string }[]; resources?: { requests?: Record<string, string>; limits?: Record<string, string> } }[]; serviceAccountName?: string };
+  status?: { phase?: string; podIP?: string; hostIP?: string; qosClass?: string; startTime?: string; conditions?: { type: string; status: string; reason?: string; message?: string }[];
+    containerStatuses?: { name: string; ready: boolean; restartCount: number; state?: Record<string, { reason?: string; message?: string; startedAt?: string; exitCode?: number }>; lastState?: Record<string, { reason?: string; exitCode?: number; finishedAt?: string }> }[] } };
+
+/** The side panel for one pod: what it is, its containers, why it is unhealthy, and a shortcut to its logs. */
+function PodDrawer({ cluster, ns, name, canLogs, onClose, onLogs }: { cluster: Cluster; ns: string; name: string; canLogs: boolean; onClose: () => void; onLogs: () => void }) {
+  const d = useCluster<{ object: PodObject; events: Ev[] }>(cluster.id, { kind: 'describe', resource: 'pod', namespace: ns, name }, [ns, name], 1);
+  const { toast } = useApp();
+  useEffect(() => { const k = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); }; window.addEventListener('keydown', k); return () => window.removeEventListener('keydown', k); }, [onClose]);
+  const o = d.data?.data?.object;
+  const phase = o?.status?.phase ?? '';
+  const statuses = new Map((o?.status?.containerStatuses ?? []).map(c => [c.name, c]));
+  const owner = o?.metadata?.ownerReferences?.[0];
+  const stateOf = (c?: NonNullable<PodObject['status']>['containerStatuses'] extends (infer T)[] | undefined ? T : never) => {
+    const st = c?.state ? Object.entries(c.state)[0] : undefined;
+    return st ? { kind: st[0], reason: st[1]?.reason ?? '', message: st[1]?.message ?? '' } : { kind: 'unknown', reason: '', message: '' };
+  };
+  return (
+    <div className="drawer-overlay" onMouseDown={e => e.target === e.currentTarget && onClose()}>
+      <aside className="drawer" role="dialog" aria-modal="true" aria-label={`Pod ${name}`}>
+        <div className="drawer-head">
+          <div style={{ minWidth: 0 }}><div className="sm muted">Pod · <span className="nschip">{ns}</span></div><h2 className="trunc" title={name}>{name}</h2></div>
+          <button className="btn ghost sm" onClick={onClose} aria-label="Close"><Icon name="x" /></button>
+        </div>
+        <div className="drawer-actions">
+          {phase && <span className={`kstatus ${podTone(phase)}`}><i />{phase}</span>}
+          {canLogs && <button className="btn primary sm" onClick={onLogs}><Icon name="logs" size={14} />View logs</button>}
+          <button className="btn sm" onClick={() => { void navigator.clipboard?.writeText(`kubectl -n ${ns} describe pod ${name}`); toast('kubectl command copied'); }}>Copy kubectl describe</button>
+        </div>
+        <div className="drawer-body">
+          <Loading busy={d.busy && !d.data} error={d.error} retry={d.reload} />
+          {o && <>
+            <div className="facts">
+              <div><small>Node</small><b>{o.spec?.nodeName ?? '–'}</b></div><div><small>Pod IP</small><b className="mono">{o.status?.podIP ?? '–'}</b></div>
+              <div><small>Owner</small><b>{owner ? `${owner.kind}/${owner.name}` : '–'}</b></div><div><small>QoS</small><b>{o.status?.qosClass ?? '–'}</b></div>
+              <div><small>Started</small><b>{o.status?.startTime ? timeAgo(o.status.startTime).replace(' ago', ' ago') : '–'}</b></div><div><small>Service account</small><b>{o.spec?.serviceAccountName ?? '–'}</b></div>
+            </div>
+            <h3 className="drawer-h">Containers</h3>
+            {(o.spec?.containers ?? []).map(c => { const cs = statuses.get(c.name); const st = stateOf(cs); const lastTerm = cs?.lastState?.terminated; return (
+              <div key={c.name} className="ctr">
+                <div className="ctr-head"><b>{c.name}</b><span className={`kstatus ${st.kind === 'running' ? 'ok' : st.kind === 'terminated' && !st.reason.match(/Error|OOM/i) ? 'muted' : st.kind === 'waiting' ? 'warn' : 'bad'}`}><i />{st.kind === 'running' ? 'Running' : st.reason || st.kind}</span>
+                  {cs && cs.restartCount > 0 && <span className={`rbadge ${cs.restartCount > 20 ? 'bad' : 'warn'}`}>{cs.restartCount} restarts</span>}</div>
+                <div className="sm muted mono trunc" title={c.image}>{c.image}</div>
+                <div className="ctr-res">
+                  <span>CPU <b>{c.resources?.requests?.cpu ?? '–'}</b> / <b>{c.resources?.limits?.cpu ?? 'no limit'}</b></span>
+                  <span>Memory <b>{c.resources?.requests?.memory ?? '–'}</b> / <b>{c.resources?.limits?.memory ?? 'no limit'}</b></span>
+                  {c.ports?.length ? <span>Ports <b>{c.ports.map(p => p.containerPort).join(', ')}</b></span> : null}</div>
+                {(st.message || lastTerm) && <div className="ctr-why">{st.message && <p>{st.message}</p>}{lastTerm && <p>Last exit: <b>{lastTerm.reason ?? 'terminated'}</b>{lastTerm.exitCode != null ? ` (code ${lastTerm.exitCode})` : ''}{lastTerm.finishedAt ? ` · ${timeAgo(lastTerm.finishedAt)}` : ''}</p>}</div>}
+              </div>); })}
+            {(o.status?.conditions ?? []).some(c => c.status !== 'True') && <><h3 className="drawer-h">Conditions</h3>
+              {(o.status?.conditions ?? []).filter(c => c.status !== 'True').map(c => <div key={c.type} className="sm" style={{ marginBottom: 6 }}><b className="warn">{c.type}</b> {c.reason}{c.message ? `: ${c.message}` : ''}</div>)}</>}
+            <h3 className="drawer-h">Events</h3>
+            {(d.data?.data?.events ?? []).length === 0 ? <p className="muted sm">No events for this pod.</p> : (d.data?.data?.events ?? []).slice(0, 12).map((e, i) => (
+              <div key={i} className="evt"><span className={`evt-dot ${e.type === 'Warning' ? 'warn' : ''}`} /><div><b className={e.type === 'Warning' ? 'warn' : ''}>{e.reason}</b> <span className="muted sm">{timeAgo(e.last)}{e.count > 1 ? ` ×${e.count}` : ''}</span><div className="sm">{e.message}</div></div></div>))}
+            {o.metadata?.labels && Object.keys(o.metadata.labels).length > 0 && <><h3 className="drawer-h">Labels</h3><div className="chips">{Object.entries(o.metadata.labels).slice(0, 14).map(([k, v]) => <span key={k} className="chip mono" title={`${k}=${v}`}>{k.split('/').pop()}={v.length > 24 ? `${v.slice(0, 22)}…` : v}</span>)}</div></>}
+          </>}
+        </div>
+      </aside>
     </div>
   );
 }
@@ -540,87 +732,41 @@ function Describe({ cluster, resource, ns, name, pod, onClose }: { cluster: Clus
 }
 
 /* ---------------------------------------------------------------- pod logs */
-function PodLogs({ cluster }: { cluster: Cluster }) {
-  const [ns, setNs] = useState('');
-  const [pod, setPod] = useState('');
+const POD_DOT = (status: string) => (/^Running$|^Completed$|^Succeeded$/.test(status) ? (status === 'Running' ? 'running' : '') : /Pending|Init|Creating|Terminating|Containers/i.test(status) ? 'paused' : 'exited');
+
+function PodLogs({ cluster, preset }: { cluster: Cluster; preset?: { ns: string; pod: string } | null }) {
+  const [ns, setNs] = useState(preset?.ns ?? '');
+  const [pod, setPod] = useState(preset?.pod ?? '');
   const [container, setContainer] = useState('');
   const [previous, setPrevious] = useState(false);
-  const [lines, setLines] = useState('200');
-  const [since, setSince] = useState('0');
-  const [search, setSearch] = useState('');
-  const [applied, setApplied] = useState('');
-  const [level, setLevel] = useState<'all' | 'error' | 'warn'>('all');
-  const [live, setLive] = useState(false);
-  const [wrap, setWrap] = useState(true);
-  const [out, setOut] = useState<{ text: string; truncated: boolean; at: Date } | null>(null);
-  const [error, setError] = useState('');
-  const [busy, setBusy] = useState(false);
   const pods = useCluster<Items<Pod>>(cluster.id, ns ? { kind: 'pods', namespace: ns, limit: 500 } : null, [ns]);
   const nsList = useCluster<Items<{ name: string }>>(cluster.id, { kind: 'namespaces' }, []);
   const allowed = (n: string) => cluster.log_policy.enabled && cluster.log_policy.include.some(p => glob(p, n)) && !cluster.log_policy.exclude.some(p => glob(p, n));
-  const podRow = (pods.data?.data?.items ?? []).find(p => p.name === pod);
-  const scroller = useRef<HTMLDivElement>(null);
-  const seq = useRef(0);
+  const nsOptions = (nsList.data?.data?.items ?? []).filter(n => allowed(n.name)).map(n => ({ value: n.name, label: n.name }));
+  const hidden = (nsList.data?.data?.items ?? []).length - nsOptions.length;
+  const podItems = pods.data?.data?.items ?? [];
+  const podOptions = podItems.map(p => ({ value: p.name, label: p.name, dot: POD_DOT(p.status), hint: p.status === 'Running' ? undefined : p.status }));
+  const podRow = podItems.find(p => p.name === pod);
+  useEffect(() => { setContainer(''); }, [pod]);
 
-  const fetchLogs = useCallback(async (override?: { filter?: string }) => {
-    if (!ns || !pod) return;
-    const mine = ++seq.current;
-    setBusy(true);
-    try {
-      const filter = override?.filter ?? applied;
-      const r = await ask<never>(cluster.id, { kind: 'logs', namespace: ns, name: pod, container, previous, lines: Number(lines), since_minutes: Number(since), grep: filter }, () => mine !== seq.current);
-      setOut({ text: r.text ?? '', truncated: r.truncated, at: new Date() }); setError('');
-    } catch (e) { if ((e as Error).message !== 'cancelled') setError((e as Error).message); } finally { if (mine === seq.current) setBusy(false); }
-  }, [cluster.id, ns, pod, container, previous, lines, since, applied]);
+  const fetcher: LogFetch = useCallback(async (q, cancelled) => {
+    const r = await ask<never>(cluster.id, { kind: 'logs', namespace: ns, name: pod, container, previous, lines: q.lines, since_seconds: q.sinceSeconds, grep: q.grep }, cancelled);
+    return { text: r.text ?? '', truncated: r.truncated };
+  }, [cluster.id, ns, pod, container, previous]);
 
-  useEffect(() => { setOut(null); setContainer(''); if (pod) void fetchLogs(); }, [pod]); // eslint-disable-line react-hooks/exhaustive-deps
-  useEffect(() => { if (!live) return; const t = window.setInterval(() => { if (!document.hidden) void fetchLogs(); }, 5000); return () => window.clearInterval(t); }, [live, fetchLogs]);
-  useEffect(() => { const el = scroller.current; if (el && live) el.scrollTop = el.scrollHeight; }, [out, live]);
-
-  const rows = out ? parse(out.text) : [];
-  const shown = level === 'all' ? rows : rows.filter(r => r.level === level);
-  const errors = rows.filter(r => r.level === 'error').length, warns = rows.filter(r => r.level === 'warn').length;
+  const controls = (
+    <>
+      <TargetPicker value={ns} options={nsOptions} onChange={v => { setNs(v); setPod(''); }} icon="k8s" placeholder="Namespace…" width={220} />
+      <TargetPicker value={pod} options={podOptions} onChange={setPod} icon="server" placeholder={ns ? (pods.busy ? 'Loading pods…' : 'Choose a pod…') : 'Choose a pod'} disabled={!ns} width={360} />
+      {podRow && podRow.containers.length > 1 && <select className="lg-mini" style={{ height: 38 }} value={container} onChange={e => setContainer(e.target.value)} aria-label="Container"><option value="">All containers</option>{podRow.containers.map(c => <option key={c.name} value={c.name}>{c.name}</option>)}</select>}
+      <label className="lg-opt"><input type="checkbox" checked={previous} onChange={e => setPrevious(e.target.checked)} />Previous (crashed) container</label>
+      {hidden > 0 && <span className="sm muted" title="An admin limited which namespaces' logs can be read (Settings tab)"><Icon name="shield" size={13} /> {hidden} namespace{hidden === 1 ? '' : 's'} hidden by policy</span>}
+    </>
+  );
+  const banner = cluster.restricted ? <div className="lv-note"><p><Icon name="shield" size={14} />Log access is limited by this cluster’s policy ({cluster.log_policy.enabled ? `only ${cluster.log_policy.include.join(', ')}${cluster.log_policy.exclude.length ? `, not ${cluster.log_policy.exclude.join(', ')}` : ''}` : 'off'}). Every read is recorded in the audit log.</p></div> : null;
   return (
-    <div className="lv">
-      <div className="lv-filters">
-        <select className="lv-select" value={ns} onChange={e => { setNs(e.target.value); setPod(''); setOut(null); }} aria-label="Namespace">
-          <option value="">Choose a namespace…</option>
-          {(nsList.data?.data?.items ?? []).map(n => <option key={n.name} value={n.name} disabled={!allowed(n.name)}>{n.name}{allowed(n.name) ? '' : '  (blocked by policy)'}</option>)}</select>
-        <select className="lv-select" value={pod} onChange={e => setPod(e.target.value)} disabled={!ns} aria-label="Pod" style={{ minWidth: 220 }}>
-          <option value="">{ns ? (pods.busy ? 'Loading pods…' : 'Choose a pod…') : 'Pod'}</option>{(pods.data?.data?.items ?? []).map(p => <option key={p.name} value={p.name}>{p.name}  ({p.status})</option>)}</select>
-        {podRow && podRow.containers.length > 1 && <select className="lv-select" value={container} onChange={e => setContainer(e.target.value)} aria-label="Container"><option value="">All / default container</option>{podRow.containers.map(c => <option key={c.name} value={c.name}>{c.name}</option>)}</select>}
-        <label className="check"><input type="checkbox" checked={previous} onChange={e => setPrevious(e.target.checked)} />Previous (crashed) container</label>
-      </div>
-      <form className="lv-filters" onSubmit={(e: FormEvent) => { e.preventDefault(); setApplied(search); void fetchLogs({ filter: search }); }}>
-        <label className="lv-search"><Icon name="logs" size={15} /><input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search in logs…  (press Enter)" maxLength={200} aria-label="Search" /></label>
-        <select className="lv-select" value={since} onChange={e => setSince(e.target.value)} aria-label="Time range"><option value="0">Any time</option><option value="15">Last 15 min</option><option value="60">Last hour</option><option value="360">Last 6 hours</option><option value="1440">Last 24 hours</option></select>
-        <select className="lv-select" value={lines} onChange={e => setLines(e.target.value)} aria-label="Number of lines">{['100', '200', '500', '1000', '2000'].map(n => <option key={n} value={n}>{n} lines</option>)}</select>
-        <button className="btn primary sm" disabled={busy || !pod}>Apply</button>
-        <button type="button" className={`lv-live ${live ? 'on' : ''}`} onClick={() => setLive(!live)} aria-pressed={live}><i />{live ? 'Live' : 'Live off'}</button>
-        <div className="lv-levels" role="group" aria-label="Level filter">
-          <button type="button" className={level === 'all' ? 'on' : ''} onClick={() => setLevel('all')}>All</button>
-          <button type="button" className={`err ${level === 'error' ? 'on' : ''}`} onClick={() => setLevel(level === 'error' ? 'all' : 'error')}>Errors <b>{errors}</b></button>
-          <button type="button" className={`wrn ${level === 'warn' ? 'on' : ''}`} onClick={() => setLevel(level === 'warn' ? 'all' : 'warn')}>Warnings <b>{warns}</b></button>
-        </div>
-      </form>
-      {cluster.restricted && <div className="lv-note"><p><Icon name="shield" size={14} />Log access is limited by this cluster’s policy ({cluster.log_policy.enabled ? `only ${cluster.log_policy.include.join(', ')}${cluster.log_policy.exclude.length ? `, not ${cluster.log_policy.exclude.join(', ')}` : ''}` : 'off'}).</p></div>}
-      {error && <div className="lv-error" role="alert"><Icon name="alert" size={15} />{error}<button className="btn sm" onClick={() => void fetchLogs()}>Retry</button></div>}
-      <div className="lv-body">
-        <div className="lv-cols"><span>#</span><span>Time</span><span>Level</span><span>Message</span></div>
-        {!pod ? <div className="lv-empty"><Icon name="logs" size={26} /><h3>Choose a namespace and pod</h3><p>Logs are fetched from the cluster when you ask and are never stored on the control plane. Every read is recorded in the audit log.</p></div>
-          : !out ? <div className="lv-skel">{Array.from({ length: 12 }, (_, i) => <i key={i} style={{ width: `${30 + ((i * 53) % 65)}%` }} />)}</div>
-          : shown.length === 0 ? <div className="lv-empty"><Icon name="logs" size={26} /><h3>{rows.length ? 'No lines at this level' : applied ? 'No lines match your search' : 'No log output'}</h3></div>
-          : <div className={`lv-scroll ${wrap ? 'wrap' : ''}`} ref={scroller}>{shown.map(r => (
-            <div key={r.n} className={`lv-row ${r.level}`}><span className="n">{r.n}</span><span className="t" title={r.tsTitle}>{r.ts}</span>
-              <span className="l">{r.level && <em className={r.level}>{LEVEL_LABEL[r.level]}</em>}</span><span className="m"><Highlight text={r.msg} term={applied} /></span></div>))}</div>}
-      </div>
-      <div className="lv-foot">
-        <span><b>{shown.length.toLocaleString()}</b>{shown.length !== rows.length ? ` of ${rows.length.toLocaleString()}` : ''} lines</span>
-        {out?.truncated && <span className="warn">newest part only</span>}{out && <span className="muted">fetched {out.at.toLocaleTimeString()}</span>}
-        <span className="grow" /><label className="check"><input type="checkbox" checked={wrap} onChange={e => setWrap(e.target.checked)} />Wrap lines</label>
-        <button className="btn ghost sm" onClick={() => void navigator.clipboard?.writeText(shown.map(r => `${r.ts} ${r.msg}`.trim()).join('\n'))} disabled={!shown.length}>Copy</button>
-      </div>
-    </div>
+    <LogViewer fetcher={fetcher} fetchKey={`${cluster.id}|${ns}|${pod}|${container}|${previous}`} canFetch={!!ns && !!pod} controls={controls} banner={banner} storageKey={`cluster-${cluster.id}`} downloadName={pod || 'pod-logs'}
+      emptyHint={!pod ? <p className="muted sm">Choose a namespace and a pod above. Logs are fetched when you ask and are never stored on the control plane.</p> : undefined} />
   );
 }
 

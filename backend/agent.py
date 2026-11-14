@@ -965,12 +965,65 @@ def _tail_file(path: str, max_bytes: int = 4_000_000) -> str:
     return text.split("\n", 1)[1] if size > max_bytes and "\n" in text else text
 
 
+_ISO_TS = re.compile(r"^\[?(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:[.,]\d+)?\s*(Z|[+-]\d{2}:?\d{2})?")
+_NGINX_TS = re.compile(r"\[(\d{2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2}) ([+-]\d{4})\]")
+_SYSLOG_TS = re.compile(r"^([A-Z][a-z]{2})\s+(\d{1,2}) (\d{2}):(\d{2}):(\d{2})")
+_MONTHS = {m: i for i, m in enumerate(("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"), 1)}
+
+
+def line_time(line: str, now: float | None = None) -> float | None:
+    """Epoch seconds of a log line, from the timestamp most logs start with (ISO 8601, nginx access, classic syslog), else None."""
+    import calendar
+    from datetime import timedelta
+    m = _ISO_TS.match(line)
+    if m:
+        y, mo, d, hh, mi, ss = (int(m.group(i)) for i in range(1, 7))
+        tz = m.group(7)
+        try:
+            stamp = calendar.timegm((y, mo, d, hh, mi, ss))
+        except (ValueError, OverflowError):
+            return None
+        if tz and tz != "Z":
+            sign = 1 if tz[0] == "+" else -1
+            digits = tz[1:].replace(":", "")
+            stamp -= sign * (int(digits[:2]) * 3600 + int(digits[2:4] or 0) * 60)
+        elif not tz:
+            stamp = time.mktime((y, mo, d, hh, mi, ss, 0, 0, -1))      # no zone given: the machine's own time
+        return float(stamp)
+    m = _NGINX_TS.search(line)
+    if m and m.group(2) in _MONTHS:
+        stamp = calendar.timegm((int(m.group(3)), _MONTHS[m.group(2)], int(m.group(1)), int(m.group(4)), int(m.group(5)), int(m.group(6))))
+        tz = m.group(7)
+        return float(stamp - (1 if tz[0] == "+" else -1) * (int(tz[1:3]) * 3600 + int(tz[3:5]) * 60))
+    m = _SYSLOG_TS.match(line)
+    if m and m.group(1) in _MONTHS:
+        now = now or time.time()
+        year = time.localtime(now).tm_year
+        stamp = time.mktime((year, _MONTHS[m.group(1)], int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5)), 0, 0, -1))
+        return float(stamp - 366 * 86400) if stamp > now + 86400 else float(stamp)   # "Dec 31" read in January belongs to last year
+    return None
+
+
+def filter_lines_by_time(text: str, seconds: int, now: float | None = None) -> str:
+    """Keeps the lines from the last `seconds`. A line without a timestamp (a stack trace line, a wrapped message) follows the decision
+    made for the line before it; lines before the first timestamp are kept."""
+    cutoff = (now or time.time()) - seconds
+    keep, out = True, []
+    for row in text.splitlines():
+        stamp = line_time(row, now)
+        if stamp is not None:
+            keep = stamp >= cutoff
+        if keep:
+            out.append(row)
+    return "\n".join(out)
+
+
 def fetch_logs(task: dict) -> tuple[str, bool]:
     """Runs one validated log request. Returns (text, truncated)."""
     source = task.get("source")
     target = str(task.get("target") or "")
     lines = max(1, min(MAX_LOG_LINES, int(task.get("lines") or 200)))
-    since = max(0, min(60 * 24 * 30, int(task.get("since_minutes") or 0)))
+    since = max(0, min(31 * 86400, max(int(task.get("since_seconds") or 0), int(task.get("since_minutes") or 0) * 60)))   # seconds; 0 = no time limit
     needle = str(task.get("grep") or "")[:200].lower()
     priority = task.get("priority") or ""
     if source == "inventory":
@@ -986,15 +1039,15 @@ def fetch_logs(task: dict) -> tuple[str, bool]:
             raise ValueError("Docker logs are not available to this agent")
         if target not in {c["name"] for c in docker_containers()}:
             raise ValueError("No such container on this server")
-        query = f"stdout=1&stderr=1&timestamps=1&tail={scan}" + (f"&since={int(time.time()) - since * 60}" if since else "")
+        query = f"stdout=1&stderr=1&timestamps=1&tail={scan}" + (f"&since={int(time.time()) - since}" if since else "")
         text = _demux(_docker(f"/containers/{target}/logs?{query}", raw=True))
     elif source == "journal":
         base = _journalctl()
         if not base:
             raise ValueError("The system journal is not available to this agent")
         if IS_MAC:
-            minutes = since or 60                                   # the unified log is huge: always bound the time window
-            command = base + ["show", "--style", "compact", "--last", f"{min(minutes, 60 * 24)}m"]
+            window = since or 3600                                  # the unified log is huge: always bound the time window
+            command = base + ["show", "--style", "compact", "--last", f"{min(window, 86400)}s"]
             predicates = []
             if target != "all":
                 predicates.append(f'process == "{target}"')          # target is validated: letters, digits and . _ : / @ - only
@@ -1010,7 +1063,7 @@ def fetch_logs(task: dict) -> tuple[str, bool]:
             if target != "all":
                 command += ["-u", target]
             if since:
-                command += ["--since", f"-{since}min"]
+                command += ["--since", f"-{since}s"]
             if priority in PRIORITIES:
                 command += ["-p", priority]
             result = subprocess.run(command, capture_output=True, text=True, timeout=25, errors="replace")
@@ -1018,7 +1071,9 @@ def fetch_logs(task: dict) -> tuple[str, bool]:
                 raise RuntimeError((result.stderr or "journalctl failed").strip()[:300])
             text = result.stdout
     elif source == "file":
-        text = _tail_file(_allowed_file(target))   # `since` does not apply: plain files have no reliable timestamps
+        text = _tail_file(_allowed_file(target))
+        if since:   # files carry no timestamps of their own: use the ones in the lines (ISO, nginx, syslog) when they have them
+            text = filter_lines_by_time(text, since)
     else:
         raise ValueError("Unknown log source")
 

@@ -46,7 +46,8 @@ class K8sQuery(BaseModel):
     container: str = Field(default="", pattern=r"^([A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?)?$")
     limit: int = Field(default=200, ge=1, le=500)
     lines: int = Field(default=200, ge=1, le=2000)
-    since_minutes: int = Field(default=0, ge=0, le=10080)
+    since_minutes: int = Field(default=0, ge=0, le=44640)
+    since_seconds: int = Field(default=0, ge=0, le=60 * 60 * 24 * 31)
     previous: bool = False
     grep: str = Field(default="", max_length=200)
     warnings_only: bool = False

@@ -136,12 +136,12 @@ def test_macos_system_log_command(agent, monkeypatch):
     out, _ = agent.fetch_logs({"source": "journal", "target": "myapp", "lines": 10, "since_minutes": 15, "priority": "err", "grep": "boom"})
     assert out == "2026-11-13 10:00:01 E myapp[1]: ERROR boom"
     cmd = seen["cmd"]
-    assert cmd[:2] == ["log", "show"] and cmd[cmd.index("--last") + 1] == "15m"
+    assert cmd[:2] == ["log", "show"] and cmd[cmd.index("--last") + 1] == "900s"
     assert 'process == "myapp"' in cmd[cmd.index("--predicate") + 1] and "messageType == error" in cmd[cmd.index("--predicate") + 1]
     with pytest.raises(ValueError):
         agent.fetch_logs({"source": "journal", "target": 'x" || true || "'})                          # quoting tricks never reach the predicate
     seen.clear(); agent.fetch_logs({"source": "journal", "target": "all"})
-    assert seen["cmd"][seen["cmd"].index("--last") + 1] == "60m"                                    # unbounded asks are bounded to an hour
+    assert seen["cmd"][seen["cmd"].index("--last") + 1] == "3600s"                                    # unbounded asks are bounded to an hour
 
 
 def test_docker_desktop_vm_is_explained(tmp_path, monkeypatch):
@@ -555,3 +555,35 @@ def test_process_cpu_is_measured_between_reports_not_in_a_150ms_blip(monkeypatch
         assert any(row["pid"] == os.getpid() for row in second) and all(row["cpu"] >= 0 for row in second)
     finally:
         sys.modules.pop("agent", None)
+
+
+# =================================================================== finer time filters ("last 15 seconds" ... "last month")
+def test_time_filter_uses_the_timestamps_inside_log_files(agent, tmp_path):
+    import calendar, time as _t
+    now = _t.time()
+    iso = lambda ago: _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime(now - ago))      # noqa: E731
+    nginx = lambda ago: _t.strftime("%d/%b/%Y:%H:%M:%S +0000", _t.gmtime(now - ago))   # noqa: E731
+    text = "\n".join([f"{iso(7200)} old error", "    old stack frame", f"{iso(600)} ten minutes ago", f"{iso(20)} twenty seconds ago", "    its continuation", f'1.2.3.4 - - [{nginx(5)}] "GET / HTTP/1.1" 200 5 "-" "ua"'])
+    assert agent.filter_lines_by_time(text, 3600, now).splitlines() == [f"{iso(600)} ten minutes ago", f"{iso(20)} twenty seconds ago", "    its continuation", f'1.2.3.4 - - [{nginx(5)}] "GET / HTTP/1.1" 200 5 "-" "ua"']
+    kept = agent.filter_lines_by_time(text, 30, now).splitlines()
+    assert kept == [f"{iso(20)} twenty seconds ago", "    its continuation", f'1.2.3.4 - - [{nginx(5)}] "GET / HTTP/1.1" 200 5 "-" "ua"']      # wrapped lines follow their parent line
+    assert agent.filter_lines_by_time("no timestamps at all\nstill none", 10, now) == "no timestamps at all\nstill none"                   # nothing to judge by: keep it
+    assert agent.line_time("2026-11-14 10:00:00+03:00 x") - agent.line_time("2026-11-14 07:00:00Z x") == 0                                 # zones are honoured
+    syslog = _t.strftime("%b %e %H:%M:%S", _t.localtime(now - 5)) + " host sshd[1]: x"
+    assert abs(agent.line_time(syslog, now) - (now - 5)) < 2
+    assert agent.line_time("Foo 99 99:99:99 nope") is None and agent.line_time("") is None
+
+
+def test_fetch_logs_accepts_seconds_and_keeps_minutes(agent, tmp_path):
+    import time as _t
+    log = tmp_path / "logs" / "app.log"
+    stamp = lambda ago: _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime(_t.time() - ago))   # noqa: E731
+    log.write_text(f"{stamp(500)} five hundred seconds ago\n{stamp(8)} eight seconds ago\n{stamp(1)} one second ago\n")
+    out, _ = agent.fetch_logs({"source": "file", "target": agent.paths["log"], "lines": 50, "since_seconds": 15})
+    assert [l.split(" ", 1)[1] for l in out.splitlines()] == ["eight seconds ago", "one second ago"]
+    out, _ = agent.fetch_logs({"source": "file", "target": agent.paths["log"], "lines": 50, "since_minutes": 15})
+    assert len(out.splitlines()) == 3                                                    # the old minutes parameter still works
+    out, _ = agent.fetch_logs({"source": "file", "target": agent.paths["log"], "lines": 50, "since_seconds": 600, "since_minutes": 0})
+    assert len(out.splitlines()) == 3
+    out, _ = agent.fetch_logs({"source": "file", "target": agent.paths["log"], "lines": 50})
+    assert len(out.splitlines()) == 3                                                    # no time limit

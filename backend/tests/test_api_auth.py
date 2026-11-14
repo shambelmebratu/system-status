@@ -496,7 +496,7 @@ def test_log_request_roundtrip(client):
     req = client.post(f"/api/servers/{sid}/logs", headers=CSRF, json={"source": "docker", "target": "nginx", "lines": 50, "grep": "error"}).json()
     assert client.get(f"/api/servers/{sid}/logs/{req['id']}").json()["status"] == "pending"
     tasks = anon.get("/api/agent/tasks", headers=auth).json()["tasks"]
-    assert tasks == [{"id": req["id"], "source": "docker", "target": "nginx", "lines": 50, "since_minutes": 0, "grep": "error", "priority": ""}]
+    assert tasks == [{"id": req["id"], "source": "docker", "target": "nginx", "lines": 50, "since_minutes": 0, "since_seconds": 0, "grep": "error", "priority": ""}]
     assert anon.get("/api/agent/tasks", headers=auth).json()["tasks"] == []                                 # handed out exactly once
     assert anon.post(f"/api/agent/tasks/{req['id']}/result", headers=auth, json={"ok": True, "output": "2026 error: upstream timed out", "truncated": False}).status_code == 200
     done = client.get(f"/api/servers/{sid}/logs/{req['id']}").json()
@@ -1891,3 +1891,18 @@ def test_graph_data_keeps_the_peaks_that_averages_hide(client):
     points = client.get(f"/api/servers/{sid}/history?range=1h").json()["points"]
     assert max(p["cpu_max"] for p in points) == 85.0 and all(p["cpu_max"] >= p["cpu"] for p in points) and "cpu_hi" not in points[0]
     assert all(("memory_max" in p) and ("net_rx_bps_max" in p or True) for p in points)
+
+
+def test_log_requests_accept_second_level_time_windows(client, monkeypatch):
+    from app.config import get_settings
+    monkeypatch.setattr(get_settings(), "log_max_pending_per_server", 50)
+    sign_in(client)
+    anon = TestClient(main.app)
+    sid, auth = _push_server(client, anon)
+    for seconds in (15, 60, 300, 900, 1800, 3600, 21600, 43200, 86400, 604800, 2592000):      # 15s, 1m, 5m, 15m, 30m, 1h, 6h, 12h, 1d, 7d, 1 month
+        r = client.post(f"/api/servers/{sid}/logs", headers=CSRF, json={"source": "journal", "target": "all", "since_seconds": seconds})
+        assert r.status_code == 200, (seconds, r.text)
+    assert client.post(f"/api/servers/{sid}/logs", headers=CSRF, json={"source": "journal", "target": "all", "since_seconds": -1}).status_code == 422
+    assert client.post(f"/api/servers/{sid}/logs", headers=CSRF, json={"source": "journal", "target": "all", "since_seconds": 60 * 60 * 24 * 40}).status_code == 422
+    queued = anon.get("/api/agent/tasks", headers=auth).json()["tasks"]
+    assert any(t.get("since_seconds") == 15 for t in queued)                                  # the agent receives the exact window

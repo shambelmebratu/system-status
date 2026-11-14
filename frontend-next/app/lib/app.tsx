@@ -77,6 +77,13 @@ export function useLimits() {
   };
 }
 
+/** The current time, re-read every second: keeps "12s ago" labels counting instead of freezing until the next data refresh. */
+export function useNow(ms = 1000) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => { const t = setInterval(() => setNow(Date.now()), ms); return () => clearInterval(t); }, [ms]);
+  return now;
+}
+
 /** Re-runs `load` on an interval (and when deps change); returns data, loading and a manual reload. */
 export function usePoll<T>(load: () => Promise<T>, deps: unknown[], intervalMs = 15000) {
   const [value, setValue] = useState<T | null>(null);
