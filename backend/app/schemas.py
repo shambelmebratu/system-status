@@ -173,6 +173,7 @@ class TrafficStatus(BaseModel):
 
 class AgentReport(BaseModel):
     cpu: float = Field(ge=0, le=100)
+    cpu_peak: float | None = Field(default=None, ge=0, le=100)
     memory: float = Field(ge=0, le=100)
     disk: float = Field(ge=0, le=100)
     load: float = Field(ge=0, le=100000)

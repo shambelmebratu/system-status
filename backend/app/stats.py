@@ -35,8 +35,9 @@ def percentile(values: list[float], fraction: float) -> float | None:
     return round(ordered[min(len(ordered) - 1, int(len(ordered) * fraction))], 1)
 
 
-def bucketize(rows: list[tuple[datetime, dict]], since: datetime, until: datetime, buckets: int = 120) -> list[dict]:
-    """Averages (timestamp, {key: value}) rows into at most `buckets` evenly spaced points."""
+def bucketize(rows: list[tuple[datetime, dict]], since: datetime, until: datetime, buckets: int = 120, with_max: bool = False) -> list[dict]:
+    """Averages (timestamp, {key: value}) rows into at most `buckets` evenly spaced points. With with_max, every key also gets
+    `<key>_max`: the highest value in the bucket (an average alone flattens the spikes that matter)."""
     width = max(1.0, (until - since).total_seconds() / buckets)
     grouped: dict[int, dict[str, list[float]]] = {}
     for ts, values in rows:
@@ -50,6 +51,8 @@ def bucketize(rows: list[tuple[datetime, dict]], since: datetime, until: datetim
         point = {"t": (since + timedelta(seconds=index * width + width / 2)).isoformat()}
         for key, values in grouped[index].items():
             point[key] = round(sum(values) / len(values), 2)
+            if with_max:
+                point[f"{key}_max"] = round(max(values), 2)
         points.append(point)
     return points
 
@@ -58,13 +61,16 @@ def server_history(db: Session, server_id: int, hours: int) -> dict:
     until = datetime.now(timezone.utc)
     since = until - timedelta(hours=hours)
     samples = db.execute(select(MetricSample).where(MetricSample.server_id == server_id, MetricSample.ts >= since).order_by(MetricSample.ts)).scalars().all()
-    points = bucketize([(m.ts, {key: getattr(m, key) for key in METRIC_KEYS}) for m in samples], since, until)
+    points = bucketize([(m.ts, {**{key: getattr(m, key) for key in METRIC_KEYS}, "cpu_hi": m.cpu_peak if m.cpu_peak is not None else m.cpu}) for m in samples], since, until, with_max=True)
+    for point in points:   # the real CPU peak is the highest reported peak (agent 2.12+), or the highest average where there is none
+        point["cpu_max"] = max(point.pop("cpu_hi_max", point.get("cpu", 0)), point.get("cpu_max", 0))
+        point.pop("cpu_hi", None)
     uptime = uptime_by_target(db, hours).get(("server", server_id))
     results = db.execute(select(CheckResult).where(CheckResult.target_type == "server", CheckResult.target_id == server_id, CheckResult.checked_at >= since, CheckResult.latency_ms.is_not(None)).order_by(CheckResult.checked_at)).scalars().all()
     latencies = [r.latency_ms for r in results]
     return {
         "hours": hours, "points": points, "samples": len(samples), "uptime_pct": uptime,
-        "latency_points": bucketize([(r.checked_at, {"latency": r.latency_ms}) for r in results], since, until),
+        "latency_points": bucketize([(r.checked_at, {"latency": r.latency_ms}) for r in results], since, until, with_max=True),
         "latency_avg": round(sum(latencies) / len(latencies), 1) if latencies else None,
         "latency_p95": percentile(latencies, 0.95),
         "latency_max": round(max(latencies), 1) if latencies else None,
@@ -80,7 +86,7 @@ def service_history(db: Session, service_id: int, hours: int) -> dict:
     failures = [{"t": aware(r.checked_at).isoformat(), "error": r.error, "http_status": r.http_status} for r in results if r.status == "down"][-20:]
     return {
         "hours": hours,
-        "points": bucketize(rows, since, until),
+        "points": bucketize(rows, since, until, with_max=True),
         "checks": len(results),
         "uptime_pct": uptime_by_target(db, hours).get(("service", service_id)),
         "latency_avg": round(sum(latencies) / len(latencies), 1) if latencies else None,

@@ -39,7 +39,7 @@ from typing import Any
 
 import psutil
 
-AGENT_VERSION = "2.11.0"
+AGENT_VERSION = "2.12.0"
 _ENV_TOKEN = os.getenv("AGENT_TOKEN", "")                      # the token supplied by configuration; a rotation may supersede it (see _load_state)
 AGENT_TOKEN = ""                                                # the token in use: resolved by ensure_token() (saved state first, then configuration)
 AGENT_ALLOW_INSECURE = os.getenv("AGENT_ALLOW_INSECURE", "") == "1"   # permit http:// to a public address (not recommended)
@@ -82,29 +82,75 @@ def _network_rates() -> tuple[float | None, float | None]:
     return (round(max(0, counters.bytes_recv - previous[1]) / elapsed, 1), round(max(0, counters.bytes_sent - previous[2]) / elapsed, 1))
 
 
+# CPU is measured over the WHOLE reporting interval, not at the instant of the report: a background sampler reads the system CPU every
+# few seconds and each report carries the average and the peak of those readings. (A single 0.25 s snapshot, which is what an
+# instantaneous reading is, makes graphs and alerts jump around and miss what happened in between.)
+AGENT_CPU_SAMPLE_SECONDS = max(1.0, min(30.0, float(os.getenv("AGENT_CPU_SAMPLE_SECONDS", "5"))))
+_cpu_lock = threading.Lock()
+_cpu_window = {"sum": 0.0, "n": 0, "peak": 0.0}
+_cpu_thread: threading.Thread | None = None
+
+
+def _cpu_sampler() -> None:
+    psutil.cpu_percent(interval=None)   # prime: the first reading since process start is meaningless
+    while True:
+        time.sleep(AGENT_CPU_SAMPLE_SECONDS)
+        value = psutil.cpu_percent(interval=None)
+        with _cpu_lock:
+            _cpu_window["sum"] += value
+            _cpu_window["n"] += 1
+            _cpu_window["peak"] = max(_cpu_window["peak"], value)
+
+
+def cpu_window() -> tuple[float, float | None]:
+    """(average, peak) CPU % since the previous call. Before the first interval has elapsed, a short direct sample."""
+    global _cpu_thread
+    if _cpu_thread is None:
+        _cpu_thread = threading.Thread(target=_cpu_sampler, daemon=True, name="cpu")
+        _cpu_thread.start()
+    with _cpu_lock:
+        n, total, peak = _cpu_window["n"], _cpu_window["sum"], _cpu_window["peak"]
+        _cpu_window.update(sum=0.0, n=0, peak=0.0)
+    if n == 0:
+        value = psutil.cpu_percent(interval=0.25)
+        return value, None
+    return total / n, peak
+
+
+_procs_primed = False
+
+
+def process_rows() -> list[dict]:
+    """Per-process CPU % averaged since the previous report (psutil keeps each process object between calls). The first call primes
+    the counters and waits one short sample."""
+    global _procs_primed
+    if not _procs_primed:
+        for process in psutil.process_iter():
+            try:
+                process.cpu_percent(interval=None)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        time.sleep(AGENT_PROCESS_SAMPLE_SECONDS)
+        _procs_primed = True
+    rows = []
+    for process in psutil.process_iter(["pid", "name", "username", "memory_percent"]):
+        try:
+            rows.append({"pid": process.info["pid"], "name": (process.info["name"] or "unknown")[:100], "user": (process.info["username"] or "unknown")[:100], "cpu": round(process.cpu_percent(interval=None), 1), "memory": round(min(100.0, process.info["memory_percent"] or 0), 1)})
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    rows.sort(key=lambda item: item["cpu"], reverse=True)
+    return rows
+
+
 def collect() -> dict[str, Any]:
     memory = psutil.virtual_memory()
     swap = psutil.swap_memory()
-    candidates = []
-    for process in psutil.process_iter(["pid", "name", "username", "memory_percent"]):
-        try:
-            process.cpu_percent(interval=None)
-            candidates.append(process)
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-    if candidates:
-        time.sleep(AGENT_PROCESS_SAMPLE_SECONDS)
-    processes = []
-    for process in candidates:
-        try:
-            processes.append({"pid": process.info["pid"], "name": (process.info["name"] or "unknown")[:100], "user": (process.info["username"] or "unknown")[:100], "cpu": round(process.cpu_percent(interval=None), 1), "memory": round(min(100.0, process.info["memory_percent"] or 0), 1)})
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            continue
-    processes.sort(key=lambda item: item["cpu"], reverse=True)
+    processes = process_rows()
+    cpu, cpu_peak = cpu_window()
     try:
         load = os.getloadavg()[0]
     except (AttributeError, OSError):  # Windows
-        load = psutil.cpu_percent(interval=None) / 100 * (psutil.cpu_count() or 1)
+        load = cpu / 100 * (psutil.cpu_count() or 1)
     rx, tx = _network_rates()
     return {
         "hostname": host_name(),
@@ -113,7 +159,8 @@ def collect() -> dict[str, Any]:
         "kernel": kernel_version(),
         "arch": platform.machine()[:30],
         "agent_version": AGENT_VERSION,
-        "cpu": round(psutil.cpu_percent(interval=0.25), 1),
+        "cpu": round(min(100.0, cpu), 1),
+        "cpu_peak": round(min(100.0, cpu_peak), 1) if cpu_peak is not None else None,
         "cpu_count": psutil.cpu_count() or 1,
         "memory": round(memory.percent, 1),
         "disk": round(psutil.disk_usage(AGENT_DISK_PATH).percent, 1),

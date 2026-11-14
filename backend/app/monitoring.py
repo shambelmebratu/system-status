@@ -617,7 +617,7 @@ def apply_server_result(session, server: Server, status: str, failures: list[str
     if metrics is not None:
         server.last_metrics = json.dumps(metrics)
         if all(key in metrics for key in ("cpu", "memory", "disk", "load", "swap")):  # ping-only checks carry no resource metrics
-            session.add(MetricSample(server_id=server.id, ts=now, cpu=metrics["cpu"], memory=metrics["memory"], disk=metrics["disk"], load=metrics["load"], swap=metrics["swap"], net_rx_bps=metrics.get("net_rx_bps"), net_tx_bps=metrics.get("net_tx_bps")))
+            session.add(MetricSample(server_id=server.id, ts=now, cpu=metrics["cpu"], cpu_peak=metrics.get("cpu_peak"), memory=metrics["memory"], disk=metrics["disk"], load=metrics["load"], swap=metrics["swap"], net_rx_bps=metrics.get("net_rx_bps"), net_tx_bps=metrics.get("net_tx_bps")))
     resolved = sync_incident(session, "server", server, status, detail)
     if status == "down":
         if previous != "down" or should_notify_again(session, "server", server.id, reminder_minutes(server)):

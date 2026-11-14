@@ -12,7 +12,7 @@ import { CodeBox, Empty, Field, Icon, Meter, Modal, StatusPill } from '../compon
 import { api, del, post, put } from '../lib/api';
 import { useApp, useLimits, usePoll } from '../lib/app';
 import { bytesPerSecond, duration, isOlder, ms, pct, timeAgo } from '../lib/format';
-import type { Incident, Mode, Range, Server, ServerHistory } from '../lib/types';
+import type { Incident, Mode, Point, Range, Server, ServerHistory } from '../lib/types';
 import { IncidentList } from './Overview';
 
 const MODE_LABEL: Record<Mode, string> = { push: 'Agent · push', agent: 'Agent · pull', ping: 'Ping only' };
@@ -138,7 +138,7 @@ function ServerDetail({ server }: { server: Server }) {
             <>
               <div className="seg" style={{ alignSelf: 'flex-start' }}>{(['1h', '6h', '24h', '7d'] as Range[]).map(r => <button key={r} className={range === r ? 'on' : ''} onClick={() => setRange(r)}>{r}</button>)}</div>
               <section className="card"><div className="card-head"><h2>Ping latency</h2></div>
-                <AreaChart points={h?.latency_points ?? []} height={200} unit="ms" showDate={showDate} series={[{ key: 'latency', label: 'Latency', color: 'var(--accent)', format: v => `${Math.round(v)} ms` }]} /></section>
+                <AreaChart points={h?.latency_points ?? []} height={200} unit="ms" showDate={showDate} series={[{ key: 'latency', label: 'Latency', color: 'var(--accent)', peakKey: 'latency_max', format: v => `${Math.round(v)} ms` }]} /></section>
             </>
           )}
 
@@ -148,16 +148,18 @@ function ServerDetail({ server }: { server: Server }) {
                 <div className="seg">{(['1h', '6h', '24h', '7d'] as Range[]).map(r => <button key={r} className={range === r ? 'on' : ''} onClick={() => setRange(r)}>{r}</button>)}</div>
                 {h && <span className="muted sm">{h.samples} samples · uptime {pct(h.uptime_pct, 2)}</span>}
               </div>
-              <section className="card"><div className="card-head"><h2>CPU & memory</h2><span className="grow" /><Legend items={[['CPU', 'var(--c1)'], ['Memory', 'var(--c2)']]} /></div>
-                <AreaChart points={h?.points ?? []} unit="%" yMax={100} showDate={showDate} series={[{ key: 'cpu', label: 'CPU', color: 'var(--c1)' }, { key: 'memory', label: 'Memory', color: 'var(--c2)' }]} /></section>
               <div className="grid g2">
-                <section className="card"><div className="card-head"><h2>Load average</h2></div>
-                  <AreaChart points={h?.points ?? []} height={150} showDate={showDate} series={[{ key: 'load', label: 'Load', color: 'var(--c3)' }]} /></section>
-                <section className="card"><div className="card-head"><h2>Disk & swap</h2><span className="grow" /><Legend items={[['Disk', 'var(--c4)'], ['Swap', 'var(--c5)']]} /></div>
-                  <AreaChart points={h?.points ?? []} height={150} unit="%" yMax={100} showDate={showDate} series={[{ key: 'disk', label: 'Disk', color: 'var(--c4)' }, { key: 'swap', label: 'Swap', color: 'var(--c5)' }]} /></section>
+                <MetricCard title="CPU" unit="%" metric="cpu" peakKey="cpu_max" now={m?.cpu} limit={server.cpu_threshold} limitLabel="alert limit" color="var(--c1)" points={h?.points ?? []} showDate={showDate} percent
+                  note="Average over each reporting interval; the shaded band reaches up to the highest CPU seen in it." />
+                <MetricCard title="Memory" unit="%" metric="memory" peakKey="memory_max" now={m?.memory} limit={server.memory_threshold} limitLabel="alert limit" color="var(--c2)" points={h?.points ?? []} showDate={showDate} percent
+                  note="Memory in use, not counting cache the system can give back." />
+                <MetricCard title="Load average (1 min)" metric="load" peakKey="load_max" now={m?.load} limit={server.load_threshold} limitLabel="alert limit" color="var(--c3)" points={h?.points ?? []} showDate={showDate}
+                  note={m?.cpu_count ? `Runnable processes; ${m.cpu_count} CPU cores, so a load above ${m.cpu_count} means work is queuing.` : 'Runnable processes waiting for a CPU.'} />
+                <MetricCard title="Swap" unit="%" metric="swap" peakKey="swap_max" now={m?.swap} limit={server.swap_threshold} limitLabel="alert limit" color="var(--c5)" points={h?.points ?? []} showDate={showDate} percent />
+                <MetricCard title="Disk" unit="%" metric="disk" peakKey="disk_max" now={m?.disk} limit={server.disk_threshold} limitLabel="alert limit" color="var(--c4)" points={h?.points ?? []} showDate={showDate} percent />
+                <MetricCard title="Network" metric="net_rx_bps" peakKey="net_rx_bps_max" color="var(--c1)" points={h?.points ?? []} showDate={showDate} format={bytesPerSecond}
+                  second={{ key: 'net_tx_bps', peakKey: 'net_tx_bps_max', label: 'Send', color: 'var(--c4)' }} firstLabel="Receive" now={m?.net_rx_bps ?? undefined} />
               </div>
-              <section className="card"><div className="card-head"><h2>Network</h2><span className="grow" /><Legend items={[['Receive', 'var(--c1)'], ['Send', 'var(--c4)']]} /></div>
-                <AreaChart points={h?.points ?? []} height={150} showDate={showDate} series={[{ key: 'net_rx_bps', label: 'Receive', color: 'var(--c1)', format: bytesPerSecond }, { key: 'net_tx_bps', label: 'Send', color: 'var(--c4)', format: bytesPerSecond }]} /></section>
             </>
           )}
           <AvailabilityPanel kind="servers" id={server.id} />
@@ -202,6 +204,33 @@ function ServerDetail({ server }: { server: Server }) {
       {editing && <ServerWizard existing={server} onClose={() => setEditing(false)} />}
       {rotated && <Modal title="New agent token" onClose={() => setRotated(null)}><InstallInstructions token={rotated} serverId={server.id} /></Modal>}
     </>
+  );
+}
+
+type MetricPoint = Record<string, number | string | undefined>;
+/** One chart in its own card: what it is now, the average and peak over the chosen range, and the alert limit as a dashed line. */
+function MetricCard({ title, metric, peakKey, now, limit, limitLabel, color, points, showDate, percent, unit = '', format, note, second, firstLabel }: {
+  title: string; metric: string; peakKey: string; now?: number; limit?: number; limitLabel?: string; color: string; points: Point[]; showDate: boolean; percent?: boolean; unit?: string;
+  format?: (v: number) => string; note?: string; firstLabel?: string; second?: { key: string; peakKey: string; label: string; color: string };
+}) {
+  const fmt = format ?? ((v: number) => (percent ? pct(v, 0) : `${+v.toFixed(2)}`));
+  const vals = points.map(p => (p as MetricPoint)[metric]).filter((v): v is number => typeof v === 'number');
+  const peaks = points.map(p => (p as MetricPoint)[peakKey] ?? (p as MetricPoint)[metric]).filter((v): v is number => typeof v === 'number');
+  const avg = vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+  const peak = peaks.length ? Math.max(...peaks) : null;
+  const series = [{ key: metric, label: firstLabel ?? title, color, peakKey, format: fmt }, ...(second ? [{ key: second.key, label: second.label, color: second.color, peakKey: second.peakKey, format: fmt }] : [])];
+  return (
+    <section className="card metric">
+      <div className="card-head"><h2>{title}</h2><span className="grow" />{second && <Legend items={[[firstLabel ?? 'Receive', color], [second.label, second.color]]} />}</div>
+      <div className="metric-stats">
+        {now != null && <span><small>now</small><b>{fmt(now)}</b></span>}
+        <span><small>average</small><b>{avg != null ? fmt(avg) : '–'}</b></span>
+        <span><small>peak</small><b>{peak != null ? fmt(peak) : '–'}</b></span>
+      </div>
+      <AreaChart points={points} height={150} percent={percent} unit={unit || (percent ? '%' : '')} showDate={showDate} series={series}
+        refLines={limit != null ? [{ value: limit, label: `${limitLabel ?? 'limit'} ${percent ? `${limit}%` : limit}` }] : []} />
+      {note && <p className="sm muted" style={{ marginTop: 6 }}>{note}</p>}
+    </section>
   );
 }
 

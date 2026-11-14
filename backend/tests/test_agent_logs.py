@@ -517,3 +517,41 @@ def test_the_agent_explains_why_there_is_no_response_time_data(tmp_path, monkeyp
         os.chmod(log, 0o644)
     finally:
         sys.modules.pop("agent", None)
+
+
+# =================================================================== CPU is measured over the whole interval
+def test_cpu_is_the_average_and_peak_of_the_interval_not_one_snapshot(tmp_path, monkeypatch):
+    sys.path.insert(0, ROOT); sys.modules.pop("agent", None)
+    a = importlib.import_module("agent")
+    try:
+        a._cpu_thread = object()                                          # do not start the real sampler in this test
+        with a._cpu_lock:
+            for value in (10.0, 20.0, 90.0, 20.0):                        # four 5-second readings, one short spike
+                a._cpu_window["sum"] += value; a._cpu_window["n"] += 1; a._cpu_window["peak"] = max(a._cpu_window["peak"], value)
+        avg, peak = a.cpu_window()
+        assert round(avg, 1) == 35.0 and peak == 90.0                     # a snapshot taken at any one moment would show 10, 20 or 90
+        assert a._cpu_window == {"sum": 0.0, "n": 0, "peak": 0.0}         # the next report starts a fresh window
+        monkeypatch.setattr(a.psutil, "cpu_percent", lambda interval=None: 12.5)
+        assert a.cpu_window() == (12.5, None)                             # before one interval has passed: a short direct sample, no peak yet
+        monkeypatch.undo()
+        report = a.collect()
+        assert 0 <= report["cpu"] <= 100 and report["cpu_peak"] is None or report["cpu_peak"] >= report["cpu"] - 0.1
+    finally:
+        sys.modules.pop("agent", None)
+
+
+def test_process_cpu_is_measured_between_reports_not_in_a_150ms_blip(monkeypatch):
+    sys.path.insert(0, ROOT); sys.modules.pop("agent", None)
+    a = importlib.import_module("agent")
+    try:
+        monkeypatch.setattr(a, "AGENT_PROCESS_SAMPLE_SECONDS", 0.05)
+        slept = []
+        real_sleep = a.time.sleep
+        monkeypatch.setattr(a.time, "sleep", lambda s: (slept.append(s), real_sleep(0.01))[1])
+        first = a.process_rows()
+        assert a._procs_primed and slept == [0.05] and first                # the first report primes the counters and waits once
+        second = a.process_rows()
+        assert slept == [0.05]                                              # later reports do not wait: they read the average since the last one
+        assert any(row["pid"] == os.getpid() for row in second) and all(row["cpu"] >= 0 for row in second)
+    finally:
+        sys.modules.pop("agent", None)

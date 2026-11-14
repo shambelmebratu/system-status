@@ -647,4 +647,4 @@ def history(cluster_id: int, range: str = Query("24h", pattern="^(1h|6h|24h|7d)$
     since = until - timedelta(hours=hours)
     rows = db.scalars(select(ClusterSample).where(ClusterSample.cluster_id == cluster_id, ClusterSample.ts >= since).order_by(ClusterSample.ts)).all()
     keys = ("nodes_ready", "nodes_total", "pods_running", "pods_total", "pods_failing", "cpu_m", "cpu_alloc_m", "mem_mib", "mem_alloc_mib")
-    return {"hours": hours, "samples": len(rows), "points": bucketize([(r.ts, {k: getattr(r, k) for k in keys}) for r in rows], since, until)}
+    return {"hours": hours, "samples": len(rows), "points": bucketize([(r.ts, {k: getattr(r, k) for k in keys}) for r in rows], since, until, with_max=True)}

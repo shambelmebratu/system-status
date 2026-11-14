@@ -150,6 +150,7 @@ class MetricSample(Base):
     server_id: Mapped[int] = mapped_column(ForeignKey("servers.id", ondelete="CASCADE"))
     ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     cpu: Mapped[float] = mapped_column(Float)
+    cpu_peak: Mapped[float | None] = mapped_column(Float)     # highest CPU % seen between two reports (agent 2.12+)
     memory: Mapped[float] = mapped_column(Float)
     disk: Mapped[float] = mapped_column(Float)
     load: Mapped[float] = mapped_column(Float)

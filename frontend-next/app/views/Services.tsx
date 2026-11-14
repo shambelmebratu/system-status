@@ -89,7 +89,7 @@ function ServiceDetail({ service }: { service: Service }) {
       </div>
       <div className="grid">
         <section className="card"><div className="card-head"><h2>Response time</h2></div>
-          <AreaChart points={h?.points ?? []} height={200} showDate={range === '7d' || range === '30d'} series={[{ key: 'latency', label: 'Latency', color: 'var(--accent)', format: v => `${Math.round(v)} ms` }]} unit="ms" /></section>
+          <AreaChart points={h?.points ?? []} height={200} showDate={range === '7d' || range === '30d'} series={[{ key: 'latency', label: 'Latency', color: 'var(--accent)', peakKey: 'latency_max', format: v => `${Math.round(v)} ms` }]} unit="ms" /></section>
         <AvailabilityPanel kind="services" id={service.id} />
         <section className="card"><div className="card-head"><h2>Recent failures</h2></div>
           {h?.recent_failures.length ? <table className="tbl"><tbody>{[...h.recent_failures].reverse().map(f => <tr key={f.t}><td className="muted" style={{ whiteSpace: 'nowrap' }}>{clock(f.t, true)}</td><td className="bad">{f.http_status ? `HTTP ${f.http_status}` : 'No response'}</td><td className="sm mono">{f.error}</td></tr>)}</tbody></table> : <p className="muted sm">No failed checks in this range.</p>}

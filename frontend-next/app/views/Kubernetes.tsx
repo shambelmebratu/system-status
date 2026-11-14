@@ -310,10 +310,10 @@ function Overview({ cluster }: { cluster: Cluster }) {
 
       <div className="grid g2">
         <section className="card"><div className="card-head"><h2>CPU, last 24 h</h2><span className="grow" />{s.cpu_m != null && <span className="sm muted">now {cores(s.cpu_m)}</span>}</div>
-          <AreaChart points={points} height={150} series={[{ key: 'cpu_m', label: 'Used', color: 'var(--c1)', format: v => cores(v) }]} />
+          <AreaChart points={points} height={150} series={[{ key: 'cpu_m', label: 'Used', color: 'var(--c1)', peakKey: 'cpu_m_max', format: v => cores(v) }]} />
           {s.cpu_alloc_m != null && <div className="sm muted" style={{ marginTop: 6 }}>Capacity {cores(s.cpu_alloc_m)}</div>}</section>
         <section className="card"><div className="card-head"><h2>Memory, last 24 h</h2><span className="grow" />{s.mem_mib != null && <span className="sm muted">now {mib(s.mem_mib)}</span>}</div>
-          <AreaChart points={points} height={150} series={[{ key: 'mem_mib', label: 'Used', color: 'var(--c2)', format: v => mib(v) }]} />
+          <AreaChart points={points} height={150} series={[{ key: 'mem_mib', label: 'Used', color: 'var(--c2)', peakKey: 'mem_mib_max', format: v => mib(v) }]} />
           {s.mem_alloc_mib != null && <div className="sm muted" style={{ marginTop: 6 }}>Capacity {mib(s.mem_alloc_mib)}</div>}</section>
       </div>
       <section className="card"><div className="card-head"><h2>Pods over time</h2></div>

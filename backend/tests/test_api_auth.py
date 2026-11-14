@@ -1867,3 +1867,27 @@ def test_public_status_page_time_frames(client, monkeypatch):
     assert anon.get("/api/public/status").json()["days"] == 1                                              # a default that is not offered falls back to the first
     monkeypatch.setattr(s, "public_status_ranges", "banana")
     assert anon.get("/api/public/status").json()["ranges"] == [7, 30, 90]                                  # nonsense falls back to safe values
+
+
+def test_graph_data_keeps_the_peaks_that_averages_hide(client):
+    from datetime import timedelta
+    from app.models import MetricSample
+    from app.stats import bucketize
+    now = datetime.now(timezone.utc)
+    rows = [(now - timedelta(minutes=5), {"v": 10.0}), (now - timedelta(minutes=4), {"v": 90.0}), (now - timedelta(minutes=3), {"v": 20.0})]
+    plain = bucketize(rows, now - timedelta(hours=1), now, buckets=4)
+    assert plain[-1]["v"] == 40.0 and "v_max" not in plain[-1]                                       # an average alone says 40 ...
+    peaked = bucketize(rows, now - timedelta(hours=1), now, buckets=4, with_max=True)
+    assert peaked[-1]["v"] == 40.0 and peaked[-1]["v_max"] == 90.0                                   # ... the peak says 90
+    sign_in(client)
+    anon = TestClient(main.app)
+    sid, auth = _push_server(client, anon)
+    assert anon.post("/api/agent/report", json=report(cpu=30.0, cpu_peak=85.0), headers=auth).status_code == 200
+    assert anon.post("/api/agent/report", json=report(cpu=20.0), headers=auth).status_code == 200    # an older agent: no peak reported
+    assert anon.post("/api/agent/report", json=report(cpu=30.0, cpu_peak=150), headers=auth).status_code == 422
+    with database.SessionLocal() as db:
+        peaks = sorted(m.cpu_peak for m in db.query(MetricSample).filter(MetricSample.server_id == sid, MetricSample.cpu_peak.is_not(None)))
+    assert peaks == [85.0]
+    points = client.get(f"/api/servers/{sid}/history?range=1h").json()["points"]
+    assert max(p["cpu_max"] for p in points) == 85.0 and all(p["cpu_max"] >= p["cpu"] for p in points) and "cpu_hi" not in points[0]
+    assert all(("memory_max" in p) and ("net_rx_bps_max" in p or True) for p in points)

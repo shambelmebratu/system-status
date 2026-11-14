@@ -337,6 +337,14 @@ The **Data sources** card on the Performance page says, per server, what the age
 
 On the Performance page, **Set a target** on a service (or on a server that reports real traffic): for example *p95 faster than 800 ms over the last 10 minutes*. When the percentile is slower than the target the monitor goes to *Over a limit*, an incident is opened and an alert is sent (to the channels and with the reminder interval set in that monitor's Alerts section); when it is back under, a recovery message follows. A monitor is not judged on too little data: `PERF_MIN_CHECK_SAMPLES` (5 probes) and `PERF_MIN_REQUESTS` (50 requests); the default window is `PERF_DEFAULT_WINDOW_MINUTES` (10).
 
+## Graphs
+
+Each server metric has its own chart: **CPU, Memory, Load, Swap, Disk and Network**, each with its current value, the average and the peak over the chosen range, and the alert limit as a dashed line. The charts are built to show what happened rather than a smoothed picture:
+
+- **CPU is measured over the whole reporting interval.** The agent (2.12+) samples the CPU every few seconds (`AGENT_CPU_SAMPLE_SECONDS`, default 5) and reports the average and the peak of the interval, instead of one snapshot taken at the moment of the report. The shaded band on a chart reaches up to the highest value in each bucket, so a spike is not averaged away. Per-process CPU (which drives the "process over a limit" alerts) is also the average since the previous report, no longer a 150 ms blip.
+- **Gaps are shown as gaps.** When an agent or a monitor stops reporting, the chart shows a shaded "no data" stretch instead of a straight line across it.
+- **Percent charts scale to the data** (the axis tops out at 10, 20, 25, 40, 50, 75 or 100 %, whichever just fits), and the limit line is drawn when it is within view.
+
 ## Agent addresses and updates
 
 The System card shows the real **operating system** (for example `Ubuntu 22.04.5 LTS`, read from the host's `/etc/os-release`, also inside Docker), the kernel and the architecture. Each server shows its **public IP** (the address the control plane sees it connect from, or `AGENT_PUBLIC_IP` / `AGENT_PUBLIC_IP_URL` if you set one on the agent; nothing contacts the outside by default). An address on a network the control plane itself is attached to (for example a Docker network) is never called public, even if its number is in a public range; the agent bundled with SM-Watch shows the control plane's public address instead (`HOST_PUBLIC_IP`, or what `PUBLIC_URL` resolves to) and its **private IPs** (its own LAN addresses, container networks excluded). Alerts and Telegram messages name the server with its host name and public IP, falling back to a private one.
