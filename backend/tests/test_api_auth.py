@@ -148,7 +148,7 @@ def test_public_status_and_install_assets(client):
         monitoring.apply_service_result(db, svc, {"status": "up", "http_status": 200, "latency_ms": 42.0, "error": None})
     page = TestClient(main.app).get("/api/public/status").json()
     assert [s["name"] for s in page["services"]] == ["Website"]          # private service hidden
-    assert page["overall"] == "up" and len(page["services"][0]["daily"]) == 90 and "url" not in page["services"][0]
+    assert page["overall"] == "up" and len(page["services"][0]["daily"]) == 30 and "url" not in page["services"][0]
     assert page["services"][0]["daily"][-1]["pct"] == 100.0
     hist = client.get(f"/api/services/{a['id']}/history?range=24h").json()
     assert hist["checks"] == 1 and hist["latency_avg"] == 42.0
@@ -1843,3 +1843,27 @@ def test_traffic_status_from_the_agent_is_stored_and_validated(client):
     srv = next(s for s in client.get("/api/dashboard").json()["servers"] if s["id"] == sid)
     assert srv["last_metrics"]["traffic_status"]["state"] == "no_timing" and srv["last_metrics"]["traffic_status"]["detected"][0]["timing"] is False
     assert anon.post("/api/agent/report", json=report(traffic_status={"state": "bogus"}), headers=auth).status_code == 422
+
+
+def test_public_status_page_time_frames(client, monkeypatch):
+    from app.config import get_settings
+    sign_in(client)
+    svc = client.post("/api/services", headers=CSRF, json={"name": "pub-frame", "url": "https://example.com", "public": True}).json()
+    anon = TestClient(main.app)
+    default = anon.get("/api/public/status").json()
+    assert default["days"] == 30 and default["ranges"] == [7, 30, 90]                                   # opens on 30 days
+    row = next(r for r in default["services"] if r["name"] == "pub-frame")
+    assert len(row["daily"]) == 30 and "uptime" in row
+    for days in (7, 90):
+        page = anon.get(f"/api/public/status?days={days}").json()
+        assert page["days"] == days and len(next(r for r in page["services"] if r["name"] == "pub-frame")["daily"]) == days
+    assert anon.get("/api/public/status?days=45").status_code == 422                                      # only the offered time frames
+    assert anon.get("/api/public/status?days=0").status_code == 422 and anon.get("/api/public/status?days=999").status_code == 422
+    s = get_settings()
+    monkeypatch.setattr(s, "public_status_ranges", "1, 14,180"); monkeypatch.setattr(s, "public_status_default_days", 14)
+    configured = anon.get("/api/public/status").json()
+    assert configured["ranges"] == [1, 14, 180] and configured["days"] == 14                              # both come from .env
+    monkeypatch.setattr(s, "public_status_default_days", 60)
+    assert anon.get("/api/public/status").json()["days"] == 1                                              # a default that is not offered falls back to the first
+    monkeypatch.setattr(s, "public_status_ranges", "banana")
+    assert anon.get("/api/public/status").json()["ranges"] == [7, 30, 90]                                  # nonsense falls back to safe values

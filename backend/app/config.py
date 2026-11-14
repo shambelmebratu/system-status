@@ -29,6 +29,8 @@ class Settings(BaseSettings):
     reminder_minutes: int = 30         # minimum gap between repeat alerts while a target stays down
     alert_retry_minutes: int = 60      # undelivered alerts older than this are expired, not retried
     public_status_enabled: bool = True
+    public_status_default_days: int = 30       # the status page opens on this time frame ...
+    public_status_ranges: str = "7,30,90"      # ... and visitors can switch between these (days, 1 to 365)
     audit_retention_days: int = 365
     agent_min_report_seconds: float = 2   # an agent may not report more often than this (flood protection)
     dockerhub_username: str = "shambi21"  # where the published agent image lives (used by the Docker install command)

@@ -93,7 +93,7 @@ export function Sparkline({ values, color = 'var(--accent)', height = 34 }: { va
 export function UptimeBar({ days }: { days: Daily[] }) {
   return (
     <div>
-      <div className="uptime-bar" role="img" aria-label="Daily availability over the last 90 days">
+      <div className="uptime-bar" role="img" aria-label={`Daily availability over the last ${days.length} days`}>
         {days.map(d => <i key={d.date} className={uptimeClass(d.pct)} title={`${d.date}: ${d.pct == null ? 'no data' : d.pct.toFixed(2) + '%'}`} />)}
       </div>
       <div className="scale"><span>{days.length} days ago</span><span>Today</span></div>

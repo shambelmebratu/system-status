@@ -20,6 +20,17 @@ def hours_for(range_: str, retention_days: int) -> int:
     return min(RANGES[range_], retention_days * 24)
 
 
+def public_ranges() -> list[int]:
+    """The time frames the public status page offers (PUBLIC_STATUS_RANGES, days). Bad values fall back to 7, 30 and 90."""
+    try:
+        values = sorted({int(x) for x in get_settings().public_status_ranges.split(",") if x.strip()})
+        if values and all(1 <= v <= 365 for v in values):
+            return values[:8]
+    except ValueError:
+        pass
+    return [7, 30, 90]
+
+
 def serialize_incident(item: Incident) -> dict:
     started, resolved = aware(item.started_at), aware(item.resolved_at) if item.resolved_at else None
     return {
@@ -81,19 +92,23 @@ def incidents(state: str = Query("all", pattern="^(all|open|resolved)$"), limit:
 
 
 @router.get("/public/status")
-def public_status(db: Session = Depends(get_db)) -> dict:
+def public_status(days: int | None = Query(None, ge=1, le=365), db: Session = Depends(get_db)) -> dict:
     """Unauthenticated status page data. Only items flagged `public` appear; URLs/hosts are never exposed."""
     settings = get_settings()
     if not settings.public_status_enabled:
         raise HTTPException(404, "Status page is disabled")
     services = db.scalars(select(Service).where(Service.public.is_(True), Service.enabled.is_(True)).order_by(Service.name)).all()
     servers = db.scalars(select(Server).where(Server.public.is_(True), Server.enabled.is_(True)).order_by(Server.name)).all()
-    uptime = uptime_by_target(db, 24 * 90)
-    since = datetime.now(timezone.utc) - timedelta(days=30)
+    ranges = public_ranges()
+    days = days if days is not None else (settings.public_status_default_days if settings.public_status_default_days in ranges else ranges[0])
+    if days not in ranges:
+        raise HTTPException(422, f"Choose one of: {', '.join(str(r) for r in ranges)} days")
+    uptime = uptime_by_target(db, 24 * days)
+    since = datetime.now(timezone.utc) - timedelta(days=days)
 
     def row(kind: str, item, latency) -> dict:
-        daily = daily_uptime(db, kind, [item.id], 90)[item.id]
-        return {"id": f"{kind}-{item.id}", "kind": kind, "name": item.name, "status": item.last_status, "latency_ms": latency, "uptime_90d": uptime.get((kind, item.id)), "daily": daily}
+        daily = daily_uptime(db, kind, [item.id], days)[item.id]
+        return {"id": f"{kind}-{item.id}", "kind": kind, "name": item.name, "status": item.last_status, "latency_ms": latency, "uptime": uptime.get((kind, item.id)), "daily": daily}
 
     items = [row("service", i, i.last_latency_ms) for i in services] + [row("server", i, (json.loads(i.last_metrics).get("latency_ms") if i.last_metrics else None)) for i in servers]
     items.sort(key=lambda r: r["name"].lower())
@@ -106,4 +121,4 @@ def public_status(db: Session = Depends(get_db)) -> dict:
         item["detail"] = None
     statuses = [r["status"] for r in items]
     overall = "down" if "down" in statuses else ("alert" if "alert" in statuses else ("unknown" if not statuses or all(s == "unknown" for s in statuses) else "up"))
-    return {"company_name": settings.company_name, "overall": overall, "services": items, "incidents": incidents[:20], "updated_at": datetime.now(timezone.utc).isoformat()}
+    return {"company_name": settings.company_name, "overall": overall, "days": days, "ranges": ranges, "services": items, "incidents": incidents[:50], "updated_at": datetime.now(timezone.utc).isoformat()}
