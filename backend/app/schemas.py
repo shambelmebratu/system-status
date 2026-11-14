@@ -113,6 +113,31 @@ class IpEntry(BaseModel):
         return str(ipaddress.ip_address(v))
 
 
+class TrafficReport(BaseModel):
+    """What the agent measured from the web server's access log during one reporting window (no individual requests)."""
+    source: str = Field(default="", max_length=120)
+    window_seconds: float = Field(ge=0, le=86400)
+    requests: int = Field(ge=0, le=50_000_000)
+    errors_5xx: int = Field(default=0, ge=0, le=50_000_000)
+    errors_4xx: int = Field(default=0, ge=0, le=50_000_000)
+    sum_ms: float = Field(default=0, ge=0, le=1e13)
+    max_ms: float = Field(default=0, ge=0, le=1e9)
+    upstream_sum_ms: float = Field(default=0, ge=0, le=1e13)
+    upstream_count: int = Field(default=0, ge=0, le=50_000_000)
+    bounds: list[float] = Field(min_length=1, max_length=40)
+    counts: list[int] = Field(min_length=2, max_length=41)
+
+    @model_validator(mode="after")
+    def consistent(self):
+        if len(self.counts) != len(self.bounds) + 1:
+            raise ValueError("counts must have one more entry than bounds")
+        if sorted(self.bounds) != self.bounds or any(b <= 0 for b in self.bounds) or any(c < 0 for c in self.counts):
+            raise ValueError("bounds must be positive and ascending, counts non-negative")
+        if sum(self.counts) != self.requests:
+            raise ValueError("counts must add up to requests")
+        return self
+
+
 class AgentReport(BaseModel):
     cpu: float = Field(ge=0, le=100)
     memory: float = Field(ge=0, le=100)
@@ -135,6 +160,7 @@ class AgentReport(BaseModel):
     public_ip: str = Field(default="", max_length=45)
     install: str = Field(default="", max_length=20)
     machine: str = Field(default="", max_length=64, pattern="^[0-9a-f]*$")
+    traffic: TrafficReport | None = None
 
     @field_validator("hostname", "platform", "os", "kernel", "arch", "install", "agent_version")
     @classmethod

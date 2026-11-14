@@ -142,6 +142,26 @@ class MetricSample(Base):
     net_tx_bps: Mapped[float | None] = mapped_column(Float)
 
 
+class TrafficSample(Base):
+    """Response times of REAL traffic at a load balancer / web server, summarised by the agent for one reporting window.
+    Only a histogram is kept (never the requests themselves), so percentiles stay exact enough to merge across windows."""
+    __tablename__ = "traffic_samples"
+    __table_args__ = (Index("ix_traffic_samples_server_time", "server_id", "ts"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    server_id: Mapped[int] = mapped_column(ForeignKey("servers.id", ondelete="CASCADE"))
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    window_seconds: Mapped[float] = mapped_column(Float, default=0)
+    requests: Mapped[int] = mapped_column(Integer, default=0)
+    errors_5xx: Mapped[int] = mapped_column(Integer, default=0)
+    errors_4xx: Mapped[int] = mapped_column(Integer, default=0)
+    sum_ms: Mapped[float] = mapped_column(Float, default=0)
+    max_ms: Mapped[float] = mapped_column(Float, default=0)
+    upstream_sum_ms: Mapped[float] = mapped_column(Float, default=0)
+    upstream_count: Mapped[int] = mapped_column(Integer, default=0)
+    bounds: Mapped[str] = mapped_column(Text)        # JSON list of bucket upper bounds in ms (the last bucket is "above the last bound")
+    counts: Mapped[str] = mapped_column(Text)        # JSON list of per-bucket request counts, len(bounds) + 1
+
+
 class Incident(Base):
     """An outage/alert window. Opened on first failure, resolved on recovery."""
     __tablename__ = "incidents"

@@ -4,7 +4,7 @@ from datetime import date, datetime, timedelta, timezone
 from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
-from .models import CheckResult, MetricSample
+from .models import CheckResult, MetricSample, TrafficSample
 
 METRIC_KEYS = ("cpu", "memory", "disk", "load", "swap", "net_rx_bps", "net_tx_bps")
 

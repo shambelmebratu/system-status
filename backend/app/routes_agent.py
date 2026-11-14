@@ -9,7 +9,10 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from .database import get_db
-from .models import Server
+import json
+
+from .models import Server, TrafficSample
+from .performance import traffic_bounds
 from .monitoring import apply_server_result, evaluate_metrics
 from .schemas import AgentReport
 from . import log_policy as policy_lib
@@ -57,6 +60,7 @@ def report(payload: AgentReport, request: Request, authorization: str | None = H
     server.last_agent_ip = ip
 
     metrics = payload.model_dump()
+    traffic = metrics.pop("traffic", None)   # stored in its own table, not in the host metrics JSON
     metrics["received_at"] = now.isoformat()
     try:
         status, failures = evaluate_metrics(server, metrics)
@@ -65,7 +69,11 @@ def report(payload: AgentReport, request: Request, authorization: str | None = H
     server.last_seen_at = now
     # deliver=False: alerts are queued and sent by the worker so ingest stays fast.
     apply_server_result(db, server, status, failures, metrics, deliver=False)
+    if traffic and traffic["requests"] > 0:
+        db.add(TrafficSample(server_id=server.id, ts=now, bounds=json.dumps(traffic["bounds"]), counts=json.dumps(traffic["counts"]),
+                             **{k: traffic[k] for k in ("window_seconds", "requests", "errors_5xx", "errors_4xx", "sum_ms", "max_ms", "upstream_sum_ms", "upstream_count")}))
     db.commit()
+    reply["traffic_buckets_ms"] = traffic_bounds()   # the agent uses these histogram boundaries from its next report on
     reply["log_policy"] = policy_lib.compile_for_agent(policy_lib.parse(server.log_policy))   # the agent enforces this too
     return {**reply, "status": status, "interval_seconds": server.check_interval_seconds}
 

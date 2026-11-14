@@ -1571,3 +1571,104 @@ def test_channels_only_receive_the_alerts_they_are_set_to(client, monkeypatch):
         assert event.sent is False and event.delivery_attempts == 10 and event.delivery_error == m.NOT_ROUTED
     with database.SessionLocal() as db:
         db.query(Channel).delete(); db.commit()
+
+
+# =================================================================== response-time dashboard
+def _traffic(requests, counts, bounds=(10, 50, 100, 500), **kw):
+    body = {"source": "access.log", "window_seconds": 60, "requests": requests, "errors_5xx": 0, "errors_4xx": 0, "sum_ms": 0, "max_ms": 0, "upstream_sum_ms": 0, "upstream_count": 0,
+            "bounds": list(bounds), "counts": counts}
+    body.update(kw)
+    return body
+
+
+def test_histogram_percentiles_and_merging():
+    from app.performance import histogram_percentile, merge
+    bounds, counts = [10, 50, 100, 500], [50, 30, 15, 4, 1]                                   # 100 requests
+    assert histogram_percentile(bounds, counts, 0.50) == 10.0                                  # the median is at the top of the first bucket
+    assert 50 < histogram_percentile(bounds, counts, 0.95) <= 100
+    assert histogram_percentile(bounds, counts, 0.99, max_ms=900) <= 500
+    assert histogram_percentile(bounds, counts, 1.0, max_ms=900) == 900                        # the open-ended top bucket is capped by the slowest seen
+    assert histogram_percentile(bounds, [0, 0, 0, 0, 0], 0.5) is None
+    a = merge([([10, 50], [5, 5, 0]), ([10, 50], [0, 5, 5])])
+    assert a == ([10, 50, 100], [5, 10, 5])                                                    # same boundaries: counts simply add up
+    mixed = merge([([10, 50], [4, 0, 0]), ([20, 40], [0, 4, 0])])
+    assert mixed[0] == [10, 40] and sum(mixed[1]) == 8                                         # different boundaries are still merged, never lost
+
+
+def test_agent_traffic_is_stored_and_served_as_percentiles(client):
+    from datetime import timedelta
+    from app.models import TrafficSample
+    sign_in(client)
+    anon = TestClient(main.app)
+    sid, auth = _push_server(client, anon)
+    bad = _traffic(5, [1, 1, 1, 1, 1], bounds=(10, 50, 100, 500))
+    assert anon.post("/api/agent/report", json=report(traffic={**bad, "counts": [1, 1, 1, 1]}), headers=auth).status_code == 422       # wrong length
+    assert anon.post("/api/agent/report", json=report(traffic={**bad, "requests": 9}), headers=auth).status_code == 422                   # counts must add up
+    assert anon.post("/api/agent/report", json=report(traffic={**bad, "bounds": [50, 10, 100, 500]}), headers=auth).status_code == 422    # ascending
+    good = _traffic(100, [50, 30, 15, 4, 1], sum_ms=5000, max_ms=900, errors_5xx=2, upstream_sum_ms=3000, upstream_count=100)
+    r = anon.post("/api/agent/report", json=report(traffic=good), headers=auth)
+    assert r.status_code == 200 and r.json()["traffic_buckets_ms"][0] == 5.0                  # the agent is told which boundaries to use
+    assert anon.post("/api/agent/report", json=report(traffic=_traffic(0, [0, 0, 0, 0, 0])), headers=auth).status_code == 200          # idle window: nothing stored
+    data = client.get("/api/performance/traffic?range=1h").json()
+    assert len(data["servers"]) == 1
+    s = data["servers"][0]
+    assert s["requests"] == 100 and s["p50"] == 10.0 and 50 < s["p95"] <= 100 and s["p99"] <= 500 and s["max"] == 900.0
+    assert s["avg"] == 50.0 and s["upstream_avg"] == 30.0 and s["error_rate_5xx"] == 2.0 and s["rps"] == round(100 / 60, 2)
+    assert s["series"] and s["series"][0]["p99"] is not None and data["total"]["requests"] == 100
+    assert "traffic" not in json.dumps(next(x for x in client.get("/api/dashboard").json()["servers"] if x["id"] == sid)["last_metrics"])   # not duplicated into host metrics
+    with database.SessionLocal() as db:                                                         # old windows fall out of a short range
+        db.add(TrafficSample(server_id=sid, ts=datetime.now(timezone.utc) - timedelta(hours=30), window_seconds=60, requests=10, bounds="[10]", counts="[0, 10]", max_ms=4000)); db.commit()
+    assert client.get("/api/performance/traffic?range=24h").json()["servers"][0]["requests"] == 100
+    assert client.get("/api/performance/traffic?range=7d").json()["servers"][0]["requests"] == 110
+    assert TestClient(main.app).get("/api/performance/traffic").status_code == 401
+    assert client.get("/api/performance/traffic?range=1y").status_code == 422
+    purged = client.post("/api/retention/purge", headers=CSRF, json={"categories": ["metrics"], "older_than_days": 1}).json()["deleted"]["metrics"]
+    assert purged >= 1                                                                          # traffic history is part of the "metrics" retention
+    assert client.get("/api/performance/traffic?range=7d").json()["servers"][0]["requests"] == 100
+
+
+def test_check_latency_percentiles(client):
+    from datetime import timedelta
+    from app.models import CheckResult
+    sign_in(client)
+    svc = client.post("/api/services", headers=CSRF, json={"name": "perf-svc", "url": "https://example.com", "expected_status": 200}).json()
+    now = datetime.now(timezone.utc)
+    with database.SessionLocal() as db:
+        for i in range(100):
+            db.add(CheckResult(target_type="service", target_id=svc["id"], status="up", latency_ms=float(i + 1), checked_at=now - timedelta(minutes=i)))
+        db.add(CheckResult(target_type="service", target_id=svc["id"], status="down", latency_ms=9999.0, checked_at=now))      # failures are not response times
+        db.commit()
+    items = client.get("/api/performance/checks?range=24h").json()["items"]
+    mine = next(i for i in items if i["name"] == "perf-svc")
+    assert mine["checks"] == 100 and mine["p50"] == 51.0 and mine["p95"] == 96.0 and mine["p99"] == 100.0 and mine["max"] == 100.0
+    series = client.get(f"/api/performance/checks/service/{svc['id']}?range=1h").json()
+    assert series["points"] and {"p50", "p95", "p99"} <= set(series["points"][0])
+    assert client.get("/api/performance/checks/cluster/1").status_code == 404
+
+
+def test_what_the_real_agent_produces_is_accepted_and_summarised(client, tmp_path, monkeypatch):
+    """End to end: the agent's own summary of a real nginx-format log goes through the API validation and comes back as percentiles."""
+    import importlib, sys
+    log = tmp_path / "access.log"; log.write_text("")
+    monkeypatch.setenv("AGENT_ACCESS_LOG", str(log)); monkeypatch.setenv("AGENT_HOST_ROOT", "/")
+    sys.path.insert(0, os.path.dirname(os.path.dirname(__file__))); sys.modules.pop("agent", None)
+    agent = importlib.import_module("agent")
+    try:
+        sign_in(client)
+        anon = TestClient(main.app)
+        sid, auth = _push_server(client, anon)
+        first = anon.post("/api/agent/report", json=report(), headers=auth).json()
+        agent.adopt_traffic_bounds(first["traffic_buckets_ms"])                                 # what a real agent does with the reply
+        agent.traffic_stats()
+        line = '10.0.0.1 - - [14/Nov/2026:10:00:01 +0000] "GET /x HTTP/1.1" {s} 10 "ua" rt={rt} urt={rt}\n'
+        with open(log, "a") as handle:
+            for i in range(200):
+                handle.write(line.format(s=500 if i == 0 else 200, rt=f"{0.01 + i * 0.002:.3f}"))      # 10 ms .. 408 ms
+        body = report(); body["traffic"] = agent.traffic_stats()
+        assert body["traffic"]["requests"] == 200
+        assert anon.post("/api/agent/report", json=body, headers=auth).status_code == 200
+        s = next(x for x in client.get("/api/performance/traffic?range=1h").json()["servers"] if x["server_id"] == sid)
+        assert s["requests"] == 200 and s["errors_5xx"] == 1
+        assert 190 <= s["p50"] <= 250 and 340 <= s["p95"] <= 420 and s["p99"] >= s["p95"]       # true values: ~209 / ~390 / ~404 ms, within one bucket
+    finally:
+        sys.modules.pop("agent", None)

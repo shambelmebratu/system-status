@@ -11,6 +11,7 @@ import { Incidents } from './views/Incidents';
 import { Login } from './views/Login';
 import { Logs } from './views/Logs';
 import { Overview } from './views/Overview';
+import { Performance } from './views/Performance';
 import { Servers } from './views/Servers';
 import { Services } from './views/Services';
 import { Schedules } from './views/Schedules';
@@ -50,6 +51,7 @@ const NAV: { id: string; label: string; icon: string; min: Role }[] = [
   { id: 'servers', label: 'Servers', icon: 'server', min: 'viewer' },
   { id: 'services', label: 'Services', icon: 'globe', min: 'viewer' },
   { id: 'kubernetes', label: 'Kubernetes', icon: 'k8s', min: 'viewer' },
+  { id: 'performance', label: 'Performance', icon: 'zap', min: 'viewer' },
   { id: 'logs', label: 'Logs', icon: 'logs', min: 'operator' },
   { id: 'incidents', label: 'Incidents', icon: 'alert', min: 'viewer' },
   { id: 'alerts', label: 'Alerts', icon: 'bell', min: 'operator' },
@@ -76,7 +78,7 @@ function Shell({ company, me, onSignOut }: { company: string; me: Me; onSignOut:
     try { localStorage.setItem('smw_theme', next); } catch { /* storage unavailable */ }
   };
 
-  const view = { overview: <Overview />, servers: <Servers />, services: <Services />, kubernetes: <Kubernetes />, incidents: <Incidents />, alerts: <Channels />, schedules: <Schedules />, logs: <Logs />, users: <Users />, audit: <Audit />, settings: <Settings /> }[page] ?? <Overview />;
+  const view = { overview: <Overview />, servers: <Servers />, services: <Services />, kubernetes: <Kubernetes />, performance: <Performance />, incidents: <Incidents />, alerts: <Channels />, schedules: <Schedules />, logs: <Logs />, users: <Users />, audit: <Audit />, settings: <Settings /> }[page] ?? <Overview />;
 
   return (
     <div className="shell">

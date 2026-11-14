@@ -381,3 +381,81 @@ def test_agent_never_forwards_its_token_to_a_redirect_target(cred_agent):
     finally:
         urllib.request.install_opener(previous) if previous else setattr(urllib.request, "_opener", None)
         collector.shutdown(); redirector.shutdown()
+
+
+# =================================================================== real-traffic response times (access log summary)
+@pytest.fixture()
+def traffic_agent(tmp_path, monkeypatch):
+    log = tmp_path / "access.log"
+    log.write_text("")
+    monkeypatch.setenv("AGENT_ACCESS_LOG", str(log))
+    monkeypatch.setenv("AGENT_HOST_ROOT", "/")
+    monkeypatch.setenv("AGENT_DOCKER_SOCKET", str(tmp_path / "no.sock"))
+    sys.path.insert(0, ROOT)
+    sys.modules.pop("agent", None)
+    module = importlib.import_module("agent")
+    yield module, log
+    sys.modules.pop("agent", None)
+
+
+LINE = '203.0.113.9 - - [14/Nov/2026:10:00:01 +0000] "GET /api/x HTTP/1.1" {status} 512 "curl/8" rt={rt} urt={urt}\n'
+
+
+def test_access_log_lines_are_parsed(traffic_agent):
+    a, _ = traffic_agent
+    assert a.parse_access_line(LINE.format(status=200, rt="0.250", urt="0.200")) == (250.0, 200, 200.0)
+    ms, status, upstream = a.parse_access_line(LINE.format(status=502, rt="1.500", urt="0.300, 0.400"))     # nginx lists retries
+    assert (round(ms), status, round(upstream)) == (1500, 502, 700)
+    assert a.parse_access_line(LINE.format(status=499, rt="0.020", urt="-"))[2] is None                    # no upstream (cache hit / client gone)
+    assert a.parse_access_line('{"status":"404","request_time":"0.042","upstream_response_time":"0.040"}') == (42.0, 404, 40.0)
+    assert a.parse_access_line('1.2.3.4 - - [x] "GET / HTTP/1.1" 200 5 "-"') is None                        # no timing in this format
+    assert a.parse_access_line("garbage") is None and a.parse_access_line("") is None and a.parse_access_line("{not json") is None
+    assert a.parse_access_line('x "GET / HTTP/1.1" 200 1 "ua with urt=9 inside" rt=0.1')[0] == 100.0      # the real timing field, not look-alikes
+
+
+def test_traffic_summary_is_a_histogram_and_never_replays_history(traffic_agent):
+    a, log = traffic_agent
+    log.write_text(LINE.format(status=200, rt="9.999", urt="9.9") * 5)                    # old history: must be ignored
+    assert a.traffic_stats() is None                                                       # first call only remembers the end of the file
+    rows = [("0.004", 200), ("0.040", 200), ("0.040", 200), ("0.120", 200), ("0.900", 500), ("3.000", 404), ("30.0", 200)]
+    with open(log, "a") as handle:
+        for rt, status in rows:
+            handle.write(LINE.format(status=status, rt=rt, urt="0.001"))
+        handle.write('partial line without newline rt=1.0')                                # a half-written line waits for its newline
+    t = a.traffic_stats()
+    assert t["requests"] == 7 and t["errors_5xx"] == 1 and t["errors_4xx"] == 1 and t["upstream_count"] == 7
+    assert sum(t["counts"]) == 7 and len(t["counts"]) == len(t["bounds"]) + 1
+    assert t["counts"][0] == 1 and t["counts"][-1] == 1 and round(t["max_ms"]) == 30000          # 4 ms in the first bucket, 30 s above the last bound
+    assert round(t["sum_ms"]) == round(sum(float(rt) * 1000 for rt, _ in rows))
+    assert "203.0.113.9" not in json.dumps(t) and "curl" not in json.dumps(t)                  # nothing identifying leaves the server
+    assert a.traffic_stats() is None                                                       # nothing new since
+    with open(log, "a") as handle:
+        handle.write("\n")                                                                  # completes the partial line
+    assert a.traffic_stats()["requests"] == 1
+
+
+def test_log_rotation_and_bounds_from_the_control_plane(traffic_agent, tmp_path):
+    a, log = traffic_agent
+    a.traffic_stats()
+    log.write_text(LINE.format(status=200, rt="0.010", urt="0.005"))
+    assert a.traffic_stats()["requests"] == 1
+    os.rename(log, tmp_path / "access.log.1")                                               # logrotate moves the file and starts a new one
+    log.write_text(LINE.format(status=200, rt="0.020", urt="0.005") * 3)
+    assert a.traffic_stats()["requests"] == 3
+    a.adopt_traffic_bounds([50, 10, 100, -5, "x"][:3])
+    assert a._traffic_bounds == [10.0, 50.0, 100.0]
+    a.adopt_traffic_bounds(["bad"]); a.adopt_traffic_bounds([])
+    assert a._traffic_bounds == [10.0, 50.0, 100.0]                                         # garbage from a broken control plane is ignored
+    with open(log, "a") as handle:
+        handle.write(LINE.format(status=200, rt="0.030", urt="0.005"))
+    assert a.traffic_stats()["bounds"] == [10.0, 50.0, 100.0]
+
+
+def test_traffic_is_off_unless_configured(tmp_path, monkeypatch):
+    monkeypatch.delenv("AGENT_ACCESS_LOG", raising=False)
+    sys.path.insert(0, ROOT); sys.modules.pop("agent", None)
+    a = importlib.import_module("agent")
+    try:
+        assert a.traffic_stats() is None and a.collect()["traffic"] is None
+    finally:
+        sys.modules.pop("agent", None)

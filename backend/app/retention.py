@@ -18,12 +18,12 @@ from sqlalchemy import delete, func, select, text
 from sqlalchemy.orm import Session
 
 from .config import get_settings
-from .models import AlertEvent, AppSetting, AuditEvent, CheckResult, ClusterSample, Enrollment, Incident, K8sRequest, LogRequest, MetricSample
+from .models import TrafficSample, AlertEvent, AppSetting, AuditEvent, CheckResult, ClusterSample, Enrollment, Incident, K8sRequest, LogRequest, MetricSample
 
 KEY = "retention"
 CATEGORIES = {
     "checks": "Uptime history (checks)",
-    "metrics": "Server & cluster metrics",
+    "metrics": "Server, cluster & traffic metrics",
     "alerts": "Alert messages",
     "incidents": "Resolved incidents",
     "audit": "Audit log",
@@ -82,6 +82,7 @@ def _delete_older(db: Session, category: str, cutoff: datetime | None) -> int:
         stmt = delete(CheckResult).where(*older(CheckResult.checked_at))
     elif category == "metrics":
         n = db.execute(delete(MetricSample).where(*older(MetricSample.ts))).rowcount or 0
+        n += db.execute(delete(TrafficSample).where(*older(TrafficSample.ts))).rowcount or 0
         return n + (db.execute(delete(ClusterSample).where(*older(ClusterSample.ts))).rowcount or 0)
     elif category == "alerts":
         stmt = delete(AlertEvent).where(*older(AlertEvent.created_at))
@@ -157,7 +158,7 @@ def stats(db: Session) -> dict:
     """Row counts, oldest entry and (on PostgreSQL) disk size for each kind."""
     spec = {
         "checks": [(CheckResult, CheckResult.checked_at)],
-        "metrics": [(MetricSample, MetricSample.ts), (ClusterSample, ClusterSample.ts)],
+        "metrics": [(MetricSample, MetricSample.ts), (TrafficSample, TrafficSample.ts), (ClusterSample, ClusterSample.ts)],
         "alerts": [(AlertEvent, AlertEvent.created_at)],
         "incidents": [(Incident, Incident.started_at)],
         "audit": [(AuditEvent, AuditEvent.ts)],

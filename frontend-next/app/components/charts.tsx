@@ -7,8 +7,8 @@ import { clock, uptimeClass } from '../lib/format';
 export type Series = { key: string; label: string; color: string; format?: (v: number) => string };
 
 /** Responsive multi-series area/line chart with hover tooltip. Pure SVG, no dependencies. */
-export function AreaChart({ points, series, height = 180, yMax, unit = '', stacked = false, showDate = false }: {
-  points: Point[]; series: Series[]; height?: number; yMax?: number; unit?: string; stacked?: boolean; showDate?: boolean;
+export function AreaChart({ points, series, height = 180, yMax, unit = '', stacked = false, showDate = false, axisFormat }: {
+  points: Point[]; series: Series[]; height?: number; yMax?: number; unit?: string; stacked?: boolean; showDate?: boolean; axisFormat?: (v: number) => string;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const [hover, setHover] = useState<number | null>(null);
@@ -52,7 +52,7 @@ export function AreaChart({ points, series, height = 180, yMax, unit = '', stack
           ))}
         </defs>
         {ticks.map(v => (
-          <g key={v}><line className="grid-line" x1={padL} x2={W - 4} y1={y(v)} y2={y(v)} /><text className="axis" x={padL - 6} y={y(v) + 3} textAnchor="end">{fmtAxis(v)}{unit}</text></g>
+          <g key={v}><line className="grid-line" x1={padL} x2={W - 4} y1={y(v)} y2={y(v)} /><text className="axis" x={padL - 6} y={y(v) + 3} textAnchor="end">{axisFormat ? axisFormat(v) : <>{fmtAxis(v)}{unit}</>}</text></g>
         ))}
         <text className="axis" x={padL} y={H - 3}>{clock(points[0].t, showDate)}</text>
         <text className="axis" x={W - 4} y={H - 3} textAnchor="end">{clock(points[points.length - 1].t, showDate)}</text>

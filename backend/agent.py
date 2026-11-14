@@ -39,7 +39,7 @@ from typing import Any
 
 import psutil
 
-AGENT_VERSION = "2.9.0"
+AGENT_VERSION = "2.10.0"
 _ENV_TOKEN = os.getenv("AGENT_TOKEN", "")                      # the token supplied by configuration; a rotation may supersede it (see _load_state)
 AGENT_TOKEN = ""                                                # the token in use: resolved by ensure_token() (saved state first, then configuration)
 AGENT_ALLOW_INSECURE = os.getenv("AGENT_ALLOW_INSECURE", "") == "1"   # permit http:// to a public address (not recommended)
@@ -127,6 +127,7 @@ def collect() -> dict[str, Any]:
         "ips": local_addresses(),
         "public_ip": public_address(),
         "install": install_kind(),
+        "traffic": traffic_stats(),
         "machine": hashlib.sha256(("smwatch-machine:" + machine_id()).encode()).hexdigest()[:32],   # lets the dashboard notice one machine monitored twice
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
@@ -242,6 +243,134 @@ def kernel_version() -> str:
             return handle.read().strip()[:60]
     except OSError:
         return platform.release()[:60]
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Real-traffic response times. When AGENT_ACCESS_LOG points at the access log of the load balancer / web server (nginx), the agent
+# summarises the response times of the requests logged since its last report into a small histogram and sends ONLY that summary:
+# no request, URL, address or user agent leaves the server. Needs `rt=$request_time` in the nginx log format (see the README).
+# $request_time starts when nginx reads the first byte of the request, i.e. the moment it hit the load balancer.
+# ---------------------------------------------------------------------------------------------------------------
+AGENT_ACCESS_LOG = os.getenv("AGENT_ACCESS_LOG", "").strip()         # comma-separated paths or globs, as seen on the host
+TRAFFIC_MAX_READ = 8 * 1024 * 1024                                    # most we read from one file per report; older lines are skipped
+_traffic_bounds: list[float] = [5, 10, 25, 50, 75, 100, 150, 200, 300, 500, 750, 1000, 1500, 2000, 3000, 5000, 10000]   # replaced by the control plane's TRAFFIC_BUCKETS_MS
+_traffic_files: dict[str, dict] = {}
+_traffic_last = 0.0
+_RT = re.compile(r'(?:^|[\s,{"])(?:rt|request_time|reqtime)["]?\s*[=:]\s*"?([0-9]+(?:\.[0-9]+)?)')
+_URT = re.compile(r'(?:^|[\s,{"])(?:urt|upstream_response_time)["]?\s*[=:]\s*"?([0-9.,:\s-]+)')
+_STATUS = re.compile(r'"\s+(\d{3})\s')
+
+
+def parse_access_line(line: str) -> tuple[float, int, float | None] | None:
+    """(request ms, HTTP status or 0, upstream ms or None) from an nginx access log line (key=value or JSON), else None."""
+    line = line.strip()
+    if not line:
+        return None
+    status, upstream = 0, None
+    if line.startswith("{"):
+        try:
+            data = json.loads(line)
+            seconds = float(data.get("request_time", data.get("rt", "")))
+            status = int(data.get("status") or 0)
+            raw = data.get("upstream_response_time", data.get("urt"))
+            if raw not in (None, "", "-"):
+                parts = [float(x) for x in re.split(r"[,:\s]+", str(raw)) if re.match(r"^[0-9.]+$", x)]
+                upstream = sum(parts) * 1000 if parts else None
+            return seconds * 1000, status, upstream
+        except (ValueError, TypeError):
+            return None
+    match = _RT.search(line)
+    if not match:
+        return None
+    seconds = float(match.group(1))
+    found = _STATUS.search(line)
+    if found:
+        status = int(found.group(1))
+    u = _URT.search(line)
+    if u:
+        parts = [float(x) for x in re.split(r"[,:\s]+", u.group(1)) if re.match(r"^[0-9]+(\.[0-9]+)?$", x)]
+        upstream = sum(parts) * 1000 if parts else None
+    return seconds * 1000, status, upstream
+
+
+def _new_lines(path: str) -> list[str]:
+    """Lines appended to `path` since the last call. The first call only remembers the end of the file (history is not replayed)."""
+    state = _traffic_files.get(path)
+    try:
+        info = os.stat(path)
+    except OSError:
+        return []
+    if state is None:
+        _traffic_files[path] = {"inode": info.st_ino, "offset": info.st_size}
+        return []
+    if info.st_ino != state["inode"] or info.st_size < state["offset"]:   # rotated or truncated: start at the top of the new file
+        state["inode"], state["offset"] = info.st_ino, 0
+    start = state["offset"]
+    if info.st_size - start > TRAFFIC_MAX_READ:
+        start = info.st_size - TRAFFIC_MAX_READ
+    if info.st_size <= start:
+        return []
+    with open(path, "rb") as handle:
+        handle.seek(start)
+        chunk = handle.read(info.st_size - start)
+    end = chunk.rfind(b"\n")
+    if end < 0:
+        return []
+    state["offset"] = start + end + 1
+    return chunk[:end].decode("utf-8", errors="replace").split("\n")
+
+
+def traffic_stats() -> dict | None:
+    """Histogram + counters of the requests logged since the last report, or None (not configured / nothing new)."""
+    global _traffic_last
+    if not AGENT_ACCESS_LOG:
+        return None
+    import bisect
+    now = time.monotonic()
+    window = now - _traffic_last if _traffic_last else 0.0
+    _traffic_last = now
+    bounds = list(_traffic_bounds)
+    counts = [0] * (len(bounds) + 1)
+    total = errors5 = errors4 = up_count = 0
+    sum_ms = peak = up_sum = 0.0
+    sources = []
+    for pattern in [p.strip() for p in AGENT_ACCESS_LOG.split(",") if p.strip()]:
+        for path in sorted(glob.glob(_host_path(pattern))):
+            if not os.path.isfile(path):
+                continue
+            for line in _new_lines(path):
+                parsed = parse_access_line(line)
+                if parsed is None:
+                    continue
+                ms, status, upstream = parsed
+                if ms < 0 or ms > 3_600_000:
+                    continue
+                counts[bisect.bisect_left(bounds, ms)] += 1
+                total += 1
+                sum_ms += ms
+                peak = max(peak, ms)
+                if 500 <= status <= 599:
+                    errors5 += 1
+                elif 400 <= status <= 499:
+                    errors4 += 1
+                if upstream is not None:
+                    up_sum += upstream
+                    up_count += 1
+            sources.append(os.path.basename(path))
+    if not total:
+        return None
+    return {"source": ",".join(sources)[:120], "window_seconds": round(window, 1), "requests": total, "errors_5xx": errors5, "errors_4xx": errors4,
+            "sum_ms": round(sum_ms, 1), "max_ms": round(peak, 1), "upstream_sum_ms": round(up_sum, 1), "upstream_count": up_count, "bounds": bounds, "counts": counts}
+
+
+def adopt_traffic_bounds(values) -> None:
+    global _traffic_bounds
+    try:
+        bounds = sorted({float(v) for v in values})
+        if 1 <= len(bounds) <= 40 and all(b > 0 for b in bounds):
+            _traffic_bounds = bounds
+    except (TypeError, ValueError):
+        pass
 
 
 def host_name() -> str:
@@ -889,6 +1018,8 @@ def push_once() -> int:
         adopt_rotated_token(str(reply["rotate_token"]))
     if "log_policy" in reply:
         apply_policy(reply["log_policy"])
+    if reply.get("traffic_buckets_ms"):
+        adopt_traffic_bounds(reply["traffic_buckets_ms"])
     return max(5, int(reply.get("interval_seconds", AGENT_PUSH_INTERVAL)))
 
 

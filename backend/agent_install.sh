@@ -94,6 +94,8 @@ SMWATCH_TOKEN="${SMWATCH_TOKEN:-}"
 # an update keeps the log-access mode this agent was installed with unless a new one is given
 SMWATCH_LOGS="${SMWATCH_LOGS:-$(sed -n 's/^AGENT_LOGS=//p' "$ENV_FILE" 2>/dev/null | head -1)}"
 SMWATCH_LOGS="${SMWATCH_LOGS:-on}"
+# Optional: report response-time percentiles of real traffic from a web server / load balancer access log (see the README).
+SMWATCH_ACCESS_LOG="${SMWATCH_ACCESS_LOG:-$(sed -n 's/^AGENT_ACCESS_LOG=//p' "$ENV_FILE" 2>/dev/null | head -1)}"
 case "$SMWATCH_LOGS" in on|nodocker|off) ;; *) die "SMWATCH_LOGS must be on, nodocker or off" ;; esac
 if [ -n "$SMWATCH_TOKEN" ] && [ "${#SMWATCH_TOKEN}" -lt 32 ]; then die "SMWATCH_TOKEN looks too short; copy the whole command from the dashboard"; fi
 case "$SMWATCH_URL" in http://localhost*|http://127.*|https://localhost*) die "SMWATCH_URL points at localhost, which is this server itself. Use the control plane's real address." ;; esac
@@ -222,6 +224,7 @@ if [ "$IS_MAC" = 1 ]; then
     <key>AGENT_MODE</key><string>push</string>
     <key>AGENT_STATE_DIR</key><string>$STATE_DIR</string>
     <key>AGENT_LOGS</key><string>$SMWATCH_LOGS</string>
+    <key>AGENT_ACCESS_LOG</key><string>$SMWATCH_ACCESS_LOG</string>
     <key>AGENT_HOST_ROOT</key><string>/</string>
     <key>AGENT_DISK_PATH</key><string>/</string>
     <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin</string>
@@ -251,6 +254,7 @@ chown -R "$USER_NAME":"$USER_NAME" "$STATE_DIR"
     echo "AGENT_MODE=push"
     echo "AGENT_STATE_DIR=$STATE_DIR"
     echo "AGENT_LOGS=$SMWATCH_LOGS"
+    [ -n "$SMWATCH_ACCESS_LOG" ] && echo "AGENT_ACCESS_LOG=$SMWATCH_ACCESS_LOG"
     [ -n "$SMWATCH_TOKEN" ] && echo "AGENT_TOKEN=$SMWATCH_TOKEN"
     true
   } > "$ENV_FILE" )

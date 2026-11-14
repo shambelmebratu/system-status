@@ -77,6 +77,7 @@ class Settings(BaseSettings):
     schedule_max_attempts: int = 3             # scheduled messages: tries per run
     schedule_retry_minutes: int = 1
     schedule_missed_minutes: int = 15          # a reminder this late is skipped instead of sent
+    traffic_buckets_ms: str = "5,10,25,50,75,100,150,200,300,500,750,1000,1500,2000,3000,5000,10000"   # response-time histogram boundaries agents use (ms)
     usage_warn_percent: float = 70             # dashboard colouring of usage bars (amber)
     usage_bad_percent: float = 90              # (red)
     company_name: str = "SM-Watch"

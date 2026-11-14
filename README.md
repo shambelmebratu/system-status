@@ -305,6 +305,30 @@ Review the manifest first by running the `curl` alone. It creates a `smwatch` na
 
 **Images.** `sm-watch-k8s-agent` is published with the other images (override with `K8S_AGENT_IMAGE`). Live CPU/memory needs metrics-server in the cluster; without it everything else still works.
 
+## Response times (p50 / p95 / p99)
+
+**Performance** in the sidebar shows response-time percentiles from two sources:
+
+- **Real traffic (load balancer).** The agent on your nginx / load-balancer server summarises its access log and sends only a small histogram: no request, URL, address or user agent leaves the server. The time is nginx's `$request_time`, which starts the moment a request reaches the load balancer and ends when the last byte is sent, so it includes everything after that point (queueing, the upstream, sending). `$upstream_response_time` is shown separately so you can see how much of it was your application.
+- **Synthetic checks.** The probes SM-Watch itself runs against your services (and pings of servers), from the control plane.
+
+To enable real traffic, add the timing fields to the nginx log format (the provided `deploy/nginx/*.conf` already has them), reload nginx, and tell the agent where the log is:
+
+```nginx
+log_format smwatch '$remote_addr - $remote_user [$time_local] "$request_method $request_uri $server_protocol" '
+                   '$status $body_bytes_sent "$http_user_agent" rt=$request_time urt=$upstream_response_time';
+access_log /var/log/nginx/access.log smwatch;
+```
+
+```bash
+# Linux service (re-run keeps the setting; the agent user must be able to read the log, which the "adm" group allows on Debian/Ubuntu)
+curl -fsSL <url>/api/agent/install.sh | sudo SMWATCH_ACCESS_LOG=/var/log/nginx/access.log bash -s -- update
+# Docker agent: add  -e AGENT_ACCESS_LOG=/var/log/nginx/access.log  (the host is mounted at /host; the path is the host path)
+# agent bundled with SM-Watch: set HOST_ACCESS_LOG=/var/log/nginx/access.log in .env, then: docker compose up -d host-agent
+```
+
+JSON access logs with `request_time` / `status` / `upstream_response_time` fields work too. Several files can be given, comma-separated, and globs are allowed. Only requests logged after the agent starts are counted. Percentiles are computed from histograms (boundaries in `TRAFFIC_BUCKETS_MS`), so they stay correct when merged across minutes, hours and servers; the precision is within one bucket. The history is kept under *Server, cluster & traffic metrics* in the retention settings.
+
 ## Agent addresses and updates
 
 The System card shows the real **operating system** (for example `Ubuntu 22.04.5 LTS`, read from the host's `/etc/os-release`, also inside Docker), the kernel and the architecture. Each server shows its **public IP** (the address the control plane sees it connect from, or `AGENT_PUBLIC_IP` / `AGENT_PUBLIC_IP_URL` if you set one on the agent; nothing contacts the outside by default). An address on a network the control plane itself is attached to (for example a Docker network) is never called public, even if its number is in a public range; the agent bundled with SM-Watch shows the control plane's public address instead (`HOST_PUBLIC_IP`, or what `PUBLIC_URL` resolves to) and its **private IPs** (its own LAN addresses, container networks excluded). Alerts and Telegram messages name the server with its host name and public IP, falling back to a private one.

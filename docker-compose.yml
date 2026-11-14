@@ -116,6 +116,7 @@ services:
       AGENT_DISK_PATH: /host
       AGENT_LOGS: ${HOST_AGENT_LOGS:-on}
       SMWATCH_BUNDLED: "1"
+      AGENT_ACCESS_LOG: ${HOST_ACCESS_LOG:-}   # e.g. /var/log/nginx/access.log: response-time percentiles of real traffic
     volumes:
       - /:/host:ro
       - /var/run/docker.sock:/var/run/docker.sock
