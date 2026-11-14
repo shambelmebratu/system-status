@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 280 64" role="img" aria-label="SM-Watch">
+  <defs><linearGradient id="g" x1="6" y1="4" x2="58" y2="60" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#c9f36b"/><stop offset="1" stop-color="#68d5e8"/></linearGradient></defs>
+  <rect width="64" height="64" rx="15" fill="url(#g)"/>
+  <path d="M32 11.5C18.500 11.500 8.800 22 5.500 32c3.300 10 13 20.500 26.500 20.500S55.200 42 58.500 32C55.200 22 45.500 11.500 32 11.500z" fill="#08111f"/>
+  <path d="M13.500 33.500h9.500l4.500-11 6.500 20 4.500-9h11" fill="none" stroke="url(#g)" stroke-width="4.400" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="80" y="43" font-family="Inter, 'Segoe UI', system-ui, -apple-system, Helvetica, Arial, sans-serif" font-size="34" font-weight="800" letter-spacing="-0.5" fill="#0f1b33">SM<tspan font-weight="500" fill="#33425f">-Watch</tspan></text>
+</svg>

@@ -1,5 +1,6 @@
 'use client';
 
+import { Logo } from '../components/logo';
 import { FormEvent, useState } from 'react';
 import { post } from '../lib/api';
 
@@ -20,7 +21,7 @@ export function Login({ company, onSignedIn }: { company: string; onSignedIn: ()
   return (
     <main className="login">
       <section className="login-art">
-        <div className="brand"><span className="logo">★</span>{company}</div>
+        <div className="brand"><Logo size={36} />{company}</div>
         <div>
           <h1>Know before <em>they know.</em></h1>
           <p>Uptime, host metrics, incidents and alerts for every server and service, in one place.</p>

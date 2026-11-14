@@ -1,5 +1,6 @@
 'use client';
 
+import { Logo } from '../components/logo';
 import { useEffect, useState } from 'react';
 import { UptimeBar } from '../components/charts';
 import { StatusPill } from '../components/ui';
@@ -28,7 +29,7 @@ export default function StatusPage() {
   const headline = { up: 'All systems operational', alert: 'Some systems are degraded', down: 'Some systems are experiencing issues', unknown: 'No status information yet' }[data.overall];
   return (
     <main className="public">
-      <h1 style={{ fontSize: 26 }}>{data.company_name} Status</h1>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}><Logo size={38} /><h1 style={{ fontSize: 26 }}>{data.company_name} Status</h1></div>
       <div className={`banner-big ${data.overall === 'alert' ? 'down' : data.overall}`}><span style={{ color: data.overall === 'up' ? 'var(--good)' : data.overall === 'down' ? 'var(--bad)' : data.overall === 'alert' ? 'var(--warn)' : 'var(--muted)' }}>{data.overall === 'up' ? '✓' : data.overall === 'unknown' ? '…' : '!'}</span>{headline}</div>
       {data.services.map(s => (
         <section key={s.id} className="card pub-svc">

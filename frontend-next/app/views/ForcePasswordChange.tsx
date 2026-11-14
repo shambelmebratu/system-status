@@ -1,5 +1,6 @@
 'use client';
 
+import { Logo } from '../components/logo';
 import { FormEvent, useState } from 'react';
 import { Field } from '../components/ui';
 import { post } from '../lib/api';
@@ -24,7 +25,7 @@ export function ForcePasswordChange({ company, me, onDone, onSignOut }: { compan
   return (
     <main className="login">
       <section className="login-art">
-        <div className="brand"><span className="logo">★</span>{company}</div>
+        <div className="brand"><Logo size={36} />{company}</div>
         <div><h1>One last <em>step.</em></h1><p>An administrator set a temporary password for your account. Choose your own before you continue.</p></div>
         <small className="muted">Signed in as {me.email}</small>
       </section>

@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
+import { Logo } from './components/logo';
 import { Icon } from './components/ui';
 import { api, post } from './lib/api';
 import { AppProvider, useApp } from './lib/app';
@@ -82,9 +83,9 @@ function Shell({ company, me, onSignOut }: { company: string; me: Me; onSignOut:
 
   return (
     <div className="shell">
-      <div className="mobile-bar"><button className="btn ghost sm" onClick={() => setOpen(!open)} aria-label="Menu"><Icon name="menu" /></button><b>{company}</b></div>
+      <div className="mobile-bar"><button className="btn ghost sm" onClick={() => setOpen(!open)} aria-label="Menu"><Icon name="menu" /></button><Logo size={26} /><b>{company}</b></div>
       <aside className={`side ${open ? 'open' : ''}`}>
-        <div className="brand"><span className="logo">★</span><span>{company}</span></div>
+        <div className="brand"><Logo size={32} /><span>{company}</span></div>
         {allowed.map(item => (
           <button key={item.id} className={`nav ${page === item.id ? 'active' : ''}`} onClick={() => go(item.id)}>
             <Icon name={item.icon} />{item.label}

@@ -1,7 +1,7 @@
 import './globals.css';
 import type { Metadata, Viewport } from 'next';
 
-export const metadata: Metadata = { title: 'SM-Watch', description: 'Infrastructure and uptime monitoring' };
+export const metadata: Metadata = { title: 'SM-Watch', description: 'Infrastructure and uptime monitoring', icons: { icon: [{ url: '/icon.svg', type: 'image/svg+xml' }, { url: '/favicon.ico', sizes: 'any' }], apple: '/apple-icon.png' } };
 export const viewport: Viewport = { themeColor: '#0b1220', width: 'device-width', initialScale: 1 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
