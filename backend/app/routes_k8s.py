@@ -602,11 +602,14 @@ def ask(cluster_id: int, payload: K8sQuery, request: Request, user: dict = Depen
     return {"id": item.id}
 
 
-def _read(cluster_id: int, request_id: int) -> dict:
+def _read(cluster_id: int, request_id: int, role: str = "admin") -> dict:
     with SessionLocal() as db:
         item = db.get(K8sRequest, request_id)
         if not item or item.cluster_id != cluster_id:
             raise HTTPException(404, "Request not found (results are kept for 15 minutes)")
+        # Request ids are sequential: without this a viewer could read the pod logs an operator just fetched by guessing the id.
+        if json.loads(item.query).get("kind") == "logs" and RANK.get(role, 0) < RANK["operator"]:
+            raise HTTPException(403, f"Your role ({role}) cannot read pod logs. It needs the operator role.")
         status, error = item.status, item.error
         if status in ("pending", "running") and datetime.now(timezone.utc) - aware(item.created_at) > pickup_timeout():
             status, error = "error", "The cluster agent did not answer in time."
@@ -624,13 +627,13 @@ def _read(cluster_id: int, request_id: int) -> dict:
 
 
 @router.get("/api/clusters/{cluster_id}/query/{request_id}")
-async def read_query(cluster_id: int, request_id: int, wait: int = Query(0, ge=0, le=20), _: dict = Depends(require_user)) -> dict:
+async def read_query(cluster_id: int, request_id: int, wait: int = Query(0, ge=0, le=20), user: dict = Depends(require_user)) -> dict:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + wait
     with _Waiter(_result_waiters, request_id) as event:
         while True:
             event.clear()
-            result = await run_in_threadpool(_read, cluster_id, request_id)
+            result = await run_in_threadpool(_read, cluster_id, request_id, user["role"])
             remaining = deadline - loop.time()
             if result["status"] in ("done", "error") or remaining <= 0:
                 return result

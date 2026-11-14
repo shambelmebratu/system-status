@@ -28,7 +28,7 @@ from .routes_schedule import router as schedule_router
 from .routes_stats import router as stats_router
 from .schemas import ChannelCreate, ChannelUpdate, LoginRequest, PasswordChange, ProfileUpdate, TokenBody, ServerCreate, ServiceCreate
 from .stats import uptime_by_target
-from .netguard import BlockedTargetError, validate_host, validate_url
+from .netguard import BlockedTargetError, insecure_pull_problem, validate_host, validate_url
 from .routes_users import router as users_router, serialize_user
 from .audit import audit
 from .security import COOKIE_NAME, client_ip, create_token, hash_password, login_limiter, needs_rehash, require_operator, require_user, verify_password
@@ -405,11 +405,12 @@ def update_channel(item_id: int, payload: ChannelUpdate, request: Request, user:
 
 
 @app.post("/api/channels/{item_id}/test")
-def test_channel(item_id: int, _: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict[str, str | bool]:
+def test_channel(item_id: int, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict[str, str | bool]:
     item = db.get(Channel, item_id)
     if not item:
         raise HTTPException(404, "Notification channel not found")
     delivered, detail = send_channel_test(item)
+    audit(db, request, "channel.test", user=user, target=f"channel:{item.id}", detail=item.name, success=delivered, commit=True)
     if not delivered:
         raise HTTPException(502, detail)
     return {"ok": True, "detail": detail}
@@ -431,6 +432,9 @@ def validate_server_targets(payload: ServerCreate) -> None:
         guard_target(validate_host, payload.host, "Host")
     if payload.monitor_mode == "agent":
         guard_target(validate_url, payload.endpoint, "Agent endpoint")
+        problem = insecure_pull_problem(payload.endpoint)
+        if problem:
+            raise HTTPException(422, f"Agent endpoint: {problem}")
 
 
 @app.post("/api/servers")
@@ -518,14 +522,16 @@ def delete_server(item_id: int, request: Request, user: dict = Depends(require_o
 
 
 @app.post("/api/services")
-def create_service(payload: ServiceCreate, _: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+def create_service(payload: ServiceCreate, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
     guard_target(validate_url, payload.url, "URL")
     if payload.server_id is not None and not db.get(Server, payload.server_id): raise HTTPException(404, "Server not found")
-    item = Service(**alert_settings(payload.model_dump(), "service", db)); db.add(item); db.commit(); db.refresh(item); return serialize(item)
+    item = Service(**alert_settings(payload.model_dump(), "service", db)); db.add(item); db.flush()
+    audit(db, request, "service.create", user=user, target=f"service:{item.id}", detail=item.name)
+    db.commit(); db.refresh(item); return serialize(item)
 
 
 @app.put("/api/services/{item_id}")
-def update_service(item_id: int, payload: ServiceCreate, _: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+def update_service(item_id: int, payload: ServiceCreate, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
     item = db.get(Service, item_id)
     if not item:
         raise HTTPException(404, "Service monitor not found")
@@ -539,15 +545,17 @@ def update_service(item_id: int, payload: ServiceCreate, _: dict = Depends(requi
     item.last_status = "unknown"
     item.last_error = None
     item.last_http_status = None
+    audit(db, request, "service.update", user=user, target=f"service:{item.id}", detail=item.name)
     db.commit()
     db.refresh(item)
     return serialize(item)
 
 
 @app.delete("/api/services/{item_id}")
-def delete_service(item_id: int, _: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict[str, bool]:
+def delete_service(item_id: int, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict[str, bool]:
     item = db.get(Service, item_id)
     if item:
+        audit(db, request, "service.delete", user=user, target=f"service:{item.id}", detail=item.name)
         purge_history(db, "service", item.id)
         db.delete(item); db.commit()
     return {"deleted": True}

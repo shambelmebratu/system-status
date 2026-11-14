@@ -7,7 +7,7 @@ import { usePoll } from '../lib/app';
 import { timeAgo } from '../lib/format';
 import { ROLE_INFO, type AuditEvent, type Role } from '../lib/types';
 
-const CATEGORIES = [['', 'Everything'], ['auth', 'Sign-ins & passwords'], ['user', 'Users & roles'], ['agent', 'Agents'], ['enroll', 'Install links'], ['server', 'Servers & tokens'], ['logs', 'Log access'], ['k8s', 'Kubernetes'], ['purge', 'Data purges'], ['channel', 'Alert channels']];
+const CATEGORIES = [['', 'Everything'], ['auth', 'Sign-ins & passwords'], ['user', 'Users & roles'], ['agent', 'Agents'], ['enroll', 'Install links'], ['server', 'Servers & tokens'], ['logs', 'Log access'], ['k8s', 'Kubernetes'], ['purge', 'Data purges'], ['channel', 'Alert channels'], ['service', 'Service monitors'], ['schedule', 'Scheduled messages']];
 
 const LABELS: Record<string, string> = {
   'auth.login': 'Sign-in', 'auth.logout': 'Sign-out', 'auth.password_change': 'Password change', 'auth.email_change': 'Email change',
@@ -18,6 +18,8 @@ const LABELS: Record<string, string> = {
   'enroll.link_create': 'Install link created', 'enroll.link_revoke': 'Install link revoked', 'logs.read': 'Logs viewed', 'logs.denied': 'Log access blocked', 'server.log_policy': 'Log policy changed',
   'k8s.register': 'Cluster registered', 'k8s.cluster_update': 'Cluster edited', 'k8s.cluster_delete': 'Cluster removed', 'k8s.token_rotate': 'Cluster token rotation', 'k8s.token_revoke': 'Cluster token revoked',
   'k8s.logs.read': 'Pod logs viewed', 'k8s.logs.denied': 'Pod logs blocked', 'k8s.log_policy': 'Cluster log policy changed',
+  'service.create': 'Service monitor added', 'service.update': 'Service monitor changed', 'service.delete': 'Service monitor deleted', 'channel.test': 'Channel test sent',
+  'schedule.create': 'Scheduled message added', 'schedule.update': 'Scheduled message changed', 'schedule.delete': 'Scheduled message deleted', 'schedule.send_now': 'Scheduled message sent now',
   'purge.settings': 'Retention changed', 'purge.manual': 'Manual purge', 'purge.scheduled': 'Scheduled purge',
   'channel.create': 'Channel added', 'channel.update': 'Channel edited', 'channel.delete': 'Channel removed',
 };

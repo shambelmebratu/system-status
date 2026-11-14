@@ -39,7 +39,7 @@ from typing import Any
 
 import psutil
 
-AGENT_VERSION = "2.12.0"
+AGENT_VERSION = "2.12.1"
 _ENV_TOKEN = os.getenv("AGENT_TOKEN", "")                      # the token supplied by configuration; a rotation may supersede it (see _load_state)
 AGENT_TOKEN = ""                                                # the token in use: resolved by ensure_token() (saved state first, then configuration)
 AGENT_ALLOW_INSECURE = os.getenv("AGENT_ALLOW_INSECURE", "") == "1"   # permit http:// to a public address (not recommended)
@@ -1329,7 +1329,13 @@ def main() -> None:
             push_loop()
     if AGENT_MODE in ("pull", "both"):
         import uvicorn
-        uvicorn.run(_build_app(), host=os.getenv("AGENT_BIND", "0.0.0.0"), port=int(os.getenv("AGENT_PORT", "9100")))
+        # Pull mode receives the agent token on every check. AGENT_TLS_CERT + AGENT_TLS_KEY serve it over https so the token is
+        # never readable on the network (without them: keep the port on a private network or behind a TLS proxy).
+        cert, key = os.getenv("AGENT_TLS_CERT", ""), os.getenv("AGENT_TLS_KEY", "")
+        tls = {"ssl_certfile": cert, "ssl_keyfile": key} if cert and key else {}
+        if not tls:
+            log.warning("pull mode without TLS: the agent token travels unencrypted. Set AGENT_TLS_CERT and AGENT_TLS_KEY, or restrict port %s to a private network.", os.getenv("AGENT_PORT", "9100"))
+        uvicorn.run(_build_app(), host=os.getenv("AGENT_BIND", "0.0.0.0"), port=int(os.getenv("AGENT_PORT", "9100")), **tls)
 
 
 if __name__ == "__main__":

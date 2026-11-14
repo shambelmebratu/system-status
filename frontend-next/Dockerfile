@@ -19,9 +19,11 @@ WORKDIR /app
 ENV NODE_ENV=production
 COPY --from=builder --chown=node:node /app/.next/standalone ./
 COPY --from=builder --chown=node:node /app/.next/static ./.next/static
+# start.js wraps server.js: forwarded-address headers are only believed from a trusted reverse proxy (see the file).
+COPY --chown=node:node start.js ./start.js
 # The image optimizer is disabled (next.config.ts) and unused: do not ship its native library, which carries its own CVEs.
 RUN rm -rf node_modules/sharp node_modules/@img node_modules/@emnapi
 # Run as an unprivileged user, never root.
 USER node
 EXPOSE 3000
-CMD ["node", "server.js"]
+CMD ["node", "start.js"]

@@ -107,7 +107,10 @@ def check_server(server: Server) -> tuple[str, list[str], dict]:
     if server.agent_token:
         request.add_header("Authorization", f"Bearer {server.agent_token}")
     with safe_urlopen(request, timeout=8) as response:
-        metrics = json.loads(response.read().decode())
+        raw = response.read(1_000_001)   # a metrics answer is a few KB: never buffer an endless response
+    if len(raw) > 1_000_000:
+        raise ValueError("Agent response is too large")
+    metrics = json.loads(raw.decode())
     status, failures = evaluate_metrics(server, metrics)
     metrics["latency_ms"] = latency
     return status, failures, metrics

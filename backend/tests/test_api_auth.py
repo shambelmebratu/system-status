@@ -1906,3 +1906,53 @@ def test_log_requests_accept_second_level_time_windows(client, monkeypatch):
     assert client.post(f"/api/servers/{sid}/logs", headers=CSRF, json={"source": "journal", "target": "all", "since_seconds": 60 * 60 * 24 * 40}).status_code == 422
     queued = anon.get("/api/agent/tasks", headers=auth).json()["tasks"]
     assert any(t.get("since_seconds") == 15 for t in queued)                                  # the agent receives the exact window
+
+
+# ---------------------------------------------------------------------------------------------------------------- security review fixes
+def test_viewer_cannot_read_pod_log_results_by_id(client):
+    """Request ids are sequential: a viewer must not be able to read the pod logs an operator fetched."""
+    sign_in(client)
+    anon = TestClient(main.app)
+    _, r = _k8s_register(client, anon, "leak-test")
+    auth = {"Authorization": f"Bearer {_k8s_token(r.text)}"}
+    cid = next(c["id"] for c in client.get("/api/clusters").json() if c["name"] == "leak-test")
+    anon.post("/api/k8s-agent/report", json=HEALTHY, headers=auth)
+    make_user(client, "leak-view@example.com", "viewer")
+    viewer = session_for("leak-view@example.com", new_password="viewer-pass-123456")
+    rid = client.post(f"/api/clusters/{cid}/query", headers=CSRF, json={"kind": "logs", "namespace": "demo", "name": "web-1"}).json()["id"]
+    anon.get("/api/k8s-agent/tasks", headers=auth)
+    assert anon.post(f"/api/k8s-agent/tasks/{rid}/result", headers=auth, json={"ok": True, "output": "password=hunter2"}).status_code == 200
+    assert client.get(f"/api/clusters/{cid}/query/{rid}").json()["text"] == "password=hunter2"
+    leaked = viewer.get(f"/api/clusters/{cid}/query/{rid}")
+    assert leaked.status_code == 403 and "hunter2" not in leaked.text
+
+
+def test_admin_cannot_reset_own_password_without_current_one(client):
+    sign_in(client)
+    me = client.get("/api/auth/me").json()
+    r = client.put(f"/api/users/{me['id']}", headers=CSRF, json={"password": "attacker-chosen-pass-1"})
+    assert r.status_code == 409 and "current password" in r.json()["detail"]
+    assert TestClient(main.app).post("/api/auth/login", json={"email": "admin@example.com", "password": "attacker-chosen-pass-1"}).status_code == 401
+    assert client.put(f"/api/users/{me['id']}", headers=CSRF, json={"name": "Administrator"}).status_code == 200   # other edits still work
+
+
+def test_pull_endpoint_must_be_https_on_public_addresses(client):
+    sign_in(client)
+    body = {"name": "pull", "host": "93.184.216.34", "monitor_mode": "agent", "agent_token": "t" * 40}
+    r = client.post("/api/servers", headers=CSRF, json={**body, "endpoint": "http://93.184.216.34:9100"})
+    assert r.status_code == 422 and "unencrypted" in r.json()["detail"]
+    assert client.post("/api/servers", headers=CSRF, json={**body, "name": "pull-tls", "endpoint": "https://93.184.216.34:9100"}).status_code == 200
+    assert client.post("/api/servers", headers=CSRF, json={**body, "name": "pull-lan", "host": "10.0.0.5", "endpoint": "http://10.0.0.5:9100"}).status_code == 200
+    assert client.post("/api/servers", headers=CSRF, json={**body, "name": "pull-vpn", "host": "100.100.1.5", "endpoint": "http://100.100.1.5:9100"}).status_code == 200
+
+
+def test_services_and_schedules_are_audited(client):
+    sign_in(client)
+    sid = client.post("/api/services", headers=CSRF, json={"name": "audited", "url": "https://example.com"}).json()["id"]
+    client.delete(f"/api/services/{sid}", headers=CSRF)
+    actions = [e["action"] for e in client.get("/api/audit?category=service").json()]
+    assert "service.create" in actions and "service.delete" in actions
+
+
+def test_oversized_login_fields_are_refused(client):
+    assert client.post("/api/auth/login", json={"email": "admin@example.com", "password": "x" * 5000}).status_code == 422

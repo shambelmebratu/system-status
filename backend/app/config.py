@@ -51,6 +51,7 @@ class Settings(BaseSettings):
     blocked_hosts: str = "postgres,api,worker,migrate,frontend,localhost,metadata.google.internal"
     # When true, RFC1918/ULA private ranges are blocked too (off: monitoring LAN hosts is the point).
     block_private_targets: bool = False
+    allow_insecure_pull: bool = False   # pull-mode agents on PUBLIC addresses must use https (the check carries the agent token)
     cpu_threshold: float = 85
     memory_threshold: float = 90
     disk_threshold: float = 85

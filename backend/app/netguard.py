@@ -5,6 +5,7 @@ default (see BLOCK_PRIVATE_TARGETS). Loopback, link-local (cloud metadata),
 unspecified, multicast and the stack's own internal service names are always
 blocked. Redirects are re-validated on every hop.
 """
+import http.client
 import ipaddress
 import re
 import socket
@@ -70,13 +71,86 @@ def validate_url(url: str, resolve: bool = True) -> str:
 class _GuardedRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         validate_url(newurl)
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None:
+            old_origin, new_origin = urllib.parse.urlsplit(req.full_url), urllib.parse.urlsplit(newurl)
+            downgrade = old_origin.scheme == "https" and new_origin.scheme != "https"
+            if downgrade or (old_origin.scheme, old_origin.netloc.lower()) != (new_origin.scheme, new_origin.netloc.lower()):
+                # urllib copies every header to the redirect target. An agent token, webhook secret or bot token must never
+                # travel to a different host (or from https down to http) just because the first server said "go there".
+                for name in list(new.headers):
+                    if name.lower() in ("authorization", "cookie", "proxy-authorization"):
+                        del new.headers[name]
+                for name in list(new.unredirected_hdrs):
+                    if name.lower() in ("authorization", "cookie", "proxy-authorization"):
+                        del new.unredirected_hdrs[name]
+        return new
 
 
-_opener = urllib.request.build_opener(_GuardedRedirect)
+def _check_peer(sock, host: str) -> None:
+    """validate_url() resolves the name BEFORE the request; the connection resolves it again. A hostile DNS server can answer the
+    second lookup differently ("DNS rebinding") and point the request at 127.0.0.1 or the cloud metadata address. Checking the
+    address we are ACTUALLY connected to closes that gap."""
+    if urllib.request.getproxies():   # behind an outbound proxy (HTTP(S)_PROXY) the peer IS the proxy: it resolves the name, not us
+        return
+    try:
+        peer = ipaddress.ip_address(sock.getpeername()[0].split("%")[0])
+    except (OSError, ValueError, IndexError):
+        return
+    reason = _ip_blocked(peer)
+    if reason:
+        sock.close()
+        raise BlockedTargetError(f"Host '{host}' rejected: {reason}")
+
+
+class _GuardedHTTPConnection(http.client.HTTPConnection):
+    def connect(self):
+        super().connect()
+        _check_peer(self.sock, self.host)
+
+
+class _GuardedHTTPSConnection(http.client.HTTPSConnection):
+    def connect(self):
+        # Checked on the plain TCP socket, before the TLS handshake sends anything.
+        http.client.HTTPConnection.connect(self)
+        _check_peer(self.sock, self.host)
+        server_hostname = self._tunnel_host or self.host
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=server_hostname)
+
+
+class _GuardedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_GuardedHTTPConnection, req)
+
+
+class _GuardedHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_GuardedHTTPSConnection, req, context=self._context)
+
+
+_opener = urllib.request.build_opener(_GuardedHTTPHandler, _GuardedHTTPSHandler, _GuardedRedirect)
 
 
 def safe_urlopen(request: urllib.request.Request, timeout: float):
-    """urlopen that validates the destination and every redirect hop."""
+    """urlopen that validates the destination, the address actually connected to, and every redirect hop."""
     validate_url(request.full_url)
     return _opener.open(request, timeout=timeout)
+
+
+def insecure_pull_problem(endpoint: str) -> str | None:
+    """A pull-mode check sends the agent token to the agent. Over plain http to a public address anyone on the path can read it
+    (and then read that server's metrics). Private/VPN addresses are accepted; ALLOW_INSECURE_PULL=true overrides."""
+    parsed = urllib.parse.urlsplit(endpoint)
+    if parsed.scheme != "http" or get_settings().allow_insecure_pull:
+        return None
+    try:
+        addresses = [ipaddress.ip_address((parsed.hostname or "").strip("[]"))]
+    except ValueError:
+        try:
+            addresses = [ipaddress.ip_address(info[4][0]) for info in socket.getaddrinfo(parsed.hostname, None)]
+        except (socket.gaierror, UnicodeError):
+            return None   # unresolved: the check itself will fail
+    cgnat = ipaddress.ip_network("100.64.0.0/10")   # Tailscale and other overlay networks
+    if all(a.is_private or a in cgnat for a in addresses):
+        return None
+    return "the agent token would be sent unencrypted over the internet. Use an https:// endpoint (put the agent behind a TLS proxy or set AGENT_TLS_CERT/AGENT_TLS_KEY on it), use push mode, or set ALLOW_INSECURE_PULL=true to accept the risk."

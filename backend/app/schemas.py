@@ -6,8 +6,8 @@ from .config import get_settings
 
 
 class LoginRequest(BaseModel):
-    email: str
-    password: str
+    email: str = Field(max_length=320)
+    password: str = Field(max_length=1024)
 
 
 class AlertPrefs(BaseModel):
@@ -279,7 +279,7 @@ class ProfileUpdate(BaseModel):
 
 
 class PasswordChange(BaseModel):
-    current_password: str
+    current_password: str = Field(max_length=1024)
     new_password: str = Field(min_length=12, max_length=200)
 
 

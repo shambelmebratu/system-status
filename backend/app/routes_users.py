@@ -53,6 +53,9 @@ def update_user(user_id: int, payload: UserUpdate, request: Request, me: dict = 
     is_self = user.id == me["uid"]
     if is_self and ((payload.role is not None and payload.role != user.role) or payload.active is False):
         raise HTTPException(409, "You cannot change your own role or disable your own account. Ask another admin.")
+    if is_self and payload.password:
+        # Otherwise a stolen admin session could set a new password without knowing the current one (and keep every session alive).
+        raise HTTPException(409, "Change your own password under Profile: it needs your current password.")
     losing_admin = user.role == "admin" and ((payload.role is not None and payload.role != "admin") or payload.active is False)
     if losing_admin and other_active_admins(db, user) == 0:
         raise HTTPException(409, "There must always be at least one active admin")
@@ -69,7 +72,7 @@ def update_user(user_id: int, payload: UserUpdate, request: Request, me: dict = 
     if payload.password:
         changes.append("password reset")
         user.password_hash = hash_password(payload.password)
-        user.must_change_password = not is_self      # a reset by an admin is temporary; the person picks their own
+        user.must_change_password = True             # a reset by an admin is temporary; the person picks their own
         revoke = True
     if revoke and not is_self:
         user.token_version += 1                      # sign the person out everywhere so the change applies at once

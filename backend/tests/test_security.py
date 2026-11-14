@@ -78,3 +78,34 @@ def test_client_ip_behind_proxies():
     assert client_ip(req("172.18.0.5", "not-an-ip")) == "172.18.0.5"                    # garbage falls back to the peer
     assert client_ip(req("172.18.0.5")) == "172.18.0.5" and client_ip(req(None)) == "unknown"
     assert client_ip(req("testclient", "1.2.3.4")) == "testclient"                      # non-IP peer (test client): unchanged
+
+
+def test_outbound_requests_check_the_connected_address_and_keep_credentials_on_origin(monkeypatch):
+    import http.server, threading, urllib.request
+    from app import netguard
+    seen = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args): pass
+        def do_GET(self):
+            seen[self.server.server_port] = self.headers.get("Authorization")
+            if self.path == "/go":
+                self.send_response(302); self.send_header("Location", f"http://127.0.0.1:{other.server_port}/x"); self.end_headers()
+            else:
+                self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
+
+    first, other = http.server.HTTPServer(("127.0.0.1", 0), Handler), http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    for server in (first, other):
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        # DNS rebinding: even when the name check is fooled, the address actually connected to is checked.
+        monkeypatch.setattr(netguard, "validate_url", lambda url, resolve=True: url)
+        with pytest.raises(BlockedTargetError):
+            netguard.safe_urlopen(urllib.request.Request(f"http://127.0.0.1:{first.server_port}/x"), timeout=3)
+        # A redirect to another origin never receives the Authorization header.
+        monkeypatch.setattr(netguard, "_ip_blocked", lambda ip: None)
+        request = urllib.request.Request(f"http://127.0.0.1:{first.server_port}/go", headers={"Authorization": "Bearer secret"})
+        netguard.safe_urlopen(request, timeout=3).read()
+        assert seen[first.server_port] == "Bearer secret" and seen[other.server_port] is None
+    finally:
+        first.shutdown(); other.shutdown()

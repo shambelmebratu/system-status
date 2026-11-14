@@ -11,6 +11,10 @@ x-host-agent-image: &host-agent-image ${DOCKERHUB_USERNAME:-shambi21}/sm-watch-h
 x-hardening: &hardening
   security_opt: ["no-new-privileges:true"]
   cap_drop: [ALL]
+# The API image never writes to its own filesystem: mounted read-only, an intruder cannot alter the application code.
+x-readonly: &readonly
+  read_only: true
+  tmpfs: ["/tmp:rw,noexec,nosuid,size=64m"]
 
 x-frontend-image: &frontend-image ${DOCKERHUB_USERNAME:-shambi21}/sm-watch-frontend:${SMWATCH_VERSION:-latest}
 
@@ -21,6 +25,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-smwatch}
       POSTGRES_USER: ${POSTGRES_USER:-smwatch}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-replace-this-password}
+    security_opt: ["no-new-privileges:true"]
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -31,7 +36,7 @@ services:
     restart: unless-stopped
 
   migrate:
-    <<: *hardening
+    <<: [*hardening, *readonly]
     image: *api-image
     command: ["alembic", "-c", "alembic.ini", "upgrade", "head"]
     environment:
@@ -46,7 +51,7 @@ services:
     restart: "no"
 
   api:
-    <<: *hardening
+    <<: [*hardening, *readonly]
     image: *api-image
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
     environment:
@@ -78,7 +83,7 @@ services:
     restart: unless-stopped
 
   worker:
-    <<: *hardening
+    <<: [*hardening, *readonly]
     image: *api-image
     command: ["python", "-m", "app.worker"]
     cap_add:
@@ -133,6 +138,8 @@ services:
     image: *frontend-image
     environment:
       BACKEND_URL: http://api:8000
+      # Whose X-Forwarded-For is believed (default: only this machine, i.e. nginx on the Docker host). See frontend-next/start.js.
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
     depends_on:
       api:
         condition: service_healthy

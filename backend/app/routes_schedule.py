@@ -2,10 +2,11 @@
 import json
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import Request, APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from .audit import audit
 from .database import get_db
 from .models import Channel, ScheduledMessage
 from .schemas import ScheduledMessageIn
@@ -57,38 +58,43 @@ def list_messages(_: dict = Depends(require_operator), db: Session = Depends(get
 
 
 @router.post("")
-def create_message(payload: ScheduledMessageIn, _: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+def create_message(payload: ScheduledMessageIn, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
     item = ScheduledMessage()
     apply(item, payload, db)
-    db.add(item); db.commit(); db.refresh(item)
+    db.add(item); db.flush()
+    audit(db, request, "schedule.create", user=user, target=f"schedule:{item.id}", detail=item.name)
+    db.commit(); db.refresh(item)
     return serialize(item)
 
 
 @router.put("/{item_id}")
-def update_message(item_id: int, payload: ScheduledMessageIn, _: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+def update_message(item_id: int, payload: ScheduledMessageIn, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
     item = db.get(ScheduledMessage, item_id)
     if not item:
         raise HTTPException(404, "Scheduled message not found")
     apply(item, payload, db)
+    audit(db, request, "schedule.update", user=user, target=f"schedule:{item.id}", detail=item.name)
     db.commit(); db.refresh(item)
     return serialize(item)
 
 
 @router.delete("/{item_id}")
-def delete_message(item_id: int, _: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict[str, bool]:
+def delete_message(item_id: int, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict[str, bool]:
     item = db.get(ScheduledMessage, item_id)
     if item:
+        audit(db, request, "schedule.delete", user=user, target=f"schedule:{item.id}", detail=item.name)
         db.delete(item); db.commit()
     return {"deleted": True}
 
 
 @router.post("/{item_id}/send")
-def send_now(item_id: int, _: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+def send_now(item_id: int, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
     """Sends the message immediately to its channels without affecting the schedule."""
     item = db.get(ScheduledMessage, item_id)
     if not item:
         raise HTTPException(404, "Scheduled message not found")
     failed, errors = send_scheduled(db, item)
+    audit(db, request, "schedule.send_now", user=user, target=f"schedule:{item.id}", detail=item.name, success=not (failed or errors), commit=True)
     if failed or errors:
         raise HTTPException(502, "; ".join(errors) or "Delivery failed")
     return {"ok": True, "detail": f"Sent to {len(channel_list(item.channel_ids))} channel(s)"}

@@ -77,7 +77,7 @@ function UserForm({ existing, onClose, onSaved }: { existing?: Me; onClose: () =
     event.preventDefault(); setError(''); setBusy(true);
     try {
       if (existing) {
-        await put(`/users/${existing.id}`, { name, ...(isSelf ? {} : { role, active }), ...(password ? { password } : {}) });
+        await put(`/users/${existing.id}`, { name, ...(isSelf ? {} : { role, active }), ...(password && !isSelf ? { password } : {}) });
         toast(password ? `Saved. Share the new temporary password with ${existing.email}.` : 'User updated');
         onSaved(password ? { email: existing.email, password } : undefined);
       } else { await post('/users', { email, name, role, password }); onSaved({ email, password }); }
@@ -97,12 +97,12 @@ function UserForm({ existing, onClose, onSaved }: { existing?: Me; onClose: () =
         </div>
         <div className="field">Role{isSelf && <small>You cannot change your own role. Ask another admin.</small>}<RolePicker value={role} onChange={setRole} disabled={isSelf} /></div>
         {existing && !isSelf && <label className="check"><input type="checkbox" checked={active} onChange={e => setActive(e.target.checked)} />Account enabled <span className="muted">(disabled users are signed out and cannot sign in)</span></label>}
-        <Field label={existing ? 'Reset password (optional)' : 'Temporary password'} hint={existing ? 'Leave empty to keep the current password. A reset signs the user out and they must choose a new password.' : 'They must replace it at first sign-in. At least 12 characters.'}>
+        {isSelf ? <p className="muted sm">To change your own password use your profile (it asks for your current password).</p> : <Field label={existing ? 'Reset password (optional)' : 'Temporary password'} hint={existing ? 'Leave empty to keep the current password. A reset signs the user out and they must choose a new password.' : 'They must replace it at first sign-in. At least 12 characters.'}>
           <div style={{ display: 'flex', gap: 8 }}>
             <input style={{ flex: 1, fontFamily: 'var(--mono)' }} value={password} onChange={e => setPassword(e.target.value)} minLength={password ? 12 : undefined} required={!existing} autoComplete="off" />
             <button type="button" className="btn" onClick={() => setPassword(generatePassword())}>Generate</button>
           </div>
-        </Field>
+        </Field>}
         {error && <div className="err" role="alert">{error}</div>}
         <div style={{ display: 'flex', gap: 10, justifyContent: 'space-between' }}>
           {existing && !isSelf ? <button type="button" className="btn danger" onClick={remove}>Delete user</button> : <span />}
