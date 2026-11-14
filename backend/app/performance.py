@@ -8,14 +8,16 @@ Two sources, shown side by side:
 import json
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .config import get_settings
 from .database import get_db
 from .models import CheckResult, Server, Service, TrafficSample
-from .security import require_user
+from .audit import audit
+from .security import require_operator, require_user
 from .stats import aware
 
 router = APIRouter(prefix="/api/performance", tags=["performance"])
@@ -109,6 +111,51 @@ def window(range_: str) -> tuple[datetime, datetime]:
     return until - timedelta(hours=RANGES[range_]), until
 
 
+# ------------------------------------------------------------------------------------------------------------ targets
+def target_info(target) -> dict | None:
+    if not getattr(target, "perf_threshold_ms", None):
+        return None
+    return {"percentile": target.perf_percentile or "p95", "threshold_ms": target.perf_threshold_ms, "window_minutes": target.perf_window_minutes or get_settings().perf_default_window_minutes}
+
+
+def measure_service(db: Session, service: Service) -> dict | None:
+    """The percentile a service's target is about, over its window, from SM-Watch's own probes. None = not enough data to judge."""
+    info = target_info(service)
+    if not info:
+        return None
+    since = datetime.now(timezone.utc) - timedelta(minutes=info["window_minutes"])
+    values = [r.latency_ms for r in _check_rows(db, "service", service.id, since) if r.status != "down"]
+    if len(values) < get_settings().perf_min_check_samples:
+        return {**info, "value": None, "samples": len(values), "breaching": False}
+    value = _percentiles(values)[info["percentile"]]
+    return {**info, "value": value, "samples": len(values), "breaching": value is not None and value > info["threshold_ms"]}
+
+
+def measure_server_traffic(db: Session, server: Server) -> dict | None:
+    """Same for the real traffic of a server (load balancer), from its reported histograms."""
+    info = target_info(server)
+    if not info:
+        return None
+    since = datetime.now(timezone.utc) - timedelta(minutes=info["window_minutes"])
+    samples = db.scalars(select(TrafficSample).where(TrafficSample.server_id == server.id, TrafficSample.ts >= since)).all()
+    part = summarise(samples) if samples else {"requests": 0}
+    if part["requests"] < get_settings().perf_min_requests:
+        return {**info, "value": None, "samples": part["requests"], "breaching": False}
+    value = part[info["percentile"]]
+    return {**info, "value": value, "samples": part["requests"], "breaching": value is not None and value > info["threshold_ms"]}
+
+
+def breach_text(m: dict, what: str) -> str:
+    fmt = lambda v: f"{v / 1000:.2f} s" if v >= 1000 else f"{round(v)} ms"  # noqa: E731
+    return f"Slow {what}: {m['percentile']} is {fmt(m['value'])} over the last {m['window_minutes']} min (target {fmt(m['threshold_ms'])} or faster, {m['samples']:,} samples)"
+
+
+class TargetBody(BaseModel):
+    percentile: str = Field(default="p95", pattern="^(p50|p95|p99)$")
+    threshold_ms: int | None = Field(default=None, ge=1, le=600_000)      # None removes the target
+    window_minutes: int | None = Field(default=None, ge=1, le=1440)
+
+
 # ------------------------------------------------------------------------------------------------------------ endpoints
 @router.get("/traffic")
 def traffic(range: str = Query("24h", pattern="^(1h|6h|24h|7d|30d)$"), _: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
@@ -119,7 +166,10 @@ def traffic(range: str = Query("24h", pattern="^(1h|6h|24h|7d|30d)$"), _: dict =
     for sample in rows:
         by_server.setdefault(sample.server_id, []).append(sample)
     names = {s.id: s.name for s in db.scalars(select(Server).where(Server.id.in_(list(by_server) or [0]))).all()}
-    servers = [{"server_id": sid, "name": names.get(sid, f"server {sid}"), **summarise(samples), "series": series(samples, since, until)} for sid, samples in by_server.items()]
+    objs = {s.id: s for s in db.scalars(select(Server).where(Server.id.in_(list(by_server) or [0]))).all()}
+    servers = [{"server_id": sid, "name": names.get(sid, f"server {sid}"), **summarise(samples), "series": series(samples, since, until),
+                "last_data_at": aware(samples[-1].ts).isoformat(), "target": measure_server_traffic(db, objs[sid]) if sid in objs else None}
+               for sid, samples in by_server.items()]
     servers.sort(key=lambda s: s["requests"], reverse=True)
     everything = summarise(rows) if rows else None
     return {"range": range, "servers": servers, "total": everything, "bounds_ms": traffic_bounds()}
@@ -140,11 +190,12 @@ def checks(range: str = Query("24h", pattern="^(1h|6h|24h|7d|30d)$"), _: dict = 
     """p50 / p95 / p99 of SM-Watch's own probes: services (HTTP) and servers (ping)."""
     since, _until = window(range)
     items = []
+    svc_by_id = {s.id: s for s in db.scalars(select(Service)).all()}
     targets = [("service", s.id, s.name) for s in db.scalars(select(Service).order_by(Service.name)).all()] + [("server", s.id, s.name) for s in db.scalars(select(Server).where(Server.monitor_mode != "push").order_by(Server.name)).all()]
     for kind, target_id, name in targets:
         rows = [r for r in _check_rows(db, kind, target_id, since) if r.status != "down"]
         if rows:
-            items.append({"kind": kind, "id": target_id, "name": name, "checks": len(rows), **_percentiles([r.latency_ms for r in rows])})
+            items.append({"kind": kind, "id": target_id, "name": name, "checks": len(rows), **_percentiles([r.latency_ms for r in rows]), "target": measure_service(db, svc_by_id[target_id]) if kind == "service" else None})
     items.sort(key=lambda i: i["p95"] or 0, reverse=True)
     return {"range": range, "items": items}
 
@@ -161,3 +212,21 @@ def check_series(kind: str, target_id: int, range: str = Query("24h", pattern="^
         grouped.setdefault(int((aware(r.checked_at) - since).total_seconds() // width), []).append(r.latency_ms)
     points = [{"t": (since + timedelta(seconds=i * width + width / 2)).isoformat(), **{k: v for k, v in _percentiles(vals).items() if k in ("p50", "p95", "p99")}} for i, vals in sorted(grouped.items())]
     return {"range": range, "checks": len(rows), **_percentiles([r.latency_ms for r in rows]), "points": points}
+
+
+@router.put("/targets/{kind}/{target_id}")
+def set_target(kind: str, target_id: int, payload: TargetBody, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+    """A response-time target: alert when the chosen percentile over the window is slower than the threshold. threshold_ms=null removes it."""
+    model = {"service": Service, "server": Server}.get(kind)
+    item = db.get(model, target_id) if model else None
+    if item is None:
+        raise HTTPException(404, "Monitor not found")
+    if payload.threshold_ms is None:
+        item.perf_percentile = item.perf_threshold_ms = item.perf_window_minutes = None
+        detail = "response-time target removed"
+    else:
+        item.perf_percentile, item.perf_threshold_ms, item.perf_window_minutes = payload.percentile, payload.threshold_ms, payload.window_minutes
+        detail = f"target: {payload.percentile} <= {payload.threshold_ms} ms over {payload.window_minutes or get_settings().perf_default_window_minutes} min"
+    audit(db, request, "perf.target", user=user, target=f"{kind}:{item.id}", detail=f"{item.name}: {detail}")
+    db.commit()
+    return {"target": target_info(item)}

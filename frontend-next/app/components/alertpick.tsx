@@ -19,7 +19,7 @@ const PRESETS: [string, number][] = [['5 min', 5], ['15 min', 15], ['30 min', 30
 export function MonitorAlertSettings({ kind, value, onChange, pingOnly }: { kind: 'server' | 'service' | 'cluster'; value: MonitorAlerts; onChange: (v: MonitorAlerts) => void; pingOnly?: boolean }) {
   const { channels } = useApp();
   const lim = useLimits();
-  const applicable = EVENTS.filter(e => !(e.id === 'alert' && (kind === 'service' || pingOnly)));
+  const applicable = EVENTS.filter(e => !(e.id === 'alert' && pingOnly));
   const all = applicable.map(e => e.id);
   const events = value.alert_events.length ? value.alert_events.filter(e => all.includes(e)) : all;
   const toggleEvent = (id: string) => {

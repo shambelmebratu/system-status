@@ -257,7 +257,7 @@ NOT_ROUTED = "Not sent: no channel is set to receive this kind of alert"
 MONITOR_MUTED = "Not sent: this monitor is set not to send this kind of alert"
 
 # Which alert types each kind of monitor can produce (a service has no "over a limit"; a ping-only host cannot go over a limit either).
-APPLICABLE_EVENTS = {"server": ("down", "alert", "recovered", "reminder"), "service": ("down", "recovered", "reminder"), "cluster": ("down", "alert", "recovered", "reminder")}
+APPLICABLE_EVENTS = {"server": ("down", "alert", "recovered", "reminder"), "service": ("down", "alert", "recovered", "reminder"), "cluster": ("down", "alert", "recovered", "reminder")}
 
 
 def csv_list(value: str | None) -> list[str]:
@@ -567,11 +567,20 @@ def apply_service_result(session, service: Service, result: dict) -> dict:
     service.last_http_status = result["http_status"]
     service.last_status = status
     service.last_error = result["error"]
-    resolved = sync_incident(session, "service", service, status, service.last_error)
-    if status == "down":
+    if status == "up" and service.perf_threshold_ms:   # healthy, but is it fast enough? (the service's own response-time target)
+        from .performance import breach_text, measure_service
+        session.flush()
+        slow = measure_service(session, service)
+        if slow and slow["breaching"]:
+            status, service.last_status, service.last_error = "alert", "alert", breach_text(slow, "responses")
+    resolved = sync_incident(session, "service", service, status, service.last_error, alert_title=f"{service.name} is slow")
+    if status == "alert":
+        if previous_status != "alert" or should_notify_again(session, "service", service.id, reminder_minutes(service)):
+            queue_event(session, "service", service, "critical", format_alert("Service", "alert" if previous_status != "alert" else "still_alert", service.name, service.last_error, at=now, link=service.url), deliver=True, state="alert" if previous_status != "alert" else "still_alert")
+    elif status == "down":
         if previous_status != "down" or should_notify_again(session, "service", service.id, reminder_minutes(service)):
             queue_event(session, "service", service, "critical", format_alert("Service", "down" if previous_status != "down" else "still_down", service.name, service.last_error, at=now, link=service.url), deliver=True, state="down" if previous_status != "down" else "still_down")
-    elif previous_status == "down":
+    elif previous_status in ("down", "alert"):
         queue_event(session, "service", service, "info", format_alert("Service", "recovered", service.name, f"Responding again: HTTP {service.last_http_status} in {round(service.last_latency_ms or 0)} ms", at=now, link=service.url, duration=outage_seconds(resolved)), deliver=True, state="recovered")
     session.commit()
     return _service_payload(service, status, result, now)

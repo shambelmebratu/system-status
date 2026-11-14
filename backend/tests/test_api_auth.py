@@ -1615,7 +1615,7 @@ def test_agent_traffic_is_stored_and_served_as_percentiles(client):
     assert s["requests"] == 100 and s["p50"] == 10.0 and 50 < s["p95"] <= 100 and s["p99"] <= 500 and s["max"] == 900.0
     assert s["avg"] == 50.0 and s["upstream_avg"] == 30.0 and s["error_rate_5xx"] == 2.0 and s["rps"] == round(100 / 60, 2)
     assert s["series"] and s["series"][0]["p99"] is not None and data["total"]["requests"] == 100
-    assert "traffic" not in json.dumps(next(x for x in client.get("/api/dashboard").json()["servers"] if x["id"] == sid)["last_metrics"])   # not duplicated into host metrics
+    assert "traffic" not in next(x for x in client.get("/api/dashboard").json()["servers"] if x["id"] == sid)["last_metrics"]   # histograms are not duplicated into host metrics
     with database.SessionLocal() as db:                                                         # old windows fall out of a short range
         db.add(TrafficSample(server_id=sid, ts=datetime.now(timezone.utc) - timedelta(hours=30), window_seconds=60, requests=10, bounds="[10]", counts="[0, 10]", max_ms=4000)); db.commit()
     assert client.get("/api/performance/traffic?range=24h").json()["servers"][0]["requests"] == 100
@@ -1692,7 +1692,7 @@ def test_each_monitor_chooses_its_alert_types_channels_and_reminder_interval(cli
     assert client.post("/api/services", headers=CSRF, json={"name": "x", "url": "https://example.com", "alert_channels": [99999]}).status_code == 422
     assert client.post("/api/services", headers=CSRF, json={"name": "x", "url": "https://example.com", "alert_events": ["nope"]}).status_code == 422
     assert client.post("/api/services", headers=CSRF, json={"name": "x", "url": "https://example.com", "alert_reminder_minutes": -1}).status_code == 422
-    all_types = client.post("/api/services", headers=CSRF, json={"name": "all-svc", "url": "https://example.com", "alert_events": ["down", "recovered", "reminder"]}).json()
+    all_types = client.post("/api/services", headers=CSRF, json={"name": "all-svc", "url": "https://example.com", "alert_events": ["down", "alert", "recovered", "reminder"]}).json()
     assert all_types["alert_events"] == [] and all_types["alert_reminder_minutes"] is None              # every applicable type ticked = inherit
     srv = client.post("/api/servers", headers=CSRF, json={"name": "alert-srv", "host": "10.1.1.1", "monitor_mode": "ping", "alert_events": ["down", "recovered"], "alert_reminder_minutes": 0}).json()
     assert srv["alert_events"] == ["down", "recovered"] and srv["alert_reminder_minutes"] == 0 and srv["alert_channels"] == []
@@ -1755,3 +1755,91 @@ def test_clusters_have_the_same_alert_settings(client):
     assert client.put(f"/api/clusters/{cid}", headers=CSRF, json={"alert_settings": True, "alert_channels": [424242]}).status_code == 422
     cleared = client.put(f"/api/clusters/{cid}", headers=CSRF, json={"alert_settings": True}).json()
     assert cleared["alert_events"] == [] and cleared["alert_reminder_minutes"] is None
+
+
+# =================================================================== response-time targets and honesty about the data
+def test_response_time_targets_alert_when_a_service_is_slow_and_recover(client, monkeypatch):
+    from datetime import timedelta
+    from app import monitoring as m
+    from app.models import AlertEvent, CheckResult, Incident, Service
+    sign_in(client)
+    svc = client.post("/api/services", headers=CSRF, json={"name": "slow-svc", "url": "https://example.com", "alert_events": []}).json()
+    assert client.put(f"/api/performance/targets/service/{svc['id']}", headers=CSRF, json={"percentile": "p95", "threshold_ms": 0}).status_code == 422
+    assert client.put(f"/api/performance/targets/service/{svc['id']}", headers=CSRF, json={"percentile": "p42", "threshold_ms": 500}).status_code == 422
+    assert client.put("/api/performance/targets/service/987654", headers=CSRF, json={"threshold_ms": 500}).status_code == 404
+    assert client.put("/api/performance/targets/cluster/1", headers=CSRF, json={"threshold_ms": 500}).status_code == 404
+    viewer_pw = "viewer-pass-123456"; make_user(client, "perf-view@example.com", "viewer")
+    assert session_for("perf-view@example.com", new_password=viewer_pw).put(f"/api/performance/targets/service/{svc['id']}", headers=CSRF, json={"threshold_ms": 500}).status_code == 403
+    r = client.put(f"/api/performance/targets/service/{svc['id']}", headers=CSRF, json={"percentile": "p95", "threshold_ms": 500, "window_minutes": 10}).json()
+    assert r["target"] == {"percentile": "p95", "threshold_ms": 500, "window_minutes": 10}
+
+    now = datetime.now(timezone.utc)
+    queued = []
+    monkeypatch.setattr(m, "deliver_event", lambda event, session: queued.append((event.state, event.message)))
+    def check(latency, minutes_ago=0):
+        with database.SessionLocal() as db:
+            service = db.get(Service, svc["id"])
+            m.apply_service_result(db, service, {"status": "up", "latency_ms": latency, "http_status": 200, "error": None})
+            return db.get(Service, svc["id"]).last_status
+    with database.SessionLocal() as db:                                                 # 4 earlier probes inside the window, all slow
+        for i in range(4):
+            db.add(CheckResult(target_type="service", target_id=svc["id"], status="up", latency_ms=2000.0, checked_at=now - timedelta(minutes=i + 1)))
+        db.commit()
+    check(2000.0)                                                                       # 5 samples now: enough to judge
+    with database.SessionLocal() as db:
+        assert db.get(Service, svc["id"]).last_status == "alert"
+        assert "Slow responses: p95 is 2.00 s over the last 10 min (target 500 ms or faster" in db.get(Service, svc["id"]).last_error
+        inc = db.query(Incident).filter(Incident.target_type == "service", Incident.target_id == svc["id"], Incident.resolved_at.is_(None)).one()
+        assert inc.title == "slow-svc is slow" and inc.severity == "warning"
+    assert queued and queued[0][0] == "alert"
+    with database.SessionLocal() as db:                                                 # it speeds up: the slow probes age out of the window
+        db.query(CheckResult).filter(CheckResult.target_id == svc["id"], CheckResult.target_type == "service", CheckResult.latency_ms >= 2000).update({"checked_at": now - timedelta(hours=2)})
+        db.commit()
+    queued.clear()
+    for _ in range(5):
+        check(120.0)
+    with database.SessionLocal() as db:
+        assert db.get(Service, svc["id"]).last_status == "up"
+        assert db.query(Incident).filter(Incident.target_type == "service", Incident.target_id == svc["id"], Incident.resolved_at.is_(None)).count() == 0
+    assert any(state == "recovered" for state, _ in queued)
+    # too little data is never judged
+    lonely = client.post("/api/services", headers=CSRF, json={"name": "lonely", "url": "https://example.com"}).json()
+    client.put(f"/api/performance/targets/service/{lonely['id']}", headers=CSRF, json={"percentile": "p99", "threshold_ms": 10})
+    with database.SessionLocal() as db:
+        assert m.apply_service_result(db, db.get(Service, lonely["id"]), {"status": "up", "latency_ms": 5000.0, "http_status": 200, "error": None})["status"] == "up"
+    # removing the target
+    assert client.put(f"/api/performance/targets/service/{svc['id']}", headers=CSRF, json={"threshold_ms": None}).json()["target"] is None
+
+
+def test_real_traffic_target_marks_the_server_over_a_limit(client):
+    sign_in(client)
+    anon = TestClient(main.app)
+    sid, auth = _push_server(client, anon)
+    r = client.put(f"/api/performance/targets/server/{sid}", headers=CSRF, json={"percentile": "p95", "threshold_ms": 100, "window_minutes": 30})
+    assert r.status_code == 200
+    slow = _traffic(100, [0, 0, 0, 0, 100], bounds=(10, 50, 100, 500), max_ms=900, sum_ms=100 * 700)
+    out = anon.post("/api/agent/report", json=report(traffic=slow), headers=auth).json()
+    assert out["status"] == "alert"
+    srv = next(s for s in client.get("/api/dashboard").json()["servers"] if s["id"] == sid)
+    assert srv["last_status"] == "alert" and "Slow responses: p95" in json.dumps(client.get("/api/incidents?state=open").json())
+    data = next(x for x in client.get("/api/performance/traffic?range=1h").json()["servers"] if x["server_id"] == sid)
+    assert data["target"]["breaching"] is True and data["target"]["value"] > 100 and data["target"]["samples"] == 100 and data["last_data_at"]
+    fast = _traffic(200, [190, 10, 0, 0, 0], bounds=(10, 50, 100, 500), max_ms=40, sum_ms=200 * 12)
+    for _ in range(3):
+        anon.post("/api/agent/report", json=report(traffic=fast), headers=auth)
+    assert anon.post("/api/agent/report", json=report(traffic=fast), headers=auth).json()["status"] in ("up", "alert")
+    few = _traffic(10, [0, 0, 0, 0, 10], bounds=(10, 50, 100, 500), max_ms=900, sum_ms=7000)           # 10 requests are too few to judge
+    sid2, auth2 = _push_server(client, anon)
+    client.put(f"/api/performance/targets/server/{sid2}", headers=CSRF, json={"percentile": "p99", "threshold_ms": 10})
+    assert anon.post("/api/agent/report", json=report(traffic=few), headers=auth2).json()["status"] == "up"
+
+
+def test_traffic_status_from_the_agent_is_stored_and_validated(client):
+    sign_in(client)
+    anon = TestClient(main.app)
+    sid, auth = _push_server(client, anon)
+    st = {"state": "no_timing", "path": "/var/log/nginx/access.log", "lines": 40, "parsed": 0, "detected": [{"path": "/var/log/nginx/access.log", "timing": False}]}
+    assert anon.post("/api/agent/report", json=report(traffic_status=st), headers=auth).status_code == 200
+    srv = next(s for s in client.get("/api/dashboard").json()["servers"] if s["id"] == sid)
+    assert srv["last_metrics"]["traffic_status"]["state"] == "no_timing" and srv["last_metrics"]["traffic_status"]["detected"][0]["timing"] is False
+    assert anon.post("/api/agent/report", json=report(traffic_status={"state": "bogus"}), headers=auth).status_code == 422

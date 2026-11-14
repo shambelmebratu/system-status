@@ -157,6 +157,20 @@ class TrafficReport(BaseModel):
         return self
 
 
+class TrafficStatus(BaseModel):
+    """Why response times are (not) being measured on this server (see agent.traffic_status)."""
+    state: str = Field(pattern="^(off|no_file|unreadable|waiting|no_timing|ok)$")
+    path: str = Field(default="", max_length=200)
+    lines: int = Field(default=0, ge=0, le=100_000_000)
+    parsed: int = Field(default=0, ge=0, le=100_000_000)
+    detected: list[dict] = Field(default_factory=list, max_length=5)
+
+    @field_validator("detected")
+    @classmethod
+    def clean_detected(cls, v: list[dict]) -> list[dict]:
+        return [{"path": _printable(str(d.get("path", "")))[:200], "timing": bool(d.get("timing"))} for d in v if isinstance(d, dict)]
+
+
 class AgentReport(BaseModel):
     cpu: float = Field(ge=0, le=100)
     memory: float = Field(ge=0, le=100)
@@ -180,6 +194,7 @@ class AgentReport(BaseModel):
     install: str = Field(default="", max_length=20)
     machine: str = Field(default="", max_length=64, pattern="^[0-9a-f]*$")
     traffic: TrafficReport | None = None
+    traffic_status: TrafficStatus | None = None
 
     @field_validator("hostname", "platform", "os", "kernel", "arch", "install", "agent_version")
     @classmethod

@@ -12,7 +12,7 @@ from .database import get_db
 import json
 
 from .models import Server, TrafficSample
-from .performance import traffic_bounds
+from .performance import breach_text, measure_server_traffic, traffic_bounds
 from .monitoring import apply_server_result, evaluate_metrics
 from .schemas import AgentReport
 from . import log_policy as policy_lib
@@ -67,11 +67,16 @@ def report(payload: AgentReport, request: Request, authorization: str | None = H
     except ValueError as error:
         raise HTTPException(422, str(error)) from error
     server.last_seen_at = now
-    # deliver=False: alerts are queued and sent by the worker so ingest stays fast.
-    apply_server_result(db, server, status, failures, metrics, deliver=False)
     if traffic and traffic["requests"] > 0:
         db.add(TrafficSample(server_id=server.id, ts=now, bounds=json.dumps(traffic["bounds"]), counts=json.dumps(traffic["counts"]),
                              **{k: traffic[k] for k in ("window_seconds", "requests", "errors_5xx", "errors_4xx", "sum_ms", "max_ms", "upstream_sum_ms", "upstream_count")}))
+        db.flush()
+    slow = measure_server_traffic(db, server) if server.perf_threshold_ms else None   # this server's response-time target (real traffic)
+    if slow and slow["breaching"]:
+        failures = [*failures, breach_text(slow, "responses")]
+        status = "alert"
+    # deliver=False: alerts are queued and sent by the worker so ingest stays fast.
+    apply_server_result(db, server, status, failures, metrics, deliver=False)
     db.commit()
     reply["traffic_buckets_ms"] = traffic_bounds()   # the agent uses these histogram boundaries from its next report on
     reply["log_policy"] = policy_lib.compile_for_agent(policy_lib.parse(server.log_policy))   # the agent enforces this too

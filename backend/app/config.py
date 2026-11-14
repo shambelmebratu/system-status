@@ -77,6 +77,9 @@ class Settings(BaseSettings):
     schedule_max_attempts: int = 3             # scheduled messages: tries per run
     schedule_retry_minutes: int = 1
     schedule_missed_minutes: int = 15          # a reminder this late is skipped instead of sent
+    perf_default_window_minutes: int = 10      # response-time targets look at this many recent minutes unless set per monitor
+    perf_min_check_samples: int = 5            # a target is not judged on fewer probes than this ...
+    perf_min_requests: int = 50                # ... or fewer real requests than this (percentiles of a handful of requests mean nothing)
     traffic_buckets_ms: str = "5,10,25,50,75,100,150,200,300,500,750,1000,1500,2000,3000,5000,10000"   # response-time histogram boundaries agents use (ms)
     usage_warn_percent: float = 70             # dashboard colouring of usage bars (amber)
     usage_bad_percent: float = 90              # (red)

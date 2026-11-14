@@ -327,7 +327,13 @@ curl -fsSL <url>/api/agent/install.sh | sudo SMWATCH_ACCESS_LOG=/var/log/nginx/a
 # agent bundled with SM-Watch: set HOST_ACCESS_LOG=/var/log/nginx/access.log in .env, then: docker compose up -d host-agent
 ```
 
-JSON access logs with `request_time` / `status` / `upstream_response_time` fields work too. Several files can be given, comma-separated, and globs are allowed. Only requests logged after the agent starts are counted. Percentiles are computed from histograms (boundaries in `TRAFFIC_BUCKETS_MS`), so they stay correct when merged across minutes, hours and servers; the precision is within one bucket. The history is kept under *Server, cluster & traffic metrics* in the retention settings.
+Understood log formats: nginx (`rt=` / `urt=` as above), nginx JSON (`request_time`, `status`, `upstream_response_time`), Caddy JSON (`duration`, `status`), Traefik JSON (`Duration`, `OriginDuration`, `DownstreamStatus`) and HAProxy's http log (`Tq/Tw/Tc/Tr/Tt`). Several files can be given, comma-separated, and globs are allowed. Only requests logged after the agent starts are counted. Percentiles are computed from histograms (boundaries in `TRAFFIC_BUCKETS_MS`), so they stay correct when merged across minutes, hours and servers; the precision is within one bucket. The history is kept under *Server, cluster & traffic metrics* in the retention settings.
+
+The **Data sources** card on the Performance page says, per server, what the agent found: *Measuring*, *Waiting for requests*, *Log found, no response time* (and what to add), *Log not found*, *Cannot read the log* (permissions), or *Ready to switch on* with the exact command. Agents (2.11+) look for access logs in the usual places on their own, but only measure after you tell them to. A figure is marked `≈` and a warning is shown when there are too few samples for it to mean anything (p95 needs about 20, p99 about 100).
+
+### Response-time targets
+
+On the Performance page, **Set a target** on a service (or on a server that reports real traffic): for example *p95 faster than 800 ms over the last 10 minutes*. When the percentile is slower than the target the monitor goes to *Over a limit*, an incident is opened and an alert is sent (to the channels and with the reminder interval set in that monitor's Alerts section); when it is back under, a recovery message follows. A monitor is not judged on too little data: `PERF_MIN_CHECK_SAMPLES` (5 probes) and `PERF_MIN_REQUESTS` (50 requests); the default window is `PERF_DEFAULT_WINDOW_MINUTES` (10).
 
 ## Agent addresses and updates
 

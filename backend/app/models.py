@@ -48,6 +48,10 @@ class Server(Base):
     alert_events: Mapped[str | None] = mapped_column(String(100))      # down,alert,recovered,reminder
     alert_channels: Mapped[str | None] = mapped_column(String(200))    # channel ids; NULL = every channel
     alert_reminder_minutes: Mapped[int | None] = mapped_column(Integer)  # NULL = REMINDER_MINUTES; 0 = never repeat
+    # Response-time target (NULL = none): alert when this percentile over the window is slower than the threshold.
+    perf_percentile: Mapped[str | None] = mapped_column(String(4))     # p50 | p95 | p99
+    perf_threshold_ms: Mapped[int | None] = mapped_column(Integer)
+    perf_window_minutes: Mapped[int | None] = mapped_column(Integer)   # NULL = PERF_DEFAULT_WINDOW_MINUTES
     token_hash: Mapped[str | None] = mapped_column(String(64), index=True)
     machine_id: Mapped[str | None] = mapped_column(String(64), index=True)
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -75,6 +79,10 @@ class Service(Base):
     alert_events: Mapped[str | None] = mapped_column(String(100))      # down,alert,recovered,reminder
     alert_channels: Mapped[str | None] = mapped_column(String(200))    # channel ids; NULL = every channel
     alert_reminder_minutes: Mapped[int | None] = mapped_column(Integer)  # NULL = REMINDER_MINUTES; 0 = never repeat
+    # Response-time target (NULL = none): alert when this percentile over the window is slower than the threshold.
+    perf_percentile: Mapped[str | None] = mapped_column(String(4))     # p50 | p95 | p99
+    perf_threshold_ms: Mapped[int | None] = mapped_column(Integer)
+    perf_window_minutes: Mapped[int | None] = mapped_column(Integer)   # NULL = PERF_DEFAULT_WINDOW_MINUTES
     fail_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     last_status: Mapped[str] = mapped_column(String(20), default="unknown")
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

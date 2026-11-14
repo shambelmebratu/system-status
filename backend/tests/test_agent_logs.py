@@ -459,3 +459,61 @@ def test_traffic_is_off_unless_configured(tmp_path, monkeypatch):
         assert a.traffic_stats() is None and a.collect()["traffic"] is None
     finally:
         sys.modules.pop("agent", None)
+
+
+def test_other_load_balancers_formats_are_understood(traffic_agent):
+    a, _ = traffic_agent
+    caddy = '{"level":"info","ts":1700000000.1,"logger":"http.log.access","request":{"method":"GET","uri":"/"},"duration":0.0425,"status":200,"size":10}'
+    assert a.parse_access_line(caddy) == (42.5, 200, None)
+    traefik = '{"ClientAddr":"1.2.3.4:5","DownstreamStatus":502,"Duration":123456789,"OriginDuration":100000000,"RequestMethod":"GET"}'
+    ms, status, upstream = a.parse_access_line(traefik)
+    assert (round(ms, 1), status, round(upstream)) == (123.5, 502, 100)
+    haproxy = 'Nov 14 10:00:01 lb haproxy[123]: 203.0.113.9:5555 [14/Nov/2026:10:00:01.123] fe be/srv1 0/0/1/12/15 200 512 - - ---- 1/1/0/0/0 0/0 "GET / HTTP/1.1"'
+    assert a.parse_access_line(haproxy) == (15.0, 200, 12.0)
+    assert a.parse_access_line('Nov 14 lb haproxy[1]: 1.2.3.4:5 [x] fe be/<NOSRV> 0/-1/-1/-1/0 503 212 - - SC-- 1/1/0/0/0 0/0 "GET / HTTP/1.1"') == (0.0, 503, None)
+    assert a.parse_access_line('{"msg":"hello"}') is None
+
+
+def test_the_agent_explains_why_there_is_no_response_time_data(tmp_path, monkeypatch):
+    log = tmp_path / "access.log"
+    sys.path.insert(0, ROOT)
+    def load(**env):
+        for k in ("AGENT_ACCESS_LOG",):
+            monkeypatch.delenv(k, raising=False)
+        for k, v in env.items():
+            monkeypatch.setenv(k, v)
+        monkeypatch.setenv("AGENT_HOST_ROOT", "/")
+        sys.modules.pop("agent", None)
+        return importlib.import_module("agent")
+    try:
+        a = load()                                                                         # not configured, nothing standard on this machine
+        a.ACCESS_LOG_CANDIDATES = (str(log),)
+        assert a.traffic_status() == {"state": "off", "detected": []}
+        log.write_text('1.2.3.4 - - [x] "GET / HTTP/1.1" 200 5 "-" "ua"\n' * 3)            # a log exists but has no timing field
+        a._detected_cache.update(at=0.0)
+        assert a.traffic_status()["detected"] == [{"path": str(log), "timing": False}]
+        log.write_text('1.2.3.4 - - [x] "GET / HTTP/1.1" 200 5 "-" "ua" rt=0.100 urt=0.050\n')
+        a._detected_cache.update(at=0.0)
+        assert a.traffic_status()["detected"] == [{"path": str(log), "timing": True}]       # ... or one that only needs to be switched on
+        a = load(AGENT_ACCESS_LOG=str(tmp_path / "missing.log")); a.traffic_stats()
+        assert a.traffic_status()["state"] == "no_file"
+        log.write_text("")
+        a = load(AGENT_ACCESS_LOG=str(log)); a.traffic_stats(); assert a.traffic_stats() is None
+        assert a.traffic_status()["state"] == "waiting"                                      # file fine, no new requests yet
+        with open(log, "a") as handle:
+            handle.write('1.2.3.4 - - [x] "GET / HTTP/1.1" 200 5 "-" "ua"\n' * 4)
+        a.traffic_stats()
+        st = a.traffic_status()
+        assert st["state"] == "no_timing" and st["lines"] == 4 and st["parsed"] == 0        # requests are logged but without a response time
+        with open(log, "a") as handle:
+            handle.write('1.2.3.4 - - [x] "GET / HTTP/1.1" 200 5 "-" "ua" rt=0.100\n' * 2)
+        a.traffic_stats()
+        st = a.traffic_status()
+        assert st["state"] == "ok" and st["lines"] == 2 and st["parsed"] == 2 and st["detected"] == []
+        os.chmod(log, 0)
+        a = load(AGENT_ACCESS_LOG=str(log)); a.traffic_stats()
+        if os.geteuid() != 0:
+            assert a.traffic_status()["state"] == "unreadable"
+        os.chmod(log, 0o644)
+    finally:
+        sys.modules.pop("agent", None)

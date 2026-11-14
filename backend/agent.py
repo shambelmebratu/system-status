@@ -39,7 +39,7 @@ from typing import Any
 
 import psutil
 
-AGENT_VERSION = "2.10.0"
+AGENT_VERSION = "2.11.0"
 _ENV_TOKEN = os.getenv("AGENT_TOKEN", "")                      # the token supplied by configuration; a rotation may supersede it (see _load_state)
 AGENT_TOKEN = ""                                                # the token in use: resolved by ensure_token() (saved state first, then configuration)
 AGENT_ALLOW_INSECURE = os.getenv("AGENT_ALLOW_INSECURE", "") == "1"   # permit http:// to a public address (not recommended)
@@ -128,6 +128,7 @@ def collect() -> dict[str, Any]:
         "public_ip": public_address(),
         "install": install_kind(),
         "traffic": traffic_stats(),
+        "traffic_status": traffic_status(),
         "machine": hashlib.sha256(("smwatch-machine:" + machine_id()).encode()).hexdigest()[:32],   # lets the dashboard notice one machine monitored twice
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
@@ -255,42 +256,54 @@ AGENT_ACCESS_LOG = os.getenv("AGENT_ACCESS_LOG", "").strip()         # comma-sep
 TRAFFIC_MAX_READ = 8 * 1024 * 1024                                    # most we read from one file per report; older lines are skipped
 _traffic_bounds: list[float] = [5, 10, 25, 50, 75, 100, 150, 200, 300, 500, 750, 1000, 1500, 2000, 3000, 5000, 10000]   # replaced by the control plane's TRAFFIC_BUCKETS_MS
 _traffic_files: dict[str, dict] = {}
+_traffic_diag: dict = {}
+_detected_cache: dict = {"at": 0.0, "found": []}
 _traffic_last = 0.0
 _RT = re.compile(r'(?:^|[\s,{"])(?:rt|request_time|reqtime)["]?\s*[=:]\s*"?([0-9]+(?:\.[0-9]+)?)')
 _URT = re.compile(r'(?:^|[\s,{"])(?:urt|upstream_response_time)["]?\s*[=:]\s*"?([0-9.,:\s-]+)')
 _STATUS = re.compile(r'"\s+(\d{3})\s')
 
 
+_HAPROXY = re.compile(r"\s(-?\d+)/(-?\d+)/(-?\d+)/(-?\d+)/(\d+)\s(\d{3})\s")   # Tq/Tw/Tc/Tr/Tt then the status, as in HAProxy's http log
+
+
+def _upstream_ms(raw) -> float | None:
+    if raw in (None, "", "-"):
+        return None
+    parts = [float(x) for x in re.split(r"[,:\s]+", str(raw)) if re.match(r"^[0-9]+(\.[0-9]+)?$", x)]
+    return sum(parts) * 1000 if parts else None
+
+
 def parse_access_line(line: str) -> tuple[float, int, float | None] | None:
-    """(request ms, HTTP status or 0, upstream ms or None) from an nginx access log line (key=value or JSON), else None."""
+    """(request ms, HTTP status or 0, upstream ms or None) from an access log line, else None. Understood: nginx (rt= / request_time=,
+    urt= / upstream_response_time=), JSON logs from nginx, Caddy (duration, seconds) and Traefik (Duration, nanoseconds), and HAProxy's http log."""
     line = line.strip()
     if not line:
         return None
-    status, upstream = 0, None
     if line.startswith("{"):
         try:
             data = json.loads(line)
-            seconds = float(data.get("request_time", data.get("rt", "")))
-            status = int(data.get("status") or 0)
-            raw = data.get("upstream_response_time", data.get("urt"))
-            if raw not in (None, "", "-"):
-                parts = [float(x) for x in re.split(r"[,:\s]+", str(raw)) if re.match(r"^[0-9.]+$", x)]
-                upstream = sum(parts) * 1000 if parts else None
-            return seconds * 1000, status, upstream
+            status = int(data.get("status") or data.get("DownstreamStatus") or 0)
+            if "request_time" in data or "rt" in data:                      # nginx JSON
+                return float(data.get("request_time", data.get("rt"))) * 1000, status, _upstream_ms(data.get("upstream_response_time", data.get("urt")))
+            if "Duration" in data:                                          # Traefik: nanoseconds
+                origin = data.get("OriginDuration")
+                return float(data["Duration"]) / 1e6, status, float(origin) / 1e6 if origin else None
+            if "duration" in data:                                          # Caddy: seconds
+                return float(data["duration"]) * 1000, status, None
+            return None
         except (ValueError, TypeError):
             return None
     match = _RT.search(line)
-    if not match:
-        return None
-    seconds = float(match.group(1))
-    found = _STATUS.search(line)
-    if found:
-        status = int(found.group(1))
-    u = _URT.search(line)
-    if u:
-        parts = [float(x) for x in re.split(r"[,:\s]+", u.group(1)) if re.match(r"^[0-9]+(\.[0-9]+)?$", x)]
-        upstream = sum(parts) * 1000 if parts else None
-    return seconds * 1000, status, upstream
+    if match:
+        found = _STATUS.search(line)
+        u = _URT.search(line)
+        return float(match.group(1)) * 1000, int(found.group(1)) if found else 0, _upstream_ms(u.group(1)) if u else None
+    haproxy = _HAPROXY.search(line)
+    if haproxy:
+        reply = int(haproxy.group(4))
+        return float(haproxy.group(5)), int(haproxy.group(6)), float(reply) if reply >= 0 else None
+    return None
 
 
 def _new_lines(path: str) -> list[str]:
@@ -334,14 +347,22 @@ def traffic_stats() -> dict | None:
     total = errors5 = errors4 = up_count = 0
     sum_ms = peak = up_sum = 0.0
     sources = []
+    diag = {"files": 0, "unreadable": 0, "lines": 0, "parsed": 0, "path": ""}
     for pattern in [p.strip() for p in AGENT_ACCESS_LOG.split(",") if p.strip()]:
         for path in sorted(glob.glob(_host_path(pattern))):
             if not os.path.isfile(path):
                 continue
+            diag["files"] += 1
+            diag["path"] = diag["path"] or path
+            if not os.access(path, os.R_OK):
+                diag["unreadable"] += 1
+                continue
             for line in _new_lines(path):
+                diag["lines"] += 1
                 parsed = parse_access_line(line)
                 if parsed is None:
                     continue
+                diag["parsed"] += 1
                 ms, status, upstream = parsed
                 if ms < 0 or ms > 3_600_000:
                     continue
@@ -357,10 +378,60 @@ def traffic_stats() -> dict | None:
                     up_sum += upstream
                     up_count += 1
             sources.append(os.path.basename(path))
+    _traffic_diag.clear(); _traffic_diag.update(diag)
     if not total:
         return None
     return {"source": ",".join(sources)[:120], "window_seconds": round(window, 1), "requests": total, "errors_5xx": errors5, "errors_4xx": errors4,
             "sum_ms": round(sum_ms, 1), "max_ms": round(peak, 1), "upstream_sum_ms": round(up_sum, 1), "upstream_count": up_count, "bounds": bounds, "counts": counts}
+
+
+ACCESS_LOG_CANDIDATES = ("/var/log/nginx/access.log", "/var/log/nginx/*access*.log", "/var/log/caddy/*.log", "/var/log/traefik/access.log", "/var/log/traefik/*.log", "/var/log/haproxy.log", "/var/log/haproxy/*.log")
+
+
+def _tail_lines(path: str, count: int = 6) -> list[str]:
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - 8192))
+            return handle.read().decode("utf-8", errors="replace").splitlines()[-count:]
+    except OSError:
+        return []
+
+
+def detect_access_logs() -> list[dict]:
+    """Looks (at most every 5 minutes) for a web server / load balancer log in the usual places and checks, locally, whether its lines
+    carry a response time. Only the answer (path, yes/no) is reported so the dashboard can say exactly what to do."""
+    if time.time() - _detected_cache["at"] < 300:
+        return _detected_cache["found"]
+    found: list[dict] = []
+    for pattern in ACCESS_LOG_CANDIDATES:
+        for path in sorted(glob.glob(_host_path(pattern))):
+            if os.path.isfile(path) and os.access(path, os.R_OK) and not path.endswith((".gz", ".1")):
+                lines = _tail_lines(path)
+                shown = "/" + os.path.relpath(path, AGENT_HOST_ROOT) if AGENT_HOST_ROOT not in ("", "/") else path
+                if lines and not any(d["path"] == shown for d in found):
+                    found.append({"path": shown[:200], "timing": any(parse_access_line(line) is not None for line in lines)})
+    _detected_cache.update(at=time.time(), found=found[:5])
+    return _detected_cache["found"]
+
+
+def traffic_status() -> dict:
+    """Why the response-time numbers are (not) there: reported with every report so the dashboard can explain it."""
+    if not AGENT_ACCESS_LOG:
+        return {"state": "off", "detected": detect_access_logs()}
+    d = _traffic_diag
+    if not d or not d.get("files"):
+        state = "no_file"
+    elif d.get("unreadable") and d["unreadable"] == d["files"]:
+        state = "unreadable"
+    elif not d.get("lines"):
+        state = "waiting"
+    elif not d.get("parsed"):
+        state = "no_timing"
+    else:
+        state = "ok"
+    return {"state": state, "path": (d.get("path") or AGENT_ACCESS_LOG)[:200], "lines": int(d.get("lines", 0)), "parsed": int(d.get("parsed", 0)), "detected": [] if state == "ok" else detect_access_logs()}
 
 
 def adopt_traffic_bounds(values) -> None:
