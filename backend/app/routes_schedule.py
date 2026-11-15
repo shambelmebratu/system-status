@@ -11,7 +11,7 @@ from .database import get_db
 from .models import Channel, ScheduledMessage
 from .schemas import ScheduledMessageIn
 from .scheduler import channel_list, compute_next_run, get_zone, parse_days, render_text, send_scheduled
-from .security import require_operator
+from .security import require_unrestricted
 from .stats import aware
 
 router = APIRouter(prefix="/api/scheduled-messages", tags=["scheduled"])
@@ -53,12 +53,12 @@ def apply(item: ScheduledMessage, payload: ScheduledMessageIn, db: Session) -> N
 
 
 @router.get("")
-def list_messages(_: dict = Depends(require_operator), db: Session = Depends(get_db)) -> list[dict]:
+def list_messages(_: dict = Depends(require_unrestricted), db: Session = Depends(get_db)) -> list[dict]:
     return [serialize(i) for i in db.scalars(select(ScheduledMessage).order_by(ScheduledMessage.name)).all()]
 
 
 @router.post("")
-def create_message(payload: ScheduledMessageIn, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+def create_message(payload: ScheduledMessageIn, request: Request, user: dict = Depends(require_unrestricted), db: Session = Depends(get_db)) -> dict:
     item = ScheduledMessage()
     apply(item, payload, db)
     db.add(item); db.flush()
@@ -68,7 +68,7 @@ def create_message(payload: ScheduledMessageIn, request: Request, user: dict = D
 
 
 @router.put("/{item_id}")
-def update_message(item_id: int, payload: ScheduledMessageIn, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+def update_message(item_id: int, payload: ScheduledMessageIn, request: Request, user: dict = Depends(require_unrestricted), db: Session = Depends(get_db)) -> dict:
     item = db.get(ScheduledMessage, item_id)
     if not item:
         raise HTTPException(404, "Scheduled message not found")
@@ -79,7 +79,7 @@ def update_message(item_id: int, payload: ScheduledMessageIn, request: Request, 
 
 
 @router.delete("/{item_id}")
-def delete_message(item_id: int, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict[str, bool]:
+def delete_message(item_id: int, request: Request, user: dict = Depends(require_unrestricted), db: Session = Depends(get_db)) -> dict[str, bool]:
     item = db.get(ScheduledMessage, item_id)
     if item:
         audit(db, request, "schedule.delete", user=user, target=f"schedule:{item.id}", detail=item.name)
@@ -88,7 +88,7 @@ def delete_message(item_id: int, request: Request, user: dict = Depends(require_
 
 
 @router.post("/{item_id}/send")
-def send_now(item_id: int, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+def send_now(item_id: int, request: Request, user: dict = Depends(require_unrestricted), db: Session = Depends(get_db)) -> dict:
     """Sends the message immediately to its channels without affecting the schedule."""
     item = db.get(ScheduledMessage, item_id)
     if not item:

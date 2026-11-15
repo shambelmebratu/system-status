@@ -258,11 +258,19 @@ EMAIL_PATTERN = r"^[^@\s]{1,64}@[^@\s]+\.[^@\s]{2,}$"
 ROLE_PATTERN = "^(admin|operator|viewer)$"
 
 
+class AccessScope(BaseModel):
+    """The only monitors a non-admin may see. Omitted / null on a user = everything."""
+    servers: list[int] = Field(default_factory=list, max_length=5000)
+    services: list[int] = Field(default_factory=list, max_length=5000)
+    clusters: list[int] = Field(default_factory=list, max_length=5000)
+
+
 class UserCreate(BaseModel):
     email: str = Field(max_length=320, pattern=EMAIL_PATTERN)
     name: str = Field(default="", max_length=100)
     role: str = Field(default="viewer", pattern=ROLE_PATTERN)
     password: str = Field(min_length=12, max_length=200)   # temporary: the person must change it at first sign-in
+    access: AccessScope | None = None                      # null = every monitor
 
 
 class UserUpdate(BaseModel):
@@ -270,6 +278,8 @@ class UserUpdate(BaseModel):
     role: str | None = Field(default=None, pattern=ROLE_PATTERN)
     active: bool | None = None
     password: str | None = Field(default=None, min_length=12, max_length=200)   # admin reset: forces a change at next sign-in
+    access: AccessScope | None = None      # only applied when access_set is true (so null can mean "everything")
+    access_set: bool = False
 
 
 class ProfileUpdate(BaseModel):

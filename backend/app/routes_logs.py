@@ -16,7 +16,7 @@ from .database import SessionLocal, get_db
 from .models import LogRequest, Server
 from .routes_agent import hash_token
 from .schemas import LogQuery, LogResult
-from .security import agent_gate, login_limiter, require_admin, require_operator
+from .security import agent_gate, ensure_access, login_limiter, require_admin, require_operator
 from .stats import aware
 
 router = APIRouter(tags=["logs"])
@@ -86,6 +86,7 @@ def supports_logs(server: Server) -> bool:
 # ------------------------------------------------------------------ dashboard side
 @router.post("/api/servers/{server_id}/logs")
 def request_logs(server_id: int, payload: LogQuery, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+    ensure_access(user, "server", server_id)
     server = db.get(Server, server_id)
     if not server:
         raise HTTPException(404, "Server not found")
@@ -130,8 +131,9 @@ def _read(server_id: int, request_id: int) -> dict:
 
 
 @router.get("/api/servers/{server_id}/logs/{request_id}")
-async def read_logs(server_id: int, request_id: int, wait: int = Query(0, ge=0, le=20), _: dict = Depends(require_operator)) -> dict:
+async def read_logs(server_id: int, request_id: int, wait: int = Query(0, ge=0, le=20), user: dict = Depends(require_operator)) -> dict:
     """Result of a log request. With ?wait=N the call returns as soon as the agent has answered (up to N seconds)."""
+    ensure_access(user, "server", server_id)
     loop = asyncio.get_running_loop()
     deadline = loop.time() + wait
     with _Waiter(_result_waiters, request_id) as event:
@@ -154,7 +156,8 @@ def policy_catalog(_: dict = Depends(require_operator)) -> dict:
 
 
 @router.get("/api/servers/{server_id}/log-policy")
-def get_policy(server_id: int, _: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+def get_policy(server_id: int, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+    ensure_access(user, "server", server_id)
     server = db.get(Server, server_id)
     if not server:
         raise HTTPException(404, "Server not found")

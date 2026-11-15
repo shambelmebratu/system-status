@@ -1,4 +1,5 @@
 """User administration (admin only). Roles: admin (everything), operator (manage monitoring), viewer (read-only)."""
+import json
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -7,9 +8,9 @@ from sqlalchemy.orm import Session
 
 from .audit import audit
 from .database import get_db
-from .models import User
-from .schemas import UserCreate, UserUpdate
-from .security import hash_password, require_admin
+from .models import Cluster, Server, Service, User
+from .schemas import AccessScope, UserCreate, UserUpdate
+from .security import SCOPE_KINDS, hash_password, parse_scope, require_admin
 from .stats import aware
 
 router = APIRouter(prefix="/api/users", tags=["users"])
@@ -19,9 +20,19 @@ def serialize_user(user: User) -> dict:
     return {
         "id": user.id, "email": user.email, "name": user.name, "role": user.role, "active": user.active,
         "must_change_password": user.must_change_password,
+        "access": ({k: sorted(v) for k, v in scope.items()} if (scope := parse_scope(user.access_scope, user.role)) is not None else None),
         "last_login_at": aware(user.last_login_at).isoformat() if user.last_login_at else None,
         "created_at": aware(user.created_at).isoformat() if user.created_at else None,
     }
+
+
+def stored_scope(db: Session, access: AccessScope | None, role: str) -> tuple[str | None, str]:
+    """(value for users.access_scope, text for the audit log). Admins always see everything; ids that do not exist are dropped."""
+    if access is None or role == "admin":
+        return None, "access: everything"
+    known = {"servers": Server, "services": Service, "clusters": Cluster}
+    clean = {kind: sorted(set(db.scalars(select(known[kind].id).where(known[kind].id.in_(getattr(access, kind) or [0]))).all())) for kind in SCOPE_KINDS}
+    return json.dumps(clean), "access limited to " + ", ".join(f"{len(clean[k])} {k}" for k in SCOPE_KINDS)
 
 
 def other_active_admins(db: Session, user: User) -> int:
@@ -38,9 +49,10 @@ def create_user(payload: UserCreate, request: Request, me: dict = Depends(requir
     email = payload.email.strip().lower()
     if db.scalar(select(User.id).where(User.email == email)) is not None:
         raise HTTPException(409, "A user with that email already exists")
-    user = User(email=email, name=payload.name.strip(), role=payload.role, password_hash=hash_password(payload.password), must_change_password=True)
+    scope, scope_text = stored_scope(db, payload.access, payload.role)
+    user = User(email=email, name=payload.name.strip(), role=payload.role, password_hash=hash_password(payload.password), must_change_password=True, access_scope=scope)
     db.add(user); db.flush()
-    audit(db, request, "user.create", user=me, target=f"user:{user.id}", detail=f"{user.email} as {user.role}")
+    audit(db, request, "user.create", user=me, target=f"user:{user.id}", detail=f"{user.email} as {user.role}; {scope_text}")
     db.commit(); db.refresh(user)
     return serialize_user(user)
 
@@ -69,6 +81,11 @@ def update_user(user_id: int, payload: UserUpdate, request: Request, me: dict = 
     if payload.active is not None and payload.active != user.active:
         changes.append("enabled" if payload.active else "disabled")
         user.active, revoke = payload.active, True
+    if payload.access_set or (user.role == "admin" and user.access_scope):
+        scope, scope_text = stored_scope(db, payload.access if payload.access_set else None, user.role)   # promoted to admin: any limit is dropped
+        if scope != user.access_scope:
+            changes.append(scope_text)
+            user.access_scope = scope
     if payload.password:
         changes.append("password reset")
         user.password_hash = hash_password(payload.password)

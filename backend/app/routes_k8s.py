@@ -26,7 +26,7 @@ from .monitoring import alert_columns, csv_list, format_alert, reminder_minutes,
 from .routes_agent import hash_token
 from .routes_enroll import control_plane_url, find_enrollment
 from .routes_logs import _Waiter, _wake, pickup_timeout, request_ttl
-from .security import RANK, agent_gate, client_ip, login_limiter, require_admin, require_operator, require_user
+from .security import RANK, agent_gate, can_see, client_ip, ensure_access, login_limiter, require_admin, require_operator, require_unrestricted, require_user
 from .stats import aware, bucketize
 
 router = APIRouter(tags=["kubernetes"])
@@ -150,7 +150,9 @@ def serialize_cluster(c: Cluster) -> dict:
     }
 
 
-def get_cluster(db: Session, cluster_id: int) -> Cluster:
+def get_cluster(db: Session, cluster_id: int, user: dict | None = None) -> Cluster:
+    if user is not None:
+        ensure_access(user, "cluster", cluster_id)
     cluster = db.get(Cluster, cluster_id)
     if not cluster:
         raise HTTPException(404, "Cluster not found")
@@ -491,18 +493,18 @@ def agent_result(request_id: int, payload: K8sResult, request: Request, authoriz
 
 # ---------------------------------------------------------------------------------------------------------------- dashboard side
 @router.get("/api/clusters")
-def list_clusters(_: dict = Depends(require_user), db: Session = Depends(get_db)) -> list[dict]:
-    return [serialize_cluster(c) for c in db.scalars(select(Cluster).order_by(Cluster.name)).all()]
+def list_clusters(user: dict = Depends(require_user), db: Session = Depends(get_db)) -> list[dict]:
+    return [serialize_cluster(c) for c in db.scalars(select(Cluster).order_by(Cluster.name)).all() if can_see(user, "cluster", c.id)]
 
 
 @router.get("/api/clusters/{cluster_id}")
-def read_cluster(cluster_id: int, _: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
-    return serialize_cluster(get_cluster(db, cluster_id))
+def read_cluster(cluster_id: int, user: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
+    return serialize_cluster(get_cluster(db, cluster_id, user))
 
 
 @router.put("/api/clusters/{cluster_id}")
 def update_cluster(cluster_id: int, payload: ClusterUpdate, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
-    cluster = get_cluster(db, cluster_id)
+    cluster = get_cluster(db, cluster_id, user)
     changes = []
     if payload.name and payload.name != cluster.name:
         if db.scalar(select(Cluster.id).where(Cluster.name == payload.name)) is not None:
@@ -526,7 +528,7 @@ def update_cluster(cluster_id: int, payload: ClusterUpdate, request: Request, us
 
 
 @router.delete("/api/clusters/{cluster_id}")
-def delete_cluster(cluster_id: int, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict[str, bool]:
+def delete_cluster(cluster_id: int, request: Request, user: dict = Depends(require_unrestricted), db: Session = Depends(get_db)) -> dict[str, bool]:
     cluster = db.get(Cluster, cluster_id)
     if cluster:
         audit(db, request, "k8s.cluster_delete", user=user, target=f"cluster:{cluster.id}", detail=cluster.name)
@@ -542,7 +544,7 @@ def delete_cluster(cluster_id: int, request: Request, user: dict = Depends(requi
 def rotate_cluster_token(cluster_id: int, request: Request, immediate: bool = Query(False), user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
     """Managed (default): the new token is delivered to the agent over its own connection and saved to its Secret. immediate=true:
     the old token dies now and the new one is returned once (patch the Secret by hand)."""
-    cluster = get_cluster(db, cluster_id)
+    cluster = get_cluster(db, cluster_id, user)
     token = secrets.token_urlsafe(32)
     if cluster.last_seen_at and not immediate:
         cluster.pending_token, cluster.pending_token_hash, cluster.pending_token_at = token, hash_token(token), datetime.now(timezone.utc)
@@ -556,8 +558,8 @@ def rotate_cluster_token(cluster_id: int, request: Request, immediate: bool = Qu
 
 
 @router.get("/api/clusters/{cluster_id}/log-policy")
-def get_policy(cluster_id: int, _: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
-    return parse_policy(get_cluster(db, cluster_id).log_policy)
+def get_policy(cluster_id: int, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+    return parse_policy(get_cluster(db, cluster_id, user).log_policy)
 
 
 @router.put("/api/clusters/{cluster_id}/log-policy")
@@ -572,7 +574,7 @@ def set_policy(cluster_id: int, policy: K8sLogPolicy, request: Request, user: di
 
 @router.post("/api/clusters/{cluster_id}/query")
 def ask(cluster_id: int, payload: K8sQuery, request: Request, user: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
-    cluster = get_cluster(db, cluster_id)
+    cluster = get_cluster(db, cluster_id, user)
     if payload.kind == "logs":
         if RANK.get(user["role"], 0) < RANK["operator"]:
             raise HTTPException(403, f"Your role ({user['role']}) cannot read pod logs. It needs the operator role.")
@@ -628,6 +630,7 @@ def _read(cluster_id: int, request_id: int, role: str = "admin") -> dict:
 
 @router.get("/api/clusters/{cluster_id}/query/{request_id}")
 async def read_query(cluster_id: int, request_id: int, wait: int = Query(0, ge=0, le=20), user: dict = Depends(require_user)) -> dict:
+    ensure_access(user, "cluster", cluster_id)
     loop = asyncio.get_running_loop()
     deadline = loop.time() + wait
     with _Waiter(_result_waiters, request_id) as event:
@@ -644,7 +647,8 @@ async def read_query(cluster_id: int, request_id: int, wait: int = Query(0, ge=0
 
 
 @router.get("/api/clusters/{cluster_id}/history")
-def history(cluster_id: int, range: str = Query("24h", pattern="^(1h|6h|24h|7d)$"), _: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
+def history(cluster_id: int, range: str = Query("24h", pattern="^(1h|6h|24h|7d)$"), user: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
+    ensure_access(user, "cluster", cluster_id)
     get_cluster(db, cluster_id)
     hours = {"1h": 1, "6h": 6, "24h": 24, "7d": 168}[range]
     until = datetime.now(timezone.utc)

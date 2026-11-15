@@ -47,7 +47,7 @@ export default function Home() {
   return <AppProvider me={session} reloadMe={async () => { await loadMe(); }} onUnauthorized={onUnauthorized}><Shell company={company} me={session} onSignOut={signOut} /></AppProvider>;
 }
 
-const NAV: { id: string; label: string; icon: string; min: Role }[] = [
+const NAV: { id: string; label: string; icon: string; min: Role; fleet?: boolean }[] = [
   { id: 'overview', label: 'Overview', icon: 'overview', min: 'viewer' },
   { id: 'servers', label: 'Servers', icon: 'server', min: 'viewer' },
   { id: 'services', label: 'Services', icon: 'globe', min: 'viewer' },
@@ -55,8 +55,8 @@ const NAV: { id: string; label: string; icon: string; min: Role }[] = [
   { id: 'performance', label: 'Performance', icon: 'zap', min: 'viewer' },
   { id: 'logs', label: 'Logs', icon: 'logs', min: 'operator' },
   { id: 'incidents', label: 'Incidents', icon: 'alert', min: 'viewer' },
-  { id: 'alerts', label: 'Alerts', icon: 'bell', min: 'operator' },
-  { id: 'schedules', label: 'Scheduled messages', icon: 'clock', min: 'operator' },
+  { id: 'alerts', label: 'Alerts', icon: 'bell', min: 'operator', fleet: true },
+  { id: 'schedules', label: 'Scheduled messages', icon: 'clock', min: 'operator', fleet: true },
   { id: 'users', label: 'Users', icon: 'users', min: 'admin' },
   { id: 'audit', label: 'Audit log', icon: 'shield', min: 'admin' },
   { id: 'settings', label: 'Settings', icon: 'settings', min: 'viewer' },
@@ -70,7 +70,7 @@ function Shell({ company, me, onSignOut }: { company: string; me: Me; onSignOut:
   useEffect(() => { setTheme(document.documentElement.dataset.theme === 'light' || (!document.documentElement.dataset.theme && matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark'); }, []);
   useEffect(() => setOpen(false), [route.join('/')]);
 
-  const allowed = NAV.filter(n => RANK[me.role] >= RANK[n.min]);
+  const allowed = NAV.filter(n => RANK[me.role] >= RANK[n.min] && !(n.fleet && me.access));   // fleet-wide pages are hidden from people limited to selected monitors
   const requested = route[0] || 'overview';
   const page = allowed.some(n => n.id === requested) ? requested : 'overview';   // a page your role cannot use falls back to Overview
   const toggleTheme = () => {

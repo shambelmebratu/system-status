@@ -15,7 +15,7 @@ from .database import get_db
 from .models import Enrollment, Server
 from .routes_agent import hash_token
 from .schemas import EnrollmentCreate, EnrollRequest
-from .security import agent_gate, client_ip, login_limiter, require_operator
+from .security import agent_gate, client_ip, login_limiter, require_unrestricted
 from .stats import aware
 
 router = APIRouter(tags=["enrollment"])
@@ -36,12 +36,12 @@ def serialize_enrollment(item: Enrollment) -> dict:
 
 
 @router.get("/api/enrollments")
-def list_enrollments(_: dict = Depends(require_operator), db: Session = Depends(get_db)) -> list[dict]:
+def list_enrollments(_: dict = Depends(require_unrestricted), db: Session = Depends(get_db)) -> list[dict]:
     return [serialize_enrollment(i) for i in db.scalars(select(Enrollment).order_by(Enrollment.id.desc()).limit(100)).all()]
 
 
 @router.post("/api/enrollments")
-def create_enrollment(payload: EnrollmentCreate, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+def create_enrollment(payload: EnrollmentCreate, request: Request, user: dict = Depends(require_unrestricted), db: Session = Depends(get_db)) -> dict:
     limit = get_settings().enrollment_max_minutes
     if payload.expires_minutes > limit:
         raise HTTPException(422, f"Install links can be valid for at most {limit} minutes")
@@ -57,7 +57,7 @@ def create_enrollment(payload: EnrollmentCreate, request: Request, user: dict = 
 
 
 @router.delete("/api/enrollments/{item_id}")
-def revoke_enrollment(item_id: int, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict[str, bool]:
+def revoke_enrollment(item_id: int, request: Request, user: dict = Depends(require_unrestricted), db: Session = Depends(get_db)) -> dict[str, bool]:
     """Revokes the join token. Servers that already joined keep working (they have their own tokens)."""
     item = db.get(Enrollment, item_id)
     if item:

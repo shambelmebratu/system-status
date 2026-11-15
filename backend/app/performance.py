@@ -17,7 +17,7 @@ from .config import get_settings
 from .database import get_db
 from .models import CheckResult, Server, Service, TrafficSample
 from .audit import audit
-from .security import require_operator, require_user
+from .security import require_operator, require_user, can_see, ensure_access
 from .stats import aware
 
 router = APIRouter(prefix="/api/performance", tags=["performance"])
@@ -158,10 +158,10 @@ class TargetBody(BaseModel):
 
 # ------------------------------------------------------------------------------------------------------------ endpoints
 @router.get("/traffic")
-def traffic(range: str = Query("24h", pattern="^(1h|6h|24h|7d|30d)$"), _: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
+def traffic(range: str = Query("24h", pattern="^(1h|6h|24h|7d|30d)$"), user: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
     """Real-traffic response times per server whose agent reads a web server / load balancer access log."""
     since, until = window(range)
-    rows = db.scalars(select(TrafficSample).where(TrafficSample.ts >= since).order_by(TrafficSample.ts)).all()
+    rows = [r for r in db.scalars(select(TrafficSample).where(TrafficSample.ts >= since).order_by(TrafficSample.ts)).all() if can_see(user, "server", r.server_id)]
     by_server: dict[int, list[TrafficSample]] = {}
     for sample in rows:
         by_server.setdefault(sample.server_id, []).append(sample)
@@ -186,13 +186,15 @@ def _check_rows(db: Session, kind: str, target_id: int, since: datetime):
 
 
 @router.get("/checks")
-def checks(range: str = Query("24h", pattern="^(1h|6h|24h|7d|30d)$"), _: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
+def checks(range: str = Query("24h", pattern="^(1h|6h|24h|7d|30d)$"), user: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
     """p50 / p95 / p99 of SM-Watch's own probes: services (HTTP) and servers (ping)."""
     since, _until = window(range)
     items = []
     svc_by_id = {s.id: s for s in db.scalars(select(Service)).all()}
     targets = [("service", s.id, s.name) for s in db.scalars(select(Service).order_by(Service.name)).all()] + [("server", s.id, s.name) for s in db.scalars(select(Server).where(Server.monitor_mode != "push").order_by(Server.name)).all()]
     for kind, target_id, name in targets:
+        if not can_see(user, kind, target_id):
+            continue
         rows = [r for r in _check_rows(db, kind, target_id, since) if r.status != "down"]
         if rows:
             items.append({"kind": kind, "id": target_id, "name": name, "checks": len(rows), **_percentiles([r.latency_ms for r in rows]), "target": measure_service(db, svc_by_id[target_id]) if kind == "service" else None})
@@ -201,9 +203,10 @@ def checks(range: str = Query("24h", pattern="^(1h|6h|24h|7d|30d)$"), _: dict = 
 
 
 @router.get("/checks/{kind}/{target_id}")
-def check_series(kind: str, target_id: int, range: str = Query("24h", pattern="^(1h|6h|24h|7d|30d)$"), buckets: int = Query(60, ge=10, le=240), _: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
+def check_series(kind: str, target_id: int, range: str = Query("24h", pattern="^(1h|6h|24h|7d|30d)$"), buckets: int = Query(60, ge=10, le=240), user: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
     if kind not in ("service", "server"):
         raise HTTPException(404, "Unknown target type")
+    ensure_access(user, kind, target_id)
     since, until = window(range)
     rows = [r for r in _check_rows(db, kind, target_id, since) if r.status != "down"]
     width = max(30.0, (until - since).total_seconds() / buckets)
@@ -218,7 +221,7 @@ def check_series(kind: str, target_id: int, range: str = Query("24h", pattern="^
 def set_target(kind: str, target_id: int, payload: TargetBody, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
     """A response-time target: alert when the chosen percentile over the window is slower than the threshold. threshold_ms=null removes it."""
     model = {"service": Service, "server": Server}.get(kind)
-    item = db.get(model, target_id) if model else None
+    item = db.get(model, target_id) if model and can_see(user, kind, target_id) else None
     if item is None:
         raise HTTPException(404, "Monitor not found")
     if payload.threshold_ms is None:

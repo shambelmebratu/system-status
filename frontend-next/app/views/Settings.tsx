@@ -10,7 +10,7 @@ import { timeAgo } from '../lib/format';
 import { useApp, useLimits } from '../lib/app';
 
 export function Settings() {
-  const { toast, data, me, canOperate, isAdmin, reloadMe } = useApp();
+  const { toast, data, me, canOperate, canManage, isAdmin, reloadMe } = useApp();
   const [current, setCurrent] = useState('');
   const [next, setNext] = useState('');
   const [error, setError] = useState('');
@@ -60,7 +60,7 @@ export function Settings() {
           <p className="sm muted" style={{ marginTop: 14 }}>{(data?.services.filter(s => s.public).length ?? 0) + (data?.servers.filter(s => s.public).length ?? 0)} item(s) are public.</p>
         </section>
       </div>
-      {canOperate && <JoinTokens />}
+      {canManage && <JoinTokens />}
       {isAdmin && <RetentionCard />}
     </>
   );

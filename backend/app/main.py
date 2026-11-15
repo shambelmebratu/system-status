@@ -31,7 +31,7 @@ from .stats import uptime_by_target
 from .netguard import BlockedTargetError, insecure_pull_problem, validate_host, validate_url
 from .routes_users import router as users_router, serialize_user
 from .audit import audit
-from .security import COOKIE_NAME, client_ip, create_token, hash_password, login_limiter, needs_rehash, require_operator, require_user, verify_password
+from .security import COOKIE_NAME, can_see, client_ip, create_token, ensure_access, hash_password, login_limiter, needs_rehash, require_operator, require_unrestricted, require_user, scope_ids, verify_password
 
 settings = get_settings()
 
@@ -300,17 +300,22 @@ def update_profile(payload: ProfileUpdate, request: Request, user: dict = Depend
 
 
 @app.get("/api/dashboard")
-def dashboard(_: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
-    servers = db.scalars(select(Server).order_by(Server.name)).all()
-    services = db.scalars(select(Service).order_by(Service.name)).all()
-    events = db.scalars(select(AlertEvent).order_by(desc(AlertEvent.created_at)).limit(10)).all()
+def dashboard(user: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
+    servers = [s for s in db.scalars(select(Server).order_by(Server.name)).all() if can_see(user, "server", s.id)]
+    services = [s for s in db.scalars(select(Service).order_by(Service.name)).all() if can_see(user, "service", s.id)]
+    restricted = user.get("scope") is not None
+    events = db.scalars(select(AlertEvent).order_by(desc(AlertEvent.created_at)).limit(200 if restricted else 10)).all()
+    events = [e for e in events if e.target_type in ("server", "service", "cluster") and can_see(user, e.target_type, e.target_id)][:10] if restricted else events
     statuses = [item.last_status for item in [*servers, *services]]
     uptime = uptime_by_target(db, 24)
 
     def with_uptime(kind: str, item) -> dict:
         return {**serialize(item), "uptime_24h": uptime.get((kind, item.id))}
 
-    open_incidents = db.scalar(select(func.count()).select_from(Incident).where(Incident.resolved_at.is_(None))) or 0
+    if restricted:
+        open_incidents = sum(1 for i in db.scalars(select(Incident).where(Incident.resolved_at.is_(None))).all() if i.target_type in ("server", "service", "cluster") and can_see(user, i.target_type, i.target_id))
+    else:
+        open_incidents = db.scalar(select(func.count()).select_from(Incident).where(Incident.resolved_at.is_(None))) or 0
     server_rows = [with_uptime("server", item) for item in servers]
     twins = same_machine_groups(servers)
     for row in server_rows:
@@ -358,13 +363,13 @@ def routing_columns(values: dict) -> dict:
 @app.get("/api/channels")
 def channels(user: dict = Depends(require_user), db: Session = Depends(get_db)) -> list[dict]:
     items = [serialize(item) for item in db.scalars(select(Channel).order_by(Channel.name)).all()]
-    if user["role"] == "viewer":   # viewers may see that channels exist, not how they are configured
+    if user["role"] == "viewer" or user.get("scope") is not None:   # viewers (and people limited to selected monitors) see that channels exist, not how they are configured
         return [{"id": i["id"], "name": i["name"], "type": i["type"], "enabled": i["enabled"]} for i in items]
     return items
 
 
 @app.post("/api/channels/telegram/discover")
-def telegram_discover(payload: TokenBody, _: dict = Depends(require_operator)) -> dict:
+def telegram_discover(payload: TokenBody, _: dict = Depends(require_unrestricted)) -> dict:
     """Helps users find the right chat ID: lists chats the bot has seen recently."""
     try:
         return discover_telegram_chats(payload.token)
@@ -373,7 +378,7 @@ def telegram_discover(payload: TokenBody, _: dict = Depends(require_operator)) -
 
 
 @app.post("/api/channels")
-def create_channel(payload: ChannelCreate, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+def create_channel(payload: ChannelCreate, request: Request, user: dict = Depends(require_unrestricted), db: Session = Depends(get_db)) -> dict:
     if payload.type in ("slack", "webhook"):
         guard_target(validate_url, payload.endpoint, "Endpoint")
     item = Channel(**routing_columns(payload.model_dump())); db.add(item); db.flush()
@@ -382,7 +387,7 @@ def create_channel(payload: ChannelCreate, request: Request, user: dict = Depend
 
 
 @app.put("/api/channels/{item_id}")
-def update_channel(item_id: int, payload: ChannelUpdate, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+def update_channel(item_id: int, payload: ChannelUpdate, request: Request, user: dict = Depends(require_unrestricted), db: Session = Depends(get_db)) -> dict:
     item = db.get(Channel, item_id)
     if not item:
         raise HTTPException(404, "Notification channel not found")
@@ -405,7 +410,7 @@ def update_channel(item_id: int, payload: ChannelUpdate, request: Request, user:
 
 
 @app.post("/api/channels/{item_id}/test")
-def test_channel(item_id: int, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict[str, str | bool]:
+def test_channel(item_id: int, request: Request, user: dict = Depends(require_unrestricted), db: Session = Depends(get_db)) -> dict[str, str | bool]:
     item = db.get(Channel, item_id)
     if not item:
         raise HTTPException(404, "Notification channel not found")
@@ -417,7 +422,7 @@ def test_channel(item_id: int, request: Request, user: dict = Depends(require_op
 
 
 @app.delete("/api/channels/{item_id}")
-def delete_channel(item_id: int, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict[str, bool]:
+def delete_channel(item_id: int, request: Request, user: dict = Depends(require_unrestricted), db: Session = Depends(get_db)) -> dict[str, bool]:
     item = db.get(Channel, item_id)
     if item:
         audit(db, request, "channel.delete", user=user, target=f"channel:{item.id}", detail=item.name)
@@ -438,7 +443,7 @@ def validate_server_targets(payload: ServerCreate) -> None:
 
 
 @app.post("/api/servers")
-def create_server(payload: ServerCreate, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+def create_server(payload: ServerCreate, request: Request, user: dict = Depends(require_unrestricted), db: Session = Depends(get_db)) -> dict:
     values = payload.model_dump()
     token = values.pop("agent_token")
     if payload.monitor_mode == "push":
@@ -460,6 +465,7 @@ def create_server(payload: ServerCreate, request: Request, user: dict = Depends(
 
 @app.put("/api/servers/{item_id}")
 def update_server(item_id: int, payload: ServerCreate, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+    ensure_access(user, "server", item_id)
     item = db.get(Server, item_id)
     if not item:
         raise HTTPException(404, "Server not found")
@@ -488,6 +494,7 @@ def update_server(item_id: int, payload: ServerCreate, request: Request, user: d
 
 @app.post("/api/servers/{item_id}/rotate-token")
 def rotate_server_token(item_id: int, request: Request, immediate: bool = Query(False), user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+    ensure_access(user, "server", item_id)
     """Replaces the server's agent token.
 
     Default (agents that have connected): the new token is staged and delivered to the agent over its own authenticated
@@ -512,7 +519,7 @@ def rotate_server_token(item_id: int, request: Request, immediate: bool = Query(
 
 
 @app.delete("/api/servers/{item_id}")
-def delete_server(item_id: int, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict[str, bool]:
+def delete_server(item_id: int, request: Request, user: dict = Depends(require_unrestricted), db: Session = Depends(get_db)) -> dict[str, bool]:
     item = db.get(Server, item_id)
     if item:
         audit(db, request, "server.delete", user=user, target=f"server:{item.id}", detail=item.name)
@@ -522,7 +529,7 @@ def delete_server(item_id: int, request: Request, user: dict = Depends(require_o
 
 
 @app.post("/api/services")
-def create_service(payload: ServiceCreate, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+def create_service(payload: ServiceCreate, request: Request, user: dict = Depends(require_unrestricted), db: Session = Depends(get_db)) -> dict:
     guard_target(validate_url, payload.url, "URL")
     if payload.server_id is not None and not db.get(Server, payload.server_id): raise HTTPException(404, "Server not found")
     item = Service(**alert_settings(payload.model_dump(), "service", db)); db.add(item); db.flush()
@@ -532,12 +539,13 @@ def create_service(payload: ServiceCreate, request: Request, user: dict = Depend
 
 @app.put("/api/services/{item_id}")
 def update_service(item_id: int, payload: ServiceCreate, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+    ensure_access(user, "service", item_id)
     item = db.get(Service, item_id)
     if not item:
         raise HTTPException(404, "Service monitor not found")
     values = payload.model_dump()
     guard_target(validate_url, payload.url, "URL")
-    if values["server_id"] is not None and not db.get(Server, values["server_id"]):
+    if values["server_id"] is not None and (not db.get(Server, values["server_id"]) or not can_see(user, "server", values["server_id"])):
         raise HTTPException(404, "Server not found")
     for key, value in alert_settings(values, "service", db).items():
         setattr(item, key, value)
@@ -552,7 +560,7 @@ def update_service(item_id: int, payload: ServiceCreate, request: Request, user:
 
 
 @app.delete("/api/services/{item_id}")
-def delete_service(item_id: int, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict[str, bool]:
+def delete_service(item_id: int, request: Request, user: dict = Depends(require_unrestricted), db: Session = Depends(get_db)) -> dict[str, bool]:
     item = db.get(Service, item_id)
     if item:
         audit(db, request, "service.delete", user=user, target=f"service:{item.id}", detail=item.name)
@@ -562,7 +570,8 @@ def delete_service(item_id: int, request: Request, user: dict = Depends(require_
 
 
 @app.post("/api/services/{item_id}/check")
-def check_service_now(item_id: int, _: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+def check_service_now(item_id: int, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+    ensure_access(user, "service", item_id)
     item = db.get(Service, item_id)
     if not item:
         raise HTTPException(404, "Service monitor not found")
@@ -574,6 +583,6 @@ def check_service_now(item_id: int, _: dict = Depends(require_operator), db: Ses
 
 
 @app.post("/api/monitor/run")
-def run_monitor(background_tasks: BackgroundTasks, _: dict = Depends(require_operator)) -> dict[str, str]:
+def run_monitor(background_tasks: BackgroundTasks, _: dict = Depends(require_unrestricted)) -> dict[str, str]:
     background_tasks.add_task(run_once)
     return {"status": "queued"}

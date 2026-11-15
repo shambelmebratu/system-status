@@ -18,9 +18,9 @@ import { IncidentList } from './Overview';
 const MODE_LABEL: Record<Mode, string> = { push: 'Agent · push', agent: 'Agent · pull', ping: 'Ping only' };
 
 export function Servers() {
-  const { data, route, go, canOperate } = useApp();
+  const { data, route, go, canOperate, canManage } = useApp();
   if (!data) return <p className="muted">Loading…</p>;
-  if (route[1] === 'new' && canOperate) return <><ServerList /><ServerWizard onClose={() => go('servers')} /></>;
+  if (route[1] === 'new' && canManage) return <><ServerList /><ServerWizard onClose={() => go('servers')} /></>;
   if (route[1]) {
     const server = data.servers.find(s => s.id === Number(route[1]));
     return server ? <ServerDetail server={server} /> : <Empty title="Server not found" action={<button className="btn" onClick={() => go('servers')}>Back to servers</button>} />;
@@ -29,13 +29,13 @@ export function Servers() {
 }
 
 function ServerList() {
-  const { data, go, canOperate } = useApp();
+  const { data, go, canOperate, canManage } = useApp();
   const lim = useLimits();
   const servers = data!.servers;
   return (
     <>
-      <div className="topbar"><h1>Servers</h1><span className="grow" />{canOperate && <button className="btn primary" onClick={() => go('servers/new')}><Icon name="plus" size={15} />Add server</button>}</div>
-      {servers.length === 0 ? <div className="card"><Empty title="No servers yet" action={canOperate ? <button className="btn primary" onClick={() => go('servers/new')}>Install your first agent</button> : undefined}>Add a server to see live CPU, memory, disk and network metrics.</Empty></div> : (
+      <div className="topbar"><h1>Servers</h1><span className="grow" />{canManage && <button className="btn primary" onClick={() => go('servers/new')}><Icon name="plus" size={15} />Add server</button>}</div>
+      {servers.length === 0 ? <div className="card"><Empty title="No servers yet" action={canManage ? <button className="btn primary" onClick={() => go('servers/new')}>Install your first agent</button> : undefined}>Add a server to see live CPU, memory, disk and network metrics.</Empty></div> : (
         <div className="tilegrid">
           {servers.map(s => {
             const m = s.last_metrics;
@@ -59,7 +59,7 @@ function ServerList() {
 
 function ServerDetail({ server }: { server: Server }) {
   const lim = useLimits();
-  const { channels, data, go, toast, refresh, canOperate, confirm } = useApp();
+  const { channels, data, go, toast, refresh, canOperate, canManage, confirm } = useApp();
   const [range, setRange] = useState<Range>('24h');
   const [editing, setEditing] = useState(false);
   const [rotated, setRotated] = useState<string | null>(null);
@@ -101,7 +101,7 @@ function ServerDetail({ server }: { server: Server }) {
         {canOperate && server.monitor_mode !== 'ping' && <button className="btn sm" onClick={rotate} disabled={!!server.token_rotation_pending} title="Delivered to the agent automatically; nothing to reinstall">{server.token_rotation_pending ? 'Rotation pending…' : 'Rotate token'}</button>}
         {canOperate && server.monitor_mode !== 'ping' && <button className="btn sm danger" onClick={revokeNow} title="Invalidate the current token immediately (if it may be stolen)">Revoke now</button>}
         {canOperate && <button className="btn sm" onClick={() => setEditing(true)}>Edit</button>}
-        {canOperate && <button className="btn sm danger" onClick={remove}>Remove</button>}
+        {canManage && <button className="btn sm danger" onClick={remove}>Remove</button>}
       </div>
 
       {canLogs && <div className="seg" style={{ marginBottom: 16 }}><button className={tab === 'overview' ? 'on' : ''} onClick={() => setTab('overview')}>Overview</button><button className={tab === 'logs' ? 'on' : ''} onClick={() => setTab('logs')}>Logs</button></div>}

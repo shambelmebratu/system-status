@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import json
 import secrets
 import ipaddress
 import threading
@@ -180,7 +181,39 @@ def require_user(request: Request, credentials: HTTPAuthorizationCredentials | N
     if account.must_change_password and request.url.path not in PASSWORD_CHANGE_PATHS:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "PASSWORD_CHANGE_REQUIRED")
     # The role is read from the database on EVERY request, so a demotion or deactivation takes effect immediately.
-    return {**claims, "uid": account.id, "role": account.role, "name": account.name, "email": account.email}
+    return {**claims, "uid": account.id, "role": account.role, "name": account.name, "email": account.email, "scope": parse_scope(account.access_scope, account.role)}
+
+
+SCOPE_KINDS = ("servers", "services", "clusters")
+
+
+def parse_scope(raw: str | None, role: str) -> dict[str, set[int]] | None:
+    """The monitors a person is limited to, or None for "everything". Admins are never limited. A value that cannot be read
+    means NO access (fail closed), never full access."""
+    if role == "admin" or not raw:
+        return None
+    try:
+        value = json.loads(raw)
+        return {kind: {int(i) for i in value.get(kind, [])} for kind in SCOPE_KINDS}
+    except (ValueError, TypeError, AttributeError):
+        return {kind: set() for kind in SCOPE_KINDS}
+
+
+def scope_ids(user: dict, kind: str) -> set[int] | None:
+    """Ids of `kind` (server | service | cluster) this person may see; None = all of them."""
+    scope = user.get("scope")
+    return None if scope is None else scope.get(kind + "s", set())
+
+
+def can_see(user: dict, kind: str, target_id: int) -> bool:
+    allowed = scope_ids(user, kind)
+    return allowed is None or target_id in allowed
+
+
+def ensure_access(user: dict, kind: str, target_id: int) -> None:
+    """404, not 403: a person limited to some monitors must not learn which other ids exist."""
+    if not can_see(user, kind, target_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"{kind.capitalize()} not found")
 
 
 RANK = {"viewer": 1, "operator": 2, "admin": 3}
@@ -198,3 +231,11 @@ def _at_least(minimum: str):
 
 require_operator = _at_least("operator")   # create/edit/delete monitors, alerts, schedules; read logs; manage agent links
 require_admin = _at_least("admin")         # manage users
+
+
+def require_unrestricted(user: dict = Depends(require_operator)) -> dict:
+    """Fleet-wide actions (adding or removing monitors, install links, alert channels, scheduled messages): operators whose
+    access is limited to selected monitors cannot do these."""
+    if user.get("scope") is not None:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Your access is limited to selected monitors, so you cannot do this. Ask an admin.")
+    return user

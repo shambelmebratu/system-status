@@ -246,6 +246,16 @@ The role is checked on the server for every request (hidden buttons are only a c
 
 **Profile.** *Settings → Profile* lets each person change their name and email (changing the email needs the current password) and *Settings → Password* changes the password and signs out their other sessions.
 
+### Limiting a person to selected monitors
+
+By default an operator or viewer sees every server, service and cluster. An admin can limit a person under **Users → Edit → What this person can see → Only selected**: tick the servers, services and Kubernetes clusters they may see (search, *All* and *None* make long lists quick). The Users table shows who is limited and to how much.
+
+- Everything not ticked is **invisible** to that person everywhere: overview, lists, graphs, uptime, incidents, recent alerts, performance, logs and the Kubernetes pages. Asking for a hidden monitor by its id answers "not found", exactly as if it did not exist.
+- Their role still decides what they may *do* with the monitors they see (a limited operator can edit them, read their logs and rotate their tokens; a limited viewer can only look).
+- Limited people cannot do fleet-wide things: add or remove servers, services and clusters, create install links, or manage alert channels and scheduled messages.
+- New monitors are **not** added to a limited person automatically: tick them when needed. Changes apply immediately, without a new sign-in, and are recorded in the audit log.
+- Admins always see everything.
+
 ## Logs
 
 The **Logs** page (servers) and the **Logs** tab of a Kubernetes cluster share one log dashboard:

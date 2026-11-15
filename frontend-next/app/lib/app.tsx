@@ -10,7 +10,7 @@ type Ctx = {
   data: Dashboard | null; channels: Channel[]; refresh: () => Promise<void>; toast: (text: string, error?: boolean) => void;
   go: (path: string) => void; route: string[];
   confirm: (message: string, opts?: { confirmLabel?: string; danger?: boolean }) => Promise<boolean>;
-  me: Me; canOperate: boolean; isAdmin: boolean; reloadMe: () => Promise<void>;
+  me: Me; canOperate: boolean; canManage: boolean; isAdmin: boolean; reloadMe: () => Promise<void>;
 };
 const AppContext = createContext<Ctx>(null as never);
 export const useApp = () => useContext(AppContext);
@@ -59,7 +59,7 @@ export function AppProvider({ children, me, reloadMe, onUnauthorized }: { childr
   }, []);
 
   return (
-    <AppContext.Provider value={{ data, channels, refresh, toast, confirm, go, route, me, canOperate: me.role !== 'viewer', isAdmin: me.role === 'admin', reloadMe }}>
+    <AppContext.Provider value={{ data, channels, refresh, toast, confirm, go, route, me, canOperate: me.role !== 'viewer', canManage: me.role !== 'viewer' && !me.access /* add/remove monitors, links, channels: not for people limited to selected monitors */, isAdmin: me.role === 'admin', reloadMe }}>
       {children}
       {dialog && <ConfirmModal {...dialog} onClose={ok => { dialog.resolve(ok); setDialog(null); }} />}
       <div className="toasts" aria-live="polite">{toasts.map(t => <div key={t.id} className={`toast ${t.error ? 'error' : ''}`}>{t.text}</div>)}</div>

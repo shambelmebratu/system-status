@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from .config import get_settings
 from .database import get_db
 from .models import Cluster, Incident, Server, Service
-from .security import require_user
+from .security import can_see, ensure_access, require_user
 from .stats import AVAILABILITY_RANGES, aware, availability, daily_uptime, server_history, service_history, uptime_by_target
 
 router = APIRouter(prefix="/api", tags=["stats"])
@@ -42,7 +42,8 @@ def serialize_incident(item: Incident) -> dict:
 
 
 @router.get("/servers/{item_id}/history")
-def server_history_endpoint(item_id: int, range: str = Query("24h", pattern="^(1h|6h|24h|7d|30d)$"), _: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
+def server_history_endpoint(item_id: int, range: str = Query("24h", pattern="^(1h|6h|24h|7d|30d)$"), user: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
+    ensure_access(user, "server", item_id)
     if not db.get(Server, item_id):
         raise HTTPException(404, "Server not found")
     result = server_history(db, item_id, hours_for(range, get_settings().metric_retention_days))
@@ -51,7 +52,8 @@ def server_history_endpoint(item_id: int, range: str = Query("24h", pattern="^(1
 
 
 @router.get("/services/{item_id}/history")
-def service_history_endpoint(item_id: int, range: str = Query("24h", pattern="^(1h|6h|24h|7d|30d)$"), _: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
+def service_history_endpoint(item_id: int, range: str = Query("24h", pattern="^(1h|6h|24h|7d|30d)$"), user: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
+    ensure_access(user, "service", item_id)
     if not db.get(Service, item_id):
         raise HTTPException(404, "Service monitor not found")
     result = service_history(db, item_id, hours_for(range, get_settings().check_retention_days))
@@ -60,35 +62,40 @@ def service_history_endpoint(item_id: int, range: str = Query("24h", pattern="^(
 
 
 @router.get("/{kind}/{item_id}/availability")
-def availability_endpoint(kind: str, item_id: int, range: str = Query("1d", pattern="^(1m|5m|15m|30m|1h|4h|12h|1d|1mo|3mo|1y)$"), _: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
+def availability_endpoint(kind: str, item_id: int, range: str = Query("1d", pattern="^(1m|5m|15m|30m|1h|4h|12h|1d|1mo|3mo|1y)$"), user: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
     """Status-bar data for one server or service over a selectable window (1 minute to 1 year)."""
     model = {"servers": Server, "services": Service, "clusters": Cluster}.get(kind)
     if model is None:
         raise HTTPException(404, "Unknown target type")
+    ensure_access(user, kind[:-1], item_id)
     if not db.get(model, item_id):
         raise HTTPException(404, "Target not found")
     return availability(db, kind[:-1], item_id, range)
 
 
 @router.get("/uptime")
-def uptime_summary(_: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
+def uptime_summary(user: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
     """Availability per target for 24h / 7d / 30d, keyed 'server:ID' and 'service:ID'."""
     windows = {"24h": 24, "7d": 168, "30d": 720}
     result: dict[str, dict[str, float | None]] = {}
     for label, hours in windows.items():
         for (kind, target_id), pct in uptime_by_target(db, hours).items():
+            if not can_see(user, kind, target_id):
+                continue
             result.setdefault(f"{kind}:{target_id}", {})[label] = pct
     return result
 
 
 @router.get("/incidents")
-def incidents(state: str = Query("all", pattern="^(all|open|resolved)$"), limit: int = Query(100, ge=1, le=500), _: dict = Depends(require_user), db: Session = Depends(get_db)) -> list[dict]:
-    query = select(Incident).order_by(desc(Incident.started_at)).limit(limit)
+def incidents(state: str = Query("all", pattern="^(all|open|resolved)$"), limit: int = Query(100, ge=1, le=500), user: dict = Depends(require_user), db: Session = Depends(get_db)) -> list[dict]:
+    restricted = user.get("scope") is not None
+    query = select(Incident).order_by(desc(Incident.started_at)).limit(5000 if restricted else limit)   # limited access: filter first, then cut
     if state == "open":
         query = query.where(Incident.resolved_at.is_(None))
     elif state == "resolved":
         query = query.where(Incident.resolved_at.is_not(None))
-    return [serialize_incident(item) for item in db.scalars(query).all()]
+    items = [item for item in db.scalars(query).all() if can_see(user, item.target_type, item.target_id)]
+    return [serialize_incident(item) for item in items[:limit]]
 
 
 @router.get("/public/status")

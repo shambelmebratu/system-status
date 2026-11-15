@@ -1956,3 +1956,67 @@ def test_services_and_schedules_are_audited(client):
 
 def test_oversized_login_fields_are_refused(client):
     assert client.post("/api/auth/login", json={"email": "admin@example.com", "password": "x" * 5000}).status_code == 422
+
+
+def test_access_limited_to_selected_monitors(client):
+    sign_in(client)
+    anon = TestClient(main.app)
+    mk = lambda name: client.post("/api/servers", headers=CSRF, json={"name": name, "host": "93.184.216.60", "monitor_mode": "ping"}).json()["id"]
+    mine, other = mk("scope-mine"), mk("scope-other")
+    svc_mine = client.post("/api/services", headers=CSRF, json={"name": "scope-svc-mine", "url": "https://example.com"}).json()["id"]
+    svc_other = client.post("/api/services", headers=CSRF, json={"name": "scope-svc-other", "url": "https://example.org"}).json()["id"]
+    _, r1 = _k8s_register(client, anon, "scope-k-mine"); _k8s_register(client, anon, "scope-k-other")
+    clusters = {c["name"]: c["id"] for c in client.get("/api/clusters").json()}
+    k_mine, k_other = clusters["scope-k-mine"], clusters["scope-k-other"]
+    anon.post("/api/k8s-agent/report", json=HEALTHY, headers={"Authorization": f"Bearer {_k8s_token(r1.text)}"})
+
+    access = {"servers": [mine, 999999], "services": [svc_mine], "clusters": [k_mine]}
+    r = client.post("/api/users", headers=CSRF, json={"email": "scoped@example.com", "role": "operator", "password": PW, "access": access})
+    assert r.status_code == 200 and r.json()["access"] == {"servers": [mine], "services": [svc_mine], "clusters": [k_mine]}   # unknown ids dropped
+    uid = r.json()["id"]
+    u = session_for("scoped@example.com", new_password="scoped-password-123")
+
+    dash = u.get("/api/dashboard").json()
+    assert [s["name"] for s in dash["servers"]] == ["scope-mine"] and [s["name"] for s in dash["services"]] == ["scope-svc-mine"]
+    assert dash["summary"]["servers"] == 1 and dash["summary"]["services"] == 1
+    assert [c["name"] for c in u.get("/api/clusters").json()] == ["scope-k-mine"]
+    assert all(k in (f"server:{mine}", f"service:{svc_mine}", f"cluster:{k_mine}") for k in u.get("/api/uptime").json())
+
+    # in scope: works. Out of scope: 404, exactly as if it did not exist.
+    assert u.get(f"/api/servers/{mine}/history").status_code == 200 and u.get(f"/api/servers/{other}/history").status_code == 404
+    assert u.get(f"/api/services/{svc_mine}/history").status_code == 200 and u.get(f"/api/services/{svc_other}/history").status_code == 404
+    assert u.get(f"/api/servers/{other}/availability").status_code == 404 and u.get(f"/api/clusters/{k_other}/availability").status_code == 404
+    assert u.get(f"/api/clusters/{k_mine}").status_code == 200 and u.get(f"/api/clusters/{k_other}").status_code == 404
+    assert u.get(f"/api/clusters/{k_other}/history").status_code == 404
+    assert u.post(f"/api/clusters/{k_other}/query", headers=CSRF, json={"kind": "pods"}).status_code == 404
+    assert u.post(f"/api/clusters/{k_mine}/query", headers=CSRF, json={"kind": "pods"}).status_code == 200
+    assert u.post(f"/api/servers/{other}/logs", headers=CSRF, json={"source": "inventory"}).status_code == 404
+    assert u.get(f"/api/servers/{other}/log-policy").status_code == 404
+    assert u.post(f"/api/servers/{other}/rotate-token", headers=CSRF).status_code == 404
+    assert u.put(f"/api/clusters/{k_other}", headers=CSRF, json={"enabled": False}).status_code == 404
+    assert u.get(f"/api/performance/checks/service/{svc_other}").status_code == 404
+    assert u.put(f"/api/performance/targets/service/{svc_other}", headers=CSRF, json={"threshold_ms": 100, "percentile": "p95"}).status_code == 404
+    edit = {"name": "scope-svc-mine", "url": "https://example.com"}
+    assert u.put(f"/api/services/{svc_mine}", headers=CSRF, json=edit).status_code == 200
+    assert u.put(f"/api/services/{svc_other}", headers=CSRF, json=edit).status_code == 404
+    assert u.put(f"/api/services/{svc_mine}", headers=CSRF, json={**edit, "server_id": other}).status_code == 404   # cannot link to a hidden server
+
+    # fleet-wide actions are refused
+    for method, path, body in (("post", "/api/servers", {"name": "x", "host": "93.184.216.61", "monitor_mode": "ping"}), ("delete", f"/api/servers/{mine}", None),
+                               ("post", "/api/services", edit), ("delete", f"/api/services/{svc_mine}", None), ("delete", f"/api/clusters/{k_mine}", None),
+                               ("post", "/api/enrollments", {"label": "x"}), ("get", "/api/enrollments", None), ("get", "/api/scheduled-messages", None),
+                               ("post", "/api/channels", {"name": "c", "type": "webhook", "endpoint": "https://example.com/h"}), ("post", "/api/monitor/run", None)):
+        r = getattr(u, method)(path, headers=CSRF, **({"json": body} if body is not None else {}))
+        assert r.status_code == 403 and "limited" in r.json()["detail"], (method, path, r.status_code)
+    assert all(set(c) == {"id", "name", "type", "enabled"} for c in u.get("/api/channels").json())
+
+    # an admin widens, narrows and lifts the limit; it applies at once (no new sign-in)
+    assert client.put(f"/api/users/{uid}", headers=CSRF, json={"access_set": True, "access": {"servers": [mine, other]}}).status_code == 200
+    assert u.get(f"/api/servers/{other}/history").status_code == 200 and u.get(f"/api/services/{svc_mine}/history").status_code == 404
+    assert client.put(f"/api/users/{uid}", headers=CSRF, json={"name": "Scoped"}).json()["access"] == {"servers": sorted([mine, other]), "services": [], "clusters": []}   # untouched without access_set
+    assert client.put(f"/api/users/{uid}", headers=CSRF, json={"access_set": True, "access": None}).json()["access"] is None
+    assert len(u.get("/api/dashboard").json()["servers"]) >= 2 and u.get("/api/enrollments").status_code == 200
+    # admins are never limited
+    assert client.put(f"/api/users/{uid}", headers=CSRF, json={"access_set": True, "access": {"servers": [mine]}}).status_code == 200
+    assert client.put(f"/api/users/{uid}", headers=CSRF, json={"role": "admin"}).json()["access"] is None
+    assert any("access" in (e["detail"] or "") for e in client.get("/api/audit?category=user").json())

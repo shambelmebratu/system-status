@@ -58,7 +58,7 @@ type Items<R> = { items: R[]; truncated: boolean };
 /* ---------------------------------------------------------------- routing */
 export function Kubernetes() {
   const lim = useLimits();
-  const { route, go, canOperate } = useApp();
+  const { route, go, canOperate, canManage } = useApp();
   const { value: clusters, reload } = usePoll(() => api<Cluster[]>('/clusters'), [], 10000);
   if (!clusters) return <p className="muted">Loading…</p>;
   if (route[1] && route[1] !== 'new') {
@@ -67,9 +67,9 @@ export function Kubernetes() {
   }
   return (
     <>
-      <div className="topbar"><h1>Kubernetes</h1><span className="grow" />{canOperate && <button className="btn primary" onClick={() => go('kubernetes/new')}><Icon name="plus" size={15} />Add cluster</button>}</div>
+      <div className="topbar"><h1>Kubernetes</h1><span className="grow" />{canManage && <button className="btn primary" onClick={() => go('kubernetes/new')}><Icon name="plus" size={15} />Add cluster</button>}</div>
       {clusters.length === 0 ? (
-        <div className="card"><Empty title="No clusters yet" action={canOperate ? <button className="btn primary" onClick={() => go('kubernetes/new')}>Connect your first cluster</button> : undefined}>
+        <div className="card"><Empty title="No clusters yet" action={canManage ? <button className="btn primary" onClick={() => go('kubernetes/new')}>Connect your first cluster</button> : undefined}>
           Install a small read-only agent in a cluster to see nodes, pods, workloads, autoscalers and resource usage, and to read pod logs on demand.</Empty></div>
       ) : (
         <>
@@ -108,7 +108,7 @@ export function Kubernetes() {
           </div>
         </>
       )}
-      {route[1] === 'new' && canOperate && <AddCluster onClose={() => { go('kubernetes'); void reload(); }} />}
+      {route[1] === 'new' && canManage && <AddCluster onClose={() => { go('kubernetes'); void reload(); }} />}
     </>
   );
 }
@@ -164,7 +164,7 @@ function LivePill({ ms, setMs, updatedAt, now, onRefresh }: { ms: number; setMs:
 
 function ClusterDetail({ cluster, reload }: { cluster: Cluster; reload: () => Promise<void> }) {
   const lim = useLimits();
-  const { go, toast, canOperate, isAdmin, confirm } = useApp();
+  const { go, toast, canOperate, canManage, isAdmin, confirm } = useApp();
   const [tab, setTab] = useState<TabId>('overview');
   const [liveMs, setLiveMs] = useState(10000);
   const [tick, setTick] = useState(0);
@@ -198,7 +198,7 @@ function ClusterDetail({ cluster, reload }: { cluster: Cluster; reload: () => Pr
           <div className="khead-title"><h1>{cluster.name}</h1><div className="khead-sub"><StatusPill status={cluster.status} /><span className="tag">{cluster.k8s_version || 'unknown version'}</span><span className="muted sm">agent {cluster.agent_version ? `v${cluster.agent_version}` : '–'} · seen {timeAgo(cluster.last_seen_at)}</span></div></div>
           <span className="grow" />
           {!offline && <LivePill ms={liveMs} setMs={chooseLive} updatedAt={updatedAt} now={now} onRefresh={() => setTick(n => n + 1)} />}
-          {canOperate && <button className="btn sm danger" onClick={remove}>Remove</button>}
+          {canManage && <button className="btn sm danger" onClick={remove}>Remove</button>}
         </header>
         <div className="ktabs" role="tablist">{tabs.map(([id, label]) => <button key={id} role="tab" aria-selected={tab === id} className={tab === id ? 'on' : ''} onClick={() => setTab(id)}><Icon name={TAB_ICON[id]} size={15} />{label}</button>)}</div>
         {cluster.agent_outdated && cluster.latest_agent_version && <div style={{ marginBottom: 16 }}><ClusterAgentUpdate current={cluster.agent_version} latest={cluster.latest_agent_version} /></div>}
