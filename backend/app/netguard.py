@@ -154,3 +154,56 @@ def insecure_pull_problem(endpoint: str) -> str | None:
     if all(a.is_private or a in cgnat for a in addresses):
         return None
     return "the agent token would be sent unencrypted over the internet. Use an https:// endpoint (put the agent behind a TLS proxy or set AGENT_TLS_CERT/AGENT_TLS_KEY on it), use push mode, or set ALLOW_INSECURE_PULL=true to accept the risk."
+
+
+def fetch_certificate(url: str, timeout: float = 10) -> dict:
+    """The TLS certificate a server presents for `url`: expiry, issuer, subject and names. The certificate is read even when it is
+    expired or untrusted (that is exactly when its dates matter); trust problems are what the regular check reports. Same address
+    rules as every other outbound request (no loopback, metadata or internal hosts, checked on the connected socket)."""
+    import ssl
+    from datetime import timezone
+    from cryptography import x509
+    from cryptography.x509.oid import ExtensionOID, NameOID
+
+    validate_url(url)
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https":
+        raise ValueError("Only https:// addresses have a certificate")
+    host, port = parsed.hostname, parsed.port or 443
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    with socket.create_connection((host, port), timeout=timeout) as raw:
+        _check_peer(raw, host)
+        with context.wrap_socket(raw, server_hostname=host) as tls:
+            der = tls.getpeercert(binary_form=True)
+    if not der:
+        raise ValueError("The server presented no certificate")
+    cert = x509.load_der_x509_certificate(der)
+
+    def name_of(name) -> str:
+        for oid in (NameOID.COMMON_NAME, NameOID.ORGANIZATION_NAME):
+            values = name.get_attributes_for_oid(oid)
+            if values:
+                return str(values[0].value)[:200]
+        return name.rfc4514_string()[:200]
+
+    try:
+        names = cert.extensions.get_extension_for_oid(ExtensionOID.SUBJECT_ALTERNATIVE_NAME).value.get_values_for_type(x509.DNSName)
+    except x509.ExtensionNotFound:
+        names = []
+    issuer = name_of(cert.issuer)
+    org = cert.issuer.get_attributes_for_oid(NameOID.ORGANIZATION_NAME)
+    if org and str(org[0].value) not in issuer:
+        issuer = f"{org[0].value} ({issuer})"[:200]
+    expires = getattr(cert, "not_valid_after_utc", None) or cert.not_valid_after.replace(tzinfo=timezone.utc)
+    starts = getattr(cert, "not_valid_before_utc", None) or cert.not_valid_before.replace(tzinfo=timezone.utc)
+    matches = any(_name_matches(host, n) for n in names) if names else _name_matches(host, name_of(cert.subject))
+    return {"expires_at": expires, "starts_at": starts, "issuer": issuer, "subject": name_of(cert.subject), "names": names[:20], "host_matches": matches}
+
+
+def _name_matches(host: str, pattern: str) -> bool:
+    host, pattern = host.lower().rstrip("."), pattern.lower().rstrip(".")
+    if pattern.startswith("*."):
+        return host.count(".") == pattern.count(".") and host.endswith(pattern[1:])
+    return host == pattern

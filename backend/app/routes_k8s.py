@@ -33,7 +33,7 @@ router = APIRouter(tags=["kubernetes"])
 
 NAME_PATTERN = r"^[A-Za-z0-9]([A-Za-z0-9._-]{0,58}[A-Za-z0-9])?$"
 NS = r"^([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)?$"
-KINDS = "namespaces|nodes|pods|deployments|statefulsets|daemonsets|jobs|cronjobs|services|ingresses|hpa|events|pvcs|quotas|pod_metrics|node_metrics|describe|logs"
+KINDS = "namespaces|nodes|pods|deployments|statefulsets|daemonsets|jobs|cronjobs|services|ingresses|hpa|events|pvcs|quotas|pod_metrics|node_metrics|describe|related|logs"
 # Limits come from .env (K8S_* settings), see config.py.
 
 
@@ -583,7 +583,7 @@ def ask(cluster_id: int, payload: K8sQuery, request: Request, user: dict = Depen
         if not namespace_allowed(parse_policy(cluster.log_policy), payload.namespace):
             audit(db, request, "k8s.logs.denied", user=user, target=f"cluster:{cluster.id}", success=False, detail=f"{payload.namespace}/{payload.name} blocked by the cluster's log policy", commit=True)
             raise HTTPException(403, f"This cluster's log policy does not allow reading logs in namespace '{payload.namespace}'. An admin can change it in the cluster's settings.")
-    if payload.kind == "describe":
+    if payload.kind in ("describe", "related"):
         if not payload.resource or not payload.name:
             raise HTTPException(422, "Choose a resource and a name")
         if payload.resource not in ("node", "namespace") and not payload.namespace:

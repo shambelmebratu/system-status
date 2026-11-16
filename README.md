@@ -316,6 +316,20 @@ Safety:
 - The shell-install agent runs as an unprivileged user, so it cannot open other users' history files (mode 600). Re-run the install command with `SMWATCH_HISTORY=on` to allow it; this gives the agent read-only access to every file (`CAP_DAC_READ_SEARCH`), and it still only sends what its allow-lists permit. The bundled host agent has this permission in `docker-compose.yml` (remove `cap_add: DAC_READ_SEARCH` to limit it to root's own history).
 - Bash writes a session's commands when that shell exits, so the commands of someone still logged in may not be listed yet.
 
+## Databases (admins)
+
+**Databases** in the menu (next to Kubernetes) connects PostgreSQL and MySQL / MariaDB databases to explain their structure and data.
+
+- **Relationships:** an interactive graph of tables and their foreign keys. Drag to move, scroll to zoom, drag a table to rearrange, click a table for its columns and links. Big schemas start with the connected tables; *Find a table* focuses the graph on one table and its neighbours (1 to 3 steps). **Tables** shows the same structure as a nested tree.
+- **Report builder:** tick tables (and, if you like, only some columns), choose whether to include sample rows, and press *Generate report*. The report is a clean, printable document. It covers row counts and sizes, keys, relationships written as plain sentences ("Each order may belong to one customer…"), and for every column how complete it is, how many distinct values it has, its range or most common values, and its average length. It ends with data-quality notes such as empty columns, missing links, tables without a primary key, and columns that are the same in every row. Print it, save it as PDF, or download it as Markdown. *Save selection* keeps the choice under **Saved reports**, which read fresh data each time they run.
+
+Safety:
+- **Admins only, read-only.** Every session is opened read-only and every query stops after 15 seconds. Create a database user with read-only grants as well; the connection form shows the statements.
+- **Credentials:** passwords are stored encrypted and never sent back to the browser. The host goes through the same network guard as service checks, so SM-Watch's own database and loopback/metadata addresses are refused.
+- **Safe queries:** table and column names in queries come only from the database's own catalog and are quoted.
+- **Sensitive columns:** values of columns that look sensitive (password, token, secret, card, IBAN, …) are never shown, only counted.
+- **Cost on big tables:** tables with more than 100,000 rows are profiled on their first 100,000 rows. Each report is recorded in the audit log.
+
 ## Choosing which logs are available (log access policy)
 
 SM-Watch never ships or stores logs. Logs are read **on demand** by the agent, shown once, and the result is deleted after 15 minutes, so there is nothing to grow. To limit *what* an agent may expose at all, an admin opens a server and edits **Log access** (Server page, push agents):
@@ -349,6 +363,12 @@ Review the manifest first by running the `curl` alone. It creates a `smwatch` na
 
 **Images.** `sm-watch-k8s-agent` is published with the other images (override with `K8S_AGENT_IMAGE`). Live CPU/memory needs metrics-server in the cluster; without it everything else still works.
 
+## Service timeout and certificate expiry
+
+Each service has a **timeout** (seconds; default `SERVICE_TIMEOUT_SECONDS=10`). A check fails when the answer does not arrive in time, even if it would have come eventually; the reason reads "Timed out…".
+
+For https services SM-Watch also reads the **TLS certificate** every `CERT_CHECK_HOURS` (6) and on *Check now*: expiry date, issuer and whether it covers the host name. The service page shows the days left on a bar with the alert points; the list shows a badge (green, amber, red). Alerts are sent once at each threshold (default `CERT_ALERT_DAYS=30,14,7`; set per service in *Edit*), once more if it expires, and a "renewed" message when a new certificate replaces one that was alerted about. Certificate alerts follow the channels' *alert* setting (renewals follow *recovered*). Untick *Watch the TLS certificate* to switch it off for a service.
+
 ## Response times (p50 / p95 / p99)
 
 **Performance** in the sidebar shows response-time percentiles from two sources:
@@ -380,6 +400,8 @@ The **Data sources** card on the Performance page says, per server, what the age
 On the Performance page, **Set a target** on a service (or on a server that reports real traffic): for example *p95 faster than 800 ms over the last 10 minutes*. When the percentile is slower than the target the monitor goes to *Over a limit*, an incident is opened and an alert is sent (to the channels and with the reminder interval set in that monitor's Alerts section); when it is back under, a recovery message follows. A monitor is not judged on too little data: `PERF_MIN_CHECK_SAMPLES` (5 probes) and `PERF_MIN_REQUESTS` (50 requests); the default window is `PERF_DEFAULT_WINDOW_MINUTES` (10).
 
 ## Kubernetes dashboard
+
+Every list (workloads, pods, nodes, autoscalers, services, ingresses, volume claims, events) is paginated (10, 25, 50 or 100 per page) and can be filtered by name. **Network** (services and ingresses) and **Storage** (volume claims, storage classes, resource quotas) are separate tabs. Clicking any workload, pod, service, ingress, volume claim, job, cron job, autoscaler or node opens a side panel with the important details, its **related pods**, the **services** that send it traffic, what it is **connected to** (owner Deployment/ReplicaSet, volumes, node, ingress backends), and the **events** of the object and its pods. Click any related item to open its panel; *Back* returns. Related pods and services need cluster agent **1.2.0**; older agents show the details and events only.
 
 The cluster page refreshes itself (**Live: every 5 s / 10 s / 30 s / 1 min / Off**, remembered in your browser; the header shows how long ago the data arrived). The overview shows capacity rings (CPU, memory, pod slots, nodes), a health summary, top consumers (switch CPU / memory / restarts and pods / namespaces), a namespace tile map, nodes and warnings. Click a pod anywhere to open a side panel with its containers, limits, why it is unhealthy, events and a *View logs* shortcut. The server page also shows how long ago its agent reported and whether that is on schedule.
 

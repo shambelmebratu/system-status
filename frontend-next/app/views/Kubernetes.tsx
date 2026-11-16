@@ -31,8 +31,8 @@ async function ask<T>(clusterId: number, query: Record<string, unknown>, cancell
 type Live = { tick: number; ms: number; touch: () => void };
 const LiveCtx = createContext<Live>({ tick: 0, ms: 0, touch: () => undefined });
 /** What the page's pieces can ask the cluster detail to do: open a pod's side panel, show a namespace's pods. */
-type Nav = { openPod: (ns: string, name: string) => void; goPods: (ns: string) => void };
-const NavCtx = createContext<Nav>({ openPod: () => undefined, goPods: () => undefined });
+type Nav = { openPod: (ns: string, name: string) => void; open: (t: { resource: string; ns: string; name: string }) => void; goPods: (ns: string) => void };
+const NavCtx = createContext<Nav>({ openPod: () => undefined, open: () => undefined, goPods: () => undefined });
 
 /** Fetches a list from the cluster when mounted (and when `deps` change). With refreshMs > 0 it follows the page's live clock and
  *  refreshes in the background (the old rows stay on screen until the new ones arrive). Nothing is stored on the control plane. */
@@ -146,8 +146,8 @@ function AddCluster({ onClose }: { onClose: () => void }) {
 }
 
 /* ---------------------------------------------------------------- cluster detail */
-type TabId = 'overview' | 'workloads' | 'pods' | 'nodes' | 'scaling' | 'network' | 'events' | 'logs' | 'settings';
-const TAB_ICON: Record<TabId, string> = { overview: 'overview', workloads: 'server', pods: 'k8s', nodes: 'server', scaling: 'zap', network: 'globe', events: 'alert', logs: 'logs', settings: 'settings' };
+type TabId = 'overview' | 'workloads' | 'pods' | 'nodes' | 'scaling' | 'network' | 'storage' | 'events' | 'logs' | 'settings';
+const TAB_ICON: Record<TabId, string> = { overview: 'overview', workloads: 'server', pods: 'k8s', nodes: 'server', scaling: 'zap', network: 'globe', storage: 'server', events: 'alert', logs: 'logs', settings: 'settings' };
 const LIVE_CHOICES: [number, string][] = [[5000, '5 s'], [10000, '10 s'], [30000, '30 s'], [60000, '1 min'], [0, 'Off']];
 
 function LivePill({ ms, setMs, updatedAt, now, onRefresh }: { ms: number; setMs: (v: number) => void; updatedAt: number | null; now: number; onRefresh: () => void }) {
@@ -171,7 +171,8 @@ function ClusterDetail({ cluster, reload }: { cluster: Cluster; reload: () => Pr
   const [updatedAt, setUpdatedAt] = useState<number | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const [podsNs, setPodsNs] = useState('');
-  const [drawer, setDrawer] = useState<{ ns: string; name: string } | null>(null);
+  const [stack, setStack] = useState<Target[]>([]);   // side panels: the last one is shown, Back returns to the one before
+  const top = stack[stack.length - 1];
   const [logPreset, setLogPreset] = useState<{ ns: string; pod: string } | null>(null);
   useEffect(() => { try { const v = Number(localStorage.getItem('smw_k8s_live')); if ([0, 5000, 10000, 30000, 60000].includes(v) && localStorage.getItem('smw_k8s_live') !== null) setLiveMs(v); } catch { /* storage unavailable */ } }, []);
   const chooseLive = (v: number) => { setLiveMs(v); try { localStorage.setItem('smw_k8s_live', String(v)); } catch { /* ignore */ } };
@@ -179,9 +180,11 @@ function ClusterDetail({ cluster, reload }: { cluster: Cluster; reload: () => Pr
   useEffect(() => { const t = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(t); }, []);
   const touch = useCallback(() => setUpdatedAt(Date.now()), []);
   const liveValue = useMemo(() => ({ tick, ms: liveMs, touch }), [tick, liveMs, touch]);
-  const nav = useMemo<Nav>(() => ({ openPod: (ns, name) => setDrawer({ ns, name }), goPods: ns => { setPodsNs(ns); setTab('pods'); } }), []);
+  const openPanel = useCallback((t: Target) => setStack(s => (s.length && s[s.length - 1].resource === t.resource && s[s.length - 1].ns === t.ns && s[s.length - 1].name === t.name ? s : [...s.slice(-9), t])), []);
+  const nav = useMemo<Nav>(() => ({ openPod: (ns, name) => setStack([{ resource: 'pod', ns, name }]), open: t => setStack([t]), goPods: ns => { setPodsNs(ns); setTab('pods'); } }), []);
+  useEffect(() => { if (!stack.length) return; const k = (e: KeyboardEvent) => { if (e.key === 'Escape') setStack([]); }; window.addEventListener('keydown', k); return () => window.removeEventListener('keydown', k); }, [stack.length]);
 
-  const tabs: [TabId, string][] = [['overview', 'Overview'], ['workloads', 'Workloads'], ['pods', 'Pods'], ['nodes', 'Nodes'], ['scaling', 'Autoscaling'], ['network', 'Network & storage'], ['events', 'Events']];
+  const tabs: [TabId, string][] = [['overview', 'Overview'], ['workloads', 'Workloads'], ['pods', 'Pods'], ['nodes', 'Nodes'], ['scaling', 'Autoscaling'], ['network', 'Network'], ['storage', 'Storage'], ['events', 'Events']];
   if (canOperate) tabs.push(['logs', 'Logs'], ['settings', 'Settings']);
   const offline = !cluster.last_seen_at || Date.now() - new Date(cluster.last_seen_at).getTime() > lim.offlineMs;
 
@@ -211,12 +214,19 @@ function ClusterDetail({ cluster, reload }: { cluster: Cluster; reload: () => Pr
             {tab === 'nodes' && <Nodes cluster={cluster} />}
             {tab === 'scaling' && <Scaling cluster={cluster} />}
             {tab === 'network' && <Network cluster={cluster} />}
+            {tab === 'storage' && <Storage cluster={cluster} />}
             {tab === 'events' && <Events cluster={cluster} />}
             {tab === 'logs' && canOperate && <PodLogs cluster={cluster} preset={logPreset} />}
             {tab === 'settings' && canOperate && <ClusterSettings cluster={cluster} isAdmin={isAdmin} reload={reload} />}
           </>
         )}
-        {drawer && <PodDrawer cluster={cluster} ns={drawer.ns} name={drawer.name} canLogs={canOperate && cluster.log_policy.enabled} onClose={() => setDrawer(null)} onLogs={() => { setLogPreset({ ns: drawer.ns, pod: drawer.name }); setDrawer(null); setTab('logs'); }} />}
+        {top && (
+          <div className="drawer-overlay" onMouseDown={e => e.target === e.currentTarget && setStack([])}>
+            {top.resource === 'pod'
+              ? <PodDrawer key={`${top.ns}/${top.name}`} cluster={cluster} ns={top.ns} name={top.name} canLogs={canOperate && cluster.log_policy.enabled} onClose={() => setStack([])} onBack={stack.length > 1 ? () => setStack(s => s.slice(0, -1)) : undefined} open={openPanel}
+                  onLogs={() => { setLogPreset({ ns: top.ns, pod: top.name }); setStack([]); setTab('logs'); }} />
+              : <ResourceDrawer key={`${top.resource}/${top.ns}/${top.name}`} cluster={cluster} target={top} onClose={() => setStack([])} onBack={stack.length > 1 ? () => setStack(s => s.slice(0, -1)) : undefined} open={openPanel} />}
+          </div>)}
       </NavCtx.Provider>
     </LiveCtx.Provider>
   );
@@ -467,37 +477,54 @@ function Overview({ cluster }: { cluster: Cluster }) {
 }
 
 type Workload = { ns: string; name: string; desired: number; ready: number; updated: number; images: string[]; message: string; kind?: string };
+type JobRow = { ns: string; name: string; state: string; succeeded: number; failed: number; completions: number | null; owner: string };
+type CronRow = { ns: string; name: string; schedule: string; suspend: boolean; last: string | null; active: number };
 function Workloads({ cluster }: { cluster: Cluster }) {
+  const nav = useContext(NavCtx);
   const [ns, setNs] = useState('');
+  const [filter, setFilter] = useState('');
+  const [kind, setKind] = useState<'all' | 'Deployment' | 'StatefulSet' | 'DaemonSet' | 'problems'>('all');
   const dep = useCluster<Items<Workload>>(cluster.id, { kind: 'deployments', namespace: ns, limit: 500 }, [ns], 20000);
   const sts = useCluster<Items<Workload>>(cluster.id, { kind: 'statefulsets', namespace: ns, limit: 500 }, [ns], 20000);
   const dss = useCluster<Items<Workload>>(cluster.id, { kind: 'daemonsets', namespace: ns, limit: 500 }, [ns], 20000);
-  const jobs = useCluster<Items<{ ns: string; name: string; state: string; succeeded: number; failed: number; completions: number | null; owner: string }>>(cluster.id, { kind: 'jobs', namespace: ns, limit: 200 }, [ns], 30000);
-  const crons = useCluster<Items<{ ns: string; name: string; schedule: string; suspend: boolean; last: string | null; active: number }>>(cluster.id, { kind: 'cronjobs', namespace: ns, limit: 200 }, [ns], 30000);
-  const rows = [...(dep.data?.data?.items ?? []).map(r => ({ ...r, kind: 'Deployment' })), ...(sts.data?.data?.items ?? []).map(r => ({ ...r, kind: 'StatefulSet' })), ...(dss.data?.data?.items ?? []).map(r => ({ ...r, kind: 'DaemonSet' }))];
-  const [describe, setDescribe] = useState<{ resource: string; ns: string; name: string } | null>(null);
+  const jobs = useCluster<Items<JobRow>>(cluster.id, { kind: 'jobs', namespace: ns, limit: 500 }, [ns], 30000);
+  const crons = useCluster<Items<CronRow>>(cluster.id, { kind: 'cronjobs', namespace: ns, limit: 500 }, [ns], 30000);
+  const all = [...(dep.data?.data?.items ?? []).map(r => ({ ...r, kind: 'Deployment' })), ...(sts.data?.data?.items ?? []).map(r => ({ ...r, kind: 'StatefulSet' })), ...(dss.data?.data?.items ?? []).map(r => ({ ...r, kind: 'DaemonSet' }))];
+  const needle = filter.trim().toLowerCase();
+  const match = (n: string, s2: string) => !needle || `${s2}/${n}`.toLowerCase().includes(needle);
+  const rows = all.filter(r => match(r.name, r.ns) && (kind === 'all' || (kind === 'problems' ? r.ready < r.desired : r.kind === kind))).sort((a, b) => Number(b.ready < b.desired) - Number(a.ready < a.desired) || a.name.localeCompare(b.name));
+  const jobRows = (jobs.data?.data?.items ?? []).filter(j => match(j.name, j.ns));
+  const cronRows = (crons.data?.data?.items ?? []).filter(c => match(c.name, c.ns));
+  const key = `${ns}|${needle}|${kind}`;
+  const w = usePaged(rows, key), jp = usePaged(jobRows, key, 10), cp = usePaged(cronRows, key, 10);
+  const count = (k: string) => all.filter(r => r.kind === k).length;
   return (
     <div className="grid">
-      <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}><NamespaceSelect cluster={cluster} value={ns} onChange={setNs} /></div>
-      <section className="card"><div className="card-head"><h2>Deployments, StatefulSets & DaemonSets</h2></div>
+      <div className="filterbar">
+        <NamespaceSelect cluster={cluster} value={ns} onChange={setNs} />
+        <label className="lg-field grow" style={{ maxWidth: 320 }}><Icon name="logs" size={15} /><input placeholder="Filter by name…" value={filter} onChange={e => setFilter(e.target.value)} aria-label="Filter workloads" />{filter && <button type="button" aria-label="Clear" onClick={() => setFilter('')}><Icon name="x" size={14} /></button>}</label>
+        <div className="seg">{([['all', `All ${all.length}`], ['Deployment', `Deployments ${count('Deployment')}`], ['StatefulSet', `StatefulSets ${count('StatefulSet')}`], ['DaemonSet', `DaemonSets ${count('DaemonSet')}`], ['problems', `Not ready ${all.filter(r => r.ready < r.desired).length}`]] as const).map(([id, l]) => <button key={id} className={kind === id ? 'on' : ''} onClick={() => setKind(id)}>{l}</button>)}</div>
+      </div>
+      <section className="card"><div className="card-head"><h2>Deployments, StatefulSets & DaemonSets</h2><span className="grow" /><span className="muted sm">Click a row for its pods, services and events</span></div>
         <Loading busy={dep.busy && !dep.data} error={dep.error} retry={dep.reload} />
-        {dep.data && (rows.length === 0 ? <p className="muted sm">None in this scope.</p> : (
-          <div className="tbl-wrap"><table className="tbl"><thead><tr><th>Name</th><th>Kind</th><th>Ready</th><th>Up-to-date</th><th>Images</th></tr></thead><tbody>
-            {rows.map(r => <tr key={`${r.kind}${r.ns}${r.name}`} className="click" onClick={() => setDescribe({ resource: r.kind!.toLowerCase(), ns: r.ns, name: r.name })}>
+        {dep.data && (rows.length === 0 ? <p className="muted sm">None match.</p> : (
+          <div className="tbl-wrap"><table className="tbl"><thead><tr><th>Name</th><th>Kind</th><th>Ready</th><th>Up-to-date</th><th className="hide-sm">Images</th></tr></thead><tbody>
+            {w.rows.map(r => <tr key={`${r.kind}${r.ns}${r.name}`} className="click" onClick={() => nav.open({ resource: r.kind.toLowerCase(), ns: r.ns, name: r.name })}>
               <td><div className="name">{r.name}<small>{r.ns}</small></div></td><td className="sm">{r.kind}</td>
-              <td className={r.ready < r.desired ? 'bad' : ''}><b>{r.ready}/{r.desired}</b></td><td>{r.updated}</td><td className="sm mono">{r.images.map(i => i.split('/').pop()).join(', ')}{r.message && <div className="bad sm">{r.message}</div>}</td></tr>)}
+              <td className={r.ready < r.desired ? 'bad' : ''}><b>{r.ready}/{r.desired}</b></td><td>{r.updated}</td><td className="sm mono hide-sm">{r.images.map(i => i.split('/').pop()).join(', ')}{r.message && <div className="bad sm">{r.message}</div>}</td></tr>)}
           </tbody></table></div>))}
-        <Trunc on={dep.data?.data?.truncated} />
+        {w.pager}<Trunc on={dep.data?.data?.truncated} />
       </section>
-      <section className="card"><div className="card-head"><h2>Jobs</h2></div>
-        {jobs.data && ((jobs.data.data?.items ?? []).length === 0 ? <p className="muted sm">No jobs.</p> : <table className="tbl"><thead><tr><th>Name</th><th>State</th><th>Succeeded</th><th>Failed</th></tr></thead><tbody>
-          {(jobs.data.data?.items ?? []).map(j => <tr key={j.ns + j.name}><td><div className="name">{j.name}<small>{j.ns}{j.owner ? ` · ${j.owner}` : ''}</small></div></td><td className={j.state === 'Failed' ? 'bad' : ''}>{j.state}</td><td>{j.succeeded}{j.completions ? `/${j.completions}` : ''}</td><td className={j.failed ? 'bad' : ''}>{j.failed}</td></tr>)}</tbody></table>)}
+      <section className="card"><div className="card-head"><h2>Jobs</h2><span className="tag">{jobRows.length}</span></div>
+        {jobs.data && (jobRows.length === 0 ? <p className="muted sm">No jobs.</p> : <div className="tbl-wrap"><table className="tbl"><thead><tr><th>Name</th><th>State</th><th>Succeeded</th><th>Failed</th></tr></thead><tbody>
+          {jp.rows.map(j => <tr key={j.ns + j.name} className="click" onClick={() => nav.open({ resource: 'job', ns: j.ns, name: j.name })}><td><div className="name">{j.name}<small>{j.ns}{j.owner ? ` · ${j.owner}` : ''}</small></div></td><td className={j.state === 'Failed' ? 'bad' : ''}>{j.state}</td><td>{j.succeeded}{j.completions ? `/${j.completions}` : ''}</td><td className={j.failed ? 'bad' : ''}>{j.failed}</td></tr>)}</tbody></table></div>)}
+        {jp.pager}
       </section>
-      <section className="card"><div className="card-head"><h2>CronJobs</h2></div>
-        {crons.data && ((crons.data.data?.items ?? []).length === 0 ? <p className="muted sm">No cron jobs.</p> : <table className="tbl"><thead><tr><th>Name</th><th>Schedule</th><th>Last run</th><th>Active</th></tr></thead><tbody>
-          {(crons.data.data?.items ?? []).map(c => <tr key={c.ns + c.name}><td><div className="name">{c.name}<small>{c.ns}</small></div></td><td className="mono sm">{c.schedule}{c.suspend && <span className="tag">suspended</span>}</td><td>{timeAgo(c.last)}</td><td>{c.active}</td></tr>)}</tbody></table>)}
+      <section className="card"><div className="card-head"><h2>CronJobs</h2><span className="tag">{cronRows.length}</span></div>
+        {crons.data && (cronRows.length === 0 ? <p className="muted sm">No cron jobs.</p> : <div className="tbl-wrap"><table className="tbl"><thead><tr><th>Name</th><th>Schedule</th><th>Last run</th><th>Active</th></tr></thead><tbody>
+          {cp.rows.map(c => <tr key={c.ns + c.name} className="click" onClick={() => nav.open({ resource: 'cronjob', ns: c.ns, name: c.name })}><td><div className="name">{c.name}<small>{c.ns}</small></div></td><td className="mono sm">{c.schedule}{c.suspend && <span className="tag">suspended</span>}</td><td>{timeAgo(c.last)}</td><td>{c.active}</td></tr>)}</tbody></table></div>)}
+        {cp.pager}
       </section>
-      {describe && <Describe cluster={cluster} {...describe} onClose={() => setDescribe(null)} />}
     </div>
   );
 }
@@ -530,6 +557,7 @@ function Pods({ cluster, initialNs = '' }: { cluster: Cluster; initialNs?: strin
   const problems = all.filter(p => badPod(p.status)).length, restarted = all.filter(p => p.restarts > 5).length;
   const rows = all.filter(p => (!filter || `${p.ns}/${p.name}`.toLowerCase().includes(filter.toLowerCase())) && (view === 'all' || (view === 'problems' ? badPod(p.status) : p.restarts > 5)))
     .sort((a, b) => Number(badPod(b.status)) - Number(badPod(a.status)) || b.restarts - a.restarts);
+  const paged = usePaged(rows, `${ns}|${filter}|${view}`);
   return (
     <div className="grid">
       <div className="filterbar">
@@ -543,7 +571,7 @@ function Pods({ cluster, initialNs = '' }: { cluster: Cluster; initialNs?: strin
         <Loading busy={pods.busy && !pods.data} error={pods.error} retry={pods.reload} />
         {pods.data && (rows.length === 0 ? <div style={{ padding: 18 }}><p className="muted sm">No pods match.</p></div> : (
           <div className="tbl-wrap"><table className="tbl ktbl"><thead><tr><th>Pod</th><th>Status</th><th>Ready</th><th className="num">Restarts</th><th>CPU</th><th>Memory</th><th className="hide-sm">Node</th><th className="num hide-sm">Age</th></tr></thead><tbody>
-            {rows.map(p => { const x = u.get(`${p.ns}/${p.name}`); return (
+            {paged.rows.map(p => { const x = u.get(`${p.ns}/${p.name}`); return (
               <tr key={p.ns + p.name} className="click" onClick={() => nav.openPod(p.ns, p.name)}>
                 <td><div className="podname"><b title={p.name}>{p.name}</b><span className="nschip">{p.ns}</span></div></td>
                 <td><span className={`kstatus ${podTone(p.status)}`}><i />{p.status}</span></td>
@@ -553,6 +581,7 @@ function Pods({ cluster, initialNs = '' }: { cluster: Cluster; initialNs?: strin
                 <td><UseBar value={x?.mem_mib} limit={p.mem_lim_mib} text={x ? mib(x.mem_mib) : ''} /></td>
                 <td className="sm hide-sm trunc" style={{ maxWidth: 160 }} title={p.node}>{p.node}</td><td className="num sm hide-sm">{ageOf(p.created)}</td></tr>); })}
           </tbody></table></div>))}
+        <div style={{ padding: '0 14px' }}>{paged.pager}</div>
         <Trunc on={pods.data?.data?.truncated} />
       </section>
     </div>
@@ -565,11 +594,11 @@ type PodObject = { metadata?: { labels?: Record<string, string>; ownerReferences
     containerStatuses?: { name: string; ready: boolean; restartCount: number; state?: Record<string, { reason?: string; message?: string; startedAt?: string; exitCode?: number }>; lastState?: Record<string, { reason?: string; exitCode?: number; finishedAt?: string }> }[] } };
 
 /** The side panel for one pod: what it is, its containers, why it is unhealthy, and a shortcut to its logs. */
-function PodDrawer({ cluster, ns, name, canLogs, onClose, onLogs }: { cluster: Cluster; ns: string; name: string; canLogs: boolean; onClose: () => void; onLogs: () => void }) {
-  const d = useCluster<{ object: PodObject; events: Ev[] }>(cluster.id, { kind: 'describe', resource: 'pod', namespace: ns, name }, [ns, name], 1);
+function PodDrawer({ cluster, ns, name, canLogs, onClose, onLogs, onBack, open }: { cluster: Cluster; ns: string; name: string; canLogs: boolean; onClose: () => void; onLogs: () => void; onBack?: () => void; open: (t: Target) => void }) {
+  const target = useMemo(() => ({ resource: 'pod', ns, name }), [ns, name]);
+  const d = useRelated(cluster, target);
   const { toast } = useApp();
-  useEffect(() => { const k = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); }; window.addEventListener('keydown', k); return () => window.removeEventListener('keydown', k); }, [onClose]);
-  const o = d.data?.data?.object;
+  const o = d.data?.data?.object as PodObject | undefined;
   const phase = o?.status?.phase ?? '';
   const statuses = new Map((o?.status?.containerStatuses ?? []).map(c => [c.name, c]));
   const owner = o?.metadata?.ownerReferences?.[0];
@@ -578,11 +607,11 @@ function PodDrawer({ cluster, ns, name, canLogs, onClose, onLogs }: { cluster: C
     return st ? { kind: st[0], reason: st[1]?.reason ?? '', message: st[1]?.message ?? '' } : { kind: 'unknown', reason: '', message: '' };
   };
   return (
-    <div className="drawer-overlay" onMouseDown={e => e.target === e.currentTarget && onClose()}>
       <aside className="drawer" role="dialog" aria-modal="true" aria-label={`Pod ${name}`}>
         <div className="drawer-head">
+          {onBack && <button className="btn ghost sm" onClick={onBack} aria-label="Back"><Icon name="back" size={15} /></button>}
           <div style={{ minWidth: 0 }}><div className="sm muted">Pod · <span className="nschip">{ns}</span></div><h2 className="trunc" title={name}>{name}</h2></div>
-          <button className="btn ghost sm" onClick={onClose} aria-label="Close"><Icon name="x" /></button>
+          <span className="grow" /><button className="btn ghost sm" onClick={onClose} aria-label="Close"><Icon name="x" /></button>
         </div>
         <div className="drawer-actions">
           {phase && <span className={`kstatus ${podTone(phase)}`}><i />{phase}</span>}
@@ -590,7 +619,7 @@ function PodDrawer({ cluster, ns, name, canLogs, onClose, onLogs }: { cluster: C
           <button className="btn sm" onClick={() => { void navigator.clipboard?.writeText(`kubectl -n ${ns} describe pod ${name}`); toast('kubectl command copied'); }}>Copy kubectl describe</button>
         </div>
         <div className="drawer-body">
-          <Loading busy={d.busy && !d.data} error={d.error} retry={d.reload} />
+          <Loading busy={d.busy && !d.data} error={d.legacy ? '' : d.error} retry={d.reload} />
           {o && <>
             <div className="facts">
               <div><small>Node</small><b>{o.spec?.nodeName ?? '–'}</b></div><div><small>Pod IP</small><b className="mono">{o.status?.podIP ?? '–'}</b></div>
@@ -611,14 +640,13 @@ function PodDrawer({ cluster, ns, name, canLogs, onClose, onLogs }: { cluster: C
               </div>); })}
             {(o.status?.conditions ?? []).some(c => c.status !== 'True') && <><h3 className="drawer-h">Conditions</h3>
               {(o.status?.conditions ?? []).filter(c => c.status !== 'True').map(c => <div key={c.type} className="sm" style={{ marginBottom: 6 }}><b className="warn">{c.type}</b> {c.reason}{c.message ? `: ${c.message}` : ''}</div>)}</>}
+            {d.data?.data && <RelatedBlock data={d.data.data} open={open} self={target} />}
             <h3 className="drawer-h">Events</h3>
-            {(d.data?.data?.events ?? []).length === 0 ? <p className="muted sm">No events for this pod.</p> : (d.data?.data?.events ?? []).slice(0, 12).map((e, i) => (
-              <div key={i} className="evt"><span className={`evt-dot ${e.type === 'Warning' ? 'warn' : ''}`} /><div><b className={e.type === 'Warning' ? 'warn' : ''}>{e.reason}</b> <span className="muted sm">{timeAgo(e.last)}{e.count > 1 ? ` ×${e.count}` : ''}</span><div className="sm">{e.message}</div></div></div>))}
+            <EventList events={d.data?.data?.events ?? []} empty="No events for this pod (Kubernetes keeps events for about an hour)." />
             {o.metadata?.labels && Object.keys(o.metadata.labels).length > 0 && <><h3 className="drawer-h">Labels</h3><div className="chips">{Object.entries(o.metadata.labels).slice(0, 14).map(([k, v]) => <span key={k} className="chip mono" title={`${k}=${v}`}>{k.split('/').pop()}={v.length > 24 ? `${v.slice(0, 22)}…` : v}</span>)}</div></>}
           </>}
         </div>
       </aside>
-    </div>
   );
 }
 
@@ -626,16 +654,17 @@ type NodeRow = { name: string; ready: boolean; roles: string[]; version: string;
   cpu_alloc_m: number; mem_alloc_mib: number; pods_cap: number; conditions: { type: string; status: string; reason: string; message: string }[] };
 function Nodes({ cluster }: { cluster: Cluster }) {
   const lim = useLimits();
+  const nav = useContext(NavCtx);
   const nodes = useCluster<Items<NodeRow>>(cluster.id, { kind: 'nodes' }, [], 20000);
   const usage = useCluster<Items<{ name: string; cpu_m: number; mem_mib: number }> & { available: boolean }>(cluster.id, { kind: 'node_metrics' }, [], 20000);
-  const [describe, setDescribe] = useState<string | null>(null);
   const u = new Map((usage.data?.data?.items ?? []).map(x => [x.name, x]));
+  const paged = usePaged(nodes.data?.data?.items ?? [], '');
   return (
     <section className="card">
       <Loading busy={nodes.busy && !nodes.data} error={nodes.error} retry={nodes.reload} />
       {nodes.data && <div className="tbl-wrap"><table className="tbl"><thead><tr><th>Node</th><th>Status</th><th>Roles</th><th style={{ minWidth: 130 }}>CPU</th><th style={{ minWidth: 130 }}>Memory</th><th>Version</th><th>Address</th></tr></thead><tbody>
-        {(nodes.data.data?.items ?? []).map(n => { const x = u.get(n.name); const cp = x ? (x.cpu_m / n.cpu_alloc_m) * 100 : null; const mp = x ? (x.mem_mib / n.mem_alloc_mib) * 100 : null; const issues = n.conditions.filter(c => (c.type === 'Ready' ? c.status !== 'True' : c.status === 'True')); return (
-          <tr key={n.name} className="click" onClick={() => setDescribe(n.name)}>
+        {paged.rows.map(n => { const x = u.get(n.name); const cp = x ? (x.cpu_m / n.cpu_alloc_m) * 100 : null; const mp = x ? (x.mem_mib / n.mem_alloc_mib) * 100 : null; const issues = n.conditions.filter(c => (c.type === 'Ready' ? c.status !== 'True' : c.status === 'True')); return (
+          <tr key={n.name} className="click" onClick={() => nav.open({ resource: 'node', ns: '', name: n.name })}>
             <td><div className="name">{n.name}<small>{n.os}</small></div></td>
             <td><StatusPill status={n.ready && !issues.length ? 'up' : 'alert'} label={n.ready ? (issues.length ? issues.map(i => i.type).join(', ') : 'Ready') : 'Not ready'} />{n.unschedulable && <span className="tag">cordoned</span>}</td>
             <td className="sm">{n.roles.join(', ')}</td>
@@ -643,91 +672,265 @@ function Nodes({ cluster }: { cluster: Cluster }) {
             <td>{mp != null ? <><div className="sm">{Math.round(x!.mem_mib)} / {Math.round(n.mem_alloc_mib)} MiB</div><Meter value={mp} warnAt={lim.warn} badAt={lim.bad} /></> : <span className="muted sm">{Math.round(n.mem_alloc_mib)} MiB allocatable</span>}</td>
             <td className="sm mono">{n.version}</td><td className="sm mono">{n.ip}</td></tr>); })}
       </tbody></table></div>}
+      {paged.pager}
       {usage.data && usage.data.data?.available === false && <p className="sm muted">Live usage needs metrics-server in the cluster.</p>}
-      {describe && <Describe cluster={cluster} resource="node" ns="" name={describe} onClose={() => setDescribe(null)} />}
     </section>
   );
 }
 
 type Hpa = { ns: string; name: string; target: string; min: number; max: number; current: number; desired: number; metrics: { name?: string; current?: string; target?: string; type?: string }[] | string[]; last_scale: string | null; conditions: { type: string; status: string; reason: string; message: string }[] };
 function Scaling({ cluster }: { cluster: Cluster }) {
+  const nav = useContext(NavCtx);
   const [ns, setNs] = useState('');
   const hpa = useCluster<Items<Hpa>>(cluster.id, { kind: 'hpa', namespace: ns, limit: 500 }, [ns], 20000);
   const fmt = (m: Hpa['metrics'][number]) => typeof m === 'string' ? m : `${m.name ?? m.type}: ${m.current ?? '?'} / ${m.target ?? '?'}`;
+  const paged = usePaged(hpa.data?.data?.items ?? [], ns);
   return (
     <div className="grid">
       <NamespaceSelect cluster={cluster} value={ns} onChange={setNs} />
       <section className="card"><div className="card-head"><h2>Horizontal Pod Autoscalers</h2></div>
         <Loading busy={hpa.busy && !hpa.data} error={hpa.error} retry={hpa.reload} />
         {hpa.data && ((hpa.data.data?.items ?? []).length === 0 ? <p className="muted sm">No HPAs in this scope.</p> : <div className="tbl-wrap"><table className="tbl"><thead><tr><th>Name</th><th>Target</th><th>Replicas</th><th>Metrics (current / target)</th><th>Last scaled</th></tr></thead><tbody>
-          {(hpa.data.data?.items ?? []).map(h => { const limited = h.conditions.find(c => c.type === 'ScalingLimited' && c.status === 'True'); const broken = h.conditions.find(c => c.type === 'ScalingActive' && c.status === 'False'); return (
-            <tr key={h.ns + h.name}><td><div className="name">{h.name}<small>{h.ns}</small></div></td><td className="sm">{h.target}</td>
+          {paged.rows.map(h => { const limited = h.conditions.find(c => c.type === 'ScalingLimited' && c.status === 'True'); const broken = h.conditions.find(c => c.type === 'ScalingActive' && c.status === 'False'); return (
+            <tr key={h.ns + h.name} className="click" onClick={() => nav.open({ resource: 'hpa', ns: h.ns, name: h.name })}><td><div className="name">{h.name}<small>{h.ns}</small></div></td><td className="sm">{h.target}</td>
               <td><b className={h.current >= h.max ? 'warn' : ''}>{h.current}</b> <span className="muted sm">(want {h.desired}; {h.min}–{h.max})</span>{limited && <div className="warn sm">{limited.reason}</div>}</td>
               <td className="sm">{(h.metrics as Hpa['metrics']).length ? (h.metrics as Hpa['metrics'][number][]).map((m, i) => <div key={i}>{fmt(m)}</div>) : <span className="muted">none</span>}{broken && <div className="bad sm">{broken.message || broken.reason}</div>}</td>
               <td className="sm">{timeAgo(h.last_scale)}</td></tr>); })}
         </tbody></table></div>)}
+        {paged.pager}
       </section>
     </div>
   );
 }
 
+function FilterRow({ cluster, ns, setNs, filter, setFilter, placeholder }: { cluster: Cluster; ns: string; setNs: (v: string) => void; filter: string; setFilter: (v: string) => void; placeholder: string }) {
+  return (
+    <div className="filterbar">
+      <NamespaceSelect cluster={cluster} value={ns} onChange={setNs} />
+      <label className="lg-field grow" style={{ maxWidth: 320 }}><Icon name="logs" size={15} /><input placeholder={placeholder} value={filter} onChange={e => setFilter(e.target.value)} aria-label="Filter" />{filter && <button type="button" aria-label="Clear" onClick={() => setFilter('')}><Icon name="x" size={14} /></button>}</label>
+    </div>
+  );
+}
+const byName = (needle: string) => (r: { ns: string; name: string }) => !needle || `${r.ns}/${r.name}`.toLowerCase().includes(needle.trim().toLowerCase());
+
+type IngRow = { ns: string; name: string; class: string; hosts: string[]; address: string[]; tls: number };
 function Network({ cluster }: { cluster: Cluster }) {
+  const nav = useContext(NavCtx);
   const [ns, setNs] = useState('');
-  const svc = useCluster<Items<{ ns: string; name: string; type: string; cluster_ip: string; external: string[]; ports: string[] }>>(cluster.id, { kind: 'services', namespace: ns, limit: 500 }, [ns], 30000);
-  const ing = useCluster<Items<{ ns: string; name: string; class: string; hosts: string[]; address: string[]; tls: number }>>(cluster.id, { kind: 'ingresses', namespace: ns, limit: 500 }, [ns], 30000);
-  const pvc = useCluster<Items<{ ns: string; name: string; status: string; capacity: string; class: string; volume: string }>>(cluster.id, { kind: 'pvcs', namespace: ns, limit: 500 }, [ns], 30000);
-  const quotas = useCluster<Items<{ ns: string; name: string; resources: { name: string; hard: string; used: string }[] }>>(cluster.id, { kind: 'quotas', namespace: ns }, [ns], 60000);
+  const [filter, setFilter] = useState('');
+  const svc = useCluster<Items<SvcRow>>(cluster.id, { kind: 'services', namespace: ns, limit: 500 }, [ns], 30000);
+  const ing = useCluster<Items<IngRow>>(cluster.id, { kind: 'ingresses', namespace: ns, limit: 500 }, [ns], 30000);
+  const services = (svc.data?.data?.items ?? []).filter(byName(filter)), ingresses = (ing.data?.data?.items ?? []).filter(byName(filter));
+  const sp = usePaged(services, `${ns}|${filter}`), ip = usePaged(ingresses, `${ns}|${filter}`, 10);
   return (
     <div className="grid">
-      <NamespaceSelect cluster={cluster} value={ns} onChange={setNs} />
-      <section className="card"><div className="card-head"><h2>Services</h2></div>{svc.data && <div className="tbl-wrap"><table className="tbl"><thead><tr><th>Name</th><th>Type</th><th>Cluster IP</th><th>External</th><th>Ports</th></tr></thead><tbody>
-        {(svc.data.data?.items ?? []).map(s => <tr key={s.ns + s.name}><td><div className="name">{s.name}<small>{s.ns}</small></div></td><td className="sm">{s.type}</td><td className="mono sm">{s.cluster_ip}</td><td className="mono sm">{s.external.join(', ') || '–'}</td><td className="mono sm">{s.ports.join(', ')}</td></tr>)}</tbody></table></div>}</section>
-      <section className="card"><div className="card-head"><h2>Ingresses</h2></div>{ing.data && ((ing.data.data?.items ?? []).length === 0 ? <p className="muted sm">No ingresses.</p> : <table className="tbl"><thead><tr><th>Name</th><th>Class</th><th>Hosts</th><th>Address</th><th>TLS</th></tr></thead><tbody>
-        {(ing.data.data?.items ?? []).map(i => <tr key={i.ns + i.name}><td><div className="name">{i.name}<small>{i.ns}</small></div></td><td className="sm">{i.class || '–'}</td><td className="mono sm">{i.hosts.join(', ')}</td><td className="mono sm">{i.address.join(', ') || '–'}</td><td>{i.tls ? 'yes' : 'no'}</td></tr>)}</tbody></table>)}</section>
-      <section className="card"><div className="card-head"><h2>Persistent volume claims</h2></div>{pvc.data && ((pvc.data.data?.items ?? []).length === 0 ? <p className="muted sm">No claims.</p> : <table className="tbl"><thead><tr><th>Name</th><th>Status</th><th>Capacity</th><th>Class</th><th>Volume</th></tr></thead><tbody>
-        {(pvc.data.data?.items ?? []).map(p => <tr key={p.ns + p.name}><td><div className="name">{p.name}<small>{p.ns}</small></div></td><td className={p.status !== 'Bound' ? 'warn' : ''}>{p.status}</td><td>{p.capacity || '–'}</td><td className="sm">{p.class}</td><td className="mono sm">{p.volume}</td></tr>)}</tbody></table>)}</section>
-      {(quotas.data?.data?.items ?? []).length > 0 && <section className="card"><div className="card-head"><h2>Resource quotas</h2></div><table className="tbl"><tbody>
-        {(quotas.data?.data?.items ?? []).flatMap(q => q.resources.map(r => <tr key={q.ns + q.name + r.name}><td className="sm">{q.ns}/{q.name}</td><td className="mono sm">{r.name}</td><td className="num">{r.used} / {r.hard}</td></tr>))}</tbody></table></section>}
+      <FilterRow cluster={cluster} ns={ns} setNs={setNs} filter={filter} setFilter={setFilter} placeholder="Filter services and ingresses…" />
+      <section className="card"><div className="card-head"><h2>Services</h2><span className="tag">{services.length}</span><span className="grow" /><span className="muted sm">Click a service for its pods and events</span></div>
+        <Loading busy={svc.busy && !svc.data} error={svc.error} retry={svc.reload} />
+        {svc.data && (services.length === 0 ? <p className="muted sm">No services.</p> : <div className="tbl-wrap"><table className="tbl"><thead><tr><th>Name</th><th>Type</th><th>Cluster IP</th><th className="hide-sm">External</th><th>Ports</th></tr></thead><tbody>
+          {sp.rows.map(s => <tr key={s.ns + s.name} className="click" onClick={() => nav.open({ resource: 'service', ns: s.ns, name: s.name })}><td><div className="name">{s.name}<small>{s.ns}</small></div></td><td className="sm">{s.type}</td><td className="mono sm">{s.cluster_ip}</td><td className="mono sm hide-sm">{s.external.join(', ') || '–'}</td><td className="mono sm">{s.ports.join(', ')}</td></tr>)}</tbody></table></div>)}
+        {sp.pager}
+      </section>
+      <section className="card"><div className="card-head"><h2>Ingresses</h2><span className="tag">{ingresses.length}</span></div>
+        {ing.data && (ingresses.length === 0 ? <p className="muted sm">No ingresses.</p> : <div className="tbl-wrap"><table className="tbl"><thead><tr><th>Name</th><th>Class</th><th>Hosts</th><th className="hide-sm">Address</th><th>TLS</th></tr></thead><tbody>
+          {ip.rows.map(i => <tr key={i.ns + i.name} className="click" onClick={() => nav.open({ resource: 'ingress', ns: i.ns, name: i.name })}><td><div className="name">{i.name}<small>{i.ns}</small></div></td><td className="sm">{i.class || '–'}</td><td className="mono sm">{i.hosts.join(', ')}</td><td className="mono sm hide-sm">{i.address.join(', ') || '–'}</td><td>{i.tls ? 'yes' : 'no'}</td></tr>)}</tbody></table></div>)}
+        {ip.pager}
+      </section>
+    </div>
+  );
+}
+
+type PvcRow = { ns: string; name: string; status: string; capacity: string; class: string; volume: string };
+function Storage({ cluster }: { cluster: Cluster }) {
+  const nav = useContext(NavCtx);
+  const [ns, setNs] = useState('');
+  const [filter, setFilter] = useState('');
+  const pvc = useCluster<Items<PvcRow>>(cluster.id, { kind: 'pvcs', namespace: ns, limit: 500 }, [ns], 30000);
+  const quotas = useCluster<Items<{ ns: string; name: string; resources: { name: string; hard: string; used: string }[] }>>(cluster.id, { kind: 'quotas', namespace: ns }, [ns], 60000);
+  const claims = (pvc.data?.data?.items ?? []).filter(byName(filter));
+  const unbound = claims.filter(c => c.status !== 'Bound').length;
+  const quotaRows = (quotas.data?.data?.items ?? []).filter(byName(filter)).flatMap(q => q.resources.map(r => ({ ...r, ns: q.ns, quota: q.name })));
+  const pp = usePaged(claims, `${ns}|${filter}`), qp = usePaged(quotaRows, `${ns}|${filter}`, 10);
+  const classes = new Map<string, number>();
+  claims.forEach(c => classes.set(c.class || 'default', (classes.get(c.class || 'default') ?? 0) + 1));
+  return (
+    <div className="grid">
+      <FilterRow cluster={cluster} ns={ns} setNs={setNs} filter={filter} setFilter={setFilter} placeholder="Filter volume claims…" />
+      <div className="ssh-stats">
+        <div className="card ssh-stat"><small>Volume claims</small><b>{pvc.data ? claims.length : '–'}</b><span className="muted sm">in this scope</span></div>
+        <div className="card ssh-stat"><small>Not bound</small><b className={unbound ? 'warn' : ''}>{pvc.data ? unbound : '–'}</b><span className="muted sm">pending or lost claims</span></div>
+        <div className="card ssh-stat"><small>Storage classes</small><b className="sm-b">{[...classes.keys()].join(', ') || '–'}</b><span className="muted sm">{[...classes.values()].join(' / ')}</span></div>
+      </div>
+      <section className="card"><div className="card-head"><h2>Persistent volume claims</h2><span className="grow" /><span className="muted sm">Click a claim to see which pods use it</span></div>
+        <Loading busy={pvc.busy && !pvc.data} error={pvc.error} retry={pvc.reload} />
+        {pvc.data && (claims.length === 0 ? <p className="muted sm">No claims.</p> : <div className="tbl-wrap"><table className="tbl"><thead><tr><th>Name</th><th>Status</th><th>Capacity</th><th>Class</th><th className="hide-sm">Volume</th></tr></thead><tbody>
+          {pp.rows.map(p => <tr key={p.ns + p.name} className="click" onClick={() => nav.open({ resource: 'pvc', ns: p.ns, name: p.name })}><td><div className="name">{p.name}<small>{p.ns}</small></div></td><td className={p.status !== 'Bound' ? 'warn' : ''}>{p.status}</td><td>{p.capacity || '–'}</td><td className="sm">{p.class}</td><td className="mono sm hide-sm">{p.volume}</td></tr>)}</tbody></table></div>)}
+        {pp.pager}
+      </section>
+      {quotaRows.length > 0 && <section className="card"><div className="card-head"><h2>Resource quotas</h2></div><div className="tbl-wrap"><table className="tbl"><thead><tr><th>Quota</th><th>Resource</th><th className="num">Used / limit</th></tr></thead><tbody>
+        {qp.rows.map(r => <tr key={r.ns + r.quota + r.name}><td className="sm">{r.ns}/{r.quota}</td><td className="mono sm">{r.name}</td><td className="num">{r.used} / {r.hard}</td></tr>)}</tbody></table></div>{qp.pager}</section>}
     </div>
   );
 }
 
 type Ev = { ns: string; type: string; reason: string; object: string; message: string; count: number; last: string | null };
 function Events({ cluster }: { cluster: Cluster }) {
+  const nav = useContext(NavCtx);
   const [ns, setNs] = useState('');
   const [warn, setWarn] = useState(true);
-  const ev = useCluster<Items<Ev>>(cluster.id, { kind: 'events', namespace: ns, warnings_only: warn, limit: 200 }, [ns, warn], 20000);
+  const [filter, setFilter] = useState('');
+  const ev = useCluster<Items<Ev>>(cluster.id, { kind: 'events', namespace: ns, warnings_only: warn, limit: 500 }, [ns, warn], 20000);
+  const needle = filter.trim().toLowerCase();
+  const rows = (ev.data?.data?.items ?? []).filter(e => !needle || `${e.ns} ${e.object} ${e.reason} ${e.message}`.toLowerCase().includes(needle));
+  const paged = usePaged(rows, `${ns}|${warn}|${needle}`);
+  const openObject = (e: Ev) => { const [k, n] = e.object.split('/'); const res = RESOURCE_OF[k]; if (res && n) nav.open({ resource: res, ns: res === 'node' ? '' : e.ns, name: n }); };
   return (
     <div className="grid">
-      <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}><NamespaceSelect cluster={cluster} value={ns} onChange={setNs} /><label className="check"><input type="checkbox" checked={warn} onChange={e => setWarn(e.target.checked)} />Warnings only</label></div>
+      <div className="filterbar"><NamespaceSelect cluster={cluster} value={ns} onChange={setNs} />
+        <label className="lg-field grow" style={{ maxWidth: 320 }}><Icon name="logs" size={15} /><input placeholder="Filter reason, object, message…" value={filter} onChange={e => setFilter(e.target.value)} aria-label="Filter events" /></label>
+        <label className="check"><input type="checkbox" checked={warn} onChange={e => setWarn(e.target.checked)} />Warnings only</label></div>
       <section className="card"><Loading busy={ev.busy && !ev.data} error={ev.error} retry={ev.reload} />
-        {ev.data && ((ev.data.data?.items ?? []).length === 0 ? <p className="muted sm">No events.</p> : <div className="tbl-wrap"><table className="tbl"><thead><tr><th>When</th><th>Reason</th><th>Object</th><th>Message</th></tr></thead><tbody>
-          {(ev.data.data?.items ?? []).map((e, i) => <tr key={i}><td className="sm">{timeAgo(e.last)}{e.count > 1 && <small> ×{e.count}</small>}</td><td className={e.type === 'Warning' ? 'warn' : ''}><b>{e.reason}</b></td><td className="sm mono">{e.ns ? `${e.ns}/` : ''}{e.object}</td><td className="sm">{e.message}</td></tr>)}</tbody></table></div>)}
+        {ev.data && (rows.length === 0 ? <p className="muted sm">No events.</p> : <div className="tbl-wrap"><table className="tbl"><thead><tr><th>When</th><th>Reason</th><th>Object</th><th>Message</th></tr></thead><tbody>
+          {paged.rows.map((e, i) => <tr key={i} className={RESOURCE_OF[e.object.split('/')[0]] ? 'click' : ''} onClick={() => openObject(e)}><td className="sm">{timeAgo(e.last)}{e.count > 1 && <small> ×{e.count}</small>}</td><td className={e.type === 'Warning' ? 'warn' : ''}><b>{e.reason}</b></td><td className="sm mono">{e.ns ? `${e.ns}/` : ''}{e.object}</td><td className="sm">{e.message}</td></tr>)}</tbody></table></div>)}
+        {paged.pager}
       </section>
     </div>
   );
 }
 
-/* ---------------------------------------------------------------- describe (secret-free: the agent redacts env values) */
-function Describe({ cluster, resource, ns, name, pod, onClose }: { cluster: Cluster; resource: string; ns: string; name: string; pod?: Pod; onClose: () => void }) {
-  const d = useCluster<{ object: unknown; events: Ev[] }>(cluster.id, { kind: 'describe', resource, namespace: ns, name }, [resource, ns, name]);
-  const [showObject, setShowObject] = useState(false);
+/* ---------------------------------------------------------------- pagination (every resource list) */
+const PAGE_SIZES = [10, 25, 50, 100];
+function Pager({ page, pages, size, total, onPage, onSize }: { page: number; pages: number; size: number; total: number; onPage: (p: number) => void; onSize: (s: number) => void }) {
+  if (total <= PAGE_SIZES[0]) return null;
+  const nums: (number | '…')[] = [];
+  for (let i = 0; i < pages; i++) if (i === 0 || i === pages - 1 || Math.abs(i - page) <= 1) nums.push(i); else if (nums[nums.length - 1] !== '…') nums.push('…');
   return (
-    <Modal title={`${resource} · ${name}`} onClose={onClose} wide>
-      {pod && <div className="sm" style={{ marginBottom: 10 }}>
-        <div className="muted">{pod.ns} · node {pod.node} · IP {pod.ip} · QoS {pod.qos} · owner {pod.owner || '–'}</div>
-        <table className="tbl"><thead><tr><th>Container</th><th>State</th><th>Restarts</th><th>Image</th></tr></thead><tbody>
-          {pod.containers.map(c => <tr key={c.name}><td>{c.name}</td><td className={c.ready ? '' : 'bad'}>{c.state}{c.reason && ` · ${c.reason}`}</td><td>{c.restarts}</td><td className="mono sm">{c.image}</td></tr>)}</tbody></table>
-        <div className="muted" style={{ marginTop: 6 }}>Requests {pod.cpu_req_m}m / {pod.mem_req_mib} MiB · limits {pod.cpu_lim_m ? `${pod.cpu_lim_m}m` : 'none'} / {pod.mem_lim_mib ? `${pod.mem_lim_mib} MiB` : 'none'}</div>
-      </div>}
-      <Loading busy={d.busy && !d.data} error={d.error} retry={d.reload} />
-      {d.data?.data && <>
-        <h3 style={{ margin: '8px 0' }}>Events</h3>
-        {d.data.data.events.length === 0 ? <p className="muted sm">No events for this object.</p> : <table className="tbl"><tbody>{d.data.data.events.map((e, i) => <tr key={i}><td className="sm">{timeAgo(e.last)}</td><td className={e.type === 'Warning' ? 'warn' : ''}><b>{e.reason}</b></td><td className="sm">{e.message}</td></tr>)}</tbody></table>}
-        <div style={{ marginTop: 10 }}><button className="btn sm" onClick={() => setShowObject(!showObject)}>{showObject ? 'Hide' : 'Show'} full object (env values redacted)</button></div>
-        {showObject && <pre className="codebox" style={{ maxHeight: 360, overflow: 'auto', whiteSpace: 'pre-wrap' }}>{JSON.stringify(d.data.data.object, null, 2)}</pre>}
-      </>}
-    </Modal>
+    <nav className="pager" aria-label="Pages">
+      <span className="muted sm">{(page * size + 1).toLocaleString()}–{Math.min(total, (page + 1) * size).toLocaleString()} of {total.toLocaleString()}</span>
+      <span className="grow" />
+      <select className="lg-mini" value={size} onChange={e => onSize(Number(e.target.value))} aria-label="Rows per page">{PAGE_SIZES.map(n => <option key={n} value={n}>{n} / page</option>)}</select>
+      <button type="button" onClick={() => onPage(page - 1)} disabled={page === 0} aria-label="Previous page">‹</button>
+      {nums.map((n, i) => n === '…' ? <span key={`e${i}`} className="muted">…</span> : <button type="button" key={n} className={n === page ? 'on' : ''} aria-current={n === page ? 'page' : undefined} onClick={() => onPage(n)}>{n + 1}</button>)}
+      <button type="button" onClick={() => onPage(page + 1)} disabled={page >= pages - 1} aria-label="Next page">›</button>
+    </nav>
+  );
+}
+/** Slices `rows` into pages. The page resets whenever `resetKey` (filters, namespace) or the page size changes. */
+function usePaged<T>(rows: T[], resetKey: string, initial = 25) {
+  const [page, setPage] = useState(0);
+  const [size, setSize] = useState(() => { try { const v = Number(localStorage.getItem('smw_k8s_page')); return PAGE_SIZES.includes(v) ? v : initial; } catch { return initial; } });
+  useEffect(() => setPage(0), [resetKey, size]);
+  const pages = Math.max(1, Math.ceil(rows.length / size));
+  const current = Math.min(page, pages - 1);
+  const chooseSize = (n: number) => { setSize(n); try { localStorage.setItem('smw_k8s_page', String(n)); } catch { /* ignore */ } };
+  return { rows: rows.slice(current * size, current * size + size), pager: <Pager page={current} pages={pages} size={size} total={rows.length} onPage={setPage} onSize={chooseSize} /> };
+}
+
+/* ---------------------------------------------------------------- side panels: any object with what is related to it */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type Obj = { [key: string]: any };
+type SvcRow = { ns: string; name: string; type: string; cluster_ip: string; external: string[]; ports: string[]; selector?: Record<string, string> };
+type Link = { kind: string; name: string; ns: string; relation?: string };
+type Related = { object: Obj; events: Ev[]; pods?: Pod[]; services?: SvcRow[]; links?: Link[]; selector?: string };
+export type Target = { resource: string; ns: string; name: string };
+const RESOURCE_OF: Record<string, string> = { Pod: 'pod', Deployment: 'deployment', StatefulSet: 'statefulset', DaemonSet: 'daemonset', Job: 'job', CronJob: 'cronjob', Service: 'service', Ingress: 'ingress',
+  PersistentVolumeClaim: 'pvc', HorizontalPodAutoscaler: 'hpa', Node: 'node', Namespace: 'namespace' };
+const LABEL_OF: Record<string, string> = { pod: 'Pod', deployment: 'Deployment', statefulset: 'StatefulSet', daemonset: 'DaemonSet', job: 'Job', cronjob: 'CronJob', service: 'Service', ingress: 'Ingress', pvc: 'Volume claim', hpa: 'Autoscaler', node: 'Node', namespace: 'Namespace' };
+
+/** Asks the agent for an object plus everything related to it. Agents older than 1.2 only know `describe`: then the panel shows the
+ *  object and its events, and says what the update would add. */
+function useRelated(cluster: Cluster, target: Target) {
+  const [legacy, setLegacy] = useState(false);
+  const r = useCluster<Related>(cluster.id, { kind: legacy ? 'describe' : 'related', resource: target.resource, namespace: target.ns, name: target.name }, [target.resource, target.ns, target.name, legacy], 1);
+  useEffect(() => { if (!legacy && /unknown query kind/i.test(r.error)) setLegacy(true); }, [r.error, legacy]);
+  return { ...r, legacy };
+}
+
+function EventList({ events, empty }: { events: Ev[]; empty: string }) {
+  const [all, setAll] = useState(false);
+  if (!events.length) return <p className="muted sm">{empty}</p>;
+  return <>{(all ? events : events.slice(0, 10)).map((e, i) => (
+    <div key={i} className="evt"><span className={`evt-dot ${e.type === 'Warning' ? 'warn' : ''}`} /><div><b className={e.type === 'Warning' ? 'warn' : ''}>{e.reason}</b> <span className="muted sm">{e.object ? `${e.object} · ` : ''}{timeAgo(e.last)}{e.count > 1 ? ` ×${e.count}` : ''}</span><div className="sm">{e.message}</div></div></div>))}
+    {events.length > 10 && <button className="ssh-more" onClick={() => setAll(!all)}>{all ? 'See less' : `See all ${events.length} events`}</button>}</>;
+}
+
+/** Pods, services and linked objects of a panel. Every row opens its own panel. */
+function RelatedBlock({ data, open, self }: { data: Related; open: (t: Target) => void; self: Target }) {
+  const pods = data.pods ?? [];
+  const paged = usePaged(pods, `${self.resource}/${self.ns}/${self.name}`, 10);
+  const links = (data.links ?? []).filter(l => l.name);
+  return <>
+    {links.length > 0 && <><h3 className="drawer-h">Connected to</h3><div className="rel-links">
+      {links.map((l, i) => { const res = RESOURCE_OF[l.kind]; return res
+        ? <button key={i} type="button" className="rel-link" onClick={() => open({ resource: res, ns: l.ns, name: l.name })}><small>{l.relation ?? l.kind}</small><b>{l.kind}</b> {l.name}</button>
+        : <span key={i} className="rel-link static"><small>{l.relation ?? l.kind}</small><b>{l.kind}</b> {l.name}</span>; })}
+    </div></>}
+    {self.resource !== 'pod' && data.pods && <><h3 className="drawer-h">Pods <span className="tag">{pods.length}</span>{data.selector ? <span className="muted mono sm" style={{ textTransform: 'none', letterSpacing: 0, marginLeft: 8 }}>{data.selector}</span> : null}</h3>
+      {pods.length === 0 ? <p className="muted sm">No pods {self.resource === 'pvc' ? 'use this claim' : 'match'}.</p> : <>
+        <table className="tbl ktbl"><thead><tr><th>Pod</th><th>Status</th><th>Ready</th><th className="num">Restarts</th><th className="hide-sm">Node</th></tr></thead><tbody>
+          {paged.rows.map(p => <tr key={p.name} className="click" onClick={() => open({ resource: 'pod', ns: p.ns, name: p.name })}><td className="trunc" style={{ maxWidth: 220 }} title={p.name}><b>{p.name}</b></td>
+            <td><span className={`kstatus ${podTone(p.status)}`}><i />{p.status}</span></td><td className="sm">{p.ready}</td><td className="num">{p.restarts || <span className="muted">0</span>}</td><td className="sm hide-sm trunc" style={{ maxWidth: 120 }}>{p.node}</td></tr>)}
+        </tbody></table>{paged.pager}</>}</>}
+    {(data.services ?? []).length > 0 && <><h3 className="drawer-h">Services sending traffic here</h3>
+      {(data.services ?? []).map(s => <button key={s.name} type="button" className="rel-row" onClick={() => open({ resource: 'service', ns: s.ns, name: s.name })}><b>{s.name}</b><span className="muted sm">{s.type} · {s.cluster_ip || 'no IP'}</span><span className="mono sm">{s.ports.join(', ')}</span></button>)}</>}
+  </>;
+}
+
+const cond = (o: Obj) => ((o.status?.conditions ?? []) as { type: string; status: string; reason?: string; message?: string }[]);
+const fmtSel = (sel?: Record<string, string>) => (sel && Object.keys(sel).length ? Object.entries(sel).map(([k, v]) => `${k}=${v}`).join(', ') : '–');
+/** The few facts that matter for each kind of object, in plain words. */
+function factsFor(resource: string, o: Obj): [string, ReactNode][] {
+  const spec = o.spec ?? {}, st = o.status ?? {};
+  const images = (spec.template?.spec?.containers ?? spec.jobTemplate?.spec?.template?.spec?.containers ?? []).map((c: Obj) => c.image).join(', ') || '–';
+  const created: [string, ReactNode] = ['Created', o.metadata?.creationTimestamp ? timeAgo(o.metadata.creationTimestamp) : '–'];
+  switch (resource) {
+    case 'deployment': return [['Replicas', `${st.readyReplicas ?? 0} ready / ${spec.replicas ?? 0} wanted`], ['Up to date', st.updatedReplicas ?? 0], ['Available', st.availableReplicas ?? 0], ['Strategy', spec.strategy?.type ?? '–'], ['Revision', o.metadata?.annotations?.['deployment.kubernetes.io/revision'] ?? '–'], created, ['Images', <span className="mono" key="i">{images}</span>]];
+    case 'statefulset': return [['Replicas', `${st.readyReplicas ?? 0} ready / ${spec.replicas ?? 0} wanted`], ['Service', spec.serviceName ?? '–'], ['Update strategy', spec.updateStrategy?.type ?? '–'], ['Volume templates', (spec.volumeClaimTemplates ?? []).map((v: Obj) => v.metadata?.name).join(', ') || '–'], created, ['Images', <span className="mono" key="i">{images}</span>]];
+    case 'daemonset': return [['Scheduled', `${st.currentNumberScheduled ?? 0} / ${st.desiredNumberScheduled ?? 0} nodes`], ['Ready', st.numberReady ?? 0], ['Unavailable', st.numberUnavailable ?? 0], ['Misscheduled', st.numberMisscheduled ?? 0], created, ['Images', <span className="mono" key="i">{images}</span>]];
+    case 'job': return [['Succeeded', `${st.succeeded ?? 0}${spec.completions ? ` / ${spec.completions}` : ''}`], ['Failed', st.failed ?? 0], ['Active', st.active ?? 0], ['Started', st.startTime ? timeAgo(st.startTime) : '–'], ['Finished', st.completionTime ? timeAgo(st.completionTime) : '–'], ['Images', <span className="mono" key="i">{images}</span>]];
+    case 'cronjob': return [['Schedule', <span className="mono" key="s">{spec.schedule}</span>], ['Suspended', spec.suspend ? 'yes' : 'no'], ['Last run', st.lastScheduleTime ? timeAgo(st.lastScheduleTime) : 'never'], ['Last success', st.lastSuccessfulTime ? timeAgo(st.lastSuccessfulTime) : '–'], ['Running now', (st.active ?? []).length], ['Images', <span className="mono" key="i">{images}</span>]];
+    case 'service': return [['Type', spec.type ?? 'ClusterIP'], ['Cluster IP', <span className="mono" key="c">{spec.clusterIP ?? '–'}</span>], ['External', <span className="mono" key="e">{[...((st.loadBalancer?.ingress ?? []).map((i: Obj) => i.ip || i.hostname)), ...(spec.externalIPs ?? [])].join(', ') || '–'}</span>],
+      ['Ports', <span className="mono" key="p">{(spec.ports ?? []).map((p: Obj) => `${p.name ? `${p.name} ` : ''}${p.port}→${p.targetPort ?? p.port}/${p.protocol ?? 'TCP'}${p.nodePort ? ` (node ${p.nodePort})` : ''}`).join(', ') || '–'}</span>], ['Selector', <span className="mono" key="s">{fmtSel(spec.selector)}</span>], ['Session affinity', spec.sessionAffinity ?? '–'], created];
+    case 'ingress': return [['Class', spec.ingressClassName ?? '–'], ['Hosts', (spec.rules ?? []).map((r: Obj) => r.host ?? '*').join(', ') || '–'], ['TLS', (spec.tls ?? []).flatMap((t: Obj) => t.hosts ?? []).join(', ') || 'none'], ['Address', (st.loadBalancer?.ingress ?? []).map((i: Obj) => i.ip || i.hostname).join(', ') || '–'], created];
+    case 'pvc': return [['Status', st.phase ?? '–'], ['Capacity', st.capacity?.storage ?? spec.resources?.requests?.storage ?? '–'], ['Storage class', spec.storageClassName ?? '–'], ['Access', (spec.accessModes ?? []).join(', ') || '–'], ['Volume', <span className="mono" key="v">{spec.volumeName ?? '–'}</span>], created];
+    case 'hpa': return [['Replicas', `${st.currentReplicas ?? 0} now · wants ${st.desiredReplicas ?? 0} · ${spec.minReplicas ?? 1}–${spec.maxReplicas}`], ['Target', `${spec.scaleTargetRef?.kind}/${spec.scaleTargetRef?.name}`], ['Last scaled', st.lastScaleTime ? timeAgo(st.lastScaleTime) : '–'], created];
+    case 'node': return [['Kubelet', st.nodeInfo?.kubeletVersion ?? '–'], ['OS', st.nodeInfo?.osImage ?? '–'], ['Runtime', st.nodeInfo?.containerRuntimeVersion ?? '–'], ['CPU', st.allocatable?.cpu ?? '–'], ['Memory', st.allocatable?.memory ?? '–'], ['Pods', st.allocatable?.pods ?? '–'], ['Address', (st.addresses ?? []).map((a: Obj) => a.address).join(', ')], ['Unschedulable', spec.unschedulable ? 'yes (cordoned)' : 'no']];
+    default: return [created];
+  }
+}
+
+function ResourceDrawer({ cluster, target, onClose, onBack, open }: { cluster: Cluster; target: Target; onClose: () => void; onBack?: () => void; open: (t: Target) => void }) {
+  const d = useRelated(cluster, target);
+  const { toast } = useApp();
+  const [showObject, setShowObject] = useState(false);
+  const o = d.data?.data?.object;
+  const problems = o ? cond(o).filter(c => (['Ready', 'Available', 'Progressing', 'Complete'].includes(c.type) ? c.status === 'False' : ['Failed', 'ReplicaFailure', 'MemoryPressure', 'DiskPressure', 'PIDPressure', 'NetworkUnavailable'].includes(c.type) && c.status === 'True')) : [];
+  return (
+    <aside className="drawer" role="dialog" aria-modal="true" aria-label={`${LABEL_OF[target.resource]} ${target.name}`}>
+      <div className="drawer-head">
+        {onBack && <button className="btn ghost sm" onClick={onBack} aria-label="Back"><Icon name="back" size={15} /></button>}
+        <div style={{ minWidth: 0 }}><div className="sm muted">{LABEL_OF[target.resource] ?? target.resource}{target.ns && <> · <span className="nschip">{target.ns}</span></>}</div><h2 className="trunc" title={target.name}>{target.name}</h2></div>
+        <span className="grow" /><button className="btn ghost sm" onClick={onClose} aria-label="Close"><Icon name="x" /></button>
+      </div>
+      <div className="drawer-actions">
+        {problems.length ? <span className="kstatus bad"><i />{problems.map(c => c.type).join(', ')}</span> : o ? <span className="kstatus ok"><i />Healthy</span> : null}
+        <button className="btn sm" onClick={() => { void navigator.clipboard?.writeText(`kubectl${target.ns ? ` -n ${target.ns}` : ''} describe ${target.resource === 'pvc' ? 'pvc' : target.resource} ${target.name}`); toast('kubectl command copied'); }}>Copy kubectl describe</button>
+      </div>
+      <div className="drawer-body">
+        <Loading busy={d.busy && !d.data} error={d.legacy ? '' : d.error} retry={d.reload} />
+        {d.legacy && <p className="sm warn">The cluster agent is older than 1.2, so related pods and services are not shown. Update it from the cluster&apos;s Overview.</p>}
+        {o && <>
+          <div className="facts">{factsFor(target.resource, o).map(([k, v]) => <div key={k}><small>{k}</small><b>{v}</b></div>)}</div>
+          {problems.length > 0 && <><h3 className="drawer-h">Problems</h3>{problems.map(c => <div key={c.type} className="sm" style={{ marginBottom: 6 }}><b className="bad">{c.type}</b> {c.reason}{c.message ? `: ${c.message}` : ''}</div>)}</>}
+          <RelatedBlock data={d.data!.data!} open={open} self={target} />
+          <h3 className="drawer-h">Events</h3>
+          <EventList events={d.data?.data?.events ?? []} empty={target.resource === 'pod' ? 'No events for this pod.' : 'No events for this object or its pods (Kubernetes keeps events for about an hour).'} />
+          {o.metadata?.labels && Object.keys(o.metadata.labels).length > 0 && <><h3 className="drawer-h">Labels</h3><div className="chips">{Object.entries(o.metadata.labels as Record<string, string>).slice(0, 16).map(([k, v]) => <span key={k} className="chip mono" title={`${k}=${v}`}>{k.split('/').pop()}={v.length > 24 ? `${v.slice(0, 22)}…` : v}</span>)}</div></>}
+          <div style={{ marginTop: 14 }}><button className="btn sm" onClick={() => setShowObject(!showObject)}>{showObject ? 'Hide' : 'Show'} full object (secret values removed)</button></div>
+          {showObject && <pre className="codebox" style={{ maxHeight: 420, overflow: 'auto', whiteSpace: 'pre-wrap', marginTop: 8 }}>{JSON.stringify(o, null, 2)}</pre>}
+        </>}
+      </div>
+    </aside>
   );
 }
 

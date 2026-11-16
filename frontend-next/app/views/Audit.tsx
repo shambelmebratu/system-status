@@ -7,7 +7,7 @@ import { usePoll } from '../lib/app';
 import { timeAgo } from '../lib/format';
 import { ROLE_INFO, type AuditEvent, type Role } from '../lib/types';
 
-const CATEGORIES = [['', 'Everything'], ['auth', 'Sign-ins & passwords'], ['user', 'Users & roles'], ['agent', 'Agents'], ['enroll', 'Install links'], ['server', 'Servers & tokens'], ['logs', 'Log access'], ['k8s', 'Kubernetes'], ['purge', 'Data purges'], ['channel', 'Alert channels'], ['service', 'Service monitors'], ['schedule', 'Scheduled messages']];
+const CATEGORIES = [['', 'Everything'], ['auth', 'Sign-ins & passwords'], ['user', 'Users & roles'], ['agent', 'Agents'], ['enroll', 'Install links'], ['server', 'Servers & tokens'], ['logs', 'Log access'], ['k8s', 'Kubernetes'], ['purge', 'Data purges'], ['channel', 'Alert channels'], ['service', 'Service monitors'], ['schedule', 'Scheduled messages'], ['db', 'Databases']];
 
 const LABELS: Record<string, string> = {
   'auth.login': 'Sign-in', 'auth.logout': 'Sign-out', 'auth.password_change': 'Password change', 'auth.email_change': 'Email change',
@@ -20,6 +20,8 @@ const LABELS: Record<string, string> = {
   'k8s.logs.read': 'Pod logs viewed', 'k8s.logs.denied': 'Pod logs blocked', 'k8s.log_policy': 'Cluster log policy changed',
   'service.create': 'Service monitor added', 'service.update': 'Service monitor changed', 'service.delete': 'Service monitor deleted', 'channel.test': 'Channel test sent',
   'schedule.create': 'Scheduled message added', 'schedule.update': 'Scheduled message changed', 'schedule.delete': 'Scheduled message deleted', 'schedule.send_now': 'Scheduled message sent now',
+  'db.connection_create': 'Database connected', 'db.connection_update': 'Database connection changed', 'db.connection_delete': 'Database connection removed',
+  'db.report': 'Database report generated', 'db.report_save': 'Database report saved', 'db.report_delete': 'Database report deleted',
   'purge.settings': 'Retention changed', 'purge.manual': 'Manual purge', 'purge.scheduled': 'Scheduled purge',
   'channel.create': 'Channel added', 'channel.update': 'Channel edited', 'channel.delete': 'Channel removed',
 };

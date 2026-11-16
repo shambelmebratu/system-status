@@ -63,6 +63,16 @@ class ServiceCreate(AlertPrefs):
     enabled: bool = True
     public: bool = False
     server_id: int | None = None
+    timeout_seconds: int | None = Field(default=None, ge=1, le=120)           # null = SERVICE_TIMEOUT_SECONDS
+    cert_check: bool = True                                                    # https only: watch the certificate's expiry date
+    cert_alert_days: list[int] = Field(default_factory=list, max_length=8)     # e.g. [30, 14, 7]; empty = CERT_ALERT_DAYS
+
+    @field_validator("cert_alert_days")
+    @classmethod
+    def valid_days(cls, v: list[int]) -> list[int]:
+        if any(d < 1 or d > 365 for d in v):
+            raise ValueError("Certificate alert days must be between 1 and 365")
+        return sorted(set(v), reverse=True)
 
 
 class ChannelCreate(BaseModel):

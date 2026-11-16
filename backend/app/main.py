@@ -19,6 +19,7 @@ from .agent_versions import latest_k8s_agent, latest_server_agent
 from .monitoring import alert_columns, server_addresses, check_service, discover_telegram_chats, run_once, send_channel_test
 from .routes_agent import hash_token, router as agent_router
 from .routes_audit import router as audit_router
+from .routes_db import router as db_router
 from .routes_enroll import router as enroll_router
 from .routes_k8s import router as k8s_router
 from .routes_logs import router as logs_router
@@ -124,6 +125,7 @@ app.include_router(retention_router)
 app.include_router(performance_router)
 app.include_router(users_router)
 app.include_router(audit_router)
+app.include_router(db_router)
 app.include_router(stats_router)
 
 
@@ -150,8 +152,14 @@ def guard_target(check, value: str, label: str) -> None:
 
 def serialize(item):
     result = {column.name: getattr(item, column.name) for column in item.__table__.columns}
-    for key in ("created_at", "last_checked_at", "last_seen_at"):
-        if result.get(key): result[key] = result[key].isoformat()
+    for key in ("created_at", "last_checked_at", "last_seen_at", "cert_expires_at", "cert_checked_at"):
+        if result.get(key): result[key] = (result[key] if result[key].tzinfo else result[key].replace(tzinfo=timezone.utc)).isoformat()
+    if "cert_alert_days" in result:   # services: the effective certificate alert schedule and timeout
+        from .monitoring import cert_thresholds, service_timeout
+        result["cert_alert_days"] = [int(d) for d in (result["cert_alert_days"] or "").split(",") if d.strip().isdigit()]
+        result["cert_alert_days_effective"] = cert_thresholds(item)
+        result["timeout_seconds_effective"] = service_timeout(item)
+        result.pop("cert_alerted", None)
     result.pop("token_hash", None)
     if "last_agent_ip" in result and "monitor_mode" in result:   # servers: public and private addresses, resolved on the server
         result.update(server_addresses(item))
@@ -336,6 +344,7 @@ def dashboard(user: dict = Depends(require_user), db: Session = Depends(get_db))
         "agents": {"latest": latest_server_agent(), "latest_k8s": latest_k8s_agent()},
         "limits": {
             "reminder_minutes": settings.reminder_minutes, "usage_warn_percent": settings.usage_warn_percent, "usage_bad_percent": settings.usage_bad_percent, "k8s_offline_seconds": settings.k8s_offline_seconds,
+            "service_timeout_seconds": settings.service_timeout_seconds, "cert_alert_days": settings.cert_alert_days, "cert_check_hours": settings.cert_check_hours,
             "enrollment_default_minutes": settings.enrollment_default_minutes, "enrollment_max_minutes": settings.enrollment_max_minutes, "log_result_ttl_minutes": settings.log_result_ttl_minutes,
         },
         "summary": {"servers": len(servers), "services": len(services), "up": statuses.count("up"), "alerts": sum(value in ("alert", "down", "degraded") for value in statuses), "open_incidents": open_incidents},
@@ -528,11 +537,17 @@ def delete_server(item_id: int, request: Request, user: dict = Depends(require_u
     return {"deleted": True}
 
 
+def service_values(payload: ServiceCreate) -> dict:
+    values = payload.model_dump()
+    values["cert_alert_days"] = ",".join(str(d) for d in values["cert_alert_days"]) or None
+    return values
+
+
 @app.post("/api/services")
 def create_service(payload: ServiceCreate, request: Request, user: dict = Depends(require_unrestricted), db: Session = Depends(get_db)) -> dict:
     guard_target(validate_url, payload.url, "URL")
     if payload.server_id is not None and not db.get(Server, payload.server_id): raise HTTPException(404, "Server not found")
-    item = Service(**alert_settings(payload.model_dump(), "service", db)); db.add(item); db.flush()
+    item = Service(**alert_settings(service_values(payload), "service", db)); db.add(item); db.flush()
     audit(db, request, "service.create", user=user, target=f"service:{item.id}", detail=item.name)
     db.commit(); db.refresh(item); return serialize(item)
 
@@ -543,8 +558,12 @@ def update_service(item_id: int, payload: ServiceCreate, request: Request, user:
     item = db.get(Service, item_id)
     if not item:
         raise HTTPException(404, "Service monitor not found")
-    values = payload.model_dump()
+    values = service_values(payload)
     guard_target(validate_url, payload.url, "URL")
+    if values["url"] != item.url or not values["cert_check"]:   # another address: forget the old certificate and its alerts
+        item.cert_expires_at = item.cert_issuer = item.cert_subject = item.cert_checked_at = item.cert_error = item.cert_alerted = None
+    if values["cert_alert_days"] != item.cert_alert_days:
+        item.cert_alerted = None
     if values["server_id"] is not None and (not db.get(Server, values["server_id"]) or not can_see(user, "server", values["server_id"])):
         raise HTTPException(404, "Server not found")
     for key, value in alert_settings(values, "service", db).items():

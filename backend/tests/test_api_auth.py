@@ -2057,3 +2057,122 @@ def test_ssh_activity_requests(client):
     delivered = anon.post("/api/agent/report", json=report(capabilities=["ssh"]), headers=auth).json()["log_policy"]
     assert delivered["ssh"] == {"enabled": True, "history": False}
     assert client.get("/api/dashboard").json()["servers"][[s["id"] for s in client.get("/api/dashboard").json()["servers"]].index(sid)]["last_metrics"].get("ssh_sessions") in (None, 3)
+
+
+# ---------------------------------------------------------------------------------------------------------------- service timeout + certificates
+def test_service_timeout_marks_slow_answers_failed(client, monkeypatch):
+    import http.server, threading, time as _t
+    from app import netguard
+    m = _setup_monitoring()
+
+    class Slow(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+        def do_GET(self):
+            _t.sleep(1.5 if self.path == "/slow" else 0)
+            self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Slow)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setattr(netguard, "_ip_blocked", lambda ip: None)          # the test server is on loopback
+    try:
+        base = f"http://127.0.0.1:{server.server_port}"
+        fast = m.Service(name="fast", url=base + "/", expected_status=200, timeout_seconds=1, cert_check=True)
+        slow = m.Service(name="slow", url=base + "/slow", expected_status=200, timeout_seconds=1, cert_check=True)
+        assert m.probe_service(fast)["status"] == "up" and "cert" not in m.probe_service(fast)          # http: no certificate to read
+        r = m.probe_service(slow)
+        assert r["status"] == "down" and "Timed out" in r["error"] and "1 s" in r["error"]
+        slow.timeout_seconds = 5
+        assert m.probe_service(slow)["status"] == "up"
+    finally:
+        server.shutdown()
+
+
+def test_certificate_alert_schedule(client, monkeypatch):
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    sign_in(client)
+    m = _setup_monitoring()
+    sent = []
+    monkeypatch.setattr(m, "queue_event", lambda session, kind, target, severity, message, deliver, state=None: sent.append((state, severity, message)))
+    sid = client.post("/api/services", headers=CSRF, json={"name": "shop", "url": "https://shop.example.com", "cert_alert_days": [7, 30, 14, 30]}).json()
+    assert sid["cert_alert_days"] == [30, 14, 7] and sid["timeout_seconds_effective"] == 10
+    with database.SessionLocal() as db:
+        svc = db.get(m.Service, sid["id"])
+        now = _dt.now(_tz.utc)
+        cert = lambda days: {"cert": {"expires_at": now + _td(days=days, hours=1), "issuer": "Let's Encrypt (R11)", "subject": "shop.example.com", "names": ["shop.example.com"], "host_matches": True}}
+        m.apply_certificate(db, svc, cert(60)); assert sent == []                        # far away: nothing
+        m.apply_certificate(db, svc, cert(29)); m.apply_certificate(db, svc, cert(28))     # crosses 30 once
+        m.apply_certificate(db, svc, cert(13)); m.apply_certificate(db, svc, cert(6))
+        m.apply_certificate(db, svc, cert(5))
+        assert [s[0] for s in sent] == ["cert", "cert", "cert"] and "expires in 29 days" in sent[0][2] and "expires in 6 days" in sent[2][2]
+        m.apply_certificate(db, svc, cert(-1)); m.apply_certificate(db, svc, cert(-2))     # expired: one critical alert
+        assert sent[-1][0] == "cert_expired" and sent[-1][1] == "critical" and len(sent) == 4
+        m.apply_certificate(db, svc, cert(89))                                              # renewed
+        assert sent[-1][0] == "cert_renewed" and svc.cert_alerted is None and len(sent) == 5
+        m.apply_certificate(db, svc, {"cert_error": "connection refused"})
+        assert svc.cert_error == "connection refused" and svc.cert_expires_at is not None   # last known expiry is kept
+        db.commit()
+    page = client.get(f"/api/services/{sid['id']}").json() if client.get(f"/api/services/{sid['id']}").status_code == 200 else next(s for s in client.get("/api/dashboard").json()["services"] if s["id"] == sid["id"])
+    assert page["cert_issuer"] == "Let's Encrypt (R11)" and page["cert_expires_at"].endswith("+00:00") and "cert_alerted" not in page
+    assert m.event_category("cert") == "alert" and m.event_category("cert_renewed") == "recovered"
+    bad = client.post("/api/services", headers=CSRF, json={"name": "x", "url": "https://x.example.com", "cert_alert_days": [400]})
+    assert bad.status_code == 422
+
+
+def test_reads_a_real_certificate():
+    from app.netguard import BlockedTargetError, fetch_certificate
+    try:
+        cert = fetch_certificate("https://example.com", timeout=8)
+    except OSError:
+        pytest.skip("no network")
+    assert cert["expires_at"] > cert["starts_at"] and cert["host_matches"] and cert["issuer"]
+    with pytest.raises(BlockedTargetError):
+        fetch_certificate("https://127.0.0.1")
+    with pytest.raises(ValueError):
+        fetch_certificate("http://example.com")
+
+
+# ---------------------------------------------------------------------------------------------------------------- databases
+def test_database_section_is_admin_only_and_keeps_passwords(client, monkeypatch):
+    from app import dbinspect, routes_db
+    sign_in(client)
+    body = {"name": "ERP", "engine": "postgresql", "host": "db.example.com", "database": "erp", "username": "report_ro", "password": "s3cret-pass", "schemas": ["public"]}
+    for bad, msg in (({**body, "host": "127.0.0.1"}, "loopback"), ({**body, "host": "postgres"}, "not allowed"), ({**body, "engine": "oracle"}, ""), ({**body, "schemas": ["a;b"]}, "")):
+        r = client.post("/api/databases", headers=CSRF, json=bad)
+        assert r.status_code == 422 and msg in r.text, bad
+    created = client.post("/api/databases", headers=CSRF, json=body).json()
+    assert created["port"] == 5432 and created["has_password"] and "password" not in created and "s3cret" not in json.dumps(client.get("/api/databases").json())
+    cid = created["id"]
+
+    # the real database is replaced by an inspector over a fixed schema
+    T = dbinspect.Table
+    tables = [T("public", "customers", columns=[dbinspect.Column("id", "integer", False, pk=True), dbinspect.Column("password_hash", "text", True)]),
+              T("public", "orders", columns=[dbinspect.Column("id", "integer", False, pk=True), dbinspect.Column("customer_id", "integer", True)])]
+    rels = [dbinspect.Relation("fk", "public.orders", ["customer_id"], "public.customers", ["id"])]
+    used = []
+
+    class Fake:
+        engine = "postgresql"
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def server_version(self): return "16.2"
+        def schema(self): return tables, rels
+    monkeypatch.setattr(dbinspect, "open_inspector", lambda c: used.append(c.password) or Fake())
+    monkeypatch.setattr(dbinspect, "build_report", lambda insp, t, r, sel, n, title: {"title": title, "tables": sel})
+    s = client.get(f"/api/databases/{cid}/schema").json()
+    assert [t["key"] for t in s["tables"]] == ["public.customers", "public.orders"] and s["relations"][0]["to"] == "public.customers"
+    assert next(c for c in s["tables"][0]["columns"] if c["name"] == "password_hash")["sensitive"] is True
+    assert used == ["s3cret-pass"] and client.get("/api/databases").json()[0]["server_version"] == "16.2"
+    rep = client.post(f"/api/databases/{cid}/report", headers=CSRF, json={"selection": [{"table": "public.orders", "columns": ["id"]}], "sample_rows": 3, "title": "Orders"})
+    assert rep.status_code == 200 and rep.json()["database"]["name"] == "ERP"
+    # editing with a blank password keeps it; testing an existing connection uses the stored one
+    client.put(f"/api/databases/{cid}", headers=CSRF, json={**body, "password": "", "name": "ERP prod"})
+    assert client.post("/api/databases/test", headers=CSRF, json={**body, "password": "", "id": cid}).json()["tables"] == 2 and used[-1] == "s3cret-pass"
+    rid = client.post(f"/api/databases/{cid}/reports", headers=CSRF, json={"name": "Weekly", "selection": [{"table": "public.orders"}]}).json()["id"]
+    assert client.get(f"/api/databases/{cid}/reports").json()[0]["name"] == "Weekly"
+    assert {"db.connection_create", "db.report", "db.report_save"} <= {e["action"] for e in client.get("/api/audit?category=db").json()}
+
+    make_user(client, "db-op@example.com", "operator")
+    op = session_for("db-op@example.com", new_password="operator-pass-12345")
+    for method, path in (("get", "/api/databases"), ("get", f"/api/databases/{cid}/schema"), ("post", f"/api/databases/{cid}/report"), ("delete", f"/api/db-reports/{rid}")):
+        assert getattr(op, method)(path, headers=CSRF, **({"json": {"selection": [{"table": "public.orders"}]}} if method == "post" else {})).status_code == 403, path
+    assert client.delete(f"/api/databases/{cid}", headers=CSRF).status_code == 200 and client.get("/api/databases").json() == []

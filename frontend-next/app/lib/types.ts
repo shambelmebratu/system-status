@@ -21,6 +21,8 @@ export type Service = {
   server_id: number | null; last_status: Status; last_checked_at: string | null; last_latency_ms: number | null;
   last_http_status: number | null; last_error: string | null; uptime_24h: number | null;
   alert_events?: string[]; alert_channels?: number[]; alert_reminder_minutes?: number | null;
+  timeout_seconds?: number | null; timeout_seconds_effective?: number; cert_check?: boolean; cert_alert_days?: number[]; cert_alert_days_effective?: number[];
+  cert_expires_at?: string | null; cert_issuer?: string | null; cert_subject?: string | null; cert_checked_at?: string | null; cert_error?: string | null;
 };
 export type ChannelType = 'telegram' | 'webhook' | 'slack' | 'whatsapp';
 export type Channel = { id: number; name: string; type: ChannelType; token: string; chat_id?: string; endpoint?: string; phone_number_id?: string; template_name?: string; enabled: boolean; notify_kinds?: string[]; notify_events?: string[] };
@@ -33,7 +35,7 @@ export type Dashboard = {
   servers: Server[]; services: Service[]; events: AlertEvent[];
   threshold_defaults: { cpu: number; memory: number; disk: number; load: number; swap: number; process: number; server_interval_seconds: number };
   agents?: { latest: string; latest_k8s: string };
-  limits?: { reminder_minutes: number; usage_warn_percent: number; usage_bad_percent: number; k8s_offline_seconds: number; enrollment_default_minutes: number; enrollment_max_minutes: number; log_result_ttl_minutes: number };
+  limits?: { reminder_minutes: number; usage_warn_percent: number; usage_bad_percent: number; k8s_offline_seconds: number; enrollment_default_minutes: number; enrollment_max_minutes: number; log_result_ttl_minutes: number; service_timeout_seconds?: number; cert_alert_days?: string; cert_check_hours?: number };
   summary: { servers: number; services: number; up: number; alerts: number; open_incidents: number };
 };
 export type Point = { t: string; [key: string]: number | string | undefined };

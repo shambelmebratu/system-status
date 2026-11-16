@@ -85,6 +85,16 @@ class Service(Base):
     perf_percentile: Mapped[str | None] = mapped_column(String(4))     # p50 | p95 | p99
     perf_threshold_ms: Mapped[int | None] = mapped_column(Integer)
     perf_window_minutes: Mapped[int | None] = mapped_column(Integer)   # NULL = PERF_DEFAULT_WINDOW_MINUTES
+    timeout_seconds: Mapped[int | None] = mapped_column(Integer)       # a slower answer is a failed check; NULL = SERVICE_TIMEOUT_SECONDS
+    # TLS certificate expiry (https only): checked every CERT_CHECK_HOURS, alerts at each of cert_alert_days (NULL = CERT_ALERT_DAYS)
+    cert_check: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    cert_alert_days: Mapped[str | None] = mapped_column(String(60))     # "30,14,7"
+    cert_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cert_issuer: Mapped[str | None] = mapped_column(String(200))
+    cert_subject: Mapped[str | None] = mapped_column(String(300))
+    cert_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cert_error: Mapped[str | None] = mapped_column(Text)
+    cert_alerted: Mapped[int | None] = mapped_column(Integer)          # the smallest threshold already alerted for this certificate (-1 = expired)
     fail_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     last_status: Mapped[str] = mapped_column(String(20), default="unknown")
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -332,3 +342,36 @@ class AppSetting(Base):
     value: Mapped[str] = mapped_column(Text, default="{}")
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
     updated_by: Mapped[str | None] = mapped_column(String(320))
+
+
+class DbConnection(Base):
+    """A database an admin connected for the Database section (schema graph and data reports). Read-only access only."""
+    __tablename__ = "db_connections"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100))
+    engine: Mapped[str] = mapped_column(String(20))                 # postgresql | mysql
+    host: Mapped[str] = mapped_column(String(255))
+    port: Mapped[int] = mapped_column(Integer)
+    database: Mapped[str] = mapped_column(String(128))
+    username: Mapped[str] = mapped_column(String(128))
+    password: Mapped[str | None] = mapped_column(EncryptedText)      # never sent back to the browser
+    ssl_mode: Mapped[str] = mapped_column(String(20), default="prefer")
+    schemas: Mapped[str | None] = mapped_column(String(500))          # comma-separated; empty = every non-system schema
+    created_by: Mapped[str | None] = mapped_column(String(320))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    last_ok_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    server_version: Mapped[str | None] = mapped_column(String(60))
+
+
+class DbReport(Base):
+    """A saved report definition: which tables and columns. The data itself is read fresh each time it is opened."""
+    __tablename__ = "db_reports"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    connection_id: Mapped[int] = mapped_column(ForeignKey("db_connections.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    selection: Mapped[str] = mapped_column(Text)                       # JSON [{"table": "schema.name", "columns": [...]}]
+    sample_rows: Mapped[int] = mapped_column(Integer, default=0)
+    created_by: Mapped[str | None] = mapped_column(String(320))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)

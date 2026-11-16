@@ -73,3 +73,57 @@ def test_plain_http_to_the_internet_is_refused(k8s, monkeypatch):
     assert k8s.insecure_url_problem()
     monkeypatch.setattr(k8s, "SMWATCH_URL", "https://monitor.example.com")
     assert not k8s.insecure_url_problem()
+
+
+def _fake_cluster(k8s, monkeypatch):
+    pod = lambda name, labels, owner=None, claim=None: {"metadata": {"name": name, "namespace": "erp", "labels": labels, "ownerReferences": [owner] if owner else []},
+                                                         "spec": {"nodeName": "node-1", "containers": [{"name": "app", "image": "erp:1"}], "volumes": [{"name": "d", "persistentVolumeClaim": {"claimName": claim}}] if claim else []},
+                                                         "status": {"phase": "Running", "containerStatuses": [{"name": "app", "ready": True, "restartCount": 0, "state": {"running": {}}}]}}
+    objects = {
+        "/apis/apps/v1/namespaces/erp/deployments/api": {"metadata": {"name": "api", "namespace": "erp"}, "spec": {"selector": {"matchLabels": {"app": "api"}, "matchExpressions": [{"key": "tier", "operator": "In", "values": ["web", "edge"]}]}}},
+        "/apis/apps/v1/namespaces/erp/replicasets/api-7d9f": {"metadata": {"name": "api-7d9f", "ownerReferences": [{"kind": "Deployment", "name": "api"}]}},
+        "/api/v1/namespaces/erp/services/api": {"metadata": {"name": "api", "namespace": "erp"}, "spec": {"selector": {"app": "api"}, "ports": [{"port": 80, "targetPort": 8000}]}},
+    }
+    pods = [pod("api-7d9f-a", {"app": "api", "tier": "web"}, {"kind": "ReplicaSet", "name": "api-7d9f"}, claim="data"), pod("api-7d9f-b", {"app": "api", "tier": "web"}, {"kind": "ReplicaSet", "name": "api-7d9f"}), pod("worker-1", {"app": "worker"})]
+    objects["/api/v1/namespaces/erp/pods/api-7d9f-a"] = pods[0]
+    services = [objects["/api/v1/namespaces/erp/services/api"], {"metadata": {"name": "other", "namespace": "erp"}, "spec": {"selector": {"app": "nope"}}}]
+    events = [{"involvedObject": {"name": n}, "type": t, "reason": r, "message": m, "lastTimestamp": ts, "count": 1, "metadata": {"namespace": "erp"}}
+              for n, t, r, m, ts in (("api", "Normal", "ScalingReplicaSet", "Scaled up", "2026-11-16T10:00:00Z"), ("api-7d9f-b", "Warning", "BackOff", "Back-off restarting", "2026-11-16T11:00:00Z"), ("worker-1", "Warning", "OOMKilled", "x", "2026-11-16T12:00:00Z"))]
+    seen = []
+
+    def klist(path, params=None, cap=0):
+        seen.append((path, dict(params or {})))
+        if path.endswith("/pods"):
+            sel = (params or {}).get("labelSelector")
+            if sel:
+                assert sel in ("app=api,tier in (web,edge)", "app=api"), sel
+                return [p for p in pods if p["metadata"]["labels"].get("app") == "api"], False
+            return pods, False
+        if path.endswith("/services"):
+            return services, False
+        if path.endswith("/events"):
+            return events, False
+        return [], False
+
+    def kapi(path, *a, **kw):
+        return objects[path]
+
+    monkeypatch.setattr(k8s, "klist", klist); monkeypatch.setattr(k8s, "kapi", kapi)
+    return seen
+
+
+def test_related_for_a_workload_pod_and_service(k8s, monkeypatch):
+    _fake_cluster(k8s, monkeypatch)
+    out = k8s.related("deployment", "erp", "api")
+    assert [p["name"] for p in out["pods"]] == ["api-7d9f-a", "api-7d9f-b"] and out["selector"] == "app=api,tier in (web,edge)"
+    assert [s["name"] for s in out["services"]] == ["api"]
+    assert [e["reason"] for e in out["events"]] == ["BackOff", "ScalingReplicaSet"]          # the workload's and its pods' events, newest first; not worker-1's
+    pod = k8s.related("pod", "erp", "api-7d9f-a")
+    assert {(l["kind"], l["name"]) for l in pod["links"]} == {("ReplicaSet", "api-7d9f"), ("Deployment", "api"), ("PersistentVolumeClaim", "data"), ("Node", "node-1")}
+    assert [s["name"] for s in pod["services"]] == ["api"] and len(pod["pods"]) == 1
+    svc = k8s.related("service", "erp", "api")
+    assert [p["name"] for p in svc["pods"]] == ["api-7d9f-a", "api-7d9f-b"] and svc["selector"] == "app=api"
+    text, _ = k8s.run_query({"kind": "related", "resource": "deployment", "namespace": "erp", "name": "api"})
+    assert '"pods"' in text
+    with pytest.raises(ValueError):
+        k8s.run_query({"kind": "related", "resource": "deployment", "name": "api"})          # namespace required

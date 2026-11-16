@@ -80,6 +80,9 @@ class Settings(BaseSettings):
     schedule_max_attempts: int = 3             # scheduled messages: tries per run
     schedule_retry_minutes: int = 1
     schedule_missed_minutes: int = 15          # a reminder this late is skipped instead of sent
+    service_timeout_seconds: int = 10          # a service check that takes longer than this fails (per service override)
+    cert_alert_days: str = "30,14,7"           # certificate expiry: alert this many days before (per service override)
+    cert_check_hours: int = 6                  # how often a service's certificate is re-read
     perf_default_window_minutes: int = 10      # response-time targets look at this many recent minutes unless set per monitor
     perf_min_check_samples: int = 5            # a target is not judged on fewer probes than this ...
     perf_min_requests: int = 50                # ... or fewer real requests than this (percentiles of a handful of requests mean nothing)

@@ -5,6 +5,7 @@ import type { Status } from '../lib/types';
 
 const ICONS: Record<string, string> = {
   terminal: 'M3 5h18v14H3V5zm4 4l3 3-3 3m5 0h5',
+  database: 'M12 3c4.4 0 8 1.3 8 3s-3.6 3-8 3-8-1.3-8-3 3.6-3 8-3zM4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3',
   overview: 'M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z',
   server: 'M4 4h16v6H4V4zm0 10h16v6H4v-6zM7 7h.01M7 17h.01',
   globe: 'M12 2a10 10 0 100 20 10 10 0 000-20zm0 0c3 3 4 6.5 4 10s-1 7-4 10c-3-3-4-6.5-4-10s1-7 4-10zM2 12h20',

@@ -8,6 +8,7 @@ import { AppProvider, useApp } from './lib/app';
 import { Audit } from './views/Audit';
 import { Channels } from './views/Channels';
 import { Kubernetes } from './views/Kubernetes';
+import { Databases } from './views/Databases';
 import { Incidents } from './views/Incidents';
 import { Login } from './views/Login';
 import { Logs } from './views/Logs';
@@ -52,6 +53,7 @@ const NAV: { id: string; label: string; icon: string; min: Role; fleet?: boolean
   { id: 'servers', label: 'Servers', icon: 'server', min: 'viewer' },
   { id: 'services', label: 'Services', icon: 'globe', min: 'viewer' },
   { id: 'kubernetes', label: 'Kubernetes', icon: 'k8s', min: 'viewer' },
+  { id: 'databases', label: 'Databases', icon: 'database', min: 'admin' },
   { id: 'performance', label: 'Performance', icon: 'zap', min: 'viewer' },
   { id: 'logs', label: 'Logs', icon: 'logs', min: 'operator' },
   { id: 'incidents', label: 'Incidents', icon: 'alert', min: 'viewer' },
@@ -79,7 +81,7 @@ function Shell({ company, me, onSignOut }: { company: string; me: Me; onSignOut:
     try { localStorage.setItem('smw_theme', next); } catch { /* storage unavailable */ }
   };
 
-  const view = { overview: <Overview />, servers: <Servers />, services: <Services />, kubernetes: <Kubernetes />, performance: <Performance />, incidents: <Incidents />, alerts: <Channels />, schedules: <Schedules />, logs: <Logs />, users: <Users />, audit: <Audit />, settings: <Settings /> }[page] ?? <Overview />;
+  const view = { overview: <Overview />, servers: <Servers />, services: <Services />, kubernetes: <Kubernetes />, databases: <Databases />, performance: <Performance />, incidents: <Incidents />, alerts: <Channels />, schedules: <Schedules />, logs: <Logs />, users: <Users />, audit: <Audit />, settings: <Settings /> }[page] ?? <Overview />;
 
   return (
     <div className="shell">

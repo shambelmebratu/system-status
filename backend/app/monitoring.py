@@ -19,7 +19,7 @@ from sqlalchemy import delete, select
 from .config import get_settings
 from .database import SessionLocal
 from .models import AlertEvent, AuditEvent, Channel, CheckResult, ClusterSample, Incident, K8sRequest, LogRequest, MetricSample, Server, Service
-from .netguard import safe_urlopen, validate_host
+from .netguard import fetch_certificate, safe_urlopen, validate_host
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +127,8 @@ def redact(text: str, channel: Channel) -> str:
 # ------------------------------------------------------------------------------------------------ alert message format
 # Alerts are stored with a tiny markup (<b>..</b>, everything else HTML-escaped) and rendered per channel:
 # Telegram gets real bold text, Slack gets *bold*, webhooks and WhatsApp get plain text.
-_STATE = {"down": ("🔴", "DOWN"), "still_down": ("🔴", "STILL DOWN"), "alert": ("🟠", "ALERT"), "still_alert": ("🟠", "STILL IN ALERT"), "recovered": ("✅", "RECOVERED")}
+_STATE = {"cert": ("🔐", "CERTIFICATE EXPIRES SOON"), "cert_expired": ("⛔", "CERTIFICATE EXPIRED"), "cert_renewed": ("✅", "CERTIFICATE RENEWED"),
+          "down": ("🔴", "DOWN"), "still_down": ("🔴", "STILL DOWN"), "alert": ("🟠", "ALERT"), "still_alert": ("🟠", "STILL IN ALERT"), "recovered": ("✅", "RECOVERED")}
 
 
 def esc(value) -> str:
@@ -241,6 +242,8 @@ def event_category(state: str | None) -> str | None:
     """down / alert / recovered / reminder (a repeat while something is still failing). None for events from before routing existed."""
     if not state:
         return None
+    if state.startswith("cert"):          # certificate warnings travel with the "over a limit" alerts; a renewal with recoveries
+        return "recovered" if state == "cert_renewed" else "alert"
     return "reminder" if state.startswith("still_") else state
 
 
@@ -470,8 +473,32 @@ def send_channel_test(channel: Channel) -> tuple[bool, str]:
     return True, f"{labels.get(channel.type, channel.type)} test notification delivered"
 
 
-def probe_service(service: Service) -> dict:
-    """HTTP probe. Pure network I/O; safe to run in a worker thread."""
+def service_timeout(service: Service) -> int:
+    return service.timeout_seconds or get_settings().service_timeout_seconds
+
+
+def cert_thresholds(service: Service) -> list[int]:
+    raw = service.cert_alert_days or get_settings().cert_alert_days
+    try:
+        days = sorted({int(d) for d in str(raw).split(",") if d.strip()}, reverse=True)
+        return [d for d in days if 1 <= d <= 365] or [30, 14, 7]
+    except ValueError:
+        return [30, 14, 7]
+
+
+def cert_due(service: Service, force: bool = False) -> bool:
+    if not service.cert_check or not service.url.lower().startswith("https://"):
+        return False
+    if force or service.cert_checked_at is None:
+        return True
+    checked = service.cert_checked_at if service.cert_checked_at.tzinfo else service.cert_checked_at.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - checked >= timedelta(hours=max(1, get_settings().cert_check_hours))
+
+
+def probe_service(service: Service, force_cert: bool = False) -> dict:
+    """HTTP probe (plus, every few hours, the certificate). Pure network I/O; safe to run in a worker thread.
+    A response that takes longer than the service's timeout is a failed check, even if it eventually arrives."""
+    limit = service_timeout(service)
     started = time.perf_counter()
     http_status = None
     error_message = None
@@ -479,7 +506,7 @@ def probe_service(service: Service) -> dict:
     try:
         request = urllib.request.Request(service.url, headers={"User-Agent": "SM-Watch-Uptime/1.0"})
         try:
-            with safe_urlopen(request, timeout=10) as response:
+            with safe_urlopen(request, timeout=limit) as response:
                 http_status = response.status
         except HTTPError as response_error:
             http_status = response_error.code
@@ -488,8 +515,58 @@ def probe_service(service: Service) -> dict:
         if status == "down":
             error_message = f"Expected HTTP {service.expected_status}; received HTTP {http_status}"
     except Exception as error:
-        error_message = str(error)[:500]
-    return {"status": status, "http_status": http_status, "latency_ms": round((time.perf_counter() - started) * 1000, 1), "error": error_message}
+        reason = getattr(error, "reason", error)
+        timed_out = isinstance(reason, (TimeoutError, socket.timeout)) or "timed out" in str(error).lower()
+        error_message = f"Timed out: no response within {limit} s" if timed_out else str(error)[:500]
+    elapsed = time.perf_counter() - started
+    if status == "up" and elapsed > limit:     # a socket timeout applies per read; the whole answer must also be in time
+        status, error_message = "down", f"Timed out: the response took {elapsed:.1f} s, longer than the {limit} s limit"
+    result = {"status": status, "http_status": http_status, "latency_ms": round(elapsed * 1000, 1), "error": error_message}
+    if cert_due(service, force_cert):
+        try:
+            result["cert"] = fetch_certificate(service.url, timeout=min(limit, 15))
+        except Exception as error:   # noqa: BLE001
+            result["cert_error"] = str(error)[:300] or error.__class__.__name__
+    return result
+
+
+def apply_certificate(session, service: Service, result: dict) -> None:
+    """Stores what the certificate check found and sends at most one alert per threshold (30 / 14 / 7 days ...) per certificate,
+    one when it has expired, and one when a renewed certificate replaces one that was alerted about."""
+    if "cert" not in result and "cert_error" not in result:
+        return
+    now = datetime.now(timezone.utc)
+    service.cert_checked_at = now
+    if "cert_error" in result:
+        service.cert_error = result["cert_error"]
+        return
+    cert = result["cert"]
+    expires = cert["expires_at"]
+    previous = service.cert_expires_at.replace(tzinfo=timezone.utc) if service.cert_expires_at and not service.cert_expires_at.tzinfo else service.cert_expires_at
+    service.cert_error = None if cert.get("host_matches", True) else f"The certificate does not cover this host name (it is for {', '.join(cert.get('names') or [cert['subject']])[:200]})"
+    service.cert_issuer, service.cert_subject = cert["issuer"], cert["subject"]
+    service.cert_expires_at = expires
+    host = urllib.parse.urlsplit(service.url).hostname or service.url
+    if previous and expires > previous + timedelta(days=1):            # renewed
+        if service.cert_alerted is not None:
+            queue_event(session, "service", service, "info", format_alert("Service", "cert_renewed", service.name, [f"New certificate for {host} is valid until {expires:%d %b %Y}", f"Issuer: {cert['issuer']}"], at=now, link=service.url), deliver=True, state="cert_renewed")
+        service.cert_alerted = None
+    days_left = (expires - now).total_seconds() / 86400
+    if days_left < 0:
+        level = -1
+    else:
+        crossed = [d for d in cert_thresholds(service) if days_left <= d]
+        level = min(crossed) if crossed else None
+    if level is None or (service.cert_alerted is not None and level >= service.cert_alerted):
+        return
+    service.cert_alerted = level
+    if level == -1:
+        lines = [f"The certificate for {host} expired on {expires:%d %b %Y, %H:%M UTC}", "Visitors now see a security warning. Renew it now.", f"Issuer: {cert['issuer']}"]
+        queue_event(session, "service", service, "critical", format_alert("Service", "cert_expired", service.name, lines, at=now, link=service.url), deliver=True, state="cert_expired")
+    else:
+        whole = int(days_left)
+        lines = [f"The certificate for {host} expires in {whole} day{'s' if whole != 1 else ''} ({expires:%d %b %Y})", f"Issuer: {cert['issuer']}"]
+        queue_event(session, "service", service, "warning", format_alert("Service", "cert", service.name, lines, at=now, link=service.url), deliver=True, state="cert")
 
 
 def record_result(session, target_type: str, target_id: int, status: str, latency_ms=None, http_status=None, error=None) -> None:
@@ -561,6 +638,10 @@ def apply_service_result(session, service: Service, result: dict) -> dict:
     now = datetime.now(timezone.utc)
     record_result(session, "service", service.id, raw_status, result["latency_ms"], result["http_status"], result["error"])
     service.last_checked_at = now
+    try:
+        apply_certificate(session, service, result)
+    except Exception:   # a certificate problem must never stop the uptime result from being recorded
+        logger.exception("certificate check failed for service id=%s", service.id)
     status = settle_status(service, raw_status)
     if status == previous_status and raw_status == "down" and previous_status != "down":
         # Failure absorbed by the debounce: history keeps it, but no state change, incident or alert yet.
@@ -594,7 +675,7 @@ def _service_payload(service: Service, status: str, result: dict, now: datetime,
 
 
 def check_service(service: Service, session) -> dict:
-    return apply_service_result(session, service, probe_service(service))
+    return apply_service_result(session, service, probe_service(service, force_cert=True))
 
 
 def apply_server_result(session, server: Server, status: str, failures: list[str] | None = None, metrics: dict | None = None, error: str | None = None, deliver: bool = True, debounce: bool = True) -> None:

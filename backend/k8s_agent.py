@@ -24,7 +24,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-AGENT_VERSION = "1.1.0"
+AGENT_VERSION = "1.2.0"
 SMWATCH_URL = os.getenv("SMWATCH_URL", "").rstrip("/")
 _TOKEN = os.getenv("SMWATCH_TOKEN", "")                       # this cluster's agent token (from the Secret the manifest created)
 AGENT_ALLOW_INSECURE = os.getenv("AGENT_ALLOW_INSECURE", "") == "1"
@@ -407,6 +407,106 @@ def apply_policy(candidate) -> None:
         pass
 
 
+def _selector_string(selector: dict | None) -> str | None:
+    """A labelSelector query string from a Kubernetes selector (matchLabels plus In / NotIn / Exists / DoesNotExist), or None
+    when it selects nothing."""
+    if not selector:
+        return None
+    labels = selector.get("matchLabels") if "matchLabels" in selector or "matchExpressions" in selector else selector
+    parts = [f"{k}={v}" for k, v in (labels or {}).items()]
+    for expr in selector.get("matchExpressions") or [] if isinstance(selector.get("matchExpressions"), list) else []:
+        key, op, values = expr.get("key", ""), expr.get("operator", ""), expr.get("values") or []
+        if op == "In":
+            parts.append(f"{key} in ({','.join(values)})")
+        elif op == "NotIn":
+            parts.append(f"{key} notin ({','.join(values)})")
+        elif op == "Exists":
+            parts.append(key)
+        elif op == "DoesNotExist":
+            parts.append(f"!{key}")
+    return ",".join(parts) or None
+
+
+def _events_for(namespace: str, names: list[str], cap: int = 60) -> list[dict]:
+    """Events about any of `names` in `namespace`, newest first (one list call, filtered here)."""
+    if not names:
+        return []
+    wanted = set(names)
+    events, _ = klist(api_path("v1", "events", namespace), cap=2000)
+    rows = [event_row(e) for e in events if (e.get("involvedObject") or {}).get("name") in wanted]
+    rows.sort(key=lambda r: r.get("last") or "", reverse=True)
+    return rows[:cap]
+
+
+def related(resource: str, namespace: str, name: str) -> dict:
+    """One object with everything connected to it: its pods, the services that select it, its owner chain, the volumes it
+    mounts, the node it runs on, and the events of the object and its pods. Same read-only permissions as `describe`."""
+    gv, plural, namespaced = DESCRIBE[resource]
+    obj = kapi(api_path(gv, plural, namespace if namespaced else "", name))
+    spec = obj.get("spec") or {}
+    links: list[dict] = []
+    pods: list[dict] = []
+    selector = None
+    if resource in ("deployment", "statefulset", "daemonset", "job", "replicaset"):
+        selector = _selector_string(spec.get("selector"))
+    elif resource == "service":
+        selector = _selector_string(spec.get("selector") or None)
+    elif resource == "cronjob":
+        jobs, _ = klist(api_path("batch/v1", "jobs", namespace), cap=500)
+        mine = [meta(j)["name"] for j in jobs if any(r.get("kind") == "CronJob" and r.get("name") == name for r in meta(j).get("ownerReferences") or [])]
+        links += [{"kind": "Job", "name": j, "ns": namespace} for j in mine[-20:]]
+        if mine:
+            selector = f"job-name in ({','.join(mine[-20:])})"
+    if resource == "pod":
+        pods = [pod_row(obj)]
+        for ref in meta(obj).get("ownerReferences") or []:
+            links.append({"kind": ref.get("kind", ""), "name": ref.get("name", ""), "ns": namespace, "relation": "owner"})
+            if ref.get("kind") == "ReplicaSet":                       # ReplicaSet -> Deployment
+                try:
+                    rs = kapi(api_path("apps/v1", "replicasets", namespace, ref.get("name", "")))
+                    links += [{"kind": r.get("kind", ""), "name": r.get("name", ""), "ns": namespace, "relation": "owner"} for r in meta(rs).get("ownerReferences") or []]
+                except K8sError:
+                    pass
+        for volume in spec.get("volumes") or []:
+            claim = (volume.get("persistentVolumeClaim") or {}).get("claimName")
+            if claim:
+                links.append({"kind": "PersistentVolumeClaim", "name": claim, "ns": namespace, "relation": "volume"})
+        if spec.get("nodeName"):
+            links.append({"kind": "Node", "name": spec["nodeName"], "ns": "", "relation": "runs on"})
+    elif selector:
+        items, _ = klist(api_path("v1", "pods", namespace), {"labelSelector": selector}, cap=300)
+        pods = [pod_row(p) for p in items]
+    if resource == "pvc":
+        items, _ = klist(api_path("v1", "pods", namespace), cap=MAX_LIST_ITEMS)
+        pods = [pod_row(p) for p in items if any((v.get("persistentVolumeClaim") or {}).get("claimName") == name for v in (p.get("spec") or {}).get("volumes") or [])]
+    if resource == "ingress":
+        for rule in spec.get("rules") or []:
+            for path in ((rule.get("http") or {}).get("paths") or []):
+                svc = (((path.get("backend") or {}).get("service")) or {}).get("name")
+                if svc:
+                    links.append({"kind": "Service", "name": svc, "ns": namespace, "relation": f"{rule.get('host', '*')}{path.get('path', '/')}"})
+    if resource == "hpa":
+        ref = spec.get("scaleTargetRef") or {}
+        links.append({"kind": ref.get("kind", ""), "name": ref.get("name", ""), "ns": namespace, "relation": "scales"})
+    # services that send traffic to these pods (or to this pod)
+    services: list[dict] = []
+    if namespaced and resource not in ("service", "namespace") and (pods or resource == "pod"):
+        pod_labels = [meta(p).get("labels") or {} for p in ([obj] if resource == "pod" else klist(api_path("v1", "pods", namespace), {"labelSelector": selector}, cap=50)[0] if selector else [])]
+        all_services, _ = klist(api_path("v1", "services", namespace), cap=500)
+        for svc in all_services:
+            sel = (svc.get("spec") or {}).get("selector") or {}
+            if sel and any(all(labels.get(k) == v for k, v in sel.items()) for labels in pod_labels):
+                services.append(service_row(svc))
+    names = [name] + [p["name"] for p in pods[:100]]
+    events = _events_for(namespace, names) if namespaced else rows_for_cluster_object(name)
+    return {"object": redact(obj), "pods": pods, "services": services, "links": links, "events": events, "selector": selector or ""}
+
+
+def rows_for_cluster_object(name: str) -> list[dict]:
+    events, _ = klist(api_path("v1", "events", ""), {"fieldSelector": f"involvedObject.name={name}"}, cap=100)
+    return sorted((event_row(e) for e in events), key=lambda r: r.get("last") or "", reverse=True)[:60]
+
+
 def run_query(task: dict) -> tuple[str, bool]:
     """Executes one validated question. Returns (output, truncated). Output is JSON, except for logs (plain text)."""
     check(task)
@@ -464,6 +564,13 @@ def run_query(task: dict) -> tuple[str, bool]:
         events, _ = klist(api_path("v1", "events", namespace if namespaced else "default" if resource == "node" else ""), {"fieldSelector": selector}, cap=100) if True else ([], False)
         rows = sorted((event_row(e) for e in events), key=lambda r: r.get("last") or "", reverse=True)
         return _json({"object": redact(obj), "events": rows[:50]})
+    if kind == "related":
+        resource = task.get("resource", "")
+        if resource not in DESCRIBE or not name:
+            raise ValueError("Unknown resource")
+        if DESCRIBE[resource][2] and not namespace:
+            raise ValueError("namespace is required")
+        return _json(related(resource, namespace, name))
     if kind == "logs":
         if not namespace or not name:
             raise ValueError("namespace and pod are required")

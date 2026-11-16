@@ -74,6 +74,7 @@ export function useLimits() {
   return {
     warn: l?.usage_warn_percent ?? 70, bad: l?.usage_bad_percent ?? 90, offlineMs: (l?.k8s_offline_seconds ?? 120) * 1000,
     reminder: l?.reminder_minutes ?? 30, enrollDefault: l?.enrollment_default_minutes ?? 15, enrollMax: l?.enrollment_max_minutes ?? 1440, logTtl: l?.log_result_ttl_minutes ?? 15,
+    serviceTimeout: l?.service_timeout_seconds ?? 10, certDays: (l?.cert_alert_days ?? '30,14,7').split(',').map(Number).filter(Boolean), certHours: l?.cert_check_hours ?? 6,
   };
 }
 
@@ -96,6 +97,7 @@ export function usePoll<T>(load: () => Promise<T>, deps: unknown[], intervalMs =
   useEffect(() => {
     setValue(null);
     void reload();
+    if (intervalMs <= 0) return;   // 0 = load once (reload() refreshes on demand)
     const timer = window.setInterval(() => { if (!document.hidden) void reload(); }, intervalMs);
     return () => window.clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
