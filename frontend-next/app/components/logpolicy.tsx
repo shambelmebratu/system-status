@@ -6,6 +6,7 @@ import { useApp } from '../lib/app';
 import { Modal } from './ui';
 
 type Policy = {
+  ssh?: { enabled: boolean; history: boolean };
   docker: { enabled: boolean; include: string[]; exclude: string[] };
   journal: { enabled: boolean; units: string[] };
   files: { enabled: boolean; mode: 'all' | 'selected'; categories: string[]; custom: string[] };
@@ -30,6 +31,7 @@ function PatternList({ value, onChange, placeholder }: { value: string[]; onChan
 const summary = (p: Policy) => [
   `Containers: ${!p.docker.enabled ? 'off' : p.docker.include.join(', ') === '*' && !p.docker.exclude.length ? 'all' : 'selected'}`,
   `Journal: ${!p.journal.enabled ? 'off' : p.journal.units.join(', ') === '*' ? 'all' : 'selected units'}`,
+  `SSH: ${p.ssh?.enabled === false ? 'off' : p.ssh?.history === false ? 'sessions only' : 'sessions + commands'}`,
   `Files: ${!p.files.enabled ? 'off' : p.files.mode === 'all' ? 'all' : `${p.files.categories.length} types${p.files.custom.length ? ` + ${p.files.custom.length} paths` : ''}`}`,
 ];
 
@@ -74,7 +76,10 @@ function PolicyEditor({ serverId, initial, onClose, onSaved }: { serverId: numbe
   return (
     <Modal title="Log access policy" onClose={onClose} wide>
       <form onSubmit={save} style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-        <div className="seg" style={{ flexWrap: 'wrap', alignSelf: 'flex-start' }}>{PRESETS.map(x => <button type="button" key={x.label} title={x.hint} onClick={() => setP(x.policy)}>{x.label}</button>)}</div>
+        <div className="seg" style={{ flexWrap: 'wrap', alignSelf: 'flex-start' }}>{PRESETS.map(x => <button type="button" key={x.label} title={x.hint} onClick={() => setP({ ...x.policy, ssh: x.label === 'Nothing' ? { enabled: false, history: false } : p.ssh })}>{x.label}</button>)}</div>
+        {block('SSH activity', p.ssh?.enabled !== false, v => setP({ ...p, ssh: { enabled: v, history: p.ssh?.history !== false } }), <>
+          <p className="muted sm" style={{ margin: 0 }}>Who is logged in over SSH, from which address, and past logins and logouts.</p>
+          <label className="check"><input type="checkbox" checked={p.ssh?.history !== false} onChange={e => setP({ ...p, ssh: { enabled: true, history: e.target.checked } })} />Also show the shell command history of the server&apos;s users <span className="muted sm">(recognisable secrets are masked on the server)</span></label></>)}
         {block('Docker containers', p.docker.enabled, v => setP({ ...p, docker: { ...p.docker, enabled: v } }), <>
           <label className="field">Allowed container names <small>one pattern per line; * = any. Example: web-*</small>{area(p.docker.include, v => setP({ ...p, docker: { ...p.docker, include: v } }), '*')}</label>
           <label className="field">Never allow <small>patterns that always win. Example: *-secrets</small>{area(p.docker.exclude, v => setP({ ...p, docker: { ...p.docker, exclude: v } }), '')}</label></>)}

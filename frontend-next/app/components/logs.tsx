@@ -14,7 +14,7 @@ const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 /** Queues a log request and waits for the agent's answer. The server holds each GET open until the agent has answered
  *  (long-poll), so the result appears the instant it exists instead of on the next polling tick. */
-async function runQuery(serverId: number, query: Record<string, unknown>, isCancelled: () => boolean): Promise<LogResponse> {
+export async function runQuery(serverId: number, query: Record<string, unknown>, isCancelled: () => boolean): Promise<LogResponse> {
   const { id } = await post<{ id: number }>(`/servers/${serverId}/logs`, query);
   const deadline = Date.now() + 50_000;
   while (Date.now() < deadline) {

@@ -113,6 +113,10 @@ services:
     image: *host-agent-image
     command: ["python", "agent.py"]
     pid: host
+    # Read access (never write) to every file on the read-only host mount, so the SSH tab can show every user's shell history
+    # (files are mode 600). Remove these two lines to limit it to root's own history.
+    cap_add:
+      - DAC_READ_SEARCH
     environment:
       SMWATCH_URL: http://api:8000
       AGENT_TOKEN_FILE: /shared/agent.token
@@ -120,6 +124,7 @@ services:
       AGENT_PROCFS_PATH: /host/proc
       AGENT_DISK_PATH: /host
       AGENT_LOGS: ${HOST_AGENT_LOGS:-on}
+      AGENT_SSH: ${HOST_AGENT_SSH:-on}         # on | nohistory | off: SSH sessions, logins and shell history of this machine
       SMWATCH_BUNDLED: "1"
       AGENT_ACCESS_LOG: ${HOST_ACCESS_LOG:-}   # e.g. /var/log/nginx/access.log: response-time percentiles of real traffic
     volumes:

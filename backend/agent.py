@@ -39,7 +39,7 @@ from typing import Any
 
 import psutil
 
-AGENT_VERSION = "2.12.1"
+AGENT_VERSION = "2.13.0"
 _ENV_TOKEN = os.getenv("AGENT_TOKEN", "")                      # the token supplied by configuration; a rotation may supersede it (see _load_state)
 AGENT_TOKEN = ""                                                # the token in use: resolved by ensure_token() (saved state first, then configuration)
 AGENT_ALLOW_INSECURE = os.getenv("AGENT_ALLOW_INSECURE", "") == "1"   # permit http:// to a public address (not recommended)
@@ -170,7 +170,8 @@ def collect() -> dict[str, Any]:
         "net_rx_bps": rx,
         "net_tx_bps": tx,
         "processes": processes[:AGENT_PROCESS_TOP_N],
-        "capabilities": ["logs"] if AGENT_LOGS != "off" else [],
+        "capabilities": (["logs"] if AGENT_LOGS != "off" else []) + (["ssh"] if AGENT_SSH != "off" else []) + (["ssh_history"] if AGENT_SSH == "on" else []),
+        "ssh_sessions": ssh_count(),
         "ips": local_addresses(),
         "public_ip": public_address(),
         "install": install_kind(),
@@ -1018,6 +1019,304 @@ def filter_lines_by_time(text: str, seconds: int, now: float | None = None) -> s
     return "\n".join(out)
 
 
+# ------------------------------------------------------------------------------------------------ SSH activity
+# Who is logged in over SSH right now (utmp), who logged in and out before (wtmp, or wtmpdb on newer distributions), and the
+# most recent shell commands (bash / zsh / fish history files). Read on demand only, like logs, and nothing is changed.
+# Command lines can contain passwords and tokens: obvious secrets are masked HERE, before anything leaves the server.
+#   AGENT_SSH=on (default when logs are on) | nohistory (sessions and logins, no command history) | off
+AGENT_SSH = os.getenv("AGENT_SSH", "on" if AGENT_LOGS != "off" else "off").lower()
+SSH_HISTORY_MAX = 500
+_UTMP = struct.Struct("<hhi32s4s32s256shhiii16s20s")   # glibc struct utmp: 384 bytes on x86_64, aarch64 and 32-bit builds alike
+USER_PROCESS, DEAD_PROCESS, BOOT_TIME = 7, 8, 2
+
+
+def _cstr(raw: bytes) -> str:
+    return "".join(ch if ch.isprintable() else " " for ch in raw.split(b"\0", 1)[0].decode("utf-8", "replace")).strip()
+
+
+def _utmp_address(raw: bytes) -> str:
+    if not any(raw):
+        return ""
+    try:
+        return socket.inet_ntop(socket.AF_INET, raw[:4]) if not any(raw[4:]) else socket.inet_ntop(socket.AF_INET6, raw)
+    except (OSError, ValueError):
+        return ""
+
+
+def _utmp_records(path: str, max_bytes: int = 8_000_000) -> list[dict]:
+    """Records of a utmp/wtmp file (only its newest `max_bytes`: wtmp grows for years)."""
+    size = _UTMP.size
+    with open(path, "rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        end = handle.tell()
+        start = max(0, end - max_bytes)
+        start -= start % size
+        handle.seek(start)
+        data = handle.read()
+    records = []
+    for offset in range(0, len(data) - size + 1, size):
+        kind, _, pid, line, _, user, host, _, _, _, sec, _, addr, _ = _UTMP.unpack_from(data, offset)
+        records.append({"type": kind, "pid": pid, "tty": _cstr(line), "user": _cstr(user), "host": _cstr(host) or _utmp_address(addr), "ts": sec})
+    return records
+
+
+def _remote(host: str) -> bool:
+    """A login that came over the network (SSH), not a local console or desktop (':0')."""
+    return bool(host) and not host.startswith(":")
+
+
+def _first_existing(*paths: str) -> str | None:
+    for path in paths:
+        real = _host_path(path)
+        if os.path.exists(real):
+            return real
+    return None
+
+
+def _wtmpdb_rows(limit: int) -> list[dict] | None:
+    """Newer systemd distributions (Debian 13, openSUSE, ...) keep logins in an SQLite database instead of wtmp."""
+    path = _first_existing("/var/lib/wtmpdb/wtmp.db")
+    if not path:
+        return None
+    import sqlite3
+    for uri in (f"file:{path}?mode=ro", f"file:{path}?immutable=1"):   # immutable: the host filesystem is mounted read-only in Docker
+        try:
+            with sqlite3.connect(uri, uri=True, timeout=2) as db:
+                rows = db.execute("SELECT User, Login, Logout, TTY, RemoteHost FROM wtmp WHERE RemoteHost IS NOT NULL AND RemoteHost != '' "
+                                  "AND User != 'reboot' ORDER BY Login DESC LIMIT ?", (limit,)).fetchall()
+            return [{"user": _cstr(str(u or "").encode()), "login": int(li / 1e6) if li else None, "logout": int(lo / 1e6) if lo else None,
+                     "tty": _cstr(str(t or "").encode()), "ip": _cstr(str(h or "").encode())} for u, li, lo, t, h in rows]
+        except Exception:   # locked, unreadable or an unexpected schema: try the next way, then give up quietly
+            continue
+    return None
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        return pid > 0 and psutil.pid_exists(pid)
+    except Exception:
+        return True
+
+
+def ssh_sessions() -> tuple[list[dict], str | None]:
+    """Current remote logins: (sessions, note). Each session: user, ip, tty, since (epoch seconds), pid."""
+    path = _first_existing("/run/utmp", "/var/run/utmp")
+    sessions: list[dict] = []
+    if path and not IS_MAC:
+        try:
+            for r in _utmp_records(path, 2_000_000):
+                if r["type"] == USER_PROCESS and _remote(r["host"]) and _pid_alive(r["pid"]):
+                    sessions.append({"user": r["user"], "ip": r["host"], "tty": r["tty"], "since": r["ts"], "pid": r["pid"]})
+            return sessions, None
+        except OSError as error:
+            return [], f"Cannot read {path}: {error.strerror or error}"
+    if AGENT_HOST_ROOT in ("", "/"):   # macOS, or a distribution without utmp: ask the operating system
+        try:
+            for u in psutil.users():
+                if _remote(u.host or ""):
+                    sessions.append({"user": u.name, "ip": u.host, "tty": u.terminal or "", "since": int(u.started), "pid": getattr(u, "pid", None) or 0})
+            return sessions, None
+        except Exception as error:   # noqa: BLE001
+            return [], f"Cannot list logged-in users: {error}"
+    rows = _wtmpdb_rows(200)   # no utmp at all (systemd 257+): open wtmpdb sessions since the last boot
+    if rows is not None:
+        boot = psutil.boot_time()
+        return [{"user": r["user"], "ip": r["ip"], "tty": r["tty"], "since": r["login"], "pid": 0} for r in rows if r["logout"] is None and (r["login"] or 0) >= boot], None
+    return [], "This server keeps no login records the agent can read (no utmp or wtmpdb)."
+
+
+def ssh_count() -> int | None:
+    """For every report: the number of open SSH sessions (no names or addresses). None when SSH reporting is off."""
+    policy = current_policy()
+    if AGENT_SSH == "off" or (policy is not None and not policy.get("ssh", {}).get("enabled", True)):
+        return None
+    try:
+        return len(ssh_sessions()[0])
+    except Exception:   # noqa: BLE001  (never let this break a metrics report)
+        return None
+
+
+def ssh_logins(limit: int = 300) -> tuple[list[dict], str | None]:
+    """Past remote logins, newest first: user, ip, tty, login, logout (epoch seconds), end: logout | reboot | active | unknown."""
+    rows = _wtmpdb_rows(limit)
+    if rows is not None:
+        active = {(s["tty"], s["user"]) for s in ssh_sessions()[0]}
+        for r in rows:
+            r["end"] = "logout" if r["logout"] else ("active" if (r["tty"], r["user"]) in active else "unknown")
+        return rows, None
+    path = _first_existing("/var/log/wtmp")
+    if not path or IS_MAC:
+        return [], "No login history file (/var/log/wtmp) on this server."
+    try:
+        records = _utmp_records(path)
+    except OSError as error:
+        return [], f"Cannot read {path}: {error.strerror or error}"
+    open_by_tty: dict[str, dict] = {}
+    done: list[dict] = []
+    for r in records:
+        if r["type"] == BOOT_TIME:
+            for s in open_by_tty.values():
+                s["logout"], s["end"] = r["ts"], "reboot"
+                done.append(s)
+            open_by_tty.clear()
+        elif r["type"] == USER_PROCESS and _remote(r["host"]):
+            if r["tty"] in open_by_tty:   # the previous session on this terminal never wrote a logout record
+                done.append(open_by_tty.pop(r["tty"]))
+            open_by_tty[r["tty"]] = {"user": r["user"], "ip": r["host"], "tty": r["tty"], "login": r["ts"], "logout": None, "end": "unknown", "pid": r["pid"]}
+        elif r["type"] == DEAD_PROCESS and r["tty"] in open_by_tty:
+            s = open_by_tty.pop(r["tty"])
+            s["logout"], s["end"] = r["ts"], "logout"
+            done.append(s)
+    for s in open_by_tty.values():
+        s["end"] = "active" if _pid_alive(s["pid"]) else "unknown"
+        done.append(s)
+    done.sort(key=lambda s: s["login"] or 0, reverse=True)
+    for s in done:
+        s.pop("pid", None)
+    return done[:limit], None
+
+
+# Obvious secrets on a command line. Best effort: anything matching is replaced with *** before the command leaves the server.
+_SECRET_PATTERNS = [
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*", re.S), "*** private key ***"),
+    (re.compile(r"(?i)(\b[A-Z0-9_]*(?:PASSWORD|PASSWD|PASS|SECRET|TOKEN|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CREDENTIALS?|AUTH)[A-Z0-9_]*\s*=\s*)(\"[^\"]*\"|'[^']*'|\S+)"), r"\1***"),
+    (re.compile(r"(?i)(--?(?:password|passwd|pass|pwd|token|secret|api[-_]?key|access[-_]?key|secret[-_]?key|auth[-_]?token|client[-_]?secret)(?:=|\s+))(\"[^\"]*\"|'[^']*'|\S+)"), r"\1***"),
+    (re.compile(r"(?i)\b((?:mysql|mysqldump|mysqladmin|mariadb|mariadb-dump)\b.*?\s-p)([^\s-][^\s]*)"), r"\1***"),
+    (re.compile(r"(?i)(\bsshpass\s+-p\s*)(\S+)"), r"\1***"),
+    (re.compile(r"(?i)(\b(?:-u|--user)\s+[^\s:]+:)(\S+)"), r"\1***"),                        # curl -u user:password
+    (re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]+:)([^@\s]+)(@)"), r"\1***\3"),           # scheme://user:password@host
+    (re.compile(r"(?i)((?:authorization|x-api-key|api-key|private-token)\s*:\s*(?:bearer\s+|basic\s+|token\s+)?)([^\s'\"]+)"), r"\1***"),
+    (re.compile(r"\b(ghp_|gho_|ghs_|ghu_|github_pat_|glpat-|xox[abprs]-|sk-|sk_live_|rk_live_|AKIA|ASIA|AIza|ya29\.)[A-Za-z0-9_\-.]{8,}"), r"\1***"),
+    (re.compile(r"(?i)(\becho\s+)(\"[^\"]*\"|'[^']*'|\S+)(?=.*\|\s*(?:sudo\s+)?(?:chpasswd|passwd|htpasswd|docker\s+login|podman\s+login|helm\s+registry\s+login))"), r"\1***"),
+    (re.compile(r"(?i)(\b(?:htpasswd)\s+(?:-\w+\s+)*\S+\s+\S+\s+)(\S+)"), r"\1***"),
+]
+
+
+def redact_command(command: str) -> str:
+    for pattern, replacement in _SECRET_PATTERNS:
+        command = pattern.sub(replacement, command)
+    return command
+
+
+def _tail_text(path: str, max_bytes: int = 512_000) -> str:
+    with open(path, "rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        size = handle.tell()
+        handle.seek(max(0, size - max_bytes))
+        data = handle.read()
+    text = data.decode("utf-8", "replace")
+    return text.split("\n", 1)[1] if size > max_bytes and "\n" in text else text   # drop the partial first line
+
+
+def _parse_history(kind: str, text: str) -> list[dict]:
+    out: list[dict] = []
+    if kind == "fish":
+        current: dict | None = None
+        for line in text.splitlines():
+            if line.startswith("- cmd: "):
+                current = {"cmd": line[7:].replace("\\n", "\n").replace("\\\\", "\\"), "ts": None}
+                out.append(current)
+            elif current is not None and line.strip().startswith("when:"):
+                try:
+                    current["ts"] = int(line.split(":", 1)[1].strip())
+                except ValueError:
+                    pass
+        return out
+    stamp = None
+    pending = ""
+    for line in text.splitlines():
+        if kind == "zsh" and line.startswith(": ") and ";" in line:   # extended history  ": 1700000000:0;command"
+            head, command = line[2:].split(";", 1)
+            try:
+                stamp = int(head.split(":", 1)[0])
+            except ValueError:
+                stamp = None
+            line = command
+        elif kind == "bash" and re.fullmatch(r"#\d{9,11}", line):    # HISTTIMEFORMAT timestamps
+            stamp = int(line[1:])
+            continue
+        if kind == "zsh" and line.endswith("\\"):                     # zsh stores multi-line commands with a trailing backslash
+            pending += line[:-1] + "\n"
+            continue
+        command = (pending + line).strip()
+        pending = ""
+        if command:
+            out.append({"cmd": command, "ts": stamp})
+        stamp = None
+    return out
+
+
+HISTORY_FILES = ((".bash_history", "bash"), (".zsh_history", "zsh"), (".histfile", "zsh"), (".local/share/fish/fish_history", "fish"), (".history", "bash"), (".ash_history", "bash"))
+
+
+def _home_dirs() -> list[tuple[str, str]]:
+    """(user, home on the host). From /etc/passwd when readable, plus /root and /home/* as a fallback."""
+    homes: dict[str, str] = {}
+    try:
+        with open(_host_path("/etc/passwd")) as handle:
+            for row in handle:
+                fields = row.strip().split(":")
+                if len(fields) >= 7 and fields[5].startswith("/") and fields[5] not in ("/", "/nonexistent", "/dev/null") and not fields[6].endswith(("nologin", "false", "sync")):
+                    homes.setdefault(fields[5], fields[0])
+    except OSError:
+        pass
+    homes.setdefault("/root", "root")
+    for real in glob.glob(_host_path("/home/*")) + glob.glob(_host_path("/Users/*")):
+        host_view = "/" + os.path.relpath(real, AGENT_HOST_ROOT) if AGENT_HOST_ROOT not in ("", "/") else real
+        homes.setdefault(host_view, os.path.basename(real))
+    return [(user, home) for home, user in sorted(homes.items(), key=lambda kv: (kv[1] != "root", kv[1]))][:100]
+
+
+def shell_history(lines: int = 100) -> dict:
+    """The newest `lines` commands per user and shell, newest first, secrets masked."""
+    lines = max(1, min(SSH_HISTORY_MAX, lines))
+    users, unreadable = [], []
+    for user, home in _home_dirs():
+        for rel, kind in HISTORY_FILES:
+            path = _host_path(os.path.join(home, rel))
+            if not os.path.isfile(path):
+                continue
+            try:
+                real = os.path.realpath(path)
+                if not real.startswith(os.path.realpath(_host_path(home)) + os.sep):   # a history "file" linked elsewhere is not followed
+                    continue
+                entries = _parse_history(kind, _tail_text(real))
+                stat = os.stat(real)
+            except PermissionError:
+                unreadable.append(user)
+                continue
+            except OSError:
+                continue
+            if not entries:
+                continue
+            newest = entries[-lines:][::-1]
+            users.append({"user": user, "shell": kind, "file": os.path.join(home, rel), "modified": int(stat.st_mtime), "total": len(entries),
+                          "commands": [{"cmd": redact_command(e["cmd"])[:2000], "ts": e["ts"]} for e in newest]})
+    notes = []
+    if unreadable:
+        notes.append(f"The agent may not read the shell history of: {', '.join(sorted(set(unreadable)))}. "
+                     "Re-run the install command with SMWATCH_HISTORY=on (shell install) to allow it.")
+    return {"users": users, "notes": notes}
+
+
+def ssh_answer(target: str, lines: int) -> str:
+    if AGENT_SSH == "off":
+        raise ValueError("SSH activity is turned off on this server (AGENT_SSH=off)")
+    policy = current_policy()
+    ssh = (policy or {}).get("ssh", {"enabled": True, "history": True})
+    if not ssh.get("enabled", True):
+        raise ValueError("Blocked by this server's access policy")
+    if target == "sessions":
+        sessions, note = ssh_sessions()
+        logins, login_note = ssh_logins()
+        return json.dumps({"sessions": sessions, "logins": logins, "notes": [n for n in (note, login_note) if n], "now": int(time.time()), "history_available": AGENT_SSH == "on" and ssh.get("history", True)})
+    if target == "history":
+        if AGENT_SSH != "on" or not ssh.get("history", True):
+            raise ValueError("Command history is turned off for this server")
+        return json.dumps(shell_history(lines))
+    raise ValueError("Unknown SSH request")
+
+
 def fetch_logs(task: dict) -> tuple[str, bool]:
     """Runs one validated log request. Returns (text, truncated)."""
     source = task.get("source")
@@ -1028,6 +1327,8 @@ def fetch_logs(task: dict) -> tuple[str, bool]:
     priority = task.get("priority") or ""
     if source == "inventory":
         return json.dumps(apply_policy_to_inventory(dict(log_inventory(units=target == "units")))), False
+    if source == "ssh":
+        return ssh_answer(target, lines), False
     if not TARGET_RE.match(target) or ".." in target:
         raise ValueError("Invalid log target")
     if not policy_allows(str(source), target):

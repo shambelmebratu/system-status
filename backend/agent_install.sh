@@ -9,6 +9,8 @@
 # Log access for the dashboard's Logs tab (default: on). Put the variable before "bash":
 #   ... | sudo SMWATCH_LOGS=nodocker bash    journald + log files, but no Docker socket access
 #   ... | sudo SMWATCH_LOGS=off bash         the dashboard cannot read any logs from this server
+#   ... | sudo SMWATCH_SSH=nohistory bash    SSH sessions and logins, but no shell command history (SMWATCH_SSH=off: neither)
+#   ... | sudo SMWATCH_HISTORY=on bash       let the agent read EVERY user's shell history (grants it read access to the whole disk)
 #
 # Other commands:
 #   curl -fsSL https://CONTROL_PLANE/api/agent/install.sh | sudo bash -s -- update      update this agent in place (no link or token needed)
@@ -97,6 +99,15 @@ SMWATCH_LOGS="${SMWATCH_LOGS:-on}"
 # Optional: report response-time percentiles of real traffic from a web server / load balancer access log (see the README).
 SMWATCH_ACCESS_LOG="${SMWATCH_ACCESS_LOG:-$(sed -n 's/^AGENT_ACCESS_LOG=//p' "$ENV_FILE" 2>/dev/null | head -1)}"
 case "$SMWATCH_LOGS" in on|nodocker|off) ;; *) die "SMWATCH_LOGS must be on, nodocker or off" ;; esac
+# SSH activity (who is logged in, login history, shell command history). An update keeps the previous choices.
+SMWATCH_SSH="${SMWATCH_SSH:-$(sed -n 's/^AGENT_SSH=//p' "$ENV_FILE" 2>/dev/null | head -1)}"
+[ -n "$SMWATCH_SSH" ] || { [ "$SMWATCH_LOGS" = off ] && SMWATCH_SSH=off || SMWATCH_SSH=on; }
+case "$SMWATCH_SSH" in on|nohistory|off) ;; *) die "SMWATCH_SSH must be on, nohistory or off" ;; esac
+# The agent runs as an unprivileged user, so it cannot open other users' history files (mode 600). SMWATCH_HISTORY=on gives it
+# CAP_DAC_READ_SEARCH: read (never write) access to every file. It still only ever SENDS what its fixed allow-lists permit.
+SMWATCH_HISTORY="${SMWATCH_HISTORY:-$(grep -q '^AmbientCapabilities=CAP_DAC_READ_SEARCH' "/etc/systemd/system/${SERVICE:-sm-watch-agent}.service" 2>/dev/null && echo on || echo off)}"
+case "$SMWATCH_HISTORY" in on|off) ;; *) die "SMWATCH_HISTORY must be on or off" ;; esac
+[ "$SMWATCH_SSH" = on ] || SMWATCH_HISTORY=off
 if [ -n "$SMWATCH_TOKEN" ] && [ "${#SMWATCH_TOKEN}" -lt 32 ]; then die "SMWATCH_TOKEN looks too short; copy the whole command from the dashboard"; fi
 case "$SMWATCH_URL" in http://localhost*|http://127.*|https://localhost*) die "SMWATCH_URL points at localhost, which is this server itself. Use the control plane's real address." ;; esac
 if [ "$IS_MAC" = 0 ]; then command -v systemctl >/dev/null 2>&1 || die "systemd was not found. Use the Docker command instead (dashboard: Install agent -> Docker)."; fi
@@ -224,6 +235,7 @@ if [ "$IS_MAC" = 1 ]; then
     <key>AGENT_MODE</key><string>push</string>
     <key>AGENT_STATE_DIR</key><string>$STATE_DIR</string>
     <key>AGENT_LOGS</key><string>$SMWATCH_LOGS</string>
+    <key>AGENT_SSH</key><string>$SMWATCH_SSH</string>
     <key>AGENT_ACCESS_LOG</key><string>$SMWATCH_ACCESS_LOG</string>
     <key>AGENT_HOST_ROOT</key><string>/</string>
     <key>AGENT_DISK_PATH</key><string>/</string>
@@ -254,6 +266,7 @@ chown -R "$USER_NAME":"$USER_NAME" "$STATE_DIR"
     echo "AGENT_MODE=push"
     echo "AGENT_STATE_DIR=$STATE_DIR"
     echo "AGENT_LOGS=$SMWATCH_LOGS"
+    echo "AGENT_SSH=$SMWATCH_SSH"
     [ -n "$SMWATCH_ACCESS_LOG" ] && echo "AGENT_ACCESS_LOG=$SMWATCH_ACCESS_LOG"
     [ -n "$SMWATCH_TOKEN" ] && echo "AGENT_TOKEN=$SMWATCH_TOKEN"
     true
@@ -270,6 +283,9 @@ if [ "$SMWATCH_LOGS" != "off" ]; then
 fi
 GROUP_LINE=""
 [ -n "$LOG_GROUPS" ] && GROUP_LINE="SupplementaryGroups=${LOG_GROUPS# }"
+CAP_LINES=""
+[ "$SMWATCH_HISTORY" = on ] && CAP_LINES="AmbientCapabilities=CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH"
 
 cat > "/etc/systemd/system/${SERVICE}.service" <<UNIT
 [Unit]
@@ -280,6 +296,7 @@ Wants=network-online.target
 [Service]
 User=$USER_NAME
 $GROUP_LINE
+$(printf "%b" "$CAP_LINES")
 EnvironmentFile=$ENV_FILE
 ExecStart=$INSTALL_DIR/venv/bin/python $INSTALL_DIR/agent.py
 Restart=always
@@ -301,6 +318,7 @@ sleep 2
 if systemctl is-active --quiet "$SERVICE"; then
   say "Done. The server is now reporting to the dashboard."
   [ -n "$LOG_GROUPS" ] && say "Log access for the dashboard:${LOG_GROUPS}  (change with SMWATCH_LOGS=nodocker|off)"
+  say "SSH activity: $SMWATCH_SSH; every user's shell history: $SMWATCH_HISTORY  (change with SMWATCH_SSH=on|nohistory|off, SMWATCH_HISTORY=on|off)"
   say "Logs: journalctl -u $SERVICE -f"
 else
   journalctl -u "$SERVICE" --no-pager -n 20 2>/dev/null || true

@@ -76,11 +76,15 @@ def agent_server(authorization: str | None, db: Session) -> Server:
     return server
 
 
-def supports_logs(server: Server) -> bool:
+def capabilities(server: Server) -> list[str]:
     try:
-        return "logs" in (json.loads(server.last_metrics or "{}").get("capabilities") or [])
-    except ValueError:
-        return False
+        return list(json.loads(server.last_metrics or "{}").get("capabilities") or [])
+    except (ValueError, AttributeError):
+        return []
+
+
+def supports_logs(server: Server) -> bool:
+    return "logs" in capabilities(server)
 
 
 # ------------------------------------------------------------------ dashboard side
@@ -92,7 +96,15 @@ def request_logs(server_id: int, payload: LogQuery, request: Request, user: dict
         raise HTTPException(404, "Server not found")
     if server.monitor_mode != "push":
         raise HTTPException(422, "Logs need the installed agent (this server is monitored by ping or pull)")
-    if not supports_logs(server):
+    if payload.source == "ssh":
+        caps = capabilities(server)
+        if payload.target not in ("sessions", "history"):
+            raise HTTPException(422, "Choose sessions or history")
+        if "ssh" not in caps:
+            raise HTTPException(422, "This server's agent does not report SSH activity: it is older than 2.13 or has AGENT_SSH=off. Update the agent to enable it.")
+        if payload.target == "history" and "ssh_history" not in caps:
+            raise HTTPException(422, "Command history is turned off in this server's agent (AGENT_SSH=nohistory).")
+    elif not supports_logs(server):
         raise HTTPException(422, "This server's agent has log access turned off or is too old. Re-run the install command to update it.")
     if payload.source != "inventory" and not payload.target:
         raise HTTPException(422, "Choose what to read (a container, a unit or a file)")
@@ -108,7 +120,8 @@ def request_logs(server_id: int, payload: LogQuery, request: Request, user: dict
     item = LogRequest(server_id=server_id, query=payload.model_dump_json())
     db.add(item)
     # Logs can contain secrets: record who looked at what (never the content itself).
-    audit(db, request, "logs.read", user=user, target=f"server:{server_id}", detail=f"{payload.source}:{payload.target or '-'} lines={payload.lines}" + (f" filter={payload.grep!r}" if payload.grep else ""))
+    action = {"history": "logs.ssh_history", "sessions": "logs.ssh_sessions"}.get(payload.target, "logs.read") if payload.source == "ssh" else "logs.read"
+    audit(db, request, action, user=user, target=f"server:{server_id}", detail=f"{payload.source}:{payload.target or '-'} lines={payload.lines}" + (f" filter={payload.grep!r}" if payload.grep else ""))
     db.commit(); db.refresh(item)
     _wake(_task_waiters, server_id)   # the agent's open long-poll returns immediately
     return {"id": item.id, "status": item.status}
@@ -174,7 +187,8 @@ def set_policy(server_id: int, policy: policy_lib.LogPolicy, request: Request, u
     compiled = policy_lib.compile_for_agent(policy)
     server.log_policy = None if not policy_lib.is_restricted(compiled) else policy.model_dump_json()
     d, j, f = policy.docker, policy.journal, policy.files
-    summary = (f"docker {'off' if not d.enabled else ','.join(d.include)}{' except ' + ','.join(d.exclude) if d.exclude else ''}; "
+    summary = (f"ssh {'off' if not policy.ssh.enabled else 'on' + ('' if policy.ssh.history else ', no command history')}; "
+               f"docker {'off' if not d.enabled else ','.join(d.include)}{' except ' + ','.join(d.exclude) if d.exclude else ''}; "
                f"journal {'off' if not j.enabled else ','.join(j.units)}; files {'off' if not f.enabled else f.mode + (':' + ','.join(f.categories) if f.mode == 'selected' else '')}")
     audit(db, request, "server.log_policy", user=user, target=f"server:{server.id}", detail=f"{server.name}: {summary}")
     db.commit()

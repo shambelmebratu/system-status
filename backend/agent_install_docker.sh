@@ -70,10 +70,14 @@ say "Starting the agent container"
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 # The agent code is INSIDE the published image: nothing is downloaded or executed from the network when the container starts.
 # Hardened: no extra privileges, read-only root filesystem (only the state volume is writable).
+# SMWATCH_HISTORY=on: the agent may read every user's shell history (DAC_READ_SEARCH = read access to every file of the read-only host
+# mount). Without it the container can read root's history only.
+CAP_ADD=""
+[ "${SMWATCH_HISTORY:-off}" = on ] && [ "${SMWATCH_SSH:-on}" = on ] && CAP_ADD="--cap-add DAC_READ_SEARCH"
 docker run -d --name "$NAME" --restart unless-stopped --pull "${SMWATCH_PULL:-always}" --pid host --hostname "$(hostname)" \
-  --cap-drop ALL --security-opt no-new-privileges:true --read-only --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+  --cap-drop ALL $CAP_ADD --security-opt no-new-privileges:true --read-only --tmpfs /tmp:rw,noexec,nosuid,size=16m \
   -v /:/host:ro -v sm-watch-agent-data:/var/lib/sm-watch-agent $SOCKET_MOUNT \
-  -e SMWATCH_URL="$SMWATCH_URL" -e AGENT_TOKEN="$AGENT_TOKEN" -e AGENT_LOGS="$SMWATCH_LOGS" ${SMWATCH_ACCESS_LOG:+-e AGENT_ACCESS_LOG="$SMWATCH_ACCESS_LOG"} \
+  -e SMWATCH_URL="$SMWATCH_URL" -e AGENT_TOKEN="$AGENT_TOKEN" -e AGENT_LOGS="$SMWATCH_LOGS" -e AGENT_SSH="${SMWATCH_SSH:-on}" ${SMWATCH_ACCESS_LOG:+-e AGENT_ACCESS_LOG="$SMWATCH_ACCESS_LOG"} \
   -e AGENT_HOST_ROOT=/host -e AGENT_PROCFS_PATH=/host/proc -e AGENT_DISK_PATH=/host \
   "$SMWATCH_AGENT_IMAGE" >/dev/null || die "could not start $SMWATCH_AGENT_IMAGE (can this server pull it from the registry?)"
 

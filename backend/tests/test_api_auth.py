@@ -2020,3 +2020,40 @@ def test_access_limited_to_selected_monitors(client):
     assert client.put(f"/api/users/{uid}", headers=CSRF, json={"access_set": True, "access": {"servers": [mine]}}).status_code == 200
     assert client.put(f"/api/users/{uid}", headers=CSRF, json={"role": "admin"}).json()["access"] is None
     assert any("access" in (e["detail"] or "") for e in client.get("/api/audit?category=user").json())
+
+
+def test_ssh_activity_requests(client):
+    sign_in(client)
+    anon = TestClient(main.app)
+    old, _ = _push_server(client, anon, caps=("logs",))                                        # agent older than 2.13
+    r = client.post(f"/api/servers/{old}/logs", headers=CSRF, json={"source": "ssh", "target": "sessions"})
+    assert r.status_code == 422 and "2.13" in r.json()["detail"]
+    nohist, _ = _push_server(client, anon, caps=("logs", "ssh"))                             # AGENT_SSH=nohistory
+    assert client.post(f"/api/servers/{nohist}/logs", headers=CSRF, json={"source": "ssh", "target": "sessions"}).status_code == 200
+    assert client.post(f"/api/servers/{nohist}/logs", headers=CSRF, json={"source": "ssh", "target": "history"}).status_code == 422
+
+    sid, auth = _push_server(client, anon, caps=("ssh", "ssh_history"))                       # works even with log access off
+    assert anon.post("/api/agent/report", json=report(capabilities=["ssh", "ssh_history"], ssh_sessions=3), headers={**auth}).status_code in (200, 429)
+    assert client.post(f"/api/servers/{sid}/logs", headers=CSRF, json={"source": "ssh", "target": "bogus"}).status_code == 422
+    rid = client.post(f"/api/servers/{sid}/logs", headers=CSRF, json={"source": "ssh", "target": "history", "lines": 100}).json()["id"]
+    task = anon.get("/api/agent/tasks", headers=auth).json()["tasks"][0]
+    assert task["source"] == "ssh" and task["target"] == "history" and task["lines"] == 100
+    answer = json.dumps({"users": [{"user": "root", "shell": "bash", "file": "/root/.bash_history", "modified": 1, "total": 1, "commands": [{"cmd": "ls", "ts": None}]}], "notes": []})
+    assert anon.post(f"/api/agent/tasks/{rid}/result", headers=auth, json={"ok": True, "output": answer}).status_code == 200
+    assert json.loads(client.get(f"/api/servers/{sid}/logs/{rid}").json()["output"])["users"][0]["commands"] == [{"cmd": "ls", "ts": None}]
+    actions = [e["action"] for e in client.get("/api/audit?category=logs").json()]
+    assert "logs.ssh_history" in actions and "logs.ssh_sessions" in actions
+
+    # viewers never; an admin can switch it off per server (enforced here and delivered to the agent)
+    make_user(client, "ssh-view@example.com", "viewer")
+    viewer = session_for("ssh-view@example.com", new_password="viewer-pass-123456")
+    assert viewer.post(f"/api/servers/{sid}/logs", headers=CSRF, json={"source": "ssh", "target": "sessions"}).status_code == 403
+    policy = client.get(f"/api/servers/{sid}/log-policy").json()["policy"]
+    assert policy["ssh"] == {"enabled": True, "history": True}
+    assert client.put(f"/api/servers/{sid}/log-policy", headers=CSRF, json={**policy, "ssh": {"enabled": True, "history": False}}).json()["restricted"] is True
+    assert client.post(f"/api/servers/{sid}/logs", headers=CSRF, json={"source": "ssh", "target": "history"}).status_code == 403
+    assert client.post(f"/api/servers/{sid}/logs", headers=CSRF, json={"source": "ssh", "target": "sessions"}).status_code == 200
+    import time as _t; _t.sleep(2.1)
+    delivered = anon.post("/api/agent/report", json=report(capabilities=["ssh"]), headers=auth).json()["log_policy"]
+    assert delivered["ssh"] == {"enabled": True, "history": False}
+    assert client.get("/api/dashboard").json()["servers"][[s["id"] for s in client.get("/api/dashboard").json()["servers"]].index(sid)]["last_metrics"].get("ssh_sessions") in (None, 3)

@@ -299,6 +299,21 @@ The same one-line install command works on a Mac. It detects macOS and sets up a
 - **The machine running SM-Watch itself** is covered by the stack's `host-agent` service, which registers it as *This server (control plane)* (on a Linux host this gives you the host journal and files plus every container's logs). That service mounts the host read-only plus the Docker socket; set `HOST_AGENT_LOGS=nodocker` or `off` in `.env`, or delete the service from `docker-compose.yml`, if you prefer not to have it.
 - Anyone with the operator or admin role can read these logs, so treat those roles accordingly. Logs often contain IP addresses, usernames and sometimes secrets.
 
+## SSH activity
+
+The server page has an **SSH** tab (operators and admins; agent 2.13+). It shows:
+
+- **Logged in now**: every open SSH session with user, source IP, terminal and how long it has been connected. Server tiles show the number of open sessions, which is sent with every report (a count only, no names or addresses).
+- **SSH login history**: user, source IP, terminal, login and logout time, duration, and whether the session ended with a logout, a reboot, or has no logout record. It comes from `/var/log/wtmp`, or `/var/lib/wtmpdb/wtmp.db` on newer distributions. The newest 15 are shown, with *See more / See less* for the rest.
+- **Command history**: the newest 100, 200 or 500 shell commands per user (bash, zsh, fish), newest first, with times when the shell records them (zsh extended history, fish, bash with `HISTTIMEFORMAT`). 20 are shown, with *See more / See less* for the rest, plus a search box.
+
+Safety:
+- Everything is read on demand, deleted after `LOG_RESULT_TTL_MINUTES` like logs, and every read is in the audit log (`logs.ssh_sessions`, `logs.ssh_history`). It also follows the per-user access limits.
+- Recognisable secrets on a command line (passwords in `-p`, `--password`, `X_PASSWORD=`, `user:pass@` URLs, `Authorization:` headers, GitHub/GitLab/Slack/AWS-style tokens, private keys) are replaced with `***` **on the server, before anything is sent**. This is best effort: an unusual way of passing a secret can still show.
+- An admin can turn SSH activity, or only the command history, off per server under **Log access**. On the server itself: `SMWATCH_SSH=on|nohistory|off` when installing (Docker agent: the same; bundled agent: `HOST_AGENT_SSH`).
+- The shell-install agent runs as an unprivileged user, so it cannot open other users' history files (mode 600). Re-run the install command with `SMWATCH_HISTORY=on` to allow it; this gives the agent read-only access to every file (`CAP_DAC_READ_SEARCH`), and it still only sends what its allow-lists permit. The bundled host agent has this permission in `docker-compose.yml` (remove `cap_add: DAC_READ_SEARCH` to limit it to root's own history).
+- Bash writes a session's commands when that shell exits, so the commands of someone still logged in may not be listed yet.
+
 ## Choosing which logs are available (log access policy)
 
 SM-Watch never ships or stores logs. Logs are read **on demand** by the agent, shown once, and the result is deleted after 15 minutes, so there is nothing to grow. To limit *what* an agent may expose at all, an admin opens a server and edits **Log access** (Server page, push agents):

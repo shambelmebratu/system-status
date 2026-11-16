@@ -190,6 +190,7 @@ class AgentReport(BaseModel):
     agent_version: str = Field(default="", max_length=32)
     processes: list[ProcessSample] = Field(default_factory=list, max_length=100)
     capabilities: list[str] = Field(default_factory=list, max_length=20)
+    ssh_sessions: int | None = Field(default=None, ge=0, le=100000)   # open SSH sessions right now (a count only: no names or addresses)
     ips: list[IpEntry] = Field(default_factory=list, max_length=10)
     public_ip: str = Field(default="", max_length=45)
     install: str = Field(default="", max_length=20)
@@ -238,7 +239,7 @@ class ScheduledMessageIn(BaseModel):
 
 class LogQuery(BaseModel):
     """A log request the dashboard queues for an agent. Every field is re-validated by the agent before use."""
-    source: str = Field(pattern="^(inventory|docker|journal|file)$")
+    source: str = Field(pattern="^(inventory|docker|journal|file|ssh)$")   # ssh: target "sessions" (who is / was logged in) or "history" (shell commands)
     target: str = Field(default="", max_length=300, pattern=r"^[A-Za-z0-9@_.:/\-]*$")  # container name, systemd unit, or file path
     lines: int = Field(default=200, ge=1, le=2000)
     since_minutes: int = Field(default=0, ge=0, le=60 * 24 * 30)                     # 0 = no time limit

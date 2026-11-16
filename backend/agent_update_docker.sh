@@ -26,6 +26,9 @@ sock=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/run/docker
 [ -n "$sock" ] && SOCKET_MOUNT=(-v "$sock:/var/run/docker.sock")
 VOLUME=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/lib/sm-watch-agent"}}{{.Name}}{{end}}{{end}}' "$NAME")
 VOLUME="${VOLUME:-sm-watch-agent-data}"
+# keep the shell-history permission the container was installed with
+CAP_ADD=()
+docker inspect -f '{{range .HostConfig.CapAdd}}{{println .}}{{end}}' "$NAME" | grep -qi DAC_READ_SEARCH && CAP_ADD=(--cap-add DAC_READ_SEARCH)
 
 if [ "${SMWATCH_PULL:-always}" != "never" ]; then
   say "Pulling $SMWATCH_AGENT_IMAGE"
@@ -35,7 +38,7 @@ fi
 say "Recreating the agent container"
 docker rm -f "$NAME" >/dev/null
 docker run -d --name "$NAME" --restart unless-stopped --pid host --hostname "$(hostname)" \
-  --cap-drop ALL --security-opt no-new-privileges:true --read-only --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+  --cap-drop ALL ${CAP_ADD[@]+"${CAP_ADD[@]}"} --security-opt no-new-privileges:true --read-only --tmpfs /tmp:rw,noexec,nosuid,size=16m \
   -v /:/host:ro -v "$VOLUME":/var/lib/sm-watch-agent ${SOCKET_MOUNT[@]+"${SOCKET_MOUNT[@]}"} \
   "${ENV_ARGS[@]}" "$SMWATCH_AGENT_IMAGE" >/dev/null || die "could not start the new container. Re-run the install command from the dashboard (Servers -> Add server -> Install agent -> Docker)."
 

@@ -5,6 +5,7 @@ import { AvailabilityPanel } from '../components/availability';
 import { AreaChart, Ring } from '../components/charts';
 import { JoinCommands, expiryText, useActiveEnrollment, useControlPlaneUrl } from '../components/join';
 import { LogsPanel } from '../components/logs';
+import { SshPanel } from '../components/ssh';
 import { AgentUpdate } from '../components/agentupdate';
 import { MonitorAlertSettings, alertSummary, alertsOf, type MonitorAlerts } from '../components/alertpick';
 import { LogPolicyCard } from '../components/logpolicy';
@@ -41,7 +42,7 @@ function ServerList() {
             const m = s.last_metrics;
             return (
               <div key={s.id} className="card tile" onClick={() => go(`servers/${s.id}`)}>
-                <div className="tile-top"><div className="grow"><div className="name">{s.name}</div><small className="muted">{m?.hostname || s.host || 'waiting for first report'}</small></div><StatusPill status={s.last_status} /></div>
+                <div className="tile-top"><div className="grow"><div className="name">{s.name}</div><small className="muted">{m?.hostname || s.host || 'waiting for first report'}</small></div>{m?.ssh_sessions != null && <span className={`ssh-badge ${m.ssh_sessions ? 'on' : ''}`} title={`${m.ssh_sessions} active SSH session${m.ssh_sessions === 1 ? '' : 's'}`}><Icon name="terminal" size={12} />{m.ssh_sessions}</span>}<StatusPill status={s.last_status} /></div>
                 {m?.cpu != null ? (
                   <div className="minis">
                     {(['cpu', 'memory', 'disk'] as const).map(k => <div key={k} className="mini">{k === 'cpu' ? 'CPU' : k === 'memory' ? 'Memory' : 'Disk'}<b>{pct(m[k], 0)}</b><Meter value={m[k]!} warnAt={s[`${k}_threshold` as const] * (lim.warn / lim.bad)} badAt={s[`${k}_threshold` as const]} /></div>)}
@@ -63,8 +64,10 @@ function ServerDetail({ server }: { server: Server }) {
   const [range, setRange] = useState<Range>('24h');
   const [editing, setEditing] = useState(false);
   const [rotated, setRotated] = useState<string | null>(null);
-  const [tab, setTab] = useState<'overview' | 'logs'>('overview');
+  const [tab, setTab] = useState<'overview' | 'logs' | 'ssh'>('overview');
   const canLogs = canOperate && server.monitor_mode === 'push' && !!server.last_metrics?.capabilities?.includes('logs');
+  const canSsh = canOperate && server.monitor_mode === 'push' && !!server.last_metrics?.capabilities?.includes('ssh');
+  const sshCount = server.last_metrics?.ssh_sessions;
   const history = usePoll(() => api<ServerHistory>(`/servers/${server.id}/history?range=${range}`), [server.id, range], 10000);
   const incidents = usePoll(() => api<Incident[]>('/incidents?limit=200'), [server.id], 30000);
   const m = server.last_metrics;
@@ -104,9 +107,12 @@ function ServerDetail({ server }: { server: Server }) {
         {canManage && <button className="btn sm danger" onClick={remove}>Remove</button>}
       </div>
 
-      {canLogs && <div className="seg" style={{ marginBottom: 16 }}><button className={tab === 'overview' ? 'on' : ''} onClick={() => setTab('overview')}>Overview</button><button className={tab === 'logs' ? 'on' : ''} onClick={() => setTab('logs')}>Logs</button></div>}
+      {(canLogs || canSsh) && <div className="seg" style={{ marginBottom: 16 }}><button className={tab === 'overview' ? 'on' : ''} onClick={() => setTab('overview')}>Overview</button>
+        {canLogs && <button className={tab === 'logs' ? 'on' : ''} onClick={() => setTab('logs')}>Logs</button>}
+        {canSsh && <button className={tab === 'ssh' ? 'on' : ''} onClick={() => setTab('ssh')}>SSH{sshCount ? <span className="lg-count" style={{ marginLeft: 6 }}>{sshCount}</span> : null}</button>}</div>}
       {server.last_status === 'down' && server.last_error && <div className="err" style={{ marginBottom: 16 }}>{server.last_error}</div>}
       {tab === 'logs' && canLogs && <LogsPanel serverId={server.id} />}
+      {tab === 'ssh' && canSsh && <SshPanel serverId={server.id} liveCount={sshCount} canHistory={!!server.last_metrics?.capabilities?.includes('ssh_history')} />}
       {!!server.same_machine_as?.length && (
         <div className="banner" style={{ marginBottom: 16 }}>
           <b>This machine is monitored twice.</b> It also reports as {server.same_machine_as.map((t, i) => <span key={t.id}>{i > 0 && ', '}<a href={`#servers/${t.id}`}>{t.name}</a></span>)}. Each entry has its own alert limits and sends its own alerts, so editing the limits here does not change the other one. Keep one and remove the other (or set the same limits on both).
@@ -117,7 +123,7 @@ function ServerDetail({ server }: { server: Server }) {
           <p className="muted">No report has been received yet. Install the agent with the token shown when this server was created (use <b>Rotate token</b> to get a new one).</p></div>
       )}
 
-      <div className="grid g-side" style={tab === 'logs' && canLogs ? { display: 'none' } : undefined}>
+      <div className="grid g-side" style={tab !== 'overview' ? { display: 'none' } : undefined}>
         <div className="grid">
           <section className="card">
             <div className="card-head"><h2>Current</h2><span className="grow" /><span className={`liveflag ${fresh ? 'on' : ''}`} title={fresh ? 'The agent is reporting on schedule' : 'No report for a while'}><i />{server.monitor_mode === 'push' ? `${fresh ? 'live · ' : ''}last report ${ago(server.last_seen_at)}` : `checked ${ago(server.last_checked_at)}`}<span className="muted"> · every {server.check_interval_seconds}s</span></span></div>

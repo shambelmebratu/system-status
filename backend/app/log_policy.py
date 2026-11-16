@@ -95,7 +95,13 @@ class FilesPolicy(_Patterns):
         return v
 
 
+class SshPolicy(BaseModel):
+    enabled: bool = True     # who is logged in over SSH and the login history
+    history: bool = True     # the shell command history of the server's users
+
+
 class LogPolicy(BaseModel):
+    ssh: SshPolicy = Field(default_factory=SshPolicy)
     docker: DockerPolicy = Field(default_factory=DockerPolicy)
     journal: JournalPolicy = Field(default_factory=JournalPolicy)
     files: FilesPolicy = Field(default_factory=FilesPolicy)
@@ -117,6 +123,7 @@ def compile_for_agent(policy: LogPolicy) -> dict:
         "docker": {"enabled": policy.docker.enabled, "include": policy.docker.include, "exclude": policy.docker.exclude},
         "journal": {"enabled": policy.journal.enabled, "units": policy.journal.units},
         "files": {"enabled": policy.files.enabled, "allow": allow},
+        "ssh": {"enabled": policy.ssh.enabled, "history": policy.ssh.enabled and policy.ssh.history},
     }
 
 
@@ -145,12 +152,16 @@ def file_allowed(compiled: dict, path: str) -> bool:
 def query_allowed(compiled: dict, source: str, target: str) -> bool:
     if source == "inventory":
         return True
+    if source == "ssh":
+        ssh = compiled.get("ssh", {"enabled": True, "history": True})
+        return ssh["enabled"] and (target != "history" or ssh["history"])
     return {"docker": docker_allowed, "journal": journal_allowed, "file": file_allowed}[source](compiled, target)
 
 
 def is_restricted(compiled: dict) -> bool:
     d, j, f = compiled["docker"], compiled["journal"], compiled["files"]
-    return (not d["enabled"] or d["include"] != ["*"] or bool(d["exclude"]) or not j["enabled"] or j["units"] != ["*"] or not f["enabled"] or f["allow"] is not None)
+    s = compiled.get("ssh", {"enabled": True, "history": True})
+    return (not s["enabled"] or not s["history"] or not d["enabled"] or d["include"] != ["*"] or bool(d["exclude"]) or not j["enabled"] or j["units"] != ["*"] or not f["enabled"] or f["allow"] is not None)
 
 
 def filter_inventory(output: str, compiled: dict) -> str:
