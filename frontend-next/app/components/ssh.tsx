@@ -22,7 +22,7 @@ function span(seconds: number): string {
 const END_LABEL: Record<Login['end'], [string, string]> = { active: ['Logged in', 'good'], logout: ['Logged out', 'muted'], reboot: ['Ended by reboot', 'warn'], unknown: ['No logout record', 'muted'] };
 
 /** Who is on this server over SSH, who was, and what they typed. Everything is read on demand from the agent and every read is audited. */
-export function SshPanel({ serverId, liveCount, canHistory }: { serverId: number; liveCount: number | null | undefined; canHistory: boolean }) {
+export function SshPanel({ serverId, liveCount, canHistory, onCount }: { serverId: number; liveCount: number | null | undefined; canHistory: boolean; onCount?: (n: number) => void }) {
   const [sessions, setSessions] = useState<SessionsAnswer | null>(null);
   const [sessionsError, setSessionsError] = useState('');
   const [busy, setBusy] = useState(false);
@@ -35,10 +35,10 @@ export function SshPanel({ serverId, liveCount, canHistory }: { serverId: number
     setBusy(true); setSessionsError('');
     try {
       const r = await runQuery(serverId, { source: 'ssh', target: 'sessions' }, () => run.current !== mine);
-      if (run.current === mine) setSessions(JSON.parse(r.output) as SessionsAnswer);
+      if (run.current === mine) { const answer = JSON.parse(r.output) as SessionsAnswer; setSessions(answer); onCount?.(answer.sessions.length); }
     } catch (e) { if ((e as Error).message !== 'cancelled' && run.current === mine) setSessionsError((e as Error).message); }
     finally { if (run.current === mine) setBusy(false); }
-  }, [serverId]);
+  }, [serverId, onCount]);
   useEffect(() => { setSessions(null); void load(); return () => { run.current++; }; }, [load]);
 
   const logins = useMemo(() => {

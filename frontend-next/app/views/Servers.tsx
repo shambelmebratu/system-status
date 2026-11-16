@@ -1,6 +1,6 @@
 'use client';
 
-import { FormEvent, useEffect, useState } from 'react';
+import { useCallback, FormEvent, useEffect, useState } from 'react';
 import { AvailabilityPanel } from '../components/availability';
 import { AreaChart, Ring } from '../components/charts';
 import { JoinCommands, expiryText, useActiveEnrollment, useControlPlaneUrl } from '../components/join';
@@ -67,7 +67,11 @@ function ServerDetail({ server }: { server: Server }) {
   const [tab, setTab] = useState<'overview' | 'logs' | 'ssh'>('overview');
   const canLogs = canOperate && server.monitor_mode === 'push' && !!server.last_metrics?.capabilities?.includes('logs');
   const canSsh = canOperate && server.monitor_mode === 'push' && !!server.last_metrics?.capabilities?.includes('ssh');
-  const sshCount = server.last_metrics?.ssh_sessions;
+  // The report carries a count that can be up to one report interval old; once the SSH tab has asked the agent directly, that
+  // fresher number is shown until the next report arrives (so the tab and the list never disagree).
+  const [sshFresh, setSshFresh] = useState<{ n: number; report: string | null } | null>(null);
+  const onSshCount = useCallback((n: number) => setSshFresh({ n, report: server.last_seen_at }), [server.last_seen_at]);
+  const sshCount = sshFresh && sshFresh.report === server.last_seen_at ? sshFresh.n : server.last_metrics?.ssh_sessions;
   const history = usePoll(() => api<ServerHistory>(`/servers/${server.id}/history?range=${range}`), [server.id, range], 10000);
   const incidents = usePoll(() => api<Incident[]>('/incidents?limit=200'), [server.id], 30000);
   const m = server.last_metrics;
@@ -112,7 +116,7 @@ function ServerDetail({ server }: { server: Server }) {
         {canSsh && <button className={tab === 'ssh' ? 'on' : ''} onClick={() => setTab('ssh')}>SSH{sshCount ? <span className="lg-count" style={{ marginLeft: 6 }}>{sshCount}</span> : null}</button>}</div>}
       {server.last_status === 'down' && server.last_error && <div className="err" style={{ marginBottom: 16 }}>{server.last_error}</div>}
       {tab === 'logs' && canLogs && <LogsPanel serverId={server.id} />}
-      {tab === 'ssh' && canSsh && <SshPanel serverId={server.id} liveCount={sshCount} canHistory={!!server.last_metrics?.capabilities?.includes('ssh_history')} />}
+      {tab === 'ssh' && canSsh && <SshPanel serverId={server.id} liveCount={sshCount} canHistory={!!server.last_metrics?.capabilities?.includes('ssh_history')} onCount={onSshCount} />}
       {!!server.same_machine_as?.length && (
         <div className="banner" style={{ marginBottom: 16 }}>
           <b>This machine is monitored twice.</b> It also reports as {server.same_machine_as.map((t, i) => <span key={t.id}>{i > 0 && ', '}<a href={`#servers/${t.id}`}>{t.name}</a></span>)}. Each entry has its own alert limits and sends its own alerts, so editing the limits here does not change the other one. Keep one and remove the other (or set the same limits on both).

@@ -39,7 +39,7 @@ from typing import Any
 
 import psutil
 
-AGENT_VERSION = "2.13.0"
+AGENT_VERSION = "2.13.1"
 _ENV_TOKEN = os.getenv("AGENT_TOKEN", "")                      # the token supplied by configuration; a rotation may supersede it (see _load_state)
 AGENT_TOKEN = ""                                                # the token in use: resolved by ensure_token() (saved state first, then configuration)
 AGENT_ALLOW_INSECURE = os.getenv("AGENT_ALLOW_INSECURE", "") == "1"   # permit http:// to a public address (not recommended)
@@ -1060,9 +1060,30 @@ def _utmp_records(path: str, max_bytes: int = 8_000_000) -> list[dict]:
     return records
 
 
+_HOST_RE = re.compile(r"[A-Za-z0-9._:%\-]{1,255}")
+
+
 def _remote(host: str) -> bool:
-    """A login that came over the network (SSH), not a local console or desktop (':0')."""
-    return bool(host) and not host.startswith(":")
+    """A login that came over the network (SSH): the host is an address or a host name. Not a local console, a desktop (':0'),
+    or the extra records terminal multiplexers write ('tmux(1234).%0', ':S.0' from screen, 'mosh [1234]')."""
+    return bool(host) and not host.startswith(":") and bool(_HOST_RE.fullmatch(host))
+
+
+def _owns_tty(pid: int, tty: str) -> bool | None:
+    """Is process `pid` still attached to terminal `tty` (pts/N)? A utmp entry whose session crashed keeps its old pid, and Linux
+    later hands that pid to an unrelated process: without this check such a ghost counts as a logged-in user. None = cannot tell."""
+    match = re.fullmatch(r"pts/(\d+)", tty)
+    if not match:
+        return None
+    try:
+        with open(os.path.join(AGENT_PROCFS_PATH, str(pid), "stat")) as handle:
+            fields = handle.read().rsplit(")", 1)[1].split()
+        tty_nr = int(fields[4])
+    except (OSError, ValueError, IndexError):
+        return None
+    major, minor = (tty_nr >> 8) & 0xFFF, (tty_nr & 0xFF) | ((tty_nr >> 12) & 0xFFF00)
+    number = int(match.group(1))
+    return 136 <= major <= 143 and (major - 136) * 256 + minor == number
 
 
 def _first_existing(*paths: str) -> str | None:
@@ -1104,10 +1125,12 @@ def ssh_sessions() -> tuple[list[dict], str | None]:
     sessions: list[dict] = []
     if path and not IS_MAC:
         try:
+            by_tty: dict[str, dict] = {}
             for r in _utmp_records(path, 2_000_000):
-                if r["type"] == USER_PROCESS and _remote(r["host"]) and _pid_alive(r["pid"]):
-                    sessions.append({"user": r["user"], "ip": r["host"], "tty": r["tty"], "since": r["ts"], "pid": r["pid"]})
-            return sessions, None
+                if r["type"] != USER_PROCESS or not _remote(r["host"]) or not _pid_alive(r["pid"]) or _owns_tty(r["pid"], r["tty"]) is False:
+                    continue
+                by_tty[r["tty"]] = {"user": r["user"], "ip": r["host"], "tty": r["tty"], "since": r["ts"], "pid": r["pid"]}   # one session per terminal
+            return sorted(by_tty.values(), key=lambda s: s["since"] or 0, reverse=True), None
         except OSError as error:
             return [], f"Cannot read {path}: {error.strerror or error}"
     if AGENT_HOST_ROOT in ("", "/"):   # macOS, or a distribution without utmp: ask the operating system
@@ -1267,23 +1290,74 @@ def _home_dirs() -> list[tuple[str, str]]:
     return [(user, home) for home, user in sorted(homes.items(), key=lambda kv: (kv[1] != "root", kv[1]))][:100]
 
 
+def _container_facts() -> dict:
+    """What limits this process's file access (only meaningful for the Docker agent)."""
+    facts = {"docker": AGENT_HOST_ROOT not in ("", "/"), "uid": os.geteuid() if hasattr(os, "geteuid") else None, "userns": False, "selinux": False, "dac_read": False}
+    try:
+        with open("/proc/self/uid_map") as handle:
+            first = handle.read().split()
+        facts["userns"] = len(first) >= 3 and not (first[0] == "0" and first[1] == "0")    # root inside is not root outside
+    except OSError:
+        pass
+    try:
+        with open("/proc/self/status") as handle:
+            capeff = int(next(line.split()[1] for line in handle if line.startswith("CapEff:")), 16)
+        facts["dac_read"] = bool(capeff & (1 << 2)) or bool(capeff & (1 << 1))           # CAP_DAC_READ_SEARCH or CAP_DAC_OVERRIDE
+    except (OSError, StopIteration, ValueError):
+        pass
+    for path in (_host_path("/sys/fs/selinux/enforce"), "/sys/fs/selinux/enforce"):
+        try:
+            with open(path) as handle:
+                facts["selinux"] = handle.read().strip() == "1"
+            break
+        except OSError:
+            continue
+    return facts
+
+
+def _history_advice(blocked: list[str], facts: dict) -> str:
+    who = ", ".join(sorted(set(blocked)))
+    if not facts["docker"]:
+        return (f"The agent may not read the shell history of: {who}. Re-run the install command on this server with SMWATCH_HISTORY=on "
+                "(this lets the agent read, never change, every file).")
+    if facts["userns"]:
+        return (f"The agent cannot read the shell history of: {who}. Docker on this server runs containers in a separate user namespace "
+                "(rootless Docker or userns-remap), so the agent is not root on the host. Re-run the Docker install command with "
+                "SMWATCH_HISTORY=on (it adds --userns=host), or use the shell install instead.")
+    if facts["selinux"]:
+        return (f"The agent cannot read the shell history of: {who}. SELinux is enforcing on this server and keeps containers out of home "
+                "folders. Re-run the Docker install command with SMWATCH_HISTORY=on (it adds --security-opt label=disable).")
+    return (f"The agent cannot read the shell history of: {who}. Re-run the Docker install command with SMWATCH_HISTORY=on "
+            "(it gives the container read-only access to every file: --cap-add DAC_READ_SEARCH).")
+
+
 def shell_history(lines: int = 100) -> dict:
-    """The newest `lines` commands per user and shell, newest first, secrets masked."""
+    """The newest `lines` commands per user and shell, newest first, secrets masked. Anything that could not be read is explained
+    in `notes` (never silently skipped: an empty answer must mean there really is no history)."""
     lines = max(1, min(SSH_HISTORY_MAX, lines))
-    users, unreadable = [], []
+    users, blocked, checked = [], [], 0
     for user, home in _home_dirs():
+        home_real = _host_path(home)
+        try:
+            os.listdir(home_real)            # raises if the agent may not open this home folder (isfile() would just say False)
+        except PermissionError:
+            blocked.append(user)
+            continue
+        except OSError:
+            continue                         # no such folder
+        checked += 1
         for rel, kind in HISTORY_FILES:
-            path = _host_path(os.path.join(home, rel))
-            if not os.path.isfile(path):
-                continue
+            path = os.path.join(home_real, rel)
             try:
                 real = os.path.realpath(path)
-                if not real.startswith(os.path.realpath(_host_path(home)) + os.sep):   # a history "file" linked elsewhere is not followed
+                if not os.path.isfile(real):
                     continue
-                entries = _parse_history(kind, _tail_text(real))
+                if not real.startswith(os.path.realpath(home_real) + os.sep):   # a history "file" linked elsewhere is not followed
+                    continue
                 stat = os.stat(real)
+                entries = _parse_history(kind, _tail_text(real))
             except PermissionError:
-                unreadable.append(user)
+                blocked.append(user)
                 continue
             except OSError:
                 continue
@@ -1293,9 +1367,11 @@ def shell_history(lines: int = 100) -> dict:
             users.append({"user": user, "shell": kind, "file": os.path.join(home, rel), "modified": int(stat.st_mtime), "total": len(entries),
                           "commands": [{"cmd": redact_command(e["cmd"])[:2000], "ts": e["ts"]} for e in newest]})
     notes = []
-    if unreadable:
-        notes.append(f"The agent may not read the shell history of: {', '.join(sorted(set(unreadable)))}. "
-                     "Re-run the install command with SMWATCH_HISTORY=on (shell install) to allow it.")
+    if blocked:
+        notes.append(_history_advice(blocked, _container_facts()))
+    if not users and not blocked:
+        notes.append(f"No shell history file was found in the {checked} home folder(s) the agent checked (.bash_history, .zsh_history, fish). "
+                     "Users whose shell writes its history elsewhere (a custom HISTFILE) are not shown.")
     return {"users": users, "notes": notes}
 
 

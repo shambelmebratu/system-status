@@ -26,9 +26,16 @@ sock=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/run/docker
 [ -n "$sock" ] && SOCKET_MOUNT=(-v "$sock:/var/run/docker.sock")
 VOLUME=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/lib/sm-watch-agent"}}{{.Name}}{{end}}{{end}}' "$NAME")
 VOLUME="${VOLUME:-sm-watch-agent-data}"
-# keep the shell-history permission the container was installed with
+# Shell history for the SSH tab (see the install script): on unless this agent was installed without it on purpose
+# (SMWATCH_HISTORY=off now, or AGENT_SSH=off/nohistory in the container). Agents from before 2.13 get it switched on.
+AGENT_SSH_NOW=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" | sed -n 's/^AGENT_SSH=//p' | head -1)
 CAP_ADD=()
-docker inspect -f '{{range .HostConfig.CapAdd}}{{println .}}{{end}}' "$NAME" | grep -qi DAC_READ_SEARCH && CAP_ADD=(--cap-add DAC_READ_SEARCH)
+if [ "${SMWATCH_HISTORY:-on}" = on ] && [ "${AGENT_SSH_NOW:-on}" = on ]; then
+  CAP_ADD=(--cap-add DAC_READ_SEARCH)
+  SECOPTS=$(docker info --format '{{json .SecurityOptions}}' 2>/dev/null || true)
+  case "$SECOPTS" in *userns*) CAP_ADD+=(--userns=host) ;; esac
+  if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" = Enforcing ]; then CAP_ADD+=(--security-opt label=disable); fi
+fi
 
 if [ "${SMWATCH_PULL:-always}" != "never" ]; then
   say "Pulling $SMWATCH_AGENT_IMAGE"

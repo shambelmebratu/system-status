@@ -49,7 +49,7 @@ def test_active_sessions_and_count(agent, monkeypatch):
     monkeypatch.setattr(agent, "_pid_alive", lambda pid: pid == me)
     sessions, note = agent.ssh_sessions()
     assert note is None
-    assert [(s["user"], s["ip"], s["tty"]) for s in sessions] == [("alice", "203.0.113.7", "pts/0"), ("root", "198.51.100.2", "pts/1")]
+    assert [(s["user"], s["ip"], s["tty"]) for s in sessions] == [("root", "198.51.100.2", "pts/1"), ("alice", "203.0.113.7", "pts/0")]   # newest first
     assert agent.ssh_count() == 2
     agent.apply_policy({"docker": {"enabled": True, "include": ["*"], "exclude": []}, "journal": {"enabled": True, "units": ["*"]}, "files": {"enabled": True, "allow": None}, "ssh": {"enabled": False, "history": False}})
     assert agent.ssh_count() is None
@@ -135,3 +135,47 @@ def test_ssh_off_and_nohistory(tmp_path, monkeypatch):
             with pytest.raises(ValueError, match="off"):
                 module.ssh_answer("sessions", 100)
     sys.modules.pop("agent", None)
+
+
+def test_ghost_and_multiplexer_entries_are_not_counted(agent, monkeypatch):
+    """The count on the dashboard and the list must agree with `who`: a crashed session whose pid was reused by another process,
+    tmux/screen/mosh records and duplicate records for one terminal are not SSH users."""
+    me, now = os.getpid(), int(time.time())
+    (agent.ROOT_FOR_TEST / "run/utmp").write_bytes(
+        record(7, me, "pts/0", "root", "196.188.229.102", now - 240)
+        + record(7, 4242, "pts/1", "root", "196.188.237.201", now - 9000)        # ghost: pid 4242 now belongs to something else
+        + record(7, me, "pts/2", "root", "tmux(1234).%0", now - 100)             # tmux pane
+        + record(7, me, "pts/3", "root", ":S.0", now - 90)                       # screen
+        + record(7, me, "pts/4", "root", "mosh [5678]", now - 80))               # mosh helper record
+    monkeypatch.setattr(agent, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(agent, "_owns_tty", lambda pid, tty: pid == me)
+    sessions, _ = agent.ssh_sessions()
+    assert [(s["user"], s["ip"], s["tty"]) for s in sessions] == [("root", "196.188.229.102", "pts/0")]
+    assert agent.ssh_count() == 1
+
+
+def test_owns_tty_reads_the_controlling_terminal(agent, tmp_path, monkeypatch):
+    proc = tmp_path / "proc"
+    (proc / "77").mkdir(parents=True)
+    tty_nr = (136 << 8) | 5                                                          # /dev/pts/5
+    (proc / "77" / "stat").write_text(f"77 (bash) S 70 77 77 {tty_nr} 77 4194560 0 0 0 0 0 0 0 0 20 0 1 0 1 0 0\n")
+    monkeypatch.setattr(agent, "AGENT_PROCFS_PATH", str(proc))
+    assert agent._owns_tty(77, "pts/5") is True and agent._owns_tty(77, "pts/1") is False
+    assert agent._owns_tty(78, "pts/5") is None and agent._owns_tty(77, "tty1") is None
+
+
+def test_unreadable_home_is_explained_not_hidden(agent):
+    root = agent.ROOT_FOR_TEST
+    (root / "etc/passwd").write_text("root:x:0:0:root:/root:/bin/bash\n")
+    (root / "root/.bash_history").write_text("ls\n")
+    os.chmod(root / "root", 0)
+    try:
+        if os.access(root / "root", os.R_OK):
+            pytest.skip("running as root: permissions cannot be tested")
+        result = agent.shell_history(100)
+        assert result["users"] == [] and "root" in result["notes"][0] and "SMWATCH_HISTORY=on" in result["notes"][0]
+    finally:
+        os.chmod(root / "root", 0o700)
+    assert agent.shell_history(100)["notes"] == []
+    (root / "root/.bash_history").unlink()
+    assert "No shell history file was found" in agent.shell_history(100)["notes"][0]

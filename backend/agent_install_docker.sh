@@ -70,14 +70,27 @@ say "Starting the agent container"
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 # The agent code is INSIDE the published image: nothing is downloaded or executed from the network when the container starts.
 # Hardened: no extra privileges, read-only root filesystem (only the state volume is writable).
-# SMWATCH_HISTORY=on: the agent may read every user's shell history (DAC_READ_SEARCH = read access to every file of the read-only host
-# mount). Without it the container can read root's history only.
+# SSH tab: shell command history. The container already runs as root with the host mounted read-only, but home folders are private
+# (mode 700/600) and Docker may isolate the container further. SMWATCH_HISTORY=on (the default) lets it READ them:
+#   --cap-add DAC_READ_SEARCH              read (never write) access to every file of the read-only host mount
+#   --userns=host                          only when Docker remaps users (userns-remap): otherwise root inside is nobody outside
+#   --security-opt label=disable           only when SELinux is enforcing: otherwise SELinux keeps containers out of home folders
+# SMWATCH_HISTORY=off keeps the container fully isolated (the SSH tab then shows sessions and logins, but no command history).
+SMWATCH_SSH="${SMWATCH_SSH:-on}"
+SMWATCH_HISTORY="${SMWATCH_HISTORY:-on}"
+[ "$SMWATCH_SSH" = on ] || SMWATCH_HISTORY=off
 CAP_ADD=""
-[ "${SMWATCH_HISTORY:-off}" = on ] && [ "${SMWATCH_SSH:-on}" = on ] && CAP_ADD="--cap-add DAC_READ_SEARCH"
+if [ "$SMWATCH_HISTORY" = on ]; then
+  CAP_ADD="--cap-add DAC_READ_SEARCH"
+  SECOPTS=$(docker info --format '{{json .SecurityOptions}}' 2>/dev/null || true)
+  case "$SECOPTS" in *rootless*) say "Note: rootless Docker cannot read other users' files; the SSH tab will show no command history (use the shell install for that)." ;; esac
+  case "$SECOPTS" in *userns*) CAP_ADD="$CAP_ADD --userns=host" ;; esac
+  if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" = Enforcing ]; then CAP_ADD="$CAP_ADD --security-opt label=disable"; fi
+fi
 docker run -d --name "$NAME" --restart unless-stopped --pull "${SMWATCH_PULL:-always}" --pid host --hostname "$(hostname)" \
   --cap-drop ALL $CAP_ADD --security-opt no-new-privileges:true --read-only --tmpfs /tmp:rw,noexec,nosuid,size=16m \
   -v /:/host:ro -v sm-watch-agent-data:/var/lib/sm-watch-agent $SOCKET_MOUNT \
-  -e SMWATCH_URL="$SMWATCH_URL" -e AGENT_TOKEN="$AGENT_TOKEN" -e AGENT_LOGS="$SMWATCH_LOGS" -e AGENT_SSH="${SMWATCH_SSH:-on}" ${SMWATCH_ACCESS_LOG:+-e AGENT_ACCESS_LOG="$SMWATCH_ACCESS_LOG"} \
+  -e SMWATCH_URL="$SMWATCH_URL" -e AGENT_TOKEN="$AGENT_TOKEN" -e AGENT_LOGS="$SMWATCH_LOGS" -e AGENT_SSH="$SMWATCH_SSH" ${SMWATCH_ACCESS_LOG:+-e AGENT_ACCESS_LOG="$SMWATCH_ACCESS_LOG"} \
   -e AGENT_HOST_ROOT=/host -e AGENT_PROCFS_PATH=/host/proc -e AGENT_DISK_PATH=/host \
   "$SMWATCH_AGENT_IMAGE" >/dev/null || die "could not start $SMWATCH_AGENT_IMAGE (can this server pull it from the registry?)"
 
