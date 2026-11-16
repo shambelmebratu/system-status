@@ -318,17 +318,34 @@ Safety:
 
 ## Databases (admins)
 
-**Databases** in the menu (next to Kubernetes) connects PostgreSQL and MySQL / MariaDB databases to explain their structure and data.
+**Databases** in the menu (next to Kubernetes) connects PostgreSQL, MySQL / MariaDB and **MongoDB** databases to explain their structure and data.
+
+MongoDB has no schema and no foreign keys, so SM-Watch infers them. Fields come from a sample of 300 documents per collection: nested objects appear as `a.b`, arrays as `a[]`, with their types and how often they are present. Relationships come from DBRefs (declared) and from id fields whose sampled values exist as `_id` in another collection, for example `orders.customerId → customers._id` or `orders.items[].product_id → products._id`. Inferred relationships are drawn dashed and labelled as inferred in reports. Enter the *authentication database* (often `admin`) if the user was created there. Give the user only the built-in `read` role: `db.createUser({user: "report_ro", pwd: "…", roles: [{role: "read", db: "erp"}]})`. SM-Watch only runs reads (find, count, aggregate without `$out`/`$merge`), each limited to 15 seconds.
 
 - **Relationships:** an interactive graph of tables and their foreign keys. Drag to move, scroll to zoom, drag a table to rearrange, click a table for its columns and links. Big schemas start with the connected tables; *Find a table* focuses the graph on one table and its neighbours (1 to 3 steps). **Tables** shows the same structure as a nested tree.
 - **Report builder:** tick tables (and, if you like, only some columns), choose whether to include sample rows, and press *Generate report*. The report is a clean, printable document. It covers row counts and sizes, keys, relationships written as plain sentences ("Each order may belong to one customer…"), and for every column how complete it is, how many distinct values it has, its range or most common values, and its average length. It ends with data-quality notes such as empty columns, missing links, tables without a primary key, and columns that are the same in every row. Print it, save it as PDF, or download it as Markdown. *Save selection* keeps the choice under **Saved reports**, which read fresh data each time they run.
 
 Safety:
-- **Admins only, read-only.** Every session is opened read-only and every query stops after 15 seconds. Create a database user with read-only grants as well; the connection form shows the statements.
+- **Admins only, read-only.** Every SQL session is opened read-only, MongoDB only receives read commands, and every query stops after 15 seconds. Create a database user with read-only grants as well; the connection form shows the statements.
 - **Credentials:** passwords are stored encrypted and never sent back to the browser. The host goes through the same network guard as service checks, so SM-Watch's own database and loopback/metadata addresses are refused.
 - **Safe queries:** table and column names in queries come only from the database's own catalog and are quoted.
 - **Sensitive columns:** values of columns that look sensitive (password, token, secret, card, IBAN, …) are never shown, only counted.
 - **Cost on big tables:** tables with more than 100,000 rows are profiled on their first 100,000 rows. Each report is recorded in the audit log.
+
+## Performance
+
+The dashboards stay fast with years of history:
+
+- **Graphs are aggregated in the database.** A 7-day graph is 120 points computed by PostgreSQL (averages, peaks and p50/p95/p99), not hundreds of thousands of rows sent to the API.
+- **Finished days are counted once.** Uptime for 7, 30, 90 or 365 days and the daily bars add up per-day totals kept in memory. Only today, and the partial first day of a rolling window, is counted live. The numbers are exact. The cache is rebuilt after a restart and dropped when history is deleted or purged.
+- **Short caches** cover the 24-hour uptime (15 s), the Performance page (20 s) and the public status page (30 s). That also means visitors to the public page cannot make the database recount history.
+- **Indexes** cover queries that look at every monitor over a time window, and the retention purge (migration 0028; built without blocking writes on PostgreSQL).
+- **Compression:** API responses are gzip-compressed, typically 5 to 20 times smaller.
+- **Polling fits the range.** A 7-day graph refreshes every 2 minutes and a 1-year availability bar every 15 minutes, while short ranges stay live.
+- **Requests never pile up.** A refresh is skipped while the previous one is still on its way.
+- **Graphs stay visible.** Switching a range keeps the current graph on screen until the new one has arrived.
+
+Measured on PostgreSQL with 30 monitors, 1.3 million checks (30 days) and 300,000 metric samples: the API calls the pages make dropped from 2.7 s to 0.3 s in total (0.7 s right after a restart), and a server or service page opens in about 0.1 s.
 
 ## Choosing which logs are available (log access policy)
 

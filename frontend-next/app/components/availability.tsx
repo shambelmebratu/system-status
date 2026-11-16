@@ -2,7 +2,7 @@
 
 import { useState } from 'react';
 import { api } from '../lib/api';
-import { usePoll } from '../lib/app';
+import { pollFor, usePoll } from '../lib/app';
 import { pct, uptimeClass } from '../lib/format';
 
 type Bucket = { t: string; pct: number | null; checks: number; down: number };
@@ -28,7 +28,7 @@ function describe(bucket: Bucket, seconds: number): string {
 export function AvailabilityPanel({ kind, id }: { kind: 'servers' | 'services'; id: number }) {
   const [range, setRange] = useState('1d');
   const [hover, setHover] = useState<Bucket | null>(null);
-  const { value, error } = usePoll(() => api<Availability>(`/${kind}/${id}/availability?range=${range}`), [kind, id, range], range === '1m' || range === '5m' ? 5000 : 15000);
+  const { value, error } = usePoll(() => api<Availability>(`/${kind}/${id}/availability?range=${range}`), [kind, id, range], pollFor(range), true);
   const current = RANGES.find(r => r.id === range)!;
   const first = value?.buckets[0], last = value?.buckets[value.buckets.length - 1];
   const edge = (b?: Bucket) => (b ? new Date(b.t).toLocaleString([], value!.bucket_seconds >= 86400 ? { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' } : { hour: '2-digit', minute: '2-digit' }) : '');

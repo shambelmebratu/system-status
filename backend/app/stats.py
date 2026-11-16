@@ -1,7 +1,9 @@
 """Read-side aggregations over check history and metric samples."""
+import threading
+import time
 from datetime import date, datetime, timedelta, timezone
 
-from sqlalchemy import case, func, select
+from sqlalchemy import Integer, case, func, select
 from sqlalchemy.orm import Session
 
 from .models import CheckResult, MetricSample, TrafficSample
@@ -16,16 +18,6 @@ def aware(value: datetime) -> datetime:
 def available(status_column):
     """A target counts as available unless it is fully down (resource 'alert' is still reachable)."""
     return case((status_column != "down", 1), else_=0)
-
-
-def uptime_by_target(db: Session, hours: int) -> dict[tuple[str, int], float]:
-    since = datetime.now(timezone.utc) - timedelta(hours=hours)
-    rows = db.execute(
-        select(CheckResult.target_type, CheckResult.target_id, func.count(), func.sum(available(CheckResult.status)))
-        .where(CheckResult.checked_at >= since)
-        .group_by(CheckResult.target_type, CheckResult.target_id)
-    ).all()
-    return {(kind, target_id): round(100.0 * (ok or 0) / total, 3) for kind, target_id, total, ok in rows if total}
 
 
 def percentile(values: list[float], fraction: float) -> float | None:
@@ -57,67 +49,234 @@ def bucketize(rows: list[tuple[datetime, dict]], since: datetime, until: datetim
     return points
 
 
+# ------------------------------------------------------------------------------------------------ fast aggregation helpers
+# Graphs are aggregated INSIDE the database (one row per chart point instead of one per sample), percentiles too on PostgreSQL.
+# Uptime per finished day never changes, so each past day is counted once and kept in memory; only "today" (and the partial
+# first day of a rolling window) is counted live. Results are exact; they are just not recomputed from millions of rows each time.
+CHART_POINTS = 120
+_lock = threading.Lock()
+_day_cache: dict[date, dict[tuple[str, int], tuple[int, int]]] = {}     # finished UTC day -> {(kind, id): (checks, available)}
+_ttl_cache: dict[tuple, tuple[float, object]] = {}
+
+
+def clear_cache() -> None:
+    """Forget cached uptime (after history is deleted or purged)."""
+    with _lock:
+        _day_cache.clear()
+        _ttl_cache.clear()
+
+
+def ttl_cached(key: tuple, seconds: float, compute):
+    now = time.monotonic()
+    with _lock:
+        hit = _ttl_cache.get(key)
+        if hit and now - hit[0] < seconds:
+            return hit[1]
+    value = compute()
+    with _lock:
+        if len(_ttl_cache) > 500:
+            _ttl_cache.clear()
+        _ttl_cache[key] = (now, value)
+    return value
+
+
+def is_pg(db: Session) -> bool:
+    return db.get_bind().dialect.name == "postgresql"
+
+
+def _naive_utc(value: datetime) -> str:
+    return aware(value).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
+
+
+def bucket_of(db: Session, column, since: datetime, width: float):
+    """The chart-point index of a timestamp column (0 = the first `width` seconds after `since`)."""
+    if is_pg(db):
+        return func.floor((func.extract("epoch", column) - aware(since).timestamp()) / width)
+    return func.cast((func.julianday(column) - func.julianday(_naive_utc(since))) * 86400.0 / width, Integer)
+
+
+def day_of(db: Session, column):
+    return func.date(func.timezone("UTC", column)) if is_pg(db) else func.date(column)
+
+
+def _as_date(value) -> date:
+    return value if isinstance(value, date) and not isinstance(value, datetime) else date.fromisoformat(str(value)[:10])
+
+
+def midnight(day: date) -> datetime:
+    return datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc)
+
+
+def live_totals(db: Session, start: datetime, end: datetime, kind: str | None = None, ids: list[int] | None = None) -> dict[tuple[str, int], tuple[int, int]]:
+    query = select(CheckResult.target_type, CheckResult.target_id, func.count(), func.sum(available(CheckResult.status))).where(CheckResult.checked_at >= start, CheckResult.checked_at < end)
+    if kind:
+        query = query.where(CheckResult.target_type == kind)
+    if ids is not None:
+        query = query.where(CheckResult.target_id.in_(ids or [0]))
+    return {(k, i): (int(total), int(ok or 0)) for k, i, total, ok in db.execute(query.group_by(CheckResult.target_type, CheckResult.target_id)).all()}
+
+
+def ensure_days(db: Session, first: date, last: date) -> None:
+    """Counts every finished day in [first, last] that is not cached yet, in ONE grouped query."""
+    today = datetime.now(timezone.utc).date()
+    last = min(last, today - timedelta(days=1))
+    with _lock:
+        missing = [first + timedelta(days=n) for n in range((last - first).days + 1) if first + timedelta(days=n) not in _day_cache]
+    if not missing:
+        return
+    lo, hi = min(missing), max(missing)
+    day = day_of(db, CheckResult.checked_at)
+    rows = db.execute(select(day, CheckResult.target_type, CheckResult.target_id, func.count(), func.sum(available(CheckResult.status)))
+                      .where(CheckResult.checked_at >= midnight(lo), CheckResult.checked_at < midnight(hi + timedelta(days=1)))
+                      .group_by(day, CheckResult.target_type, CheckResult.target_id)).all()
+    filled: dict[date, dict] = {d: {} for d in missing}
+    for when, kind, target_id, total, ok in rows:
+        d = _as_date(when)
+        if d in filled:
+            filled[d][(kind, target_id)] = (int(total), int(ok or 0))
+    with _lock:
+        _day_cache.update(filled)
+        if len(_day_cache) > 800:
+            for old in sorted(_day_cache)[: len(_day_cache) - 800]:
+                del _day_cache[old]
+
+
+def day_totals(day: date) -> dict[tuple[str, int], tuple[int, int]]:
+    with _lock:
+        return _day_cache.get(day, {})
+
+
+def uptime_by_target(db: Session, hours: int) -> dict[tuple[str, int], float]:
+    """Availability % per target over the last `hours`. Short windows are counted live (cached 15 s); long ones from cached days."""
+    def compute():
+        now = datetime.now(timezone.utc)
+        since = now - timedelta(hours=hours)
+        if hours <= 48:
+            totals = live_totals(db, since, now)
+        else:
+            first_full, today = since.date() + timedelta(days=1), now.date()
+            totals = live_totals(db, since, midnight(first_full))
+            ensure_days(db, first_full, today - timedelta(days=1))
+            for n in range((today - first_full).days):
+                for key, (t, o) in day_totals(first_full + timedelta(days=n)).items():
+                    prev = totals.get(key, (0, 0)); totals[key] = (prev[0] + t, prev[1] + o)
+            for key, (t, o) in live_totals(db, midnight(today), now).items():
+                prev = totals.get(key, (0, 0)); totals[key] = (prev[0] + t, prev[1] + o)
+        return {key: round(100.0 * ok / total, 3) for key, (total, ok) in totals.items() if total}
+    return ttl_cached(("uptime", hours), 15 if hours <= 48 else 60, compute)
+
+
+def uptime_for(db: Session, kind: str, target_id: int, hours: int) -> float | None:
+    """One target's availability (uses the per-target index; never scans other targets)."""
+    if hours > 48:
+        return uptime_by_target(db, hours).get((kind, target_id))
+    now = datetime.now(timezone.utc)
+    total, ok = live_totals(db, now - timedelta(hours=hours), now, kind, [target_id]).get((kind, target_id), (0, 0))
+    return round(100.0 * ok / total, 3) if total else None
+
+
+def latency_stats(db: Session, since: datetime, kind: str | None = None, target_id: int | None = None, until: datetime | None = None) -> dict[tuple[str, int], dict]:
+    """checks, avg, max, p50, p95, p99 of non-failed probes per target (percentiles in SQL on PostgreSQL)."""
+    where = [CheckResult.checked_at >= since, CheckResult.status != "down", CheckResult.latency_ms.is_not(None)]
+    if until is not None:
+        where.append(CheckResult.checked_at < until)
+    if kind:
+        where.append(CheckResult.target_type == kind)
+    if target_id is not None:
+        where.append(CheckResult.target_id == target_id)
+    out: dict[tuple[str, int], dict] = {}
+    if is_pg(db):
+        lat = CheckResult.latency_ms
+        rows = db.execute(select(CheckResult.target_type, CheckResult.target_id, func.count(), func.avg(lat), func.max(lat),
+                                 *[func.percentile_disc(f).within_group(lat) for f in (0.5, 0.95, 0.99)]).where(*where)
+                          .group_by(CheckResult.target_type, CheckResult.target_id)).all()
+        for k, i, n, avg, mx, p50, p95, p99 in rows:
+            out[(k, i)] = {"checks": int(n), "avg": round(float(avg), 1), "max": round(float(mx), 1), "p50": round(float(p50), 1), "p95": round(float(p95), 1), "p99": round(float(p99), 1)}
+        return out
+    grouped: dict[tuple[str, int], list[float]] = {}
+    for k, i, v in db.execute(select(CheckResult.target_type, CheckResult.target_id, CheckResult.latency_ms).where(*where)).all():
+        grouped.setdefault((k, i), []).append(v)
+    for key, values in grouped.items():
+        out[key] = {"checks": len(values), "avg": round(sum(values) / len(values), 1), "max": round(max(values), 1),
+                    "p50": percentile(values, 0.5), "p95": percentile(values, 0.95), "p99": percentile(values, 0.99)}
+    return out
+
+
+def _point_time(since: datetime, index: int, width: float) -> str:
+    return (since + timedelta(seconds=index * width + width / 2)).isoformat()
+
+
 def server_history(db: Session, server_id: int, hours: int) -> dict:
     until = datetime.now(timezone.utc)
     since = until - timedelta(hours=hours)
-    samples = db.execute(select(MetricSample).where(MetricSample.server_id == server_id, MetricSample.ts >= since).order_by(MetricSample.ts)).scalars().all()
-    points = bucketize([(m.ts, {**{key: getattr(m, key) for key in METRIC_KEYS}, "cpu_hi": m.cpu_peak if m.cpu_peak is not None else m.cpu}) for m in samples], since, until, with_max=True)
-    for point in points:   # the real CPU peak is the highest reported peak (agent 2.12+), or the highest average where there is none
-        point["cpu_max"] = max(point.pop("cpu_hi_max", point.get("cpu", 0)), point.get("cpu_max", 0))
-        point.pop("cpu_hi", None)
-    uptime = uptime_by_target(db, hours).get(("server", server_id))
-    results = db.execute(select(CheckResult).where(CheckResult.target_type == "server", CheckResult.target_id == server_id, CheckResult.checked_at >= since, CheckResult.latency_ms.is_not(None)).order_by(CheckResult.checked_at)).scalars().all()
-    latencies = [r.latency_ms for r in results]
+    width = max(1.0, (until - since).total_seconds() / CHART_POINTS)
+    b = bucket_of(db, MetricSample.ts, since, width).label("b")
+    columns = [b, func.count()]
+    for key in METRIC_KEYS:
+        column = getattr(MetricSample, key)
+        columns += [func.avg(column), func.max(column)]
+    columns.append(func.max(func.coalesce(MetricSample.cpu_peak, MetricSample.cpu)))
+    rows = db.execute(select(*columns).where(MetricSample.server_id == server_id, MetricSample.ts >= since).group_by(b).order_by(b)).all()
+    points, samples = [], 0
+    for row in rows:
+        samples += int(row[1])
+        point: dict = {"t": _point_time(since, int(row[0]), width)}
+        for n, key in enumerate(METRIC_KEYS):
+            avg, peak = row[2 + 2 * n], row[3 + 2 * n]
+            if avg is not None:
+                point[key], point[f"{key}_max"] = round(float(avg), 2), round(float(peak), 2)
+        if "cpu" in point:   # the real CPU peak is the highest reported peak (agent 2.12+), or the highest average where there is none
+            point["cpu_max"] = round(max(float(row[-1] or 0), point.get("cpu_max", 0)), 2)
+        points.append(point)
+    lb = bucket_of(db, CheckResult.checked_at, since, width).label("b")
+    target = (CheckResult.target_type == "server", CheckResult.target_id == server_id, CheckResult.checked_at >= since)
+    latency_rows = db.execute(select(lb, func.avg(CheckResult.latency_ms), func.max(CheckResult.latency_ms)).where(*target, CheckResult.latency_ms.is_not(None)).group_by(lb).order_by(lb)).all()
+    stats = latency_stats(db, since, "server", server_id).get(("server", server_id))
     return {
-        "hours": hours, "points": points, "samples": len(samples), "uptime_pct": uptime,
-        "latency_points": bucketize([(r.checked_at, {"latency": r.latency_ms}) for r in results], since, until, with_max=True),
-        "latency_avg": round(sum(latencies) / len(latencies), 1) if latencies else None,
-        "latency_p95": percentile(latencies, 0.95),
-        "latency_max": round(max(latencies), 1) if latencies else None,
+        "hours": hours, "points": points, "samples": samples, "uptime_pct": uptime_for(db, "server", server_id, hours),
+        "latency_points": [{"t": _point_time(since, int(i), width), "latency": round(float(a), 2), "latency_max": round(float(m), 2)} for i, a, m in latency_rows],
+        "latency_avg": stats["avg"] if stats else None, "latency_p95": stats["p95"] if stats else None, "latency_max": stats["max"] if stats else None,
     }
 
 
 def service_history(db: Session, service_id: int, hours: int) -> dict:
     until = datetime.now(timezone.utc)
     since = until - timedelta(hours=hours)
-    results = db.execute(select(CheckResult).where(CheckResult.target_type == "service", CheckResult.target_id == service_id, CheckResult.checked_at >= since).order_by(CheckResult.checked_at)).scalars().all()
-    rows = [(r.checked_at, {"latency": r.latency_ms, "down": 1.0 if r.status == "down" else 0.0}) for r in results]
-    latencies = [r.latency_ms for r in results if r.latency_ms is not None and r.status != "down"]
-    failures = [{"t": aware(r.checked_at).isoformat(), "error": r.error, "http_status": r.http_status} for r in results if r.status == "down"][-20:]
+    width = max(1.0, (until - since).total_seconds() / CHART_POINTS)
+    b = bucket_of(db, CheckResult.checked_at, since, width).label("b")
+    down = case((CheckResult.status == "down", 1.0), else_=0.0)
+    target = (CheckResult.target_type == "service", CheckResult.target_id == service_id, CheckResult.checked_at >= since)
+    rows = db.execute(select(b, func.count(), func.avg(CheckResult.latency_ms), func.max(CheckResult.latency_ms), func.avg(down), func.max(down)).where(*target).group_by(b).order_by(b)).all()
+    points, checks = [], 0
+    for i, n, avg, mx, d_avg, d_max in rows:
+        checks += int(n)
+        point: dict = {"t": _point_time(since, int(i), width), "down": round(float(d_avg), 2), "down_max": round(float(d_max), 2)}
+        if avg is not None:
+            point["latency"], point["latency_max"] = round(float(avg), 2), round(float(mx), 2)
+        points.append(point)
+    failures = db.execute(select(CheckResult.checked_at, CheckResult.error, CheckResult.http_status).where(*target, CheckResult.status == "down").order_by(CheckResult.checked_at.desc()).limit(20)).all()
+    stats = latency_stats(db, since, "service", service_id).get(("service", service_id))
     return {
-        "hours": hours,
-        "points": bucketize(rows, since, until, with_max=True),
-        "checks": len(results),
-        "uptime_pct": uptime_by_target(db, hours).get(("service", service_id)),
-        "latency_avg": round(sum(latencies) / len(latencies), 1) if latencies else None,
-        "latency_p95": percentile(latencies, 0.95),
-        "latency_max": round(max(latencies), 1) if latencies else None,
-        "recent_failures": failures,
+        "hours": hours, "points": points, "checks": checks, "uptime_pct": uptime_for(db, "service", service_id, hours),
+        "latency_avg": stats["avg"] if stats else None, "latency_p95": stats["p95"] if stats else None, "latency_max": stats["max"] if stats else None,
+        "recent_failures": [{"t": aware(t).isoformat(), "error": e, "http_status": h} for t, e, h in reversed(failures)],
     }
 
 
 def daily_uptime(db: Session, target_type: str, target_ids: list[int], days: int = 90) -> dict[int, list[dict]]:
-    """Per-day availability for the last `days` days (UTC). Days without data have pct=None."""
+    """Per-day availability for the last `days` days (UTC). Days without data have pct=None. Finished days come from the cache."""
     if not target_ids:
         return {}
     today = datetime.now(timezone.utc).date()
     first = today - timedelta(days=days - 1)
-    day = func.date(CheckResult.checked_at)
-    rows = db.execute(
-        select(CheckResult.target_id, day, func.count(), func.sum(available(CheckResult.status)))
-        .where(CheckResult.target_type == target_type, CheckResult.target_id.in_(target_ids), CheckResult.checked_at >= datetime.combine(first, datetime.min.time(), tzinfo=timezone.utc))
-        .group_by(CheckResult.target_id, day)
-    ).all()
-    lookup: dict[tuple[int, date], tuple[int, int]] = {}
-    for target_id, when, total, ok in rows:
-        when = when if isinstance(when, date) and not isinstance(when, datetime) else date.fromisoformat(str(when)[:10])
-        lookup[(target_id, when)] = (total, ok or 0)
+    ensure_days(db, first, today - timedelta(days=1))
+    live = live_totals(db, midnight(today), datetime.now(timezone.utc), target_type, target_ids)
     result: dict[int, list[dict]] = {}
     for target_id in target_ids:
         series = []
         for offset in range(days):
             when = first + timedelta(days=offset)
-            total, ok = lookup.get((target_id, when), (0, 0))
+            total, ok = (live if when == today else day_totals(when)).get((target_type, target_id), (0, 0))
             series.append({"date": when.isoformat(), "pct": round(100.0 * ok / total, 2) if total else None})
         result[target_id] = series
     return result
@@ -142,16 +301,12 @@ def availability(db: Session, kind: str, target_id: int, range_: str) -> dict:
         today = now.date()
         days = window // DAY
         first = today - timedelta(days=days - 1)
-        day = func.date(CheckResult.checked_at)
-        rows = db.execute(
-            select(day, func.count(), func.sum(available(CheckResult.status)))
-            .where(CheckResult.target_type == kind, CheckResult.target_id == target_id, CheckResult.checked_at >= datetime.combine(first, datetime.min.time(), tzinfo=timezone.utc))
-            .group_by(day)
-        ).all()
+        ensure_days(db, first, today - timedelta(days=1))
+        live = live_totals(db, midnight(today), now, kind, [target_id])
         per_day: dict[date, tuple[int, int]] = {}
-        for when, total, ok in rows:
-            when = when if isinstance(when, date) and not isinstance(when, datetime) else date.fromisoformat(str(when)[:10])
-            per_day[when] = (total, ok or 0)
+        for n in range(days):
+            d = first + timedelta(days=n)
+            per_day[d] = (live if d == today else day_totals(d)).get((kind, target_id), (0, 0))
         step = bucket // DAY
         buckets = []
         for index in range(count):

@@ -115,6 +115,8 @@ def cookie_secure() -> bool:
 _dev = settings.environment.lower() in ("development", "dev", "test")
 # The interactive API docs describe every endpoint: only served for local development.
 app = FastAPI(title=settings.app_name, version="4.0.0", lifespan=lifespan, docs_url="/docs" if _dev else None, redoc_url=None, openapi_url="/openapi.json" if _dev else None)
+from starlette.middleware.gzip import GZipMiddleware
+app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)   # dashboards and graphs are JSON: typically 5-10x smaller on the wire
 app.add_middleware(BodyLimitMiddleware)   # outermost: oversized bodies are refused before anything reads them
 app.include_router(agent_router)
 app.include_router(enroll_router)
@@ -132,6 +134,8 @@ app.include_router(stats_router)
 def purge_history(db: Session, kind: str, target_id: int) -> None:
     db.execute(delete(CheckResult).where(CheckResult.target_type == kind, CheckResult.target_id == target_id))
     db.execute(delete(Incident).where(Incident.target_type == kind, Incident.target_id == target_id))
+    from .stats import clear_cache
+    clear_cache()
 
 
 def set_token(item: Server, token: str | None) -> None:

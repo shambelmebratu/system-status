@@ -7,11 +7,11 @@ import { useApp, usePoll } from '../lib/app';
 import { timeAgo } from '../lib/format';
 
 /* ---------------------------------------------------------------- types */
-type Conn = { id: number; name: string; engine: 'postgresql' | 'mysql'; host: string; port: number; database: string; username: string; has_password: boolean; ssl_mode: string;
+type Conn = { id: number; name: string; engine: 'postgresql' | 'mysql' | 'mongodb'; host: string; port: number; database: string; username: string; has_password: boolean; ssl_mode: string; auth_source: string;
   schemas: string[]; created_by: string | null; last_ok_at: string | null; last_error: string | null; server_version: string | null };
 type Col = { name: string; type: string; nullable: boolean; default: string | null; pk: boolean; fk: boolean; comment: string; sensitive: boolean };
-type Tbl = { key: string; schema: string; name: string; kind: 'table' | 'view'; rows_estimate: number | null; size_bytes: number | null; comment: string; columns: Col[] };
-type Rel = { name: string; from: string; from_columns: string[]; to: string; to_columns: string[] };
+type Tbl = { key: string; schema: string; name: string; kind: 'table' | 'view' | 'collection'; rows_estimate: number | null; size_bytes: number | null; comment: string; columns: Col[] };
+type Rel = { name: string; from: string; from_columns: string[]; to: string; to_columns: string[]; inferred?: boolean };
 type Schema = { tables: Tbl[]; relations: Rel[]; server_version: string | null; read_at: string };
 type Pick = { table: string; columns: string[] };
 type Saved = { id: number; name: string; selection: Pick[]; sample_rows: number; created_by: string | null; updated_at: string };
@@ -22,7 +22,10 @@ type Section = { table: string; schema: string; name: string; kind: string; comm
   primary_key: string[]; profile: { rows: number; rows_exact: boolean; columns: ColStat[]; sample: unknown[][]; notes: string[]; seconds: number } };
 type Report = { title: string; engine: string; generated_at: string; overview: string; issues: number; relations: RelText[]; tables: Section[]; database: { name: string; engine: string; database: string; server_version: string | null } };
 
-const ENGINE_LABEL = { postgresql: 'PostgreSQL', mysql: 'MySQL / MariaDB' } as const;
+const ENGINE_LABEL = { postgresql: 'PostgreSQL', mysql: 'MySQL / MariaDB', mongodb: 'MongoDB' } as const;
+const DEFAULT_PORT = { postgresql: 5432, mysql: 3306, mongodb: 27017 } as const;
+/** Words for one database family: tables and rows, or collections and documents. */
+const words = (engine: string) => (engine === 'mongodb' ? { table: 'collection', tables: 'Collections', row: 'document', rows: 'documents', col: 'field', cols: 'Fields' } : { table: 'table', tables: 'Tables', row: 'row', rows: 'rows', col: 'column', cols: 'Columns' });
 const bytes = (n: number | null) => (n == null ? '–' : n < 1024 ** 2 ? `${Math.max(1, Math.round(n / 1024))} KB` : n < 1024 ** 3 ? `${(n / 1024 ** 2).toFixed(1)} MB` : `${(n / 1024 ** 3).toFixed(2)} GB`);
 const num = (n: number | null | undefined) => (n == null ? '–' : n.toLocaleString());
 const shown = (v: unknown) => (v == null ? '–' : String(v));
@@ -41,7 +44,7 @@ export function Databases() {
         <button className="btn primary" onClick={() => setEditing('new')}><Icon name="plus" size={15} />Connect a database</button></div>
       {list.error && <div className="err">{list.error}</div>}
       {list.value && list.value.length === 0 && <div className="card"><Empty title="No databases connected" action={<button className="btn primary" onClick={() => setEditing('new')}>Connect a database</button>}>
-        PostgreSQL and MySQL / MariaDB. Use a database user that can only read: SM-Watch also opens every session read-only and stops any query after 15 seconds.</Empty></div>}
+        PostgreSQL, MySQL / MariaDB and MongoDB. Use a database user that can only read: SM-Watch also only ever reads, and stops any query after 15 seconds.</Empty></div>}
       <div className="tilegrid">
         {(list.value ?? []).map(c => (
           <div key={c.id} className="card tile db-tile" onClick={() => go(`databases/${c.id}`)}>
@@ -59,7 +62,7 @@ export function Databases() {
 function ConnectionForm({ existing, onClose, onSaved }: { existing?: Conn; onClose: () => void; onSaved: (c?: Conn) => void }) {
   const { toast, confirm, go } = useApp();
   const [f, setF] = useState({ name: existing?.name ?? '', engine: existing?.engine ?? 'postgresql', host: existing?.host ?? '', port: existing ? String(existing.port) : '', database: existing?.database ?? '',
-    username: existing?.username ?? '', password: '', ssl_mode: existing?.ssl_mode ?? 'prefer', schemas: (existing?.schemas ?? []).join(', ') });
+    username: existing?.username ?? '', password: '', ssl_mode: existing?.ssl_mode ?? 'prefer', schemas: (existing?.schemas ?? []).join(', '), auth_source: existing?.auth_source ?? '' });
   const [busy, setBusy] = useState(''); const [error, setError] = useState(''); const [tested, setTested] = useState('');
   const set = (k: keyof typeof f) => (e: { target: { value: string } }) => { setF({ ...f, [k]: e.target.value }); setTested(''); };
   const body = () => ({ ...f, port: f.port ? Number(f.port) : null, schemas: f.schemas.split(/[\s,]+/).filter(Boolean) });
@@ -80,19 +83,23 @@ function ConnectionForm({ existing, onClose, onSaved }: { existing?: Conn; onClo
   return (
     <Modal title={existing ? `Edit ${existing.name}` : 'Connect a database'} onClose={onClose} wide>
       <form onSubmit={submit} style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-        <div className="method" role="radiogroup" aria-label="Engine">{(['postgresql', 'mysql'] as const).map(e => <button type="button" key={e} role="radio" aria-checked={f.engine === e} className={f.engine === e ? 'on' : ''} onClick={() => { setF({ ...f, engine: e }); setTested(''); }}><b>{ENGINE_LABEL[e]}</b><span>Default port {e === 'postgresql' ? 5432 : 3306}</span></button>)}</div>
+        <div className="method" role="radiogroup" aria-label="Engine">{(['postgresql', 'mysql', 'mongodb'] as const).map(e => <button type="button" key={e} role="radio" aria-checked={f.engine === e} className={f.engine === e ? 'on' : ''} onClick={() => { setF({ ...f, engine: e }); setTested(''); }}><b>{ENGINE_LABEL[e]}</b><span>Default port {DEFAULT_PORT[e]}{e === 'mongodb' ? ' · fields and relations are inferred' : ''}</span></button>)}</div>
         <div className="form-grid">
           <Field label="Name"><input value={f.name} onChange={set('name')} placeholder="ERP production" required maxLength={100} autoFocus /></Field>
           <Field label="Host" hint="Name or IP the SM-Watch server can reach (private / VPN addresses are fine)"><input value={f.host} onChange={set('host')} placeholder="10.0.0.12" required /></Field>
-          <Field label="Port"><input type="number" min={1} max={65535} value={f.port} onChange={set('port')} placeholder={f.engine === 'postgresql' ? '5432' : '3306'} /></Field>
-          <Field label="Database"><input value={f.database} onChange={set('database')} placeholder="erp" required={f.engine === 'postgresql'} /></Field>
+          <Field label="Port"><input type="number" min={1} max={65535} value={f.port} onChange={set('port')} placeholder={String(DEFAULT_PORT[f.engine])} /></Field>
+          <Field label="Database"><input value={f.database} onChange={set('database')} placeholder="erp" required={f.engine !== 'mysql'} /></Field>
           <Field label="User" hint="Ideally a user that can only read"><input value={f.username} onChange={set('username')} placeholder="report_ro" required autoComplete="off" /></Field>
           <Field label="Password" hint={existing?.has_password ? 'Leave empty to keep the stored password' : 'Stored encrypted; never shown again'}><input type="password" value={f.password} onChange={set('password')} autoComplete="new-password" placeholder={existing?.has_password ? '••••••••' : ''} /></Field>
-          <Field label="TLS"><select value={f.ssl_mode} onChange={set('ssl_mode')}><option value="prefer">Use TLS if the server offers it</option><option value="require">Require TLS</option><option value="verify-full">Require TLS and a trusted certificate</option><option value="disable">No TLS (private network only)</option></select></Field>
-          <Field label={f.engine === 'postgresql' ? 'Schemas' : 'Databases (schemas)'} hint={f.engine === 'postgresql' ? 'Comma-separated. Empty = every non-system schema' : 'Comma-separated. Empty = the database above'}><input value={f.schemas} onChange={set('schemas')} placeholder={f.engine === 'postgresql' ? 'public, billing' : ''} /></Field>
+          <Field label="TLS"><select value={f.ssl_mode} onChange={set('ssl_mode')}><option value="prefer">{f.engine === 'mongodb' ? 'No TLS (private network only)' : 'Use TLS if the server offers it'}</option><option value="require">Require TLS</option><option value="verify-full">Require TLS and a trusted certificate</option><option value="disable">No TLS (private network only)</option></select></Field>
+          {f.engine === 'mongodb'
+            ? <Field label="Authentication database" hint="Where the user was created (authSource). Empty = the database above; often admin"><input value={f.auth_source} onChange={set('auth_source')} placeholder="admin" /></Field>
+            : <Field label={f.engine === 'postgresql' ? 'Schemas' : 'Databases (schemas)'} hint={f.engine === 'postgresql' ? 'Comma-separated. Empty = every non-system schema' : 'Comma-separated. Empty = the database above'}><input value={f.schemas} onChange={set('schemas')} placeholder={f.engine === 'postgresql' ? 'public, billing' : ''} /></Field>}
         </div>
         <details className="db-howto"><summary>Create a read-only user (recommended)</summary>
-          <pre className="codebox">{f.engine === 'postgresql'
+          <pre className="codebox">{f.engine === 'mongodb'
+            ? `use ${f.database || 'erp'}\ndb.createUser({ user: "report_ro", pwd: "…", roles: [{ role: "read", db: "${f.database || 'erp'}" }] })`
+            : f.engine === 'postgresql'
             ? `CREATE ROLE report_ro LOGIN PASSWORD '…';\nGRANT CONNECT ON DATABASE ${f.database || 'erp'} TO report_ro;\nGRANT USAGE ON SCHEMA public TO report_ro;\nGRANT SELECT ON ALL TABLES IN SCHEMA public TO report_ro;\nALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO report_ro;`
             : `CREATE USER 'report_ro'@'%' IDENTIFIED BY '…';\nGRANT SELECT, SHOW VIEW ON ${f.database || 'erp'}.* TO 'report_ro'@'%';`}</pre></details>
         {tested && <div className="ok-box"><Icon name="check" size={15} /> {tested}</div>}
@@ -123,6 +130,7 @@ function DatabaseDetail({ conn, onEdit, reload, editing, closeEdit }: { conn: Co
   useEffect(() => { void load(); }, [load]);
   const addToReport = (key: string) => { setPicks(p => ({ ...p, [key]: p[key] ?? null })); setTab('report'); };
   const tables = schema?.tables ?? [];
+  const w = words(conn.engine);
   return (
     <>
       <div className="topbar">
@@ -132,17 +140,17 @@ function DatabaseDetail({ conn, onEdit, reload, editing, closeEdit }: { conn: Co
         <button className="btn sm" onClick={onEdit}>Edit</button>
       </div>
       {schema && <div className="ssh-stats" style={{ marginBottom: 14 }}>
-        <div className="card ssh-stat"><small>Tables</small><b>{tables.filter(t => t.kind === 'table').length}</b><span className="muted sm">{tables.filter(t => t.kind === 'view').length} views</span></div>
-        <div className="card ssh-stat"><small>Relationships</small><b>{schema.relations.length}</b><span className="muted sm">foreign keys</span></div>
-        <div className="card ssh-stat"><small>Rows (estimate)</small><b className="sm-b">{num(tables.reduce((a, t) => a + (t.rows_estimate ?? 0), 0))}</b><span className="muted sm">from the database&apos;s statistics</span></div>
-        <div className="card ssh-stat"><small>Size</small><b className="sm-b">{bytes(tables.reduce((a, t) => a + (t.size_bytes ?? 0), 0))}</b><span className="muted sm">tables and indexes</span></div>
+        <div className="card ssh-stat"><small>{w.tables}</small><b>{tables.filter(t => t.kind !== 'view').length}</b><span className="muted sm">{tables.filter(t => t.kind === 'view').length} views</span></div>
+        <div className="card ssh-stat"><small>Relationships</small><b>{schema.relations.length}</b><span className="muted sm">{conn.engine === 'mongodb' ? `${schema.relations.filter(r => r.inferred).length} inferred from matching ids` : 'foreign keys'}</span></div>
+        <div className="card ssh-stat"><small>{w.rows[0].toUpperCase() + w.rows.slice(1)} (estimate)</small><b className="sm-b">{num(tables.reduce((a, t) => a + (t.rows_estimate ?? 0), 0))}</b><span className="muted sm">from the database&apos;s statistics</span></div>
+        <div className="card ssh-stat"><small>Size</small><b className="sm-b">{tables.some(t => t.size_bytes != null) ? bytes(tables.reduce((a, t) => a + (t.size_bytes ?? 0), 0)) : '–'}</b><span className="muted sm">{w.table}s and indexes</span></div>
       </div>}
-      <div className="ktabs" role="tablist">{([['graph', 'Relationships', 'overview'], ['tree', 'Tables', 'logs'], ['report', `Report builder${Object.keys(picks).length ? ` (${Object.keys(picks).length})` : ''}`, 'zap'], ['saved', 'Saved reports', 'star']] as const).map(([id, label, icon]) =>
+      <div className="ktabs" role="tablist">{([['graph', 'Relationships', 'overview'], ['tree', w.tables, 'logs'], ['report', `Report builder${Object.keys(picks).length ? ` (${Object.keys(picks).length})` : ''}`, 'zap'], ['saved', 'Saved reports', 'star']] as const).map(([id, label, icon]) =>
         <button key={id} role="tab" aria-selected={tab === id} className={tab === id ? 'on' : ''} onClick={() => setTab(id)}><Icon name={icon} size={15} />{label}</button>)}</div>
       {error && <div className="err" style={{ marginBottom: 12 }}>{error}</div>}
       {!schema ? (!error && <div className="card"><p className="muted"><span className="spinner" /> Reading the schema…</p></div>) : <>
-        {tab === 'graph' && <SchemaGraph schema={schema} onAdd={addToReport} />}
-        {tab === 'tree' && <SchemaTree schema={schema} onAdd={addToReport} />}
+        {tab === 'graph' && <SchemaGraph schema={schema} onAdd={addToReport} engine={conn.engine} />}
+        {tab === 'tree' && <SchemaTree schema={schema} onAdd={addToReport} engine={conn.engine} />}
         {tab === 'report' && <ReportBuilder conn={conn} schema={schema} picks={picks} setPicks={setPicks} onReport={setReport} />}
         {tab === 'saved' && <SavedReports conn={conn} onOpen={(s) => { setPicks(Object.fromEntries(s.selection.map(p => [p.table, p.columns.length ? p.columns : null]))); setTab('report'); }} onReport={setReport} />}
       </>}
@@ -179,7 +187,8 @@ function layout(tables: Tbl[], rels: Rel[]): Record<string, Pos> {
   return Object.fromEntries(tables.map((t, i) => [t.key, { x: pos[i].x - NODE_W / 2, y: pos[i].y - nodeH(t) / 2 }]));
 }
 
-function SchemaGraph({ schema, onAdd }: { schema: Schema; onAdd: (key: string) => void }) {
+function SchemaGraph({ schema, onAdd, engine }: { schema: Schema; onAdd: (key: string) => void; engine: string }) {
+  const w = words(engine);
   const [q, setQ] = useState('');
   const [focus, setFocus] = useState<string | null>(null);
   const [depth, setDepth] = useState(1);
@@ -192,7 +201,7 @@ function SchemaGraph({ schema, onAdd }: { schema: Schema; onAdd: (key: string) =
   }, [schema]);
   // Which tables are drawn: everything for small schemas; around the focused table for big ones (or when a table is focused).
   const visible = useMemo(() => {
-    let keys = new Set(schema.tables.filter(t => showViews || t.kind === 'table').map(t => t.key));
+    let keys = new Set(schema.tables.filter(t => showViews || t.kind !== 'view').map(t => t.key));
     if (focus) { const seen = new Set([focus]); let frontier = [focus]; for (let d = 0; d < depth; d++) { const next: string[] = []; frontier.forEach(k => neighbours.get(k)?.forEach(n => { if (!seen.has(n)) { seen.add(n); next.push(n); } })); frontier = next; } keys = new Set([...seen].filter(k => keys.has(k) || k === focus)); }
     else if (big) keys = new Set([...keys].filter(k => neighbours.has(k)).slice(0, 80));
     return schema.tables.filter(t => keys.has(t.key));
@@ -230,12 +239,12 @@ function SchemaGraph({ schema, onAdd }: { schema: Schema; onAdd: (key: string) =
   return (
     <div className="db-graph-wrap">
       <div className="filterbar">
-        <div className="db-search"><label className="lg-field"><Icon name="logs" size={15} /><input value={q} onChange={e => setQ(e.target.value)} placeholder="Find a table…" aria-label="Find a table" /></label>
+        <div className="db-search"><label className="lg-field"><Icon name="logs" size={15} /><input value={q} onChange={e => setQ(e.target.value)} placeholder={`Find a ${w.table}…`} aria-label="Find" /></label>
           {matches.length > 0 && <div className="db-matches">{matches.map(t => <button key={t.key} type="button" onClick={() => { setFocus(t.key); setSelected(t.key); setQ(''); }}>{t.name}<small>{t.schema}</small></button>)}</div>}</div>
         {focus && <span className="lg-chip">around {focus.split('.').pop()} <button type="button" className="lg-link" onClick={() => setFocus(null)}>show all</button></span>}
         {focus && <div className="seg">{[1, 2, 3].map(d => <button key={d} className={depth === d ? 'on' : ''} onClick={() => setDepth(d)}>{d} step{d > 1 ? 's' : ''}</button>)}</div>}
         <label className="check"><input type="checkbox" checked={showViews} onChange={e => setShowViews(e.target.checked)} />Views</label>
-        <span className="grow" /><span className="muted sm">{visible.length} tables · {rels.length} links{big && !focus ? ' (connected tables only: find a table to focus)' : ''}</span>
+        <span className="grow" /><span className="muted sm">{visible.length} {w.table}s · {rels.length} links{big && !focus ? ` (connected ${w.table}s only: find one to focus)` : ''}</span>
       </div>
       <div className="db-graph-row">
         <div className="db-graph card flush" ref={box} onPointerDown={e => onDown(e)} onPointerMove={onMove} onPointerUp={onUp} onWheel={onWheel}>
@@ -251,7 +260,7 @@ function SchemaGraph({ schema, onAdd }: { schema: Schema; onAdd: (key: string) =
                   const leftToRight = a.x + NODE_W / 2 < b.x + NODE_W / 2;
                   const ax = leftToRight ? a.x + NODE_W : a.x, bx = leftToRight ? b.x : b.x + NODE_W, c = Math.max(60, Math.abs(bx - ax) / 2) * (leftToRight ? 1 : -1);
                   const on = !hi || (hi.has(r.from) && hi.has(r.to) && (r.from === selected || r.to === selected));
-                  return <path key={i} d={`M${ax},${ay} C${ax + c},${ay} ${bx - c},${by} ${bx},${by}`} className={`db-edge ${on ? '' : 'dim'}`} markerEnd="url(#db-arrow)"><title>{`${r.from}.${r.from_columns.join(',')} → ${r.to}.${r.to_columns.join(',')}`}</title></path>;
+                  return <path key={i} d={`M${ax},${ay} C${ax + c},${ay} ${bx - c},${by} ${bx},${by}`} className={`db-edge ${on ? '' : 'dim'} ${r.inferred ? 'inferred' : ''}`} markerEnd="url(#db-arrow)"><title>{`${r.from}.${r.from_columns.join(',')} → ${r.to}.${r.to_columns.join(',')}`}</title></path>;
                 })}
                 {visible.map(t => { const p = pos[t.key]; if (!p) return null; const { show, more } = nodeRows(t); const h = nodeH(t); const dim = hi && !hi.has(t.key); return (
                   <g key={t.key} transform={`translate(${p.x},${p.y})`} className={`db-node ${selected === t.key ? 'sel' : ''} ${dim ? 'dim' : ''} ${t.kind}`} onPointerDown={e => onDown(e, t.key)}>
@@ -262,36 +271,38 @@ function SchemaGraph({ schema, onAdd }: { schema: Schema; onAdd: (key: string) =
                     {show.map((c, i) => <g key={c.name} transform={`translate(0,${HEAD + i * ROW})`}>
                       <text x={12} y={14} className={`db-col ${c.pk ? 'pk' : c.fk ? 'fk' : ''}`}>{c.pk ? '🔑 ' : c.fk ? '↗ ' : ''}{c.name.length > 20 ? `${c.name.slice(0, 19)}…` : c.name}</text>
                       <text x={NODE_W - 10} y={14} textAnchor="end" className="db-type">{c.type.length > 14 ? `${c.type.slice(0, 13)}…` : c.type}</text></g>)}
-                    {more > 0 && <text x={12} y={HEAD + show.length * ROW + 14} className="db-type">+ {more} more column{more > 1 ? 's' : ''}</text>}
+                    {more > 0 && <text x={12} y={HEAD + show.length * ROW + 14} className="db-type">+ {more} more {w.col}{more > 1 ? 's' : ''}</text>}
                   </g>); })}
               </g>
             </svg>)}
         </div>
-        {sel && <TableCard t={sel} schema={schema} onAdd={onAdd} onFocus={() => setFocus(sel.key)} onPick={k => { setSelected(k); if (!tb.has(k)) setFocus(k); }} onClose={() => setSelected(null)} />}
+        {sel && <TableCard t={sel} schema={schema} engine={engine} onAdd={onAdd} onFocus={() => setFocus(sel.key)} onPick={k => { setSelected(k); if (!tb.has(k)) setFocus(k); }} onClose={() => setSelected(null)} />}
       </div>
-      <p className="muted sm">Drag the background to move, scroll to zoom, drag a table to rearrange. Click a table for its columns and relationships. 🔑 primary key · ↗ refers to another table.</p>
+      <p className="muted sm">Drag the background to move, scroll to zoom, drag a {w.table} to rearrange. Click one for its {w.col}s and relationships. 🔑 {engine === 'mongodb' ? '_id' : 'primary key'} · ↗ refers to another {w.table}{engine === 'mongodb' ? ' · dashed = inferred from matching ids' : ''}.</p>
     </div>
   );
 }
 
-function TableCard({ t, schema, onAdd, onFocus, onPick, onClose }: { t: Tbl; schema: Schema; onAdd: (k: string) => void; onFocus?: () => void; onPick: (k: string) => void; onClose?: () => void }) {
+function TableCard({ t, schema, engine, onAdd, onFocus, onPick, onClose }: { t: Tbl; schema: Schema; engine: string; onAdd: (k: string) => void; onFocus?: () => void; onPick: (k: string) => void; onClose?: () => void }) {
+  const w = words(engine);
   const out = schema.relations.filter(r => r.from === t.key), inc = schema.relations.filter(r => r.to === t.key);
   return (
     <aside className="card db-side">
-      <div className="card-head"><div style={{ minWidth: 0 }}><div className="muted sm">{t.kind === 'view' ? 'View' : 'Table'} · {t.schema}</div><h2 className="trunc" style={{ textTransform: 'none', letterSpacing: 0 }}>{t.name}</h2></div><span className="grow" />{onClose && <button className="btn ghost sm" onClick={onClose} aria-label="Close"><Icon name="x" /></button>}</div>
+      <div className="card-head"><div style={{ minWidth: 0 }}><div className="muted sm">{t.kind === 'view' ? 'View' : t.kind === 'collection' ? 'Collection' : 'Table'} · {t.schema}</div><h2 className="trunc" style={{ textTransform: 'none', letterSpacing: 0 }}>{t.name}</h2></div><span className="grow" />{onClose && <button className="btn ghost sm" onClick={onClose} aria-label="Close"><Icon name="x" /></button>}</div>
       {t.comment && <p className="sm" style={{ marginTop: 0 }}>{t.comment}</p>}
-      <div className="facts"><div><small>Rows (estimate)</small><b>{num(t.rows_estimate)}</b></div><div><small>Size</small><b>{bytes(t.size_bytes)}</b></div></div>
+      <div className="facts"><div><small>{w.rows} (estimate)</small><b>{num(t.rows_estimate)}</b></div><div><small>Size</small><b>{bytes(t.size_bytes)}</b></div></div>
       <div style={{ display: 'flex', gap: 8, margin: '10px 0' }}><button className="btn sm primary" onClick={() => onAdd(t.key)}><Icon name="plus" size={13} />Add to report</button>{onFocus && <button className="btn sm" onClick={onFocus}>Focus graph here</button>}</div>
-      {out.length > 0 && <><h3 className="drawer-h">Refers to</h3>{out.map(r => <button key={r.name} className="rel-row" onClick={() => onPick(r.to)}><b>{r.to.split('.').pop()}</b><span className="muted sm">many → one</span><span className="mono sm">{r.from_columns.join(', ')} → {r.to_columns.join(', ')}</span></button>)}</>}
+      {out.length > 0 && <><h3 className="drawer-h">Refers to</h3>{out.map(r => <button key={r.name} className="rel-row" onClick={() => onPick(r.to)}><b>{r.to.split('.').pop()}</b><span className="muted sm">many → one</span><span className="mono sm">{r.from_columns.join(', ')} → {r.to_columns.join(', ')}{r.inferred ? ' · inferred' : ''}</span></button>)}</>}
       {inc.length > 0 && <><h3 className="drawer-h">Referred to by</h3>{inc.map(r => <button key={r.name + r.from} className="rel-row" onClick={() => onPick(r.from)}><b>{r.from.split('.').pop()}</b><span className="muted sm">one → many</span><span className="mono sm">{r.from.split('.').pop()}.{r.from_columns.join(', ')}</span></button>)}</>}
-      <h3 className="drawer-h">Columns <span className="tag">{t.columns.length}</span></h3>
-      <table className="tbl db-cols"><tbody>{t.columns.map(c => <tr key={c.name} title={c.comment}><td><b className={c.pk ? 'good' : ''}>{c.pk ? '🔑 ' : c.fk ? '↗ ' : ''}{c.name}</b>{c.sensitive && <span className="tag" title="Values are never shown in reports">masked</span>}</td><td className="mono sm muted">{c.type}{c.nullable ? '' : ' · required'}</td></tr>)}</tbody></table>
+      <h3 className="drawer-h">{w.cols} <span className="tag">{t.columns.length}</span></h3>
+      <table className="tbl db-cols"><tbody>{t.columns.map(c => <tr key={c.name} title={c.comment}><td><b className={c.pk ? 'good' : ''}>{c.pk ? '🔑 ' : c.fk ? '↗ ' : ''}{c.name}</b>{c.sensitive && <span className="tag" title="Values are never shown in reports">masked</span>}</td><td className="mono sm muted">{c.type}{c.nullable ? '' : engine === 'mongodb' ? ' · always present' : ' · required'}{c.comment && engine === 'mongodb' ? <div>{c.comment}</div> : null}</td></tr>)}</tbody></table>
     </aside>
   );
 }
 
 /* ---------------------------------------------------------------- nested tree */
-function SchemaTree({ schema, onAdd }: { schema: Schema; onAdd: (k: string) => void }) {
+function SchemaTree({ schema, onAdd, engine }: { schema: Schema; onAdd: (k: string) => void; engine: string }) {
+  const w = words(engine);
   const [q, setQ] = useState(''); const [open, setOpen] = useState<string | null>(null);
   const [page, setPage] = useState(0);
   const needle = q.trim().toLowerCase();
@@ -303,16 +314,16 @@ function SchemaTree({ schema, onAdd }: { schema: Schema; onAdd: (k: string) => v
   return (
     <div className="db-graph-row">
       <section className="card" style={{ flex: 1, minWidth: 0 }}>
-        <label className="lg-field" style={{ marginBottom: 12 }}><Icon name="logs" size={15} /><input value={q} onChange={e => setQ(e.target.value)} placeholder="Find a table or column…" aria-label="Find" /></label>
+        <label className="lg-field" style={{ marginBottom: 12 }}><Icon name="logs" size={15} /><input value={q} onChange={e => setQ(e.target.value)} placeholder={`Find a ${w.table} or ${w.col}…`} aria-label="Find" /></label>
         {[...bySchema.entries()].map(([s, list]) => (
           <div key={s} className="db-tree"><div className="db-tree-schema">{s}</div>
             {list.map(t => { const out = schema.relations.filter(r => r.from === t.key), inc = schema.relations.filter(r => r.to === t.key); const isOpen = open === t.key; return (
               <div key={t.key} className={`db-tree-node ${isOpen ? 'open' : ''}`}>
                 <button type="button" className="db-tree-head" onClick={() => setOpen(isOpen ? null : t.key)} aria-expanded={isOpen}><span>{isOpen ? '▾' : '▸'}</span><b>{t.name}</b>{t.kind === 'view' && <span className="tag">view</span>}
-                  <span className="muted sm">{t.columns.length} columns · {num(t.rows_estimate)} rows</span><span className="grow" />{out.length > 0 && <span className="tag">→ {out.length}</span>}{inc.length > 0 && <span className="tag">← {inc.length}</span>}</button>
+                  <span className="muted sm">{t.columns.length} {w.col}s · {num(t.rows_estimate)} {w.rows}</span><span className="grow" />{out.length > 0 && <span className="tag">→ {out.length}</span>}{inc.length > 0 && <span className="tag">← {inc.length}</span>}</button>
                 {isOpen && <div className="db-tree-body">
                   <ul>{t.columns.map(c => <li key={c.name}><span className={c.pk ? 'good' : ''}>{c.pk ? '🔑 ' : c.fk ? '↗ ' : '· '}{c.name}</span> <span className="mono sm muted">{c.type}</span>
-                    {c.fk && out.filter(r => r.from_columns.includes(c.name)).map(r => <ul key={r.name}><li className="sm">→ <button type="button" className="lg-link" onClick={() => setOpen(r.to)}>{r.to.split('.').pop()}</button>.{r.to_columns.join(', ')} <span className="muted">({byKey.get(r.to)?.columns.length ?? '?'} columns)</span></li></ul>)}</li>)}</ul>
+                    {c.fk && out.filter(r => r.from_columns.includes(c.name)).map(r => <ul key={r.name}><li className="sm">→ <button type="button" className="lg-link" onClick={() => setOpen(r.to)}>{r.to.split('.').pop()}</button>.{r.to_columns.join(', ')} <span className="muted">({byKey.get(r.to)?.columns.length ?? '?'} {w.col}s)</span></li></ul>)}</li>)}</ul>
                   {inc.length > 0 && <><div className="muted sm" style={{ margin: '6px 0 2px' }}>Referred to by</div><ul>{inc.map(r => <li key={r.name + r.from} className="sm">← <button type="button" className="lg-link" onClick={() => setOpen(r.from)}>{r.from.split('.').pop()}</button>.{r.from_columns.join(', ')}</li>)}</ul></>}
                   <button className="btn sm primary" style={{ marginTop: 8 }} onClick={() => onAdd(t.key)}><Icon name="plus" size={13} />Add to report</button>
                 </div>}
@@ -350,13 +361,13 @@ function ReportBuilder({ conn, schema, picks, setPicks, onReport }: { conn: Conn
   return (
     <div className="db-graph-row">
       <section className="card" style={{ flex: 1, minWidth: 0 }}>
-        <div className="card-head"><h2>Choose tables and columns</h2><span className="grow" /><span className="muted sm">{selection.length} selected</span></div>
+        <div className="card-head"><h2>Choose {words(conn.engine).table}s and {words(conn.engine).col}s</h2><span className="grow" /><span className="muted sm">{selection.length} selected</span></div>
         <label className="lg-field" style={{ marginBottom: 10 }}><Icon name="logs" size={15} /><input value={q} onChange={e => setQ(e.target.value)} placeholder="Find a table…" aria-label="Find a table" /></label>
         <div className="db-pick-list">
           {list.slice(0, 300).map(t => { const on = t.key in picks; const cols = picks[t.key]; return (
             <div key={t.key} className={`db-pick ${on ? 'on' : ''}`}>
-              <div className="db-pick-head"><label className="check"><input type="checkbox" checked={on} onChange={() => toggle(t.key)} /><b>{t.name}</b><span className="muted sm">{t.schema} · {t.columns.length} cols · {num(t.rows_estimate)} rows</span></label><span className="grow" />
-                {on && <button type="button" className="lg-link sm" onClick={() => setExpand(expand === t.key ? null : t.key)}>{cols ? `${cols.length} of ${t.columns.length} columns` : 'all columns'} ▾</button>}</div>
+              <div className="db-pick-head"><label className="check"><input type="checkbox" checked={on} onChange={() => toggle(t.key)} /><b>{t.name}</b><span className="muted sm">{t.schema} · {t.columns.length} {words(conn.engine).col}s · {num(t.rows_estimate)} {words(conn.engine).rows}</span></label><span className="grow" />
+                {on && <button type="button" className="lg-link sm" onClick={() => setExpand(expand === t.key ? null : t.key)}>{cols ? `${cols.length} of ${t.columns.length} ${words(conn.engine).col}s` : `all ${words(conn.engine).col}s`} ▾</button>}</div>
               {on && expand === t.key && <div className="db-pick-cols">{t.columns.map(c => <label key={c.name} className="check"><input type="checkbox" checked={!cols || cols.includes(c.name)} onChange={() => toggleCol(t, c.name)} /><span className={c.pk ? 'good' : ''}>{c.pk ? '🔑 ' : c.fk ? '↗ ' : ''}{c.name}</span><small className="muted mono">{c.type}</small>{c.sensitive && <span className="tag">masked</span>}</label>)}</div>}
               {on && related(t.key).length > 0 && <div className="sm muted" style={{ paddingLeft: 26 }}>Related: {related(t.key).slice(0, 5).map(k => <button key={k} type="button" className="lg-link" style={{ marginRight: 8 }} onClick={() => setPicks({ ...picks, [k]: null })}>+ {k.split('.').pop()}</button>)}</div>}
             </div>); })}
@@ -416,19 +427,19 @@ function ReportView({ report, onClose }: { report: Report; onClose: () => void }
         <header><div className="muted sm">{report.database.name} · {ENGINE_LABEL[report.database.engine as Conn['engine']] ?? report.database.engine} {report.database.server_version ?? ''} · {report.database.database}</div>
           <h1>{report.title}</h1><div className="muted sm">Generated {new Date(report.generated_at).toLocaleString()} · read-only snapshot</div></header>
         <section className="db-r-summary"><p>{report.overview}</p>
-          <div className="db-r-kpis"><div><b>{report.tables.length}</b><small>tables</small></div><div><b>{num(report.tables.reduce((a, s) => a + s.profile.rows, 0))}</b><small>rows</small></div><div><b>{report.relations.length}</b><small>relationships</small></div><div><b className={report.issues ? 'warn' : 'good'}>{report.issues}</b><small>quality notes</small></div></div>
-          {report.relations.length > 0 && <><h2>How the tables relate</h2><ul>{report.relations.map((x, i) => <li key={i}>{x.text}</li>)}</ul></>}
-          <h2>Contents</h2><ol className="db-r-toc">{report.tables.map(s => <li key={s.table}><a href={`#t-${s.table}`}>{s.name}</a> <span className="muted">· {num(s.profile.rows)} rows{s.quality.length ? ` · ${s.quality.length} note${s.quality.length > 1 ? 's' : ''}` : ''}</span></li>)}</ol>
+          <div className="db-r-kpis"><div><b>{report.tables.length}</b><small>{words(report.engine).table}s</small></div><div><b>{num(report.tables.reduce((a, s) => a + s.profile.rows, 0))}</b><small>{words(report.engine).rows}</small></div><div><b>{report.relations.length}</b><small>relationships</small></div><div><b className={report.issues ? 'warn' : 'good'}>{report.issues}</b><small>quality notes</small></div></div>
+          {report.relations.length > 0 && <><h2>How the {words(report.engine).table}s relate</h2><ul>{report.relations.map((x, i) => <li key={i}>{x.text}</li>)}</ul></>}
+          <h2>Contents</h2><ol className="db-r-toc">{report.tables.map(s => <li key={s.table}><a href={`#t-${s.table}`}>{s.name}</a> <span className="muted">· {num(s.profile.rows)} {words(report.engine).rows}{s.quality.length ? ` · ${s.quality.length} note${s.quality.length > 1 ? 's' : ''}` : ''}</span></li>)}</ol>
         </section>
         {report.tables.map(s => (
           <section key={s.table} id={`t-${s.table}`} className="db-r-table">
             <h2>{s.name} <span className="muted">{s.schema}{s.kind === 'view' ? ' · view' : ''}</span></h2>
             {s.comment && <p className="db-r-comment">{s.comment}</p>}
             <p>{s.summary}</p>
-            <div className="db-r-facts"><span>Rows <b>{num(s.profile.rows)}{s.profile.rows_exact ? '' : ' (estimate)'}</b></span><span>Size <b>{bytes(s.size_bytes)}</b></span><span>Key <b>{s.primary_key.join(' + ') || 'none'}</b></span><span>Read in <b>{s.profile.seconds}s</b></span></div>
+            <div className="db-r-facts"><span>{words(report.engine).rows[0].toUpperCase() + words(report.engine).rows.slice(1)} <b>{num(s.profile.rows)}{s.profile.rows_exact ? '' : ' (estimate)'}</b></span><span>Size <b>{bytes(s.size_bytes)}</b></span><span>Key <b>{s.primary_key.join(' + ') || 'none'}</b></span><span>Read in <b>{s.profile.seconds}s</b></span></div>
             {(s.references.length > 0 || s.referenced_by.length > 0) && <ul className="db-r-rels">{[...s.references, ...s.referenced_by].map((x, i) => <li key={i}>{x.text}</li>)}</ul>}
             {s.quality.length > 0 && <div className="db-r-quality"><b>Data quality</b><ul>{s.quality.map((q, i) => <li key={i}>{q}</li>)}</ul></div>}
-            <table className="db-r-cols"><thead><tr><th>Column</th><th>Type</th><th>Filled</th><th className="num">Distinct</th><th>Values</th></tr></thead><tbody>
+            <table className="db-r-cols"><thead><tr><th>{words(report.engine).col[0].toUpperCase() + words(report.engine).col.slice(1)}</th><th>Type</th><th>Filled</th><th className="num">Distinct</th><th>Values</th></tr></thead><tbody>
               {s.profile.columns.map(c => <tr key={c.name}>
                 <td><b>{c.name}</b>{c.pk && <span className="tag">key</span>}{c.unique && !c.pk && <span className="tag">unique</span>}{c.comment && <div className="muted sm">{c.comment}</div>}</td>
                 <td className="mono sm">{c.type}{!c.nullable && <div className="muted sm">required</div>}</td>
@@ -439,7 +450,7 @@ function ReportView({ report, onClose }: { report: Report; onClose: () => void }
                   {c.avg_length != null && c.min == null && !c.top && <div className="muted">avg length {c.avg_length}</div>}
                   {c.top && <div className="db-top">{c.top.map((t, i) => <span key={i}><b>{shown(t.value)}</b> {t.pct}%</span>)}</div>}</>}</td></tr>)}
             </tbody></table>
-            {s.profile.sample.length > 0 && <><h3>Sample rows</h3><div className="tbl-wrap"><table className="db-r-sample"><thead><tr>{s.profile.columns.map(c => <th key={c.name}>{c.name}</th>)}</tr></thead><tbody>
+            {s.profile.sample.length > 0 && <><h3>Sample {words(report.engine).rows}</h3><div className="tbl-wrap"><table className="db-r-sample"><thead><tr>{s.profile.columns.map(c => <th key={c.name}>{c.name}</th>)}</tr></thead><tbody>
               {s.profile.sample.map((row, i) => <tr key={i}>{row.map((v, j) => <td key={j}>{v == null ? <span className="muted">null</span> : String(v)}</td>)}</tr>)}</tbody></table></div></>}
             {s.profile.notes.map((n, i) => <p key={i} className="muted sm">{n}</p>)}
           </section>))}

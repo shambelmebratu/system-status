@@ -69,6 +69,8 @@ def purge_now(payload: PurgeRequest, request: Request, user: dict = Depends(requ
         raise HTTPException(422, f"Unknown data kind '{unknown[0]}'")
     try:
         deleted = retention.purge(db, list(dict.fromkeys(payload.categories)), payload.older_than_days)
+        from .stats import clear_cache
+        clear_cache()
     except ValueError as error:
         db.rollback()
         raise HTTPException(422, str(error))

@@ -745,3 +745,4 @@ kbd{font:600 11px var(--mono);border:1px solid var(--line);background:var(--surf
 .seg{max-width:100%;overflow-x:auto;scrollbar-width:none}.seg button{flex:none;white-space:nowrap}
 .grid>*{min-width:0}
 .db-report-bar .btn{background:#ffffff;color:#1b2333;border-color:#ffffff}.db-report-bar .btn.ghost{background:transparent;color:#ffffff;border-color:rgba(255,255,255,.5)}
+.db-edge.inferred{stroke-dasharray:6 5}

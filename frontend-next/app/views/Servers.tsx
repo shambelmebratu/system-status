@@ -11,7 +11,7 @@ import { MonitorAlertSettings, alertSummary, alertsOf, type MonitorAlerts } from
 import { LogPolicyCard } from '../components/logpolicy';
 import { CodeBox, Empty, Field, Icon, Meter, Modal, StatusPill } from '../components/ui';
 import { api, del, post, put } from '../lib/api';
-import { useApp, useLimits, useNow, usePoll } from '../lib/app';
+import { pollFor, useApp, useLimits, useNow, usePoll } from '../lib/app';
 import { bytesPerSecond, duration, isOlder, ms, pct, timeAgo } from '../lib/format';
 import type { Incident, Mode, Point, Range, Server, ServerHistory } from '../lib/types';
 import { IncidentList } from './Overview';
@@ -24,7 +24,7 @@ export function Servers() {
   if (route[1] === 'new' && canManage) return <><ServerList /><ServerWizard onClose={() => go('servers')} /></>;
   if (route[1]) {
     const server = data.servers.find(s => s.id === Number(route[1]));
-    return server ? <ServerDetail server={server} /> : <Empty title="Server not found" action={<button className="btn" onClick={() => go('servers')}>Back to servers</button>} />;
+    return server ? <ServerDetail key={server.id} server={server} /> : <Empty title="Server not found" action={<button className="btn" onClick={() => go('servers')}>Back to servers</button>} />;
   }
   return <ServerList />;
 }
@@ -72,8 +72,8 @@ function ServerDetail({ server }: { server: Server }) {
   const [sshFresh, setSshFresh] = useState<{ n: number; report: string | null } | null>(null);
   const onSshCount = useCallback((n: number) => setSshFresh({ n, report: server.last_seen_at }), [server.last_seen_at]);
   const sshCount = sshFresh && sshFresh.report === server.last_seen_at ? sshFresh.n : server.last_metrics?.ssh_sessions;
-  const history = usePoll(() => api<ServerHistory>(`/servers/${server.id}/history?range=${range}`), [server.id, range], 10000);
-  const incidents = usePoll(() => api<Incident[]>('/incidents?limit=200'), [server.id], 30000);
+  const history = usePoll(() => api<ServerHistory>(`/servers/${server.id}/history?range=${range}`), [server.id, range], pollFor(range), true);
+  const incidents = usePoll(() => api<Incident[]>(`/incidents?limit=6&target_type=server&target_id=${server.id}`), [server.id], 30000);
   const m = server.last_metrics;
   const h = history.value;
   const showDate = range === '7d' || range === '30d';

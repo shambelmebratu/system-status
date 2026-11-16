@@ -26,6 +26,15 @@ database.Base.metadata.create_all(engine)
 CSRF = {"X-Requested-With": "smwatch"}
 
 
+@pytest.fixture(autouse=True)
+def fresh_stats_cache():
+    """Tests write history with past timestamps; production only ever writes "now" (cached past days never change there)."""
+    from app.stats import clear_cache
+    clear_cache()
+    yield
+    clear_cache()
+
+
 @pytest.fixture()
 def client():
     from app.security import login_limiter
@@ -2176,3 +2185,14 @@ def test_database_section_is_admin_only_and_keeps_passwords(client, monkeypatch)
     for method, path in (("get", "/api/databases"), ("get", f"/api/databases/{cid}/schema"), ("post", f"/api/databases/{cid}/report"), ("delete", f"/api/db-reports/{rid}")):
         assert getattr(op, method)(path, headers=CSRF, **({"json": {"selection": [{"table": "public.orders"}]}} if method == "post" else {})).status_code == 403, path
     assert client.delete(f"/api/databases/{cid}", headers=CSRF).status_code == 200 and client.get("/api/databases").json() == []
+
+
+def test_mongodb_connection_settings(client):
+    sign_in(client)
+    body = {"name": "Docs", "engine": "mongodb", "host": "mongo.example.com", "database": "shop", "username": "report_ro", "password": "pw-123", "auth_source": "admin"}
+    c = client.post("/api/databases", headers=CSRF, json=body).json()
+    assert c["engine"] == "mongodb" and c["port"] == 27017 and c["auth_source"] == "admin"
+    assert client.post("/api/databases", headers=CSRF, json={**body, "database": ""}).status_code == 422
+    assert client.post("/api/databases", headers=CSRF, json={**body, "auth_source": "bad name!"}).status_code == 422
+    pg = client.post("/api/databases", headers=CSRF, json={**body, "engine": "postgresql", "name": "PG"}).json()
+    assert pg["auth_source"] == ""                                                              # only kept for MongoDB

@@ -10,7 +10,7 @@ from .config import get_settings
 from .database import get_db
 from .models import Cluster, Incident, Server, Service
 from .security import can_see, ensure_access, require_user
-from .stats import AVAILABILITY_RANGES, aware, availability, daily_uptime, server_history, service_history, uptime_by_target
+from .stats import AVAILABILITY_RANGES, aware, availability, daily_uptime, server_history, service_history, ttl_cached, uptime_by_target
 
 router = APIRouter(prefix="/api", tags=["stats"])
 RANGES = {"1h": 1, "6h": 6, "24h": 24, "7d": 168, "30d": 720}
@@ -87,9 +87,12 @@ def uptime_summary(user: dict = Depends(require_user), db: Session = Depends(get
 
 
 @router.get("/incidents")
-def incidents(state: str = Query("all", pattern="^(all|open|resolved)$"), limit: int = Query(100, ge=1, le=500), user: dict = Depends(require_user), db: Session = Depends(get_db)) -> list[dict]:
+def incidents(state: str = Query("all", pattern="^(all|open|resolved)$"), limit: int = Query(100, ge=1, le=500), target_type: str = Query("", pattern="^(|server|service|cluster)$"),
+              target_id: int | None = None, user: dict = Depends(require_user), db: Session = Depends(get_db)) -> list[dict]:
     restricted = user.get("scope") is not None
     query = select(Incident).order_by(desc(Incident.started_at)).limit(5000 if restricted else limit)   # limited access: filter first, then cut
+    if target_type and target_id is not None:   # one monitor's incidents (uses the per-target index)
+        query = query.where(Incident.target_type == target_type, Incident.target_id == target_id)
     if state == "open":
         query = query.where(Incident.resolved_at.is_(None))
     elif state == "resolved":
@@ -110,12 +113,17 @@ def public_status(days: int | None = Query(None, ge=1, le=365), db: Session = De
     days = days if days is not None else (settings.public_status_default_days if settings.public_status_default_days in ranges else ranges[0])
     if days not in ranges:
         raise HTTPException(422, f"Choose one of: {', '.join(str(r) for r in ranges)} days")
+    return ttl_cached(("public-status", days, tuple(i.id for i in services), tuple(i.id for i in servers)), 30, lambda: _public_page(db, settings, services, servers, days, ranges))
+
+
+def _public_page(db: Session, settings, services, servers, days: int, ranges: list[int]) -> dict:
+    """Unauthenticated and cached for 30 s: a busy (or abusive) visitor cannot make the database recount history."""
     uptime = uptime_by_target(db, 24 * days)
     since = datetime.now(timezone.utc) - timedelta(days=days)
+    daily = {"service": daily_uptime(db, "service", [i.id for i in services], days), "server": daily_uptime(db, "server", [i.id for i in servers], days)}
 
     def row(kind: str, item, latency) -> dict:
-        daily = daily_uptime(db, kind, [item.id], days)[item.id]
-        return {"id": f"{kind}-{item.id}", "kind": kind, "name": item.name, "status": item.last_status, "latency_ms": latency, "uptime": uptime.get((kind, item.id)), "daily": daily}
+        return {"id": f"{kind}-{item.id}", "kind": kind, "name": item.name, "status": item.last_status, "latency_ms": latency, "uptime": uptime.get((kind, item.id)), "daily": daily[kind][item.id]}
 
     items = [row("service", i, i.last_latency_ms) for i in services] + [row("server", i, (json.loads(i.last_metrics).get("latency_ms") if i.last_metrics else None)) for i in servers]
     items.sort(key=lambda r: r["name"].lower())

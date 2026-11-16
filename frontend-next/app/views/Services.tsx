@@ -6,7 +6,7 @@ import { AvailabilityPanel } from '../components/availability';
 import { AreaChart } from '../components/charts';
 import { Empty, Field, Icon, Modal, StatusPill } from '../components/ui';
 import { api, del, post, put } from '../lib/api';
-import { useApp, useLimits, usePoll } from '../lib/app';
+import { pollFor, useApp, useLimits, usePoll } from '../lib/app';
 import { clock, ms, pct, timeAgo, uptimeClass } from '../lib/format';
 import type { Range, Service, ServiceHistory } from '../lib/types';
 
@@ -16,7 +16,7 @@ export function Services() {
   if (route[1] === 'new' && canManage) return <><ServiceList /><ServiceForm onClose={() => go('services')} /></>;
   if (route[1]) {
     const service = data.services.find(s => s.id === Number(route[1]));
-    return service ? <ServiceDetail service={service} /> : <Empty title="Service not found" action={<button className="btn" onClick={() => go('services')}>Back to services</button>} />;
+    return service ? <ServiceDetail key={service.id} service={service} /> : <Empty title="Service not found" action={<button className="btn" onClick={() => go('services')}>Back to services</button>} />;
   }
   return <ServiceList />;
 }
@@ -57,7 +57,7 @@ function ServiceDetail({ service }: { service: Service }) {
   const [range, setRange] = useState<Range>('24h');
   const [editing, setEditing] = useState(false);
   const [busy, setBusy] = useState(false);
-  const history = usePoll(() => api<ServiceHistory>(`/services/${service.id}/history?range=${range}`), [service.id, range], 20000);
+  const history = usePoll(() => api<ServiceHistory>(`/services/${service.id}/history?range=${range}`), [service.id, range], pollFor(range), true);
   const uptime = usePoll(() => api<Record<string, Record<string, number>>>('/uptime'), [], 60000).value?.[`service:${service.id}`];
   const h = history.value;
 

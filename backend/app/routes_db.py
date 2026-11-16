@@ -27,7 +27,8 @@ CACHE_SECONDS = 120
 
 class ConnectionIn(BaseModel):
     name: str = Field(min_length=1, max_length=100)
-    engine: str = Field(pattern="^(postgresql|mysql)$")
+    engine: str = Field(pattern="^(postgresql|mysql|mongodb)$")
+    auth_source: str = Field(default="", max_length=64, pattern=NAME.replace("{1,128}", "{0,64}"))
     host: str = Field(min_length=1, max_length=255)
     port: int | None = Field(default=None, ge=1, le=65535)
     database: str = Field(default="", max_length=128)
@@ -75,7 +76,7 @@ class SavedReportIn(ReportIn):
 def serialize(c: DbConnection) -> dict:
     iso = lambda d: (d if d.tzinfo else d.replace(tzinfo=timezone.utc)).isoformat() if d else None   # noqa: E731
     return {"id": c.id, "name": c.name, "engine": c.engine, "host": c.host, "port": c.port, "database": c.database, "username": c.username,
-            "has_password": bool(c.password), "ssl_mode": c.ssl_mode, "schemas": [s for s in (c.schemas or "").split(",") if s],
+            "has_password": bool(c.password), "ssl_mode": c.ssl_mode, "auth_source": c.auth_source or "", "schemas": [s for s in (c.schemas or "").split(",") if s],
             "created_by": c.created_by, "created_at": iso(c.created_at), "last_ok_at": iso(c.last_ok_at), "last_error": c.last_error, "server_version": c.server_version}
 
 
@@ -95,9 +96,10 @@ def apply(c: DbConnection, payload: ConnectionIn) -> None:
     c.port = payload.port or dbinspect.DEFAULT_PORTS[payload.engine]
     c.database, c.username, c.ssl_mode = payload.database, payload.username, payload.ssl_mode
     c.schemas = ",".join(payload.schemas) or None
+    c.auth_source = payload.auth_source.strip() or None if payload.engine == "mongodb" else None
     if payload.password:
         c.password = payload.password
-    if payload.engine == "postgresql" and not c.database:
+    if payload.engine in ("postgresql", "mongodb") and not c.database:
         raise HTTPException(422, "Enter the database name")
 
 
@@ -131,7 +133,7 @@ def load_schema(c: DbConnection, db: Session, refresh: bool = False) -> tuple[di
 
 
 def signature(c: DbConnection) -> str:
-    return f"{c.engine}|{c.host}|{c.port}|{c.database}|{c.username}|{c.schemas}"
+    return f"{c.engine}|{c.host}|{c.port}|{c.database}|{c.username}|{c.schemas}|{c.auth_source}"
 
 
 # ------------------------------------------------------------------------------------------------ connections

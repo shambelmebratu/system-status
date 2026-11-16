@@ -67,6 +67,7 @@ class Relation:
     from_columns: list[str]
     to_table: str
     to_columns: list[str]
+    inferred: bool = False         # MongoDB: found by matching ids, not declared by the database
 
 
 def _clean(value, limit: int = 300) -> str:
@@ -128,6 +129,9 @@ class Inspector:
 
     def length_expr(self, col: str) -> str:
         return f"LENGTH(CAST({col} AS CHAR))"
+
+    def profile(self, table: "Table", columns: list["Column"], sample_rows: int) -> dict:
+        return profile_table(self, table, columns, sample_rows)
 
     def text_expr(self, col: str) -> str:
         return f"CAST({col} AS CHAR)"
@@ -265,8 +269,13 @@ class MySqlInspector(Inspector):
         return list(tables.values()), list(grouped.values())
 
 
-ENGINES = {"postgresql": PostgresInspector, "mysql": MySqlInspector}
-DEFAULT_PORTS = {"postgresql": 5432, "mysql": 3306}
+def _mongo(*args, **kwargs):
+    from .dbmongo import MongoInspector
+    return MongoInspector(*args, **kwargs)
+
+
+ENGINES = {"postgresql": PostgresInspector, "mysql": MySqlInspector, "mongodb": _mongo}
+DEFAULT_PORTS = {"postgresql": 5432, "mysql": 3306, "mongodb": 27017}
 
 
 def open_inspector(conn) -> Inspector:
@@ -276,7 +285,8 @@ def open_inspector(conn) -> Inspector:
         raise DbError(f"Unsupported engine: {conn.engine}")
     schemas = [s.strip() for s in (conn.schemas or "").split(",") if s.strip()]
     try:
-        return cls(conn.host, conn.port, conn.database, conn.username, conn.password or "", conn.ssl_mode or "prefer", schemas)
+        extra = {"auth_source": getattr(conn, "auth_source", None)} if conn.engine == "mongodb" else {}
+        return cls(conn.host, conn.port, conn.database, conn.username, conn.password or "", conn.ssl_mode or "prefer", schemas, **extra)
     except BlockedTargetError as error:
         raise DbError(str(error)) from error
 
@@ -288,7 +298,7 @@ def schema_json(tables: list[Table], relations: list[Relation]) -> dict:
         "tables": [{"key": t.key, "schema": t.schema, "name": t.name, "kind": t.kind, "rows_estimate": t.rows_estimate, "size_bytes": t.size_bytes, "comment": t.comment,
                     "columns": [{"name": c.name, "type": c.type, "nullable": c.nullable, "default": c.default, "pk": c.pk, "fk": (t.key, c.name) in fk_cols, "comment": c.comment,
                                  "sensitive": bool(SENSITIVE.search(c.name))} for c in t.columns]} for t in tables],
-        "relations": [{"name": r.name, "from": r.from_table, "from_columns": r.from_columns, "to": r.to_table, "to_columns": r.to_columns} for r in relations],
+        "relations": [{"name": r.name, "from": r.from_table, "from_columns": r.from_columns, "to": r.to_table, "to_columns": r.to_columns, "inferred": r.inferred} for r in relations],
     }
 
 
@@ -418,7 +428,7 @@ def build_report(insp: Inspector, tables: list[Table], relations: list[Relation]
     keys = {t.key for t, _ in chosen}
     sections = []
     for t, cols in chosen:
-        profile = profile_table(insp, t, cols, max(0, min(20, sample_rows)))
+        profile = insp.profile(t, cols, max(0, min(20, sample_rows)))
         outgoing = [r for r in relations if r.from_table == t.key]
         incoming = [r for r in relations if r.to_table == t.key]
         quality = quality_notes(t, cols, profile, outgoing)
@@ -429,9 +439,11 @@ def build_report(insp: Inspector, tables: list[Table], relations: list[Relation]
     inside = [r for r in relations if r.from_table in keys and r.to_table in keys]
     total_rows = sum(s["profile"]["rows"] for s in sections)
     biggest = max(sections, key=lambda s: s["profile"]["rows"])
-    overview = (f"This report covers {_plural(len(sections), 'table')} with {_plural(total_rows, 'row')} in total. "
-                f"The largest is {biggest['name']} ({biggest['profile']['rows']:,} rows). "
-                + (f"{_plural(len(inside), 'relationship')} connect the selected tables." if inside else "None of the selected tables reference each other."))
+    mongo = insp.engine == "mongodb"
+    table_word, row_word = ("collection", "document") if mongo else ("table", "row")
+    overview = (f"This report covers {_plural(len(sections), table_word)} with {_plural(total_rows, row_word)} in total. "
+                f"The largest is {biggest['name']} ({_plural(biggest['profile']['rows'], row_word)}). "
+                + (f"{_plural(len(inside), 'relationship')} connect the selected {table_word}s." if inside else f"None of the selected {table_word}s reference each other."))
     issues = sum(len(s["quality"]) for s in sections)
     return {"title": title or f"Data report: {', '.join(s['name'] for s in sections[:4])}{' …' if len(sections) > 4 else ''}", "engine": insp.engine,
             "generated_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z", "overview": overview, "issues": issues,
@@ -439,11 +451,12 @@ def build_report(insp: Inspector, tables: list[Table], relations: list[Relation]
 
 
 def table_sentence(t: Table, profile: dict, outgoing: list[Relation], incoming: list[Relation]) -> str:
-    kind = "view" if t.kind == "view" else "table"
-    parts = [f"{t.name} is a {kind} with {_plural(profile['rows'], 'row')}{'' if profile['rows_exact'] else ' (estimated)'} and {_plural(len(t.columns), 'column')}."]
+    kind = "view" if t.kind == "view" else t.kind if t.kind == "collection" else "table"
+    row, col = ("document", "field") if t.kind == "collection" else ("row", "column")
+    parts = [f"{t.name} is a {kind} with {_plural(profile['rows'], row)}{'' if profile['rows_exact'] else ' (estimated)'} and {_plural(len(t.columns), col)}."]
     pk = [c.name for c in t.columns if c.pk]
     if pk:
-        parts.append(f"Each row is identified by {' + '.join(pk)}.")
+        parts.append(f"Each {row} is identified by {' + '.join(pk)}.")
     if outgoing:
         parts.append(f"It points to {', '.join(sorted({r.to_table.split('.')[-1] for r in outgoing}))}.")
     if incoming:
@@ -459,7 +472,9 @@ def relation_sentence(r: Relation, by_key: dict, direction: str) -> dict:
     one, parent = _singular(src), _singular(dst)
     text = (f"Each {one} {'may belong' if optional else 'belongs'} to one {parent} ({src}.{src_cols} → {dst}.{dst_cols}). "
             f"{'An' if parent[:1].lower() in 'aeiou' else 'A'} {parent} can have many {_humanize(src)}.")
-    return {"name": r.name, "from": r.from_table, "from_columns": r.from_columns, "to": r.to_table, "to_columns": r.to_columns, "optional": optional, "text": text}
+    if r.inferred:
+        text += " (Found by matching ids: MongoDB does not declare relations.)"
+    return {"name": r.name, "from": r.from_table, "from_columns": r.from_columns, "to": r.to_table, "to_columns": r.to_columns, "optional": optional, "text": text, "inferred": r.inferred}
 
 
 def quality_notes(t: Table, cols: list[Column], profile: dict, outgoing: list[Relation]) -> list[str]:
@@ -467,21 +482,23 @@ def quality_notes(t: Table, cols: list[Column], profile: dict, outgoing: list[Re
     if t.kind == "table" and not any(c.pk for c in t.columns):
         notes.append("This table has no primary key, so rows cannot be told apart reliably.")
     if profile["rows"] == 0:
-        notes.append("The table is empty.")
+        notes.append("The collection is empty." if row == "document" else "The table is empty.")
         return notes
     fk_cols = {c for r in outgoing for c in r.from_columns}
+    row = "document" if t.kind == "collection" else "row"
+    complex_type = re.compile(r"object|array|\[\]|json|dbref", re.I)
     for s in profile["columns"]:
         if "error" in s:
             continue
         if s.get("non_null", 0) == 0 and profile["rows"]:
             notes.append(f"{s['name']} is always empty.")
         elif s.get("null_pct", 0) >= 50:
-            notes.append(f"{s['name']} is empty in {s['null_pct']}% of rows.")
+            notes.append(f"{s['name']} is empty in {s['null_pct']}% of {row}s.")
         if s["name"] in fk_cols and s.get("nulls"):
-            notes.append(f"{s['name']} links to another table but is missing in {_plural(s['nulls'], 'row')}.")
+            notes.append(f"{s['name']} links to another {'collection' if row == 'document' else 'table'} but is missing in {_plural(s['nulls'], row)}.")
         if s.get("distinct") == 1 and s.get("non_null", 0) > 1:
-            notes.append(f"{s['name']} has the same value in every row.")
+            notes.append(f"{s['name']} has the same value in every {row}{' that has it' if s.get('nulls') else ''}.")
         if (s.get("unique") and not s.get("pk") and not s.get("sensitive") and not s.get("nullable") and s.get("non_null", 0) > 10 and s["name"] not in fk_cols
-                and not TEMPORAL.search(s.get("type", "")) and not NUMERIC.search(s.get("type", "")) or False) and s.get("null_pct", 0) == 0:
-            notes.append(f"{s['name']} is unique in every row: it could serve as a key.")
+                and not TEMPORAL.search(s.get("type", "")) and not NUMERIC.search(s.get("type", "")) and not complex_type.search(s.get("type", ""))) and s.get("null_pct", 0) == 0:
+            notes.append(f"{s['name']} is unique in every {row}: it could serve as a key.")
     return notes[:12]

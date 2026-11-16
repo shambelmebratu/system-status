@@ -123,6 +123,7 @@ class Channel(Base):
 
 class AlertEvent(Base):
     __tablename__ = "alert_events"
+    __table_args__ = (Index("ix_alert_events_created_at", "created_at"), Index("ix_alert_events_target", "target_type", "target_id", "id"))
     id: Mapped[int] = mapped_column(primary_key=True)
     target_type: Mapped[str] = mapped_column(String(30))
     target_id: Mapped[int] = mapped_column(Integer)
@@ -143,7 +144,8 @@ def utcnow() -> datetime:
 class CheckResult(Base):
     """One row per executed check (service probe, server poll, or agent report)."""
     __tablename__ = "check_results"
-    __table_args__ = (Index("ix_check_results_target_time", "target_type", "target_id", "checked_at"),)
+    __table_args__ = (Index("ix_check_results_target_time", "target_type", "target_id", "checked_at"),
+                      Index("ix_check_results_checked_at", "checked_at"))     # dashboards that look at every target over a time window
     id: Mapped[int] = mapped_column(primary_key=True)
     target_type: Mapped[str] = mapped_column(String(20))
     target_id: Mapped[int] = mapped_column(Integer)
@@ -157,7 +159,7 @@ class CheckResult(Base):
 class MetricSample(Base):
     """Host resource time series, written on every agent poll/report."""
     __tablename__ = "metric_samples"
-    __table_args__ = (Index("ix_metric_samples_server_time", "server_id", "ts"),)
+    __table_args__ = (Index("ix_metric_samples_server_time", "server_id", "ts"), Index("ix_metric_samples_ts", "ts"))
     id: Mapped[int] = mapped_column(primary_key=True)
     server_id: Mapped[int] = mapped_column(ForeignKey("servers.id", ondelete="CASCADE"))
     ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -175,7 +177,7 @@ class TrafficSample(Base):
     """Response times of REAL traffic at a load balancer / web server, summarised by the agent for one reporting window.
     Only a histogram is kept (never the requests themselves), so percentiles stay exact enough to merge across windows."""
     __tablename__ = "traffic_samples"
-    __table_args__ = (Index("ix_traffic_samples_server_time", "server_id", "ts"),)
+    __table_args__ = (Index("ix_traffic_samples_server_time", "server_id", "ts"), Index("ix_traffic_samples_ts", "ts"))
     id: Mapped[int] = mapped_column(primary_key=True)
     server_id: Mapped[int] = mapped_column(ForeignKey("servers.id", ondelete="CASCADE"))
     ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -357,6 +359,7 @@ class DbConnection(Base):
     password: Mapped[str | None] = mapped_column(EncryptedText)      # never sent back to the browser
     ssl_mode: Mapped[str] = mapped_column(String(20), default="prefer")
     schemas: Mapped[str | None] = mapped_column(String(500))          # comma-separated; empty = every non-system schema
+    auth_source: Mapped[str | None] = mapped_column(String(64))        # MongoDB: the database the user is defined in (default: the database itself)
     created_by: Mapped[str | None] = mapped_column(String(320))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     last_ok_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

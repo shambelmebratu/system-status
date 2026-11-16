@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .config import get_settings
@@ -18,7 +18,7 @@ from .database import get_db
 from .models import CheckResult, Server, Service, TrafficSample
 from .audit import audit
 from .security import require_operator, require_user, can_see, ensure_access
-from .stats import aware
+from .stats import aware, bucket_of, is_pg, latency_stats, ttl_cached
 
 router = APIRouter(prefix="/api/performance", tags=["performance"])
 RANGES = {"1h": 1, "6h": 6, "24h": 24, "7d": 168, "30d": 720}
@@ -187,17 +187,16 @@ def _check_rows(db: Session, kind: str, target_id: int, since: datetime):
 
 @router.get("/checks")
 def checks(range: str = Query("24h", pattern="^(1h|6h|24h|7d|30d)$"), user: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
-    """p50 / p95 / p99 of SM-Watch's own probes: services (HTTP) and servers (ping)."""
+    """p50 / p95 / p99 of SM-Watch's own probes: services (HTTP) and servers (ping). One grouped query for every target."""
     since, _until = window(range)
+    stats = ttl_cached(("perf-checks", range), 20, lambda: latency_stats(db, since))
     items = []
-    svc_by_id = {s.id: s for s in db.scalars(select(Service)).all()}
-    targets = [("service", s.id, s.name) for s in db.scalars(select(Service).order_by(Service.name)).all()] + [("server", s.id, s.name) for s in db.scalars(select(Server).where(Server.monitor_mode != "push").order_by(Server.name)).all()]
-    for kind, target_id, name in targets:
-        if not can_see(user, kind, target_id):
-            continue
-        rows = [r for r in _check_rows(db, kind, target_id, since) if r.status != "down"]
-        if rows:
-            items.append({"kind": kind, "id": target_id, "name": name, "checks": len(rows), **_percentiles([r.latency_ms for r in rows]), "target": measure_service(db, svc_by_id[target_id]) if kind == "service" else None})
+    services = db.scalars(select(Service).order_by(Service.name)).all()
+    targets = [("service", s.id, s.name, s) for s in services] + [("server", s.id, s.name, None) for s in db.scalars(select(Server).where(Server.monitor_mode != "push").order_by(Server.name)).all()]
+    for kind, target_id, name, service in targets:
+        found = stats.get((kind, target_id))
+        if found and can_see(user, kind, target_id):
+            items.append({"kind": kind, "id": target_id, "name": name, **found, "target": measure_service(db, service) if service is not None else None})
     items.sort(key=lambda i: i["p95"] or 0, reverse=True)
     return {"range": range, "items": items}
 
@@ -208,13 +207,21 @@ def check_series(kind: str, target_id: int, range: str = Query("24h", pattern="^
         raise HTTPException(404, "Unknown target type")
     ensure_access(user, kind, target_id)
     since, until = window(range)
-    rows = [r for r in _check_rows(db, kind, target_id, since) if r.status != "down"]
     width = max(30.0, (until - since).total_seconds() / buckets)
-    grouped: dict[int, list[float]] = {}
-    for r in rows:
-        grouped.setdefault(int((aware(r.checked_at) - since).total_seconds() // width), []).append(r.latency_ms)
-    points = [{"t": (since + timedelta(seconds=i * width + width / 2)).isoformat(), **{k: v for k, v in _percentiles(vals).items() if k in ("p50", "p95", "p99")}} for i, vals in sorted(grouped.items())]
-    return {"range": range, "checks": len(rows), **_percentiles([r.latency_ms for r in rows]), "points": points}
+    where = (CheckResult.target_type == kind, CheckResult.target_id == target_id, CheckResult.checked_at >= since, CheckResult.status != "down", CheckResult.latency_ms.is_not(None))
+    b = bucket_of(db, CheckResult.checked_at, since, width).label("b")
+    points = []
+    if is_pg(db):
+        lat = CheckResult.latency_ms
+        for i, p50, p95, p99 in db.execute(select(b, *[func.percentile_disc(f).within_group(lat) for f in (0.5, 0.95, 0.99)]).where(*where).group_by(b).order_by(b)).all():
+            points.append({"t": (since + timedelta(seconds=int(i) * width + width / 2)).isoformat(), "p50": round(float(p50), 1), "p95": round(float(p95), 1), "p99": round(float(p99), 1)})
+    else:
+        grouped: dict[int, list[float]] = {}
+        for i, v in db.execute(select(b, CheckResult.latency_ms).where(*where)).all():
+            grouped.setdefault(int(i), []).append(v)
+        points = [{"t": (since + timedelta(seconds=i * width + width / 2)).isoformat(), **{k: v for k, v in _percentiles(vals).items() if k in ("p50", "p95", "p99")}} for i, vals in sorted(grouped.items())]
+    overall = latency_stats(db, since, kind, target_id).get((kind, target_id)) or {"checks": 0, "p50": None, "p95": None, "p99": None, "avg": None, "max": None}
+    return {"range": range, **overall, "points": points}
 
 
 @router.put("/targets/{kind}/{target_id}")
