@@ -39,7 +39,7 @@ from typing import Any
 
 import psutil
 
-AGENT_VERSION = "2.13.1"
+AGENT_VERSION = "2.14.0"
 _ENV_TOKEN = os.getenv("AGENT_TOKEN", "")                      # the token supplied by configuration; a rotation may supersede it (see _load_state)
 AGENT_TOKEN = ""                                                # the token in use: resolved by ensure_token() (saved state first, then configuration)
 AGENT_ALLOW_INSECURE = os.getenv("AGENT_ALLOW_INSECURE", "") == "1"   # permit http:// to a public address (not recommended)
@@ -172,6 +172,8 @@ def collect() -> dict[str, Any]:
         "processes": processes[:AGENT_PROCESS_TOP_N],
         "capabilities": (["logs"] if AGENT_LOGS != "off" else []) + (["ssh"] if AGENT_SSH != "off" else []) + (["ssh_history"] if AGENT_SSH == "on" else []),
         "ssh_sessions": ssh_count(),
+        "ssh_failures": ssh_failures(),
+        "updates": updates_report(),
         "ips": local_addresses(),
         "public_ip": public_address(),
         "install": install_kind(),
@@ -1391,6 +1393,171 @@ def ssh_answer(target: str, lines: int) -> str:
             raise ValueError("Command history is turned off for this server")
         return json.dumps(shell_history(lines))
     raise ValueError("Unknown SSH request")
+
+
+# ------------------------------------------------------------------------------------------------ security signals
+# Failed SSH logins (from the auth log or the journal) and pending OS updates. Both are sent with the regular report; only counts,
+# addresses and user names are sent, never log lines. AGENT_SECURITY=off turns both off.
+AGENT_SECURITY = os.getenv("AGENT_SECURITY", "on").lower()
+AGENT_UPDATES_HOURS = max(1.0, float(os.getenv("AGENT_UPDATES_HOURS", "6")))
+SSH_FAIL_PATTERNS = [
+    re.compile(r"Failed (?:password|publickey|keyboard-interactive/pam) for (?:invalid user )?(?P<user>\S*) from (?P<ip>[0-9a-fA-F:.]+)"),
+    re.compile(r"Invalid user (?P<user>\S*) from (?P<ip>[0-9a-fA-F:.]+)"),
+    re.compile(r"Connection closed by (?:authenticating|invalid) user (?P<user>\S*) (?P<ip>[0-9a-fA-F:.]+) port \d+ \[preauth\]"),
+    re.compile(r"maximum authentication attempts exceeded for (?:invalid user )?(?P<user>\S*) from (?P<ip>[0-9a-fA-F:.]+)"),
+    re.compile(r"Did not receive identification string from (?P<ip>[0-9a-fA-F:.]+)"),
+]
+_journal_since: dict = {"t": None}
+
+
+def _auth_log() -> str | None:
+    for path in ("/var/log/auth.log", "/var/log/secure"):
+        real = _host_path(path)
+        if os.path.isfile(real) and os.access(real, os.R_OK):
+            return real
+    return None
+
+
+def parse_ssh_failures(lines: list[str]) -> dict:
+    ips: dict[str, int] = {}
+    users: dict[str, int] = {}
+    total = 0
+    for line in lines:
+        if "sshd" not in line and "Failed password" not in line:
+            continue
+        for pattern in SSH_FAIL_PATTERNS:
+            match = pattern.search(line)
+            if match:
+                try:
+                    ip = str(ipaddress.ip_address(match.group("ip")))
+                except ValueError:
+                    break
+                total += 1
+                ips[ip] = ips.get(ip, 0) + 1
+                user = match.groupdict().get("user")
+                if user:
+                    user = "".join(ch for ch in user if ch.isprintable())[:40]
+                    users[user] = users.get(user, 0) + 1
+                break
+    top = lambda d, n: dict(sorted(d.items(), key=lambda kv: -kv[1])[:n])   # noqa: E731
+    return {"total": total, "ips": top(ips, 25), "users": top(users, 15), "distinct_ips": len(ips)}
+
+
+def ssh_failures() -> dict | None:
+    """Failed SSH login attempts since the previous report, or None when this server's auth log cannot be read."""
+    if AGENT_SECURITY == "off":
+        return None
+    path = _auth_log()
+    if path:
+        return parse_ssh_failures(_new_lines(path))
+    base = _journalctl() if not IS_MAC else None
+    if not base:
+        return None
+    now = time.time()
+    since, _journal_since["t"] = _journal_since["t"], now
+    if since is None:
+        return {"total": 0, "ips": {}, "users": {}, "distinct_ips": 0}
+    try:
+        out = subprocess.run(base + ["--no-pager", "-o", "cat", "-u", "ssh.service", "-u", "sshd.service", "--since", f"@{int(since)}", "--until", f"@{int(now)}"],
+                             capture_output=True, text=True, timeout=15, errors="replace").stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return parse_ssh_failures([f"sshd: {line}" for line in out.splitlines()[-20000:]])
+
+
+_updates: dict = {"at": 0.0, "value": None, "running": False}
+
+
+def _run(command: list[str], timeout: float = 120) -> tuple[int, str]:
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout, errors="replace", env={**os.environ, "LC_ALL": "C", "LANG": "C"})
+        return result.returncode, result.stdout
+    except (OSError, subprocess.SubprocessError) as error:
+        return -1, str(error)
+
+
+def check_updates() -> dict:
+    """Pending package updates (security ones first) and whether a reboot is needed. Read-only: nothing is downloaded or installed."""
+    root = AGENT_HOST_ROOT if AGENT_HOST_ROOT not in ("", "/") else ""
+    reboot_file = _host_path("/var/run/reboot-required") if os.path.exists(_host_path("/var/run/reboot-required")) else _host_path("/run/reboot-required")
+    reboot = os.path.exists(reboot_file)
+    reboot_pkgs = []
+    try:
+        with open(reboot_file + ".pkgs") as handle:
+            reboot_pkgs = sorted({line.strip() for line in handle if line.strip()})[:30]
+    except OSError:
+        pass
+    result: dict = {"manager": None, "total": 0, "security": 0, "packages": [], "reboot_required": reboot, "reboot_packages": reboot_pkgs, "error": None,
+                    "checked_at": datetime.now(timezone.utc).isoformat()}
+    if os.path.exists(_host_path("/var/lib/dpkg/status")) and shutil.which("apt-get"):
+        result["manager"] = "apt"
+        opts = ["-o", "Debug::NoLocking=1", "-o", f"Dir::Cache={os.path.join(tempfile_dir(), 'apt-cache')}"]
+        if root:   # the Docker agent reads the HOST's package lists and dpkg database (mounted read-only)
+            opts += ["-o", f"Dir={root}", "-o", f"Dir::State::status={root}/var/lib/dpkg/status", "-o", f"Dir::Etc={root}/etc/apt", "-o", f"Dir::State::Lists={root}/var/lib/apt/lists"]
+        code, out = _run(["apt-get", "-s", "-qq", *opts, "dist-upgrade"])
+        if code != 0:
+            result["error"] = (out or "apt-get failed").strip().splitlines()[-1][:200] if out else "apt-get failed"
+        packages = []
+        for line in out.splitlines():
+            if line.startswith("Inst "):
+                parts = line.split()
+                name, security = parts[1], "-security" in line or "security." in line
+                version = re.search(r"\(([^ )]+)", line)
+                packages.append({"name": name, "version": version.group(1) if version else "", "security": security})
+        result["total"], result["security"] = len(packages), sum(p["security"] for p in packages)
+        result["packages"] = sorted(packages, key=lambda p: (not p["security"], p["name"]))[:60]
+        stamp = _host_path("/var/lib/apt/periodic/update-success-stamp")
+        lists = _host_path("/var/lib/apt/lists")
+        try:
+            result["lists_age_hours"] = round((time.time() - os.stat(stamp if os.path.exists(stamp) else lists).st_mtime) / 3600, 1)
+        except OSError:
+            pass
+    elif not root and (shutil.which("dnf") or shutil.which("yum")):
+        tool = shutil.which("dnf") or shutil.which("yum")
+        result["manager"] = os.path.basename(tool)
+        code, out = _run([tool, "-q", "-C", "check-update"])
+        names = [line.split()[0] for line in out.splitlines() if line and not line.startswith((" ", "Obsoleting", "Last metadata")) and len(line.split()) >= 3]
+        _, sec = _run([tool, "-q", "-C", "updateinfo", "list", "--security"])
+        security = {line.split()[-1].rsplit("-", 2)[0] for line in sec.splitlines() if len(line.split()) >= 3}
+        packages = [{"name": n.rsplit(".", 1)[0], "version": "", "security": n.rsplit(".", 1)[0] in security} for n in names]
+        result["total"], result["security"] = len(packages), sum(p["security"] for p in packages)
+        result["packages"] = sorted(packages, key=lambda p: (not p["security"], p["name"]))[:60]
+        if code not in (0, 100):
+            result["error"] = "the package cache is empty or stale (run 'dnf makecache')"
+        if shutil.which("needs-restarting"):
+            rc, _ = _run(["needs-restarting", "-r"], 30)
+            result["reboot_required"] = rc == 1
+    elif not root and shutil.which("apk"):
+        result["manager"] = "apk"
+        _, out = _run(["apk", "version", "-l", "<"])
+        packages = [{"name": line.split()[0].rsplit("-", 2)[0], "version": "", "security": False} for line in out.splitlines()[1:] if line.strip()]
+        result["total"], result["packages"] = len(packages), packages[:60]
+    else:
+        result["error"] = "No supported package manager found" + (" for the host (the Docker agent supports Debian and Ubuntu hosts)" if root else "")
+    return result
+
+
+def tempfile_dir() -> str:
+    import tempfile
+    return tempfile.gettempdir()
+
+
+def updates_report() -> dict | None:
+    """The cached update summary; refreshed in the background every AGENT_UPDATES_HOURS (apt simulation takes a few seconds)."""
+    if AGENT_SECURITY == "off" or IS_MAC:
+        return None
+    if not _updates["running"] and time.time() - _updates["at"] > AGENT_UPDATES_HOURS * 3600:
+        _updates["running"] = True
+
+        def work():
+            try:
+                _updates["value"] = check_updates()
+            except Exception as error:   # noqa: BLE001
+                _updates["value"] = {"error": str(error)[:200], "manager": None, "total": 0, "security": 0, "packages": [], "reboot_required": False, "checked_at": datetime.now(timezone.utc).isoformat()}
+            finally:
+                _updates["at"], _updates["running"] = time.time(), False
+        threading.Thread(target=work, daemon=True).start()
+    return _updates["value"]
 
 
 def fetch_logs(task: dict) -> tuple[str, bool]:

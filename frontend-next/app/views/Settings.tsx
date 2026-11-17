@@ -7,6 +7,7 @@ import { CodeBox, Field } from '../components/ui';
 import { post, put } from '../lib/api';
 import { ROLE_INFO } from '../lib/types';
 import { timeAgo } from '../lib/format';
+import { MfaSetup } from '../components/mfa';
 import { useApp, useLimits } from '../lib/app';
 
 export function Settings() {
@@ -46,6 +47,7 @@ export function Settings() {
           </form>
           <p className="muted sm" style={{ marginTop: 14 }}>{ROLE_INFO[me.role].blurb}</p>
         </section>
+        <TwoFactorCard />
         <section className="card"><div className="card-head"><h2>Password</h2></div>
           <form onSubmit={submit} style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
             <Field label="Current password"><input type="password" value={current} onChange={e => setCurrent(e.target.value)} autoComplete="current-password" required /></Field>
@@ -111,6 +113,29 @@ function JoinTokens() {
           ))}
         </tbody></table>
       )}
+    </section>
+  );
+}
+
+
+function TwoFactorCard() {
+  const { me, reloadMe, toast } = useApp();
+  const [mode, setMode] = useState<'idle' | 'setup' | 'disable'>('idle');
+  const [password, setPassword] = useState(''); const [code, setCode] = useState(''); const [error, setError] = useState('');
+  async function disable(e: FormEvent) {
+    e.preventDefault(); setError('');
+    try { await post('/auth/2fa/disable', { password, code }); toast('Two-factor sign-in turned off'); setMode('idle'); setPassword(''); setCode(''); await reloadMe(); } catch (e2) { setError((e2 as Error).message); }
+  }
+  return (
+    <section className="card"><div className="card-head"><h2>Two-factor sign-in</h2><span className="grow" /><span className={`tag ${me.totp_enabled ? 'good' : ''}`}>{me.totp_enabled ? 'On' : 'Off'}</span></div>
+      {mode === 'setup' ? <MfaSetup onDone={async () => { setMode('idle'); await reloadMe(); toast('Two-factor sign-in is on'); }} onCancel={() => setMode('idle')} />
+        : mode === 'disable' ? <form onSubmit={disable} style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <Field label="Password"><input type="password" value={password} onChange={e => setPassword(e.target.value)} autoComplete="current-password" required /></Field>
+            <Field label="Code from your authenticator app"><input value={code} onChange={e => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))} inputMode="numeric" required /></Field>
+            {error && <div className="err">{error}</div>}
+            <div style={{ display: 'flex', gap: 8 }}><button className="btn danger">Turn off</button><button type="button" className="btn ghost" onClick={() => setMode('idle')}>Cancel</button></div></form>
+        : <><p className="muted sm">{me.totp_enabled ? 'Every sign-in asks for a code from your authenticator app after your password. Lost your phone? Use a recovery code, or ask an admin to reset it.' : 'Protect your account with a code from your phone in addition to your password. Strongly recommended for admins and operators: this account can reach your servers.'}</p>
+          <button className={`btn ${me.totp_enabled ? '' : 'primary'}`} style={{ alignSelf: 'flex-start' }} onClick={() => setMode(me.totp_enabled ? 'disable' : 'setup')}>{me.totp_enabled ? 'Turn off…' : 'Set up'}</button></>}
     </section>
   );
 }

@@ -6,11 +6,12 @@ import { api } from '../lib/api';
 import { useApp, usePoll } from '../lib/app';
 import { duration, timeAgo } from '../lib/format';
 import type { Incident } from '../lib/types';
+import { IncidentAi } from '../components/ai';
 
 type State = 'open' | 'resolved' | 'all';
 type Kind = 'all' | Incident['target_type'];
-const KIND_LABEL: Record<Incident['target_type'], string> = { server: 'Server', service: 'Service', cluster: 'Cluster' };
-const KIND_ICON: Record<Incident['target_type'], string> = { server: 'server', service: 'globe', cluster: 'k8s' };
+const KIND_LABEL: Record<Incident['target_type'], string> = { server: 'Server', service: 'Service', cluster: 'Cluster', test: 'API test', dns: 'Domain', heartbeat: 'Cron job' };
+const KIND_ICON: Record<Incident['target_type'], string> = { server: 'server', service: 'globe', cluster: 'k8s', test: 'check', dns: 'globe', heartbeat: 'clock' };
 
 /** "web-01 is over its resource thresholds" -> "Over a resource limit": the name is shown separately. */
 function what(i: Incident): string {
@@ -35,7 +36,7 @@ export function Incidents() {
   const [state, setState] = useState<State>('all');
   const [kind, setKind] = useState<Kind>('all');
   const [q, setQ] = useState('');
-  const { value, error } = usePoll(() => api<Incident[]>('/incidents?state=all&limit=500'), [], 15000);
+  const { value, error, reload } = usePoll(() => api<Incident[]>('/incidents?state=all&limit=500'), [], 15000, true);
 
   const stats = useMemo(() => {
     const all = value ?? [];
@@ -64,7 +65,7 @@ export function Incidents() {
     return out;
   }, [shown]);
   const kinds = useMemo(() => [...new Set((value ?? []).map(i => i.target_type))], [value]);
-  const open = (i: Incident) => go(i.target_type === 'cluster' ? `kubernetes/${i.target_id}` : `${i.target_type}s/${i.target_id}`);
+  const open = (i: Incident) => go({ cluster: `kubernetes/${i.target_id}`, test: `tests/${i.target_id}`, dns: 'dns', heartbeat: 'heartbeats', server: `servers/${i.target_id}`, service: `services/${i.target_id}` }[i.target_type]);
 
   return (
     <>
@@ -106,6 +107,7 @@ export function Incidents() {
                     <div className="inc-title"><b>{i.target_name}</b><span className="tag"><Icon name={KIND_ICON[i.target_type]} size={11} /> {KIND_LABEL[i.target_type]}</span>{ongoing && <span className={`inc-sev ${i.severity}`}>{i.severity === 'critical' ? 'Critical' : 'Warning'}</span>}</div>
                     <div className="inc-what">{what(i)}</div>
                     {lines.length > 0 && <ul className="inc-reasons">{lines.slice(0, 3).map((l, n) => <li key={n}>{l}</li>)}{lines.length > 3 && <li className="muted">+ {lines.length - 3} more</li>}</ul>}
+                    <IncidentAi incidentId={i.id} analysis={i.ai_analysis ?? null} model={i.ai_model ?? null} generatedAt={i.ai_generated_at ?? null} onDone={() => void reload()} />
                   </div>
                   <div className="inc-side">
                     <span className={`inc-state ${ongoing ? i.severity : 'resolved'}`}><i />{ongoing ? 'Ongoing' : 'Resolved'}</span>

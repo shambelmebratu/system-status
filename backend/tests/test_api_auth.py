@@ -1553,7 +1553,7 @@ def test_channels_only_receive_the_alerts_they_are_set_to(client, monkeypatch):
     oncall = client.post("/api/channels", headers=CSRF, json={"name": "oncall", **tg, "notify_kinds": ["server"], "notify_events": ["down", "recovered"]}).json()
     assert oncall["notify_kinds"] == ["server"] and oncall["notify_events"] == ["down", "recovered"]
     assert client.post("/api/channels", headers=CSRF, json={"name": "x", **tg, "notify_events": ["bogus"]}).status_code == 422
-    full = client.put(f"/api/channels/{oncall['id']}", headers=CSRF, json={"name": "oncall", **tg, "token": "", "notify_kinds": ["server", "service", "cluster"], "notify_events": ["down"]}).json()
+    full = client.put(f"/api/channels/{oncall['id']}", headers=CSRF, json={"name": "oncall", **tg, "token": "", "notify_kinds": ["server", "service", "cluster", "test", "dns", "heartbeat"], "notify_events": ["down"]}).json()
     assert full["notify_kinds"] == [] and full["notify_events"] == ["down"]                             # all ticked is stored as "everything"
     client.put(f"/api/channels/{oncall['id']}", headers=CSRF, json={"name": "oncall", **tg, "token": "", "notify_kinds": ["server"], "notify_events": ["down", "recovered"]})
 

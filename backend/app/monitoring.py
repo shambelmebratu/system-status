@@ -127,7 +127,11 @@ def redact(text: str, channel: Channel) -> str:
 # ------------------------------------------------------------------------------------------------ alert message format
 # Alerts are stored with a tiny markup (<b>..</b>, everything else HTML-escaped) and rendered per channel:
 # Telegram gets real bold text, Slack gets *bold*, webhooks and WhatsApp get plain text.
-_STATE = {"cert": ("🔐", "CERTIFICATE EXPIRES SOON"), "cert_expired": ("⛔", "CERTIFICATE EXPIRED"), "cert_renewed": ("✅", "CERTIFICATE RENEWED"),
+_STATE = {"anomaly": ("📈", "UNUSUAL BEHAVIOUR"), "ai_note": ("🤖", "AI ANALYSIS"),
+          "ssh_attack": ("🛡", "SSH BRUTE-FORCE ATTACK"), "security_finding": ("🛡", "SECURITY FINDING"),
+          "slo_fast": ("🔥", "ERROR BUDGET BURNING FAST"), "slo_slow": ("🟠", "ERROR BUDGET BURNING"), "slo_exhausted": ("⛔", "ERROR BUDGET EXHAUSTED"),
+          "dns_changed": ("🧭", "DNS CHANGED"), "domain": ("🌐", "DOMAIN EXPIRES SOON"), "domain_expired": ("⛔", "DOMAIN EXPIRED"), "domain_renewed": ("✅", "DOMAIN RENEWED"),
+          "cert": ("🔐", "CERTIFICATE EXPIRES SOON"), "cert_expired": ("⛔", "CERTIFICATE EXPIRED"), "cert_renewed": ("✅", "CERTIFICATE RENEWED"),
           "down": ("🔴", "DOWN"), "still_down": ("🔴", "STILL DOWN"), "alert": ("🟠", "ALERT"), "still_alert": ("🟠", "STILL IN ALERT"), "recovered": ("✅", "RECOVERED")}
 
 
@@ -234,7 +238,7 @@ def slack_text(message: str) -> str:
     return html.unescape(re.sub(r"</?b>", "*", message))
 
 
-ALERT_KINDS = ("server", "service", "cluster")
+ALERT_KINDS = ("server", "service", "cluster", "test", "dns", "heartbeat")
 ALERT_EVENTS = ("down", "alert", "recovered", "reminder")
 
 
@@ -242,8 +246,8 @@ def event_category(state: str | None) -> str | None:
     """down / alert / recovered / reminder (a repeat while something is still failing). None for events from before routing existed."""
     if not state:
         return None
-    if state.startswith("cert"):          # certificate warnings travel with the "over a limit" alerts; a renewal with recoveries
-        return "recovered" if state == "cert_renewed" else "alert"
+    if state.startswith(("cert", "domain", "dns_", "slo_", "ssh_attack", "security_", "anomaly", "ai_")):   # certificate / domain / DNS warnings travel with "over a limit" alerts; renewals with recoveries
+        return "recovered" if state.endswith("_renewed") else "alert"
     return "reminder" if state.startswith("still_") else state
 
 
@@ -263,7 +267,7 @@ NOT_ROUTED = "Not sent: no channel is set to receive this kind of alert"
 MONITOR_MUTED = "Not sent: this monitor is set not to send this kind of alert"
 
 # Which alert types each kind of monitor can produce (a service has no "over a limit"; a ping-only host cannot go over a limit either).
-APPLICABLE_EVENTS = {"server": ("down", "alert", "recovered", "reminder"), "service": ("down", "alert", "recovered", "reminder"), "cluster": ("down", "alert", "recovered", "reminder")}
+APPLICABLE_EVENTS = {kind: ("down", "alert", "recovered", "reminder") for kind in ALERT_KINDS}
 
 
 def csv_list(value: str | None) -> list[str]:
@@ -300,10 +304,8 @@ def target_channel_ids(target) -> set[int] | None:
 
 
 def target_of(session, target_type: str, target_id: int):
-    model = {"server": Server, "service": Service}.get(target_type)
-    if target_type == "cluster":
-        from .models import Cluster
-        model = Cluster
+    from .models import ApiTest, Cluster, DnsMonitor, Heartbeat
+    model = {"server": Server, "service": Service, "cluster": Cluster, "test": ApiTest, "dns": DnsMonitor, "heartbeat": Heartbeat}.get(target_type)
     return session.get(model, target_id) if model else None
 
 
@@ -451,6 +453,11 @@ def deliver_event(event: AlertEvent, session) -> None:
     if target is not None and not target_allows(target, event.state):
         event.sent, event.delivery_error, event.delivery_attempts = False, MONITOR_MUTED, 10   # a choice made on the monitor, never retried
         return
+    from .devops import in_maintenance
+    window = in_maintenance(session, event.target_type, event.target_id)
+    if window is not None:   # planned work: the alert is recorded but not sent
+        event.sent, event.delivery_error, event.delivery_attempts = False, f"Not sent: maintenance window \"{window}\"", 10
+        return
     event.sent, event.delivery_error = send_alert(event.message, session, event.target_type, event.state, target_channel_ids(target) if target is not None else None)
     if (event.delivery_error or "").startswith("Not sent:"):
         event.delivery_attempts = 10   # a deliberate choice, not a failure: never retried
@@ -503,17 +510,25 @@ def probe_service(service: Service, force_cert: bool = False) -> dict:
     http_status = None
     error_message = None
     status = "down"
+    body = ""
     try:
         request = urllib.request.Request(service.url, headers={"User-Agent": "SM-Watch-Uptime/1.0"})
         try:
             with safe_urlopen(request, timeout=limit) as response:
                 http_status = response.status
+                body = response.read(1_000_000).decode("utf-8", "replace") if service.keyword else ""
         except HTTPError as response_error:
             http_status = response_error.code
             response_error.close()
         status = "up" if http_status == service.expected_status else "down"
         if status == "down":
             error_message = f"Expected HTTP {service.expected_status}; received HTTP {http_status}"
+        elif service.keyword:   # content check: the page must (or must not) contain this text, case-insensitive
+            found = service.keyword.lower() in body.lower()
+            if service.keyword_mode == "absent" and found:
+                status, error_message = "down", f"The page contains \"{service.keyword}\", which it must not"
+            elif service.keyword_mode != "absent" and not found:
+                status, error_message = "down", f"Expected text \"{service.keyword}\" was not found on the page"
     except Exception as error:
         reason = getattr(error, "reason", error)
         timed_out = isinstance(reason, (TimeoutError, socket.timeout)) or "timed out" in str(error).lower()
@@ -760,10 +775,16 @@ def run_once() -> None:
         servers = session.scalars(select(Server).where(Server.enabled.is_(True))).all()
         pull_servers = [s for s in servers if s.monitor_mode != "push" and is_due(s.last_checked_at, s.check_interval_seconds)]
         services = [s for s in session.scalars(select(Service).where(Service.enabled.is_(True))).all() if is_due(s.last_checked_at, s.interval_seconds)]
+        from . import dnsmon, qa
+        from .models import ApiTest, DnsMonitor
+        tests = [t for t in session.scalars(select(ApiTest).where(ApiTest.enabled.is_(True))).all() if is_due(t.last_checked_at, t.interval_seconds)]
+        dns_monitors = [m for m in session.scalars(select(DnsMonitor).where(DnsMonitor.enabled.is_(True))).all() if is_due(m.last_checked_at, m.interval_seconds)]
 
         pool = get_pool()
         server_futures = [(s, pool.submit(_probe_server, s)) for s in pull_servers]
         service_futures = [(s, pool.submit(probe_service, s)) for s in services]
+        test_futures = [(t, pool.submit(qa.run_test, json.loads(t.steps))) for t in tests]
+        dns_futures = [(m, pool.submit(dnsmon.check, m)) for m in dns_monitors]
 
         # One bad target must never abort the cycle for the others (and a crash must not leave it re-probed every second).
         for server, future in server_futures:
@@ -786,6 +807,14 @@ def run_once() -> None:
                 session.rollback()
                 logger.exception("failed to record result for service id=%s", service.id)
                 _defer(session, service)
+        for kind, futures, apply in (("test", test_futures, qa.apply_test_result), ("dns", dns_futures, dnsmon.apply_result)):
+            for target, future in futures:
+                try:
+                    apply(session, target, future.result())
+                except Exception:
+                    session.rollback()
+                    logger.exception("failed to record result for %s id=%s", kind, target.id)
+                    _defer(session, target)
 
         # Push-mode agents: the agent reports on its own; the worker only detects silence.
         now = datetime.now(timezone.utc)
@@ -800,6 +829,9 @@ def run_once() -> None:
         from .routes_k8s import check_cluster_heartbeats
         check_cluster_heartbeats(session)
         session.commit()
+        from . import devops
+        devops.check_heartbeats(session)
+        devops.check_slos(session)
         retry_pending_alerts(session)
         session.commit()
         from .scheduler import run_due_schedules
@@ -811,8 +843,11 @@ def run_once() -> None:
 def prune_history() -> None:
     """Applies the admin-configured retention when the purge schedule is due (see retention.py)."""
     from .retention import run_scheduled
+    from .qa import prune_runs
     session = SessionLocal()
     try:
+        prune_runs(session, get_settings().test_run_retention_days)
+        session.commit()
         run_scheduled(session)
     except Exception:
         session.rollback()
@@ -863,8 +898,28 @@ def retry_pending_alerts(session) -> None:
         deliver_event(event, session)
 
 
+def _security_loop() -> None:
+    """Slow background work on its own thread, so it never delays the regular checks: scheduled exposure scans and TLS audits,
+    anomaly detection, and (when enabled) AI explanations of new incidents."""
+    from . import ai, anomaly
+    from .secscan import scans_due
+    while True:
+        for name, job in (("security scan", scans_due), ("anomaly detection", lambda s: anomaly.run(s, ai.load(s)["anomaly_alerts"])), ("AI explanation", ai.auto_explain)):
+            session = SessionLocal()
+            try:
+                job(session)
+            except Exception:
+                session.rollback()
+                logger.exception("%s failed", name)
+            finally:
+                session.close()
+        time.sleep(60)
+
+
 def run_forever() -> None:
     logger.info("monitor worker started scheduler_poll_seconds=1 concurrency=%s", get_settings().worker_concurrency)
+    import threading
+    threading.Thread(target=_security_loop, name="security-scans", daemon=True).start()
     last_prune = 0.0
     while True:
         try:

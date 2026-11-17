@@ -24,6 +24,10 @@ The supported environment settings include `POSTGRES_DB`, `POSTGRES_USER`, `POST
 - **Kubernetes tab:** read-only cluster monitoring (nodes, pods and usage, workloads, HPAs, services, events) and on-demand pod logs via an outbound-only in-cluster agent; per-server and per-cluster **log access policies** instead of shipping logs.
 - **Scheduled messages** to chosen alert channels (daily/weekly/one-time, any time zone).
 - **Public status page** at `/status` for services marked public (name and uptime only; set `PUBLIC_STATUS_ENABLED=false` to disable).
+- **Quality:** multi-step API tests with assertions and run reports, content (keyword) checks on services, DNS record and domain-expiry monitors.
+- **DevOps:** cron / heartbeat monitors with ping URLs, maintenance windows (alerts muted, shown on the status page), SLOs with error budgets and burn-rate alerts.
+- **Security:** two-factor sign-in (TOTP, optionally required), SSH brute-force detection, pending security updates, open-port and TLS audits.
+- **AI (optional, your own Anthropic key):** incident explanations, log analysis, "ask your infrastructure"; plus statistical anomaly detection that needs no key.
 - **Concurrent worker:** due checks run in parallel (`WORKER_CONCURRENCY`, default 16).
 
 ## Security model
@@ -379,6 +383,40 @@ Review the manifest first by running the `curl` alone. It creates a `smwatch` na
 **Tokens.** Rotate from Settings (delivered to the agent automatically and written to its Secret) or *Revoke now* (shows a `kubectl patch` command). Re-using a cluster name while that cluster is connected is refused, so an install link cannot hijack a live cluster.
 
 **Images.** `sm-watch-k8s-agent` is published with the other images (override with `K8S_AGENT_IMAGE`). Live CPU/memory needs metrics-server in the cluster; without it everything else still works.
+
+## Quality: API tests, content checks, DNS and domains
+
+- **API tests** (*Quality → API tests*): a test is a list of HTTP steps. Each step can assert on status, response time, headers and JSON paths (`$.data[0].id`), and extract values into variables used by later steps as `{{name}}` (built-ins: `{{$timestamp}}`, `{{$isoTime}}`, `{{$uuid}}`). Variables marked secret, `Authorization`/cookie headers and extracted token-like values are masked in every report. A run stops at the first failing step; *Try it* runs a draft without saving. Run history is kept `TEST_RUN_RETENTION_DAYS` (30) and each run has a printable report.
+- **Content checks:** in a service's *Edit*, require the page to contain (or not contain) a word or phrase; a mismatch counts as down.
+- **DNS & domains:** watches chosen record types; the first lookup is the baseline, a change alerts until you *Accept* it. Domain registration expiry comes from RDAP. Resolvers: `DNS_RESOLVERS` (comma-separated; default the system resolver).
+
+## DevOps: cron jobs, maintenance windows, SLOs
+
+- **Cron jobs (heartbeats):** each gets a secret ping URL. Call it when the job finishes; it alerts when a ping is late (period + grace). Optional `/start` (measures run time) and `/fail` (reports a failure right away):
+  ```
+  0 2 * * * /usr/local/bin/backup.sh && curl -fsS -m 10 --retry 3 https://monitor.example.com/api/ping/<token>
+  ```
+  Ping URLs accept GET, POST and HEAD and need no login; treat the URL like a password (*Edit → New URL* replaces it).
+- **Maintenance windows:** pick monitors (or everything) and a time range. During a window, alerts for those monitors are not sent (still recorded), and the public status page shows the planned maintenance (both can be switched off per window).
+- **SLOs:** an availability objective over a rolling window (e.g. 99.9 % over 30 days) for any monitor. The page shows the error budget left and burn rates; alerts follow the multi-window method (fast burn: 14.4× over 1 h and 5 min; slow burn: 6× over 6 h and 30 min), plus "budget exhausted".
+
+## Security
+
+- **Two-factor sign-in:** each person turns it on in *Settings* (any authenticator app) and gets 10 one-time recovery codes. Admins can require it for admins or for everyone (*Security → Sign-in*); people without it are then sent to the setup screen after signing in. Admins can reset someone's 2FA from *Users*.
+- **SSH brute-force detection:** agents ≥ 2.14.0 report failed SSH logins (IP and user name only, never log lines). `SSH_ATTACK_THRESHOLD` (30) failures in 10 minutes on one server raise an alert (at most hourly). *Security → SSH attacks* lists top source IPs.
+- **Pending security updates:** the agent checks apt / dnf / yum / apk every `AGENT_UPDATES_HOURS` (6) using a dry run (nothing is installed) and reports counts, the packages and whether a reboot is needed. `AGENT_SECURITY=off` on a server turns both agent features off.
+- **Exposure & TLS audit:** every `SECURITY_SCAN_HOURS` (24), and on demand, SM-Watch scans common ports of each server's public address and grades HTTPS services (protocol versions, certificate, key, HSTS: A+ to F). New critical or high findings alert once. Only scan servers you own.
+
+## AI features
+
+Optional, off by default. They use Claude through the Anthropic API with **your own key** (billed to your Anthropic account). Admins set them up in *AI → AI settings*: turn on, enter a key (stored encrypted) or set `ANTHROPIC_API_KEY` in `.env` (takes precedence), choose the model (default `claude-opus-5-5`), and use *Test connection*.
+
+- **Incident explanations:** *Explain with AI* on an incident (operators) gives a summary, likely causes with confidence and evidence, and what to check next. Optionally automatic for new incidents (at most N per hour) and posted to alert channels.
+- **Log analysis:** *Analyze with AI* in the log viewer groups the lines shown, explains them and suggests fixes (an admin can disable this).
+- **Ask AI:** a chat that answers from SM-Watch's own data through read-only lookups (monitors, uptime, incidents, metrics, response times, alerts, SLOs, security, anomalies). It only sees the monitors the asking person may see.
+- **Anomalies (no AI, nothing leaves the server):** every 5 minutes, CPU, memory, load and network of each agent server and the response time of each service are compared with the same metric's last 7 days (median and robust spread). Something far outside its normal range for 10 minutes opens an anomaly; alerts are optional.
+
+**What is sent to Anthropic:** for an explanation, the incident, its monitor's recent checks and metrics, other incidents around then and recent SM-Watch configuration changes; for log analysis, the lines shown; for the assistant, the question and the data it looks up. Recognisable secrets (passwords, tokens, keys, credentials in URLs, JWTs, private keys) are masked first. Requests are rate-limited per person, audited (category *ai*), and monthly token usage is shown in AI settings.
 
 ## Service timeout and certificate expiry
 

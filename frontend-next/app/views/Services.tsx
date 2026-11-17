@@ -83,7 +83,7 @@ function ServiceDetail({ service }: { service: Service }) {
         {canOperate && <button className="btn sm" onClick={() => setEditing(true)}>Edit</button>}
         {canManage && <button className="btn sm danger" onClick={remove}>Remove</button>}
       </div>
-      <p className="muted" style={{ marginTop: -12, marginBottom: 18 }}><a href={service.url} target="_blank" rel="noreferrer noopener">{service.url}</a> · expects HTTP {service.expected_status} · every {service.interval_seconds}s · times out after {service.timeout_seconds_effective ?? 10}s</p>
+      <p className="muted" style={{ marginTop: -12, marginBottom: 18 }}><a href={service.url} target="_blank" rel="noreferrer noopener">{service.url}</a> · expects HTTP {service.expected_status}{service.keyword ? ` and a page that ${service.keyword_mode === 'absent' ? 'does not contain' : 'contains'} “${service.keyword}”` : ''} · every {service.interval_seconds}s · times out after {service.timeout_seconds_effective ?? 10}s</p>
       {service.last_status === 'down' && service.last_error && <div className="err" style={{ marginBottom: 16 }}>{service.last_error}</div>}
 
       <div className="grid g4">
@@ -140,6 +140,8 @@ function ServiceForm({ existing, onClose }: { existing?: Service; onClose: () =>
   const [timeout, setTimeoutValue] = useState(existing?.timeout_seconds ? String(existing.timeout_seconds) : '');
   const [certCheck, setCertCheck] = useState(existing?.cert_check ?? true);
   const [certDaysText, setCertDaysText] = useState((existing?.cert_alert_days ?? []).join(', '));
+  const [keyword, setKeyword] = useState(existing?.keyword ?? '');
+  const [keywordMode, setKeywordMode] = useState<'contains' | 'absent'>(existing?.keyword_mode ?? 'contains');
   const { toast, refresh } = useApp();
   const [name, setName] = useState(existing?.name ?? '');
   const [url, setUrl] = useState(existing?.url ?? 'https://');
@@ -155,7 +157,7 @@ function ServiceForm({ existing, onClose }: { existing?: Service; onClose: () =>
     setBusy(true); setError('');
     const days = certDaysText.split(/[\s,]+/).filter(Boolean).map(Number);
     if (days.some(x => !Number.isInteger(x) || x < 1 || x > 365)) { setBusy(false); setError('Certificate alert days must be whole numbers between 1 and 365, e.g. 30, 14, 7'); return; }
-    const body = { name, url, expected_status: Number(expected), interval_seconds: Number(interval), public: isPublic, ...alerts, timeout_seconds: timeout ? Number(timeout) : null, cert_check: certCheck, cert_alert_days: days };
+    const body = { name, url, expected_status: Number(expected), interval_seconds: Number(interval), public: isPublic, ...alerts, timeout_seconds: timeout ? Number(timeout) : null, cert_check: certCheck, cert_alert_days: days, keyword: keyword.trim() || null, keyword_mode: keywordMode };
     try {
       if (existing) await put(`/services/${existing.id}`, body); else await post('/services', body);
       toast(existing ? 'Service updated' : 'Service added'); await refresh(); onClose();
@@ -172,6 +174,15 @@ function ServiceForm({ existing, onClose }: { existing?: Service; onClose: () =>
           <Field label="Interval (seconds)"><input type="number" min={15} max={86400} value={interval} onChange={e => setIntervalValue(e.target.value)} required /></Field>
           <Field label="Timeout (seconds)" hint={`Slower answers count as a failed check. Empty = ${lim.serviceTimeout} s (default).`}><input type="number" min={1} max={120} value={timeout} onChange={e => setTimeoutValue(e.target.value)} placeholder={String(lim.serviceTimeout)} /></Field>
         </div>
+        <fieldset className="cert-fs">
+          <legend><b>Content check</b> <span className="muted sm">(optional)</span></legend>
+          <div className="qa-assert" style={{ marginTop: 0 }}>
+            <span className="sm">The page must</span>
+            <select value={keywordMode} onChange={e => setKeywordMode(e.target.value as 'contains' | 'absent')}><option value="contains">contain</option><option value="absent">NOT contain</option></select>
+            <input value={keyword} onChange={e => setKeyword(e.target.value)} placeholder={keywordMode === 'contains' ? 'Add to cart' : 'Error 500'} maxLength={200} />
+          </div>
+          <small className="muted">Case-insensitive, on the first 1 MB of the page. Catches pages that answer 200 but show an error or a blank template.</small>
+        </fieldset>
         <fieldset className="cert-fs" disabled={!url.toLowerCase().startsWith('https://')}>
           <legend><label className="check"><input type="checkbox" checked={certCheck && url.toLowerCase().startsWith('https://')} onChange={e => setCertCheck(e.target.checked)} /><b>Watch the TLS certificate&apos;s expiry date</b></label></legend>
           {!url.toLowerCase().startsWith('https://') ? <p className="muted sm" style={{ margin: 0 }}>Only https:// addresses have a certificate.</p> : (

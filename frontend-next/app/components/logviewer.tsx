@@ -2,6 +2,7 @@
 
 import { Fragment, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Icon } from './ui';
+import { LogAiButton } from './ai';
 
 /* ================================================================================================ time ranges */
 export const RANGES: { id: string; label: string; seconds: number; long: string }[] = [
@@ -532,6 +533,7 @@ export function LogViewer({ fetcher, fetchKey, canFetch, controls, storageKey, d
         <span className="grow" />
         <button type="button" className="btn ghost sm" onClick={() => copy(filtered.map(r => r.raw).join('\n'))} disabled={!filtered.length}>Copy</button>
         <button type="button" className="btn ghost sm" onClick={download} disabled={!filtered.length}>Download</button>
+        <LogAiButton getText={() => filtered.map(r => r.raw).join('\n')} source={downloadName} />
       </div>
       {selRow && <LogInspector row={selRow} index={selIndex} total={flat.length} onClose={() => setSelected(null)} onNav={d => { const n = flat[selIndex + d]; if (n) setSelected(n.n); }} onToken={toggleToken} tokens={tokens} onZoom={setZoom} />}
     </div>

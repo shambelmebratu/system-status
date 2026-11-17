@@ -11,6 +11,7 @@ import type { Daily } from '../lib/types';
 type PublicStatus = {
   company_name: string; overall: 'up' | 'down' | 'alert' | 'unknown'; updated_at: string; days: number; ranges: number[];
   services: { id: string; kind: string; name: string; status: string; latency_ms: number | null; uptime: number | null; daily: Daily[] }[];
+  maintenance?: { title: string; description: string; starts_at: string; ends_at: string; active: boolean }[];
   incidents: { id: number; target_name: string; title: string; severity: string; started_at: string; resolved_at: string | null; duration_seconds: number }[];
 };
 
@@ -39,6 +40,10 @@ export default function StatusPage() {
       <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}><Logo size={38} /><h1 style={{ fontSize: 26 }}>{data.company_name} Status</h1><span style={{ flex: 1 }} />
         {data.ranges.length > 1 && <div className="seg" role="group" aria-label="Time frame">{data.ranges.map(r => <button key={r} className={data.days === r ? 'on' : ''} onClick={() => choose(r)} aria-pressed={data.days === r}>{r === 1 ? '24 hours' : `${r} days`}</button>)}</div>}</div>
       <div className={`banner-big ${data.overall === 'alert' ? 'down' : data.overall}`}><span style={{ color: data.overall === 'up' ? 'var(--good)' : data.overall === 'down' ? 'var(--bad)' : data.overall === 'alert' ? 'var(--warn)' : 'var(--muted)' }}>{data.overall === 'up' ? '✓' : data.overall === 'unknown' ? '…' : '!'}</span>{headline}</div>
+      {(data.maintenance ?? []).map((m, i) => (
+        <div key={i} className={`card pub-mw ${m.active ? 'active' : ''}`}><b>{m.active ? '🛠 Maintenance in progress' : '🗓 Scheduled maintenance'}: {m.title}</b>
+          <div className="muted sm">{new Date(m.starts_at).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })} – {new Date(m.ends_at).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}</div>
+          {m.description && <p className="sm" style={{ margin: '6px 0 0' }}>{m.description}</p>}</div>))}
       {data.services.map(s => (
         <section key={s.id} className="card pub-svc">
           <div className="row"><span className="grow">{s.name}</span><span className="muted sm">{pct(s.uptime, 2)} uptime · {data.days} days</span><StatusPill status={s.status} /></div>

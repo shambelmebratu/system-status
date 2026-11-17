@@ -16,7 +16,7 @@ export const alertsOf = (x?: { alert_events?: string[]; alert_channels?: number[
 const PRESETS: [string, number][] = [['5 min', 5], ['15 min', 15], ['30 min', 30], ['1 hour', 60], ['4 hours', 240], ['1 day', 1440], ['Never', 0]];
 
 /** Which alerts this server / service / cluster sends, to which channels, and how often it repeats. Empty = inherit the defaults. */
-export function MonitorAlertSettings({ kind, value, onChange, pingOnly }: { kind: 'server' | 'service' | 'cluster'; value: MonitorAlerts; onChange: (v: MonitorAlerts) => void; pingOnly?: boolean }) {
+export function MonitorAlertSettings({ kind, value, onChange, pingOnly }: { kind: string; value: MonitorAlerts; onChange: (v: MonitorAlerts) => void; pingOnly?: boolean }) {
   const { channels } = useApp();
   const lim = useLimits();
   const applicable = EVENTS.filter(e => !(e.id === 'alert' && pingOnly));

@@ -38,6 +38,8 @@ def serialize_incident(item: Incident) -> dict:
         "severity": item.severity, "title": item.title, "detail": item.detail,
         "started_at": started.isoformat(), "resolved_at": resolved.isoformat() if resolved else None,
         "duration_seconds": int(((resolved or datetime.now(timezone.utc)) - started).total_seconds()),
+        "ai_analysis": json.loads(item.ai_analysis) if item.ai_analysis else None, "ai_model": item.ai_model,
+        "ai_generated_at": aware(item.ai_generated_at).isoformat() if item.ai_generated_at else None,
     }
 
 
@@ -132,8 +134,11 @@ def _public_page(db: Session, settings, services, servers, days: int, ranges: li
         if ids:
             incidents += [serialize_incident(i) for i in db.scalars(select(Incident).where(Incident.target_type == kind, Incident.target_id.in_(ids), Incident.started_at >= since)).all()]
     incidents.sort(key=lambda i: i["started_at"], reverse=True)
-    for item in incidents:  # internal error text stays private
+    for item in incidents:  # internal error text (and the AI's analysis of it) stays private
         item["detail"] = None
+        item["ai_analysis"] = item["ai_model"] = item["ai_generated_at"] = None
+    from .routes_devops import public_maintenance
+    maintenance = public_maintenance(db, {f"service:{i.id}" for i in services} | {f"server:{i.id}" for i in servers})
     statuses = [r["status"] for r in items]
     overall = "down" if "down" in statuses else ("alert" if "alert" in statuses else ("unknown" if not statuses or all(s == "unknown" for s in statuses) else "up"))
-    return {"company_name": settings.company_name, "overall": overall, "days": days, "ranges": ranges, "services": items, "incidents": incidents[:50], "updated_at": datetime.now(timezone.utc).isoformat()}
+    return {"company_name": settings.company_name, "overall": overall, "days": days, "ranges": ranges, "services": items, "incidents": incidents[:50], "maintenance": maintenance, "updated_at": datetime.now(timezone.utc).isoformat()}

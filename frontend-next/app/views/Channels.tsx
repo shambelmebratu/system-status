@@ -16,7 +16,7 @@ const HELP: Record<ChannelType, string> = {
   whatsapp: 'Uses the Meta WhatsApp Cloud API with an approved Utility template that has one body variable.',
 };
 
-const KINDS: { id: string; label: string }[] = [{ id: 'server', label: 'Servers' }, { id: 'service', label: 'Services' }, { id: 'cluster', label: 'Kubernetes clusters' }];
+const KINDS: { id: string; label: string }[] = [{ id: 'server', label: 'Servers' }, { id: 'service', label: 'Services' }, { id: 'cluster', label: 'Kubernetes clusters' }, { id: 'test', label: 'API tests' }, { id: 'dns', label: 'DNS & domains' }, { id: 'heartbeat', label: 'Cron jobs' }];
 /** An empty selection means "everything", which is also how the form shows it (all ticked). */
 const allOr = (chosen: string[] | undefined, all: string[]) => (chosen && chosen.length ? chosen : all);
 function routingSummary(c: Channel): string {

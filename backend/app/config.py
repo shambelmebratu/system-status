@@ -83,6 +83,10 @@ class Settings(BaseSettings):
     service_timeout_seconds: int = 10          # a service check that takes longer than this fails (per service override)
     cert_alert_days: str = "30,14,7"           # certificate expiry: alert this many days before (per service override)
     cert_check_hours: int = 6                  # how often a service's certificate is re-read
+    dns_resolvers: str = ""                    # DNS monitors: resolvers to ask (comma-separated IPs); empty = the system resolver
+    test_run_retention_days: int = 30          # API test run history is kept this long
+    ssh_attack_threshold: int = 30             # failed SSH logins on one server within 10 minutes that count as an attack
+    security_scan_hours: int = 24              # how often servers' open ports and services' TLS are re-checked (0 = only on demand)
     perf_default_window_minutes: int = 10      # response-time targets look at this many recent minutes unless set per monitor
     perf_min_check_samples: int = 5            # a target is not judged on fewer probes than this ...
     perf_min_requests: int = 50                # ... or fewer real requests than this (percentiles of a handful of requests mean nothing)

@@ -72,7 +72,7 @@ export function Users() {
           <table className="tbl"><thead><tr><th>User</th><th>Role</th><th className="hide-sm">Can see</th><th>Status</th><th className="hide-sm">Last sign-in</th><th /></tr></thead><tbody>
             {users.map(u => (
               <tr key={u.id} style={u.active ? undefined : { opacity: 0.55 }}>
-                <td><div className="name">{u.name || u.email.split('@')[0]}{u.id === me.id && <> <span className="tag">you</span></>}<small>{u.email}</small></div></td>
+                <td><div className="name">{u.name || u.email.split('@')[0]}{u.id === me.id && <> <span className="tag">you</span></>}{u.totp_enabled && <> <span className="tag good" title="Two-factor sign-in is on">2FA</span></>}<small>{u.email}</small></div></td>
                 <td><span className={`role-pill ${u.role}`}>{ROLE_INFO[u.role].label}</span></td>
                 <td className="hide-sm sm">{u.access ? <span className="tag" title="Limited to selected monitors">{accessText(u.access)}</span> : <span className="muted">Everything</span>}</td>
                 <td className="sm">{!u.active ? <span className="bad">Disabled</span> : u.must_change_password ? <span className="warn">Must set password</span> : <span className="good">Active</span>}</td>
@@ -143,6 +143,9 @@ function UserForm({ existing, onClose, onSaved }: { existing?: Me; onClose: () =
             {limited && !access.servers.length && !access.services.length && !access.clusters.length && <small className="warn">Nothing is ticked: this person will see an empty dashboard.</small>}
           </div>)}
         {!isSelf && role === 'admin' && <p className="muted sm">Admins always see everything.</p>}
+        {existing && !isSelf && existing.totp_enabled && <div className="check" style={{ gap: 10 }}><span className="tag good">2FA on</span><button type="button" className="btn sm" onClick={async () => {
+          if (!(await confirm(`Reset two-factor sign-in for ${existing.email}?\n\nUse this when they lost their phone. They are signed out and set it up again at their next sign-in (if it is required).`))) return;
+          try { await put(`/users/${existing.id}`, { reset_2fa: true }); toast('Two-factor sign-in reset'); onSaved(); } catch (e) { setError((e as Error).message); } }}>Reset 2FA (lost phone)</button></div>}
         {existing && !isSelf && <label className="check"><input type="checkbox" checked={active} onChange={e => setActive(e.target.checked)} />Account enabled <span className="muted">(disabled users are signed out and cannot sign in)</span></label>}
         {isSelf ? <p className="muted sm">To change your own password use your profile (it asks for your current password).</p> : <Field label={existing ? 'Reset password (optional)' : 'Temporary password'} hint={existing ? 'Leave empty to keep the current password. A reset signs the user out and they must choose a new password.' : 'They must replace it at first sign-in. At least 12 characters.'}>
           <div style={{ display: 'flex', gap: 8 }}>

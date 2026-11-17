@@ -148,6 +148,11 @@ def day_totals(day: date) -> dict[tuple[str, int], tuple[int, int]]:
 
 def uptime_by_target(db: Session, hours: int) -> dict[tuple[str, int], float]:
     """Availability % per target over the last `hours`. Short windows are counted live (cached 15 s); long ones from cached days."""
+    return {key: round(100.0 * ok / total, 3) for key, (total, ok) in totals_by_target(db, hours).items() if total}
+
+
+def totals_by_target(db: Session, hours: int) -> dict[tuple[str, int], tuple[int, int]]:
+    """(checks, available checks) per target over the last `hours` (see uptime_by_target)."""
     def compute():
         now = datetime.now(timezone.utc)
         since = now - timedelta(hours=hours)
@@ -162,8 +167,8 @@ def uptime_by_target(db: Session, hours: int) -> dict[tuple[str, int], float]:
                     prev = totals.get(key, (0, 0)); totals[key] = (prev[0] + t, prev[1] + o)
             for key, (t, o) in live_totals(db, midnight(today), now).items():
                 prev = totals.get(key, (0, 0)); totals[key] = (prev[0] + t, prev[1] + o)
-        return {key: round(100.0 * ok / total, 3) for key, (total, ok) in totals.items() if total}
-    return ttl_cached(("uptime", hours), 15 if hours <= 48 else 60, compute)
+        return totals
+    return ttl_cached(("totals", hours), 15 if hours <= 48 else 60, compute)
 
 
 def uptime_for(db: Session, kind: str, target_id: int, hours: int) -> float | None:

@@ -22,14 +22,16 @@ export type Service = {
   last_http_status: number | null; last_error: string | null; uptime_24h: number | null;
   alert_events?: string[]; alert_channels?: number[]; alert_reminder_minutes?: number | null;
   timeout_seconds?: number | null; timeout_seconds_effective?: number; cert_check?: boolean; cert_alert_days?: number[]; cert_alert_days_effective?: number[];
+  keyword?: string | null; keyword_mode?: 'contains' | 'absent';
   cert_expires_at?: string | null; cert_issuer?: string | null; cert_subject?: string | null; cert_checked_at?: string | null; cert_error?: string | null;
 };
 export type ChannelType = 'telegram' | 'webhook' | 'slack' | 'whatsapp';
 export type Channel = { id: number; name: string; type: ChannelType; token: string; chat_id?: string; endpoint?: string; phone_number_id?: string; template_name?: string; enabled: boolean; notify_kinds?: string[]; notify_events?: string[] };
 export type AlertEvent = { id: number; target_type: string; severity: string; message: string; sent: boolean; delivery_error: string | null; delivery_attempts: number; created_at: string };
 export type Incident = {
-  id: number; target_type: 'server' | 'service' | 'cluster'; target_id: number; target_name: string; severity: 'critical' | 'warning';
+  id: number; target_type: 'server' | 'service' | 'cluster' | 'test' | 'dns' | 'heartbeat'; target_id: number; target_name: string; severity: 'critical' | 'warning';
   title: string; detail: string | null; started_at: string; resolved_at: string | null; duration_seconds: number;
+  ai_analysis?: import('../components/ai').IncidentAnalysis | null; ai_model?: string | null; ai_generated_at?: string | null;
 };
 export type Dashboard = {
   servers: Server[]; services: Service[]; events: AlertEvent[];
@@ -64,7 +66,7 @@ export type ScheduledMessage = {
 export type Role = 'admin' | 'operator' | 'viewer';
 export type Access = { servers: number[]; services: number[]; clusters: number[] };
 /** access: the only monitors this person may see; null = everything (always null for admins). */
-export type Me = { access: Access | null; id: number; email: string; name: string; role: Role; active: boolean; must_change_password: boolean; last_login_at: string | null; created_at: string | null };
+export type Me = { access: Access | null; totp_enabled?: boolean; mfa_setup_required?: boolean; id: number; email: string; name: string; role: Role; active: boolean; must_change_password: boolean; last_login_at: string | null; created_at: string | null };
 export const ROLE_INFO: Record<Role, { label: string; blurb: string }> = {
   admin: { label: 'Admin', blurb: 'Everything, including managing users and their roles.' },
   operator: { label: 'Operator', blurb: 'Manage servers, services, alerts, schedules, logs and agent install links. Cannot manage users.' },

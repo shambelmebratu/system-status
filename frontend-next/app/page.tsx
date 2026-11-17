@@ -9,6 +9,11 @@ import { Audit } from './views/Audit';
 import { Channels } from './views/Channels';
 import { Kubernetes } from './views/Kubernetes';
 import { Databases } from './views/Databases';
+import { Tests } from './views/Tests';
+import { Dns } from './views/Dns';
+import { Heartbeats, MaintenanceView, Slos } from './views/DevOps';
+import { Security } from './views/Security';
+import { AiSettingsView, Anomalies, Assistant } from './views/Ai';
 import { Incidents } from './views/Incidents';
 import { Login } from './views/Login';
 import { Logs } from './views/Logs';
@@ -20,6 +25,8 @@ import { Schedules } from './views/Schedules';
 import { Settings } from './views/Settings';
 import { Users } from './views/Users';
 import { ForcePasswordChange } from './views/ForcePasswordChange';
+import { MfaSetup } from './components/mfa';
+import { Logo as BrandLogo } from './components/logo';
 import { ROLE_INFO, type Me, type Role } from './lib/types';
 
 type Session = Me | null | 'loading';
@@ -45,23 +52,39 @@ export default function Home() {
   const signOut = () => { void post('/auth/logout').catch(() => undefined); setSession(null); };
   // A temporary password (new account or admin reset) must be replaced before anything else is reachable.
   if (session.must_change_password) return <ForcePasswordChange company={company} me={session} onDone={() => void loadMe()} onSignOut={signOut} />;
+  if (session.mfa_setup_required) return (
+    <main className="login">
+      <section className="login-art"><div className="brand"><BrandLogo size={36} />{company}</div><div><h1>Protect your <em>account.</em></h1><p>An administrator requires two-factor sign-in. Set it up once; afterwards you confirm each sign-in with a code from your phone.</p></div><small className="muted">Signed in as {session.email}</small></section>
+      <div className="login-form"><MfaSetup onDone={() => void loadMe()} /><button className="btn ghost sm" onClick={signOut}>Sign out</button></div>
+    </main>);
   return <AppProvider me={session} reloadMe={async () => { await loadMe(); }} onUnauthorized={onUnauthorized}><Shell company={company} me={session} onSignOut={signOut} /></AppProvider>;
 }
 
-const NAV: { id: string; label: string; icon: string; min: Role; fleet?: boolean }[] = [
-  { id: 'overview', label: 'Overview', icon: 'overview', min: 'viewer' },
-  { id: 'servers', label: 'Servers', icon: 'server', min: 'viewer' },
-  { id: 'services', label: 'Services', icon: 'globe', min: 'viewer' },
-  { id: 'kubernetes', label: 'Kubernetes', icon: 'k8s', min: 'viewer' },
-  { id: 'databases', label: 'Databases', icon: 'database', min: 'admin' },
-  { id: 'performance', label: 'Performance', icon: 'zap', min: 'viewer' },
-  { id: 'logs', label: 'Logs', icon: 'logs', min: 'operator' },
-  { id: 'incidents', label: 'Incidents', icon: 'alert', min: 'viewer' },
-  { id: 'alerts', label: 'Alerts', icon: 'bell', min: 'operator', fleet: true },
-  { id: 'schedules', label: 'Scheduled messages', icon: 'clock', min: 'operator', fleet: true },
-  { id: 'users', label: 'Users', icon: 'users', min: 'admin' },
-  { id: 'audit', label: 'Audit log', icon: 'shield', min: 'admin' },
-  { id: 'settings', label: 'Settings', icon: 'settings', min: 'viewer' },
+type NavItem = { id: string; label: string; icon: string; min: Role; fleet?: boolean; group: string };
+const GROUPS = ['Monitor', 'Quality', 'DevOps', 'Security', 'AI', 'Admin'];
+const NAV: NavItem[] = [
+  { id: 'overview', label: 'Overview', icon: 'overview', min: 'viewer', group: 'Monitor' },
+  { id: 'servers', label: 'Servers', icon: 'server', min: 'viewer', group: 'Monitor' },
+  { id: 'services', label: 'Services', icon: 'globe', min: 'viewer', group: 'Monitor' },
+  { id: 'kubernetes', label: 'Kubernetes', icon: 'k8s', min: 'viewer', group: 'Monitor' },
+  { id: 'databases', label: 'Databases', icon: 'database', min: 'admin', group: 'Monitor' },
+  { id: 'performance', label: 'Performance', icon: 'zap', min: 'viewer', group: 'Monitor' },
+  { id: 'logs', label: 'Logs', icon: 'logs', min: 'operator', group: 'Monitor' },
+  { id: 'incidents', label: 'Incidents', icon: 'alert', min: 'viewer', group: 'Monitor' },
+  { id: 'tests', label: 'API tests', icon: 'check', min: 'operator', fleet: true, group: 'Quality' },
+  { id: 'dns', label: 'DNS & domains', icon: 'globe', min: 'operator', fleet: true, group: 'Quality' },
+  { id: 'heartbeats', label: 'Cron jobs', icon: 'clock', min: 'operator', fleet: true, group: 'DevOps' },
+  { id: 'maintenance', label: 'Maintenance', icon: 'settings', min: 'viewer', group: 'DevOps' },
+  { id: 'slos', label: 'SLOs', icon: 'star', min: 'viewer', group: 'DevOps' },
+  { id: 'security', label: 'Security', icon: 'shield', min: 'operator', group: 'Security' },
+  { id: 'assistant', label: 'Ask AI', icon: 'zap', min: 'viewer', group: 'AI' },
+  { id: 'anomalies', label: 'Anomalies', icon: 'alert', min: 'viewer', group: 'AI' },
+  { id: 'ai-settings', label: 'AI settings', icon: 'settings', min: 'admin', group: 'AI' },
+  { id: 'alerts', label: 'Alert channels', icon: 'bell', min: 'operator', fleet: true, group: 'Admin' },
+  { id: 'schedules', label: 'Scheduled messages', icon: 'clock', min: 'operator', fleet: true, group: 'Admin' },
+  { id: 'users', label: 'Users', icon: 'users', min: 'admin', group: 'Admin' },
+  { id: 'audit', label: 'Audit log', icon: 'shield', min: 'admin', group: 'Admin' },
+  { id: 'settings', label: 'Settings', icon: 'settings', min: 'viewer', group: 'Admin' },
 ];
 const RANK: Record<Role, number> = { viewer: 1, operator: 2, admin: 3 };
 
@@ -81,20 +104,23 @@ function Shell({ company, me, onSignOut }: { company: string; me: Me; onSignOut:
     try { localStorage.setItem('smw_theme', next); } catch { /* storage unavailable */ }
   };
 
-  const view = { overview: <Overview />, servers: <Servers />, services: <Services />, kubernetes: <Kubernetes />, databases: <Databases />, performance: <Performance />, incidents: <Incidents />, alerts: <Channels />, schedules: <Schedules />, logs: <Logs />, users: <Users />, audit: <Audit />, settings: <Settings /> }[page] ?? <Overview />;
+  const view = { overview: <Overview />, servers: <Servers />, services: <Services />, kubernetes: <Kubernetes />, databases: <Databases />, tests: <Tests />, dns: <Dns />, heartbeats: <Heartbeats />, security: <Security />, assistant: <Assistant />, anomalies: <Anomalies />, 'ai-settings': <AiSettingsView />, maintenance: <MaintenanceView />, slos: <Slos />, performance: <Performance />, incidents: <Incidents />, alerts: <Channels />, schedules: <Schedules />, logs: <Logs />, users: <Users />, audit: <Audit />, settings: <Settings /> }[page] ?? <Overview />;
 
   return (
     <div className="shell">
       <div className="mobile-bar"><button className="btn ghost sm" onClick={() => setOpen(!open)} aria-label="Menu"><Icon name="menu" /></button><Logo size={26} /><b>{company}</b></div>
       <aside className={`side ${open ? 'open' : ''}`}>
         <div className="brand"><Logo size={32} /><span>{company}</span></div>
-        {allowed.map(item => (
-          <button key={item.id} className={`nav ${page === item.id ? 'active' : ''}`} onClick={() => go(item.id)}>
-            <Icon name={item.icon} />{item.label}
-            {item.id === 'incidents' && !!data?.summary.open_incidents && <span className="count">{data.summary.open_incidents}</span>}
-          </button>
-        ))}
-        <span className="spacer" />
+        <nav className="side-nav">
+          {GROUPS.map(g => { const items = allowed.filter(i => i.group === g); return items.length ? (
+            <div key={g} className="nav-group"><div className="nav-group-label">{g}</div>
+              {items.map(item => (
+                <button key={item.id} className={`nav ${page === item.id ? 'active' : ''}`} onClick={() => go(item.id)}>
+                  <Icon name={item.icon} />{item.label}
+                  {item.id === 'incidents' && !!data?.summary.open_incidents && <span className="count">{data.summary.open_incidents}</span>}
+                </button>))}
+            </div>) : null; })}
+        </nav>
         <div className="side-foot">
           <a href="/status" target="_blank" rel="noreferrer"><Icon name="external" size={13} /> Public status page</a>
           <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>

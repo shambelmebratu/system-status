@@ -18,6 +18,10 @@ class User(Base):
     must_change_password: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     token_version: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    totp_secret: Mapped[str | None] = mapped_column(EncryptedText)      # two-factor sign-in (authenticator app); set during setup
+    totp_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    totp_last_step: Mapped[int | None] = mapped_column(Integer)          # a code is accepted once
+    recovery_codes: Mapped[str | None] = mapped_column(Text)            # JSON list of sha256 hashes of unused one-time codes
     # JSON {"servers": [ids], "services": [ids], "clusters": [ids]}: the only monitors this person may see. NULL = everything. Ignored for admins.
     access_scope: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -63,6 +67,7 @@ class Server(Base):
     pending_token: Mapped[str | None] = mapped_column(EncryptedText)      # new token waiting for the agent to pick it up
     pending_token_hash: Mapped[str | None] = mapped_column(String(64), index=True)
     pending_token_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    ssh_alert_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))   # last SSH brute-force alert (one per hour at most)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     services: Mapped[list["Service"]] = relationship(passive_deletes=True)
 
@@ -86,6 +91,8 @@ class Service(Base):
     perf_threshold_ms: Mapped[int | None] = mapped_column(Integer)
     perf_window_minutes: Mapped[int | None] = mapped_column(Integer)   # NULL = PERF_DEFAULT_WINDOW_MINUTES
     timeout_seconds: Mapped[int | None] = mapped_column(Integer)       # a slower answer is a failed check; NULL = SERVICE_TIMEOUT_SECONDS
+    keyword: Mapped[str | None] = mapped_column(String(200))           # content check: text the page must (or must not) contain
+    keyword_mode: Mapped[str] = mapped_column(String(10), default="contains", server_default="contains")   # contains | absent
     # TLS certificate expiry (https only): checked every CERT_CHECK_HOURS, alerts at each of cert_alert_days (NULL = CERT_ALERT_DAYS)
     cert_check: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
     cert_alert_days: Mapped[str | None] = mapped_column(String(60))     # "30,14,7"
@@ -116,7 +123,7 @@ class Channel(Base):
     template_language: Mapped[str | None] = mapped_column(String(20), default="en_US")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     # Which alerts this channel receives (comma-separated; NULL = everything). See alert routing in monitoring.py.
-    notify_kinds: Mapped[str | None] = mapped_column(String(100))     # server,service,cluster
+    notify_kinds: Mapped[str | None] = mapped_column(String(100))     # server,service,cluster,test,dns
     notify_events: Mapped[str | None] = mapped_column(String(100))    # down,alert,recovered,reminder
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -206,6 +213,9 @@ class Incident(Base):
     detail: Mapped[str | None] = mapped_column(Text)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    ai_analysis: Mapped[str | None] = mapped_column(Text)                # JSON: the AI explanation (summary, likely causes, checks)
+    ai_model: Mapped[str | None] = mapped_column(String(60))
+    ai_generated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))   # also set when an attempt failed (no endless retries)
 
 
 class Enrollment(Base):
@@ -378,3 +388,187 @@ class DbReport(Base):
     created_by: Mapped[str | None] = mapped_column(String(320))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class ApiTest(Base):
+    """A multi-step API test: requests run in order, each with assertions; values can be carried from one step to the next.
+    Steps and variables are stored encrypted (they often hold tokens or passwords)."""
+    __tablename__ = "api_tests"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100))
+    description: Mapped[str] = mapped_column(String(500), default="", server_default="")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    interval_seconds: Mapped[int] = mapped_column(Integer, default=300)
+    steps: Mapped[str] = mapped_column(EncryptedText)                  # JSON list of steps
+    variables: Mapped[str | None] = mapped_column(EncryptedText)       # JSON {name: value}
+    alert_events: Mapped[str | None] = mapped_column(String(100))
+    alert_channels: Mapped[str | None] = mapped_column(String(200))
+    alert_reminder_minutes: Mapped[int | None] = mapped_column(Integer)
+    fail_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    last_status: Mapped[str] = mapped_column(String(20), default="unknown")
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_duration_ms: Mapped[float | None] = mapped_column(Float)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[str | None] = mapped_column(String(320))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class TestRun(Base):
+    """One execution of an API test, with the outcome of every step and assertion (secrets masked)."""
+    __tablename__ = "test_runs"
+    __table_args__ = (Index("ix_test_runs_test_time", "test_id", "started_at"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    test_id: Mapped[int] = mapped_column(ForeignKey("api_tests.id", ondelete="CASCADE"))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    duration_ms: Mapped[float] = mapped_column(Float, default=0)
+    status: Mapped[str] = mapped_column(String(10))                    # passed | failed
+    trigger: Mapped[str] = mapped_column(String(340), default="schedule")       # schedule | manual: <email>
+    results: Mapped[str] = mapped_column(Text)                         # JSON list of step results
+    error: Mapped[str | None] = mapped_column(Text)
+
+
+class DnsMonitor(Base):
+    """Watches a domain's DNS records for changes and its registration for expiry."""
+    __tablename__ = "dns_monitors"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100))
+    domain: Mapped[str] = mapped_column(String(253))
+    record_types: Mapped[str] = mapped_column(String(60), default="A,AAAA,MX,NS,TXT")
+    interval_seconds: Mapped[int] = mapped_column(Integer, default=3600)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    baseline: Mapped[str | None] = mapped_column(Text)                 # JSON {type: [values]}: the accepted records
+    current: Mapped[str | None] = mapped_column(Text)                  # JSON: what DNS answered last
+    changed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    check_expiry: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    expiry_alert_days: Mapped[str | None] = mapped_column(String(60))
+    domain_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    registrar: Mapped[str | None] = mapped_column(String(200))
+    expiry_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expiry_error: Mapped[str | None] = mapped_column(Text)
+    expiry_alerted: Mapped[int | None] = mapped_column(Integer)
+    alert_events: Mapped[str | None] = mapped_column(String(100))
+    alert_channels: Mapped[str | None] = mapped_column(String(200))
+    alert_reminder_minutes: Mapped[int | None] = mapped_column(Integer)
+    fail_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    last_status: Mapped[str] = mapped_column(String(20), default="unknown")
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class Heartbeat(Base):
+    """A cron job / backup / batch job that pings SM-Watch. Late or failed pings raise an incident."""
+    __tablename__ = "heartbeats"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100))
+    description: Mapped[str] = mapped_column(String(500), default="", server_default="")
+    token: Mapped[str] = mapped_column(EncryptedText)                   # shown again in the dashboard (it is in the job's crontab anyway)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    period_seconds: Mapped[int] = mapped_column(Integer, default=86400)  # how often the job runs
+    grace_seconds: Mapped[int] = mapped_column(Integer, default=3600)    # how late a ping may be before it counts as missed
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    last_ping_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_start_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_duration_ms: Mapped[float | None] = mapped_column(Float)
+    alert_events: Mapped[str | None] = mapped_column(String(100))
+    alert_channels: Mapped[str | None] = mapped_column(String(200))
+    alert_reminder_minutes: Mapped[int | None] = mapped_column(Integer)
+    fail_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    last_status: Mapped[str] = mapped_column(String(20), default="unknown")
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class HeartbeatPing(Base):
+    __tablename__ = "heartbeat_pings"
+    __table_args__ = (Index("ix_heartbeat_pings_hb_time", "heartbeat_id", "ts"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    heartbeat_id: Mapped[int] = mapped_column(ForeignKey("heartbeats.id", ondelete="CASCADE"))
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    kind: Mapped[str] = mapped_column(String(10))                       # success | start | fail
+    duration_ms: Mapped[float | None] = mapped_column(Float)
+    message: Mapped[str | None] = mapped_column(Text)                   # what the job sent (e.g. the last lines of its output), cleaned
+    ip: Mapped[str | None] = mapped_column(String(64))
+
+
+class Maintenance(Base):
+    """Planned work: alerts for the chosen monitors are held back while it runs, and the status page announces it."""
+    __tablename__ = "maintenance_windows"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String(150))
+    description: Mapped[str] = mapped_column(Text, default="")
+    starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    targets: Mapped[str | None] = mapped_column(Text)                   # JSON ["server:1", "service:3"]; NULL = everything
+    suppress_alerts: Mapped[bool] = mapped_column(Boolean, default=True)
+    show_on_status: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_by: Mapped[str | None] = mapped_column(String(320))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class Slo(Base):
+    """A service level objective: e.g. 99.9 % availability of one monitor over 30 days, with its error budget."""
+    __tablename__ = "slos"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100))
+    target_type: Mapped[str] = mapped_column(String(20))
+    target_id: Mapped[int] = mapped_column(Integer)
+    objective: Mapped[float] = mapped_column(Float)                      # percent, e.g. 99.9
+    window_days: Mapped[int] = mapped_column(Integer, default=30)
+    burn_alerts: Mapped[bool] = mapped_column(Boolean, default=True)
+    alert_state: Mapped[str | None] = mapped_column(String(20))          # none | fast | slow | exhausted: what was last alerted
+    alert_state_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_by: Mapped[str | None] = mapped_column(String(320))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class SshFailureSample(Base):
+    """Failed SSH login attempts one agent saw between two reports (counts only)."""
+    __tablename__ = "ssh_failure_samples"
+    __table_args__ = (Index("ix_ssh_failures_server_time", "server_id", "ts"), Index("ix_ssh_failures_time", "ts"))
+    id: Mapped[int] = mapped_column(primary_key=True)
+    server_id: Mapped[int] = mapped_column(ForeignKey("servers.id", ondelete="CASCADE"))
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    total: Mapped[int] = mapped_column(Integer, default=0)
+    ips: Mapped[str] = mapped_column(Text, default="{}")      # JSON {ip: attempts}
+    users: Mapped[str] = mapped_column(Text, default="{}")    # JSON {user name: attempts}
+
+
+class SecurityScan(Base):
+    """One exposure scan (open ports of a server) or TLS audit (of a service or a server port)."""
+    __tablename__ = "security_scans"
+    __table_args__ = (Index("ix_security_scans_target", "kind", "target_type", "target_id", "started_at"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    kind: Mapped[str] = mapped_column(String(10))             # ports | tls
+    target_type: Mapped[str] = mapped_column(String(20))
+    target_id: Mapped[int] = mapped_column(Integer)
+    address: Mapped[str] = mapped_column(String(300), default="")
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    duration_ms: Mapped[float] = mapped_column(Float, default=0)
+    grade: Mapped[str | None] = mapped_column(String(4))
+    findings: Mapped[int] = mapped_column(Integer, default=0)
+    results: Mapped[str] = mapped_column(Text, default="{}")
+    error: Mapped[str | None] = mapped_column(Text)
+
+
+class Anomaly(Base):
+    """A metric far outside its own normal range (robust statistics over the previous 7 days). No AI involved."""
+    __tablename__ = "anomalies"
+    __table_args__ = (Index("ix_anomalies_open", "target_type", "target_id", "metric", "resolved_at"), Index("ix_anomalies_started", "started_at"))
+    id: Mapped[int] = mapped_column(primary_key=True)
+    target_type: Mapped[str] = mapped_column(String(20))
+    target_id: Mapped[int] = mapped_column(Integer)
+    target_name: Mapped[str] = mapped_column(String(100), default="")
+    metric: Mapped[str] = mapped_column(String(30))
+    direction: Mapped[str] = mapped_column(String(5))                    # up | down
+    value: Mapped[float] = mapped_column(Float)                          # the recent value (15-minute average)
+    peak: Mapped[float] = mapped_column(Float)                           # the most extreme recent value while it lasted
+    baseline: Mapped[float] = mapped_column(Float)                       # median of the previous 7 days
+    spread: Mapped[float] = mapped_column(Float)                         # robust spread (1.4826 x MAD)
+    score: Mapped[float] = mapped_column(Float)                          # how many spreads away
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    alerted: Mapped[bool] = mapped_column(Boolean, default=False)

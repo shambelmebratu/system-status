@@ -65,6 +65,8 @@ class ServiceCreate(AlertPrefs):
     server_id: int | None = None
     timeout_seconds: int | None = Field(default=None, ge=1, le=120)           # null = SERVICE_TIMEOUT_SECONDS
     cert_check: bool = True                                                    # https only: watch the certificate's expiry date
+    keyword: str | None = Field(default=None, max_length=200)                  # content check (case-insensitive); empty = off
+    keyword_mode: str = Field(default="contains", pattern="^(contains|absent)$")
     cert_alert_days: list[int] = Field(default_factory=list, max_length=8)     # e.g. [30, 14, 7]; empty = CERT_ALERT_DAYS
 
     @field_validator("cert_alert_days")
@@ -85,13 +87,13 @@ class ChannelCreate(BaseModel):
     template_name: str = ""
     template_language: str = "en_US"
     enabled: bool = True
-    notify_kinds: list[str] = Field(default_factory=list, max_length=3)     # empty = every kind (server, service, cluster)
+    notify_kinds: list[str] = Field(default_factory=list, max_length=6)     # empty = every kind (server, service, cluster, test, dns, heartbeat)
     notify_events: list[str] = Field(default_factory=list, max_length=4)    # empty = every event (down, alert, recovered, reminder)
 
     @field_validator("notify_kinds")
     @classmethod
     def known_kinds(cls, v: list[str]) -> list[str]:
-        if any(k not in ("server", "service", "cluster") for k in v):
+        if any(k not in ("server", "service", "cluster", "test", "dns", "heartbeat") for k in v):
             raise ValueError("Unknown alert kind")
         return list(dict.fromkeys(v))
 
@@ -181,6 +183,36 @@ class TrafficStatus(BaseModel):
         return [{"path": _printable(str(d.get("path", "")))[:200], "timing": bool(d.get("timing"))} for d in v if isinstance(d, dict)]
 
 
+class SshFailures(BaseModel):
+    total: int = Field(default=0, ge=0, le=10_000_000)
+    ips: dict[str, int] = Field(default_factory=dict)
+    users: dict[str, int] = Field(default_factory=dict)
+    distinct_ips: int = Field(default=0, ge=0)
+
+    @field_validator("ips", "users")
+    @classmethod
+    def small(cls, v: dict[str, int]) -> dict[str, int]:
+        return {_printable(str(k))[:64]: max(0, min(int(n), 10_000_000)) for k, n in list(v.items())[:30]}
+
+
+class PackageUpdate(BaseModel):
+    name: str = Field(max_length=200)
+    version: str = Field(default="", max_length=100)
+    security: bool = False
+
+
+class UpdatesReport(BaseModel):
+    manager: str | None = Field(default=None, max_length=20)
+    total: int = Field(default=0, ge=0, le=100000)
+    security: int = Field(default=0, ge=0, le=100000)
+    packages: list[PackageUpdate] = Field(default_factory=list, max_length=100)
+    reboot_required: bool = False
+    reboot_packages: list[str] = Field(default_factory=list, max_length=50)
+    error: str | None = Field(default=None, max_length=300)
+    checked_at: str | None = Field(default=None, max_length=40)
+    lists_age_hours: float | None = None
+
+
 class AgentReport(BaseModel):
     cpu: float = Field(ge=0, le=100)
     cpu_peak: float | None = Field(default=None, ge=0, le=100)
@@ -200,7 +232,9 @@ class AgentReport(BaseModel):
     agent_version: str = Field(default="", max_length=32)
     processes: list[ProcessSample] = Field(default_factory=list, max_length=100)
     capabilities: list[str] = Field(default_factory=list, max_length=20)
-    ssh_sessions: int | None = Field(default=None, ge=0, le=100000)   # open SSH sessions right now (a count only: no names or addresses)
+    ssh_sessions: int | None = Field(default=None, ge=0, le=100000)
+    ssh_failures: SshFailures | None = None
+    updates: UpdatesReport | None = None   # open SSH sessions right now (a count only: no names or addresses)
     ips: list[IpEntry] = Field(default_factory=list, max_length=10)
     public_ip: str = Field(default="", max_length=45)
     install: str = Field(default="", max_length=20)
@@ -291,6 +325,7 @@ class UserUpdate(BaseModel):
     password: str | None = Field(default=None, min_length=12, max_length=200)   # admin reset: forces a change at next sign-in
     access: AccessScope | None = None      # only applied when access_set is true (so null can mean "everything")
     access_set: bool = False
+    reset_2fa: bool = False
 
 
 class ProfileUpdate(BaseModel):
@@ -315,13 +350,13 @@ class ChannelUpdate(BaseModel):
     template_name: str = ""
     template_language: str = "en_US"
     enabled: bool = True
-    notify_kinds: list[str] = Field(default_factory=list, max_length=3)     # empty = every kind (server, service, cluster)
+    notify_kinds: list[str] = Field(default_factory=list, max_length=6)     # empty = every kind (server, service, cluster, test, dns, heartbeat)
     notify_events: list[str] = Field(default_factory=list, max_length=4)    # empty = every event (down, alert, recovered, reminder)
 
     @field_validator("notify_kinds")
     @classmethod
     def known_kinds(cls, v: list[str]) -> list[str]:
-        if any(k not in ("server", "service", "cluster") for k in v):
+        if any(k not in ("server", "service", "cluster", "test", "dns", "heartbeat") for k in v):
             raise ValueError("Unknown alert kind")
         return list(dict.fromkeys(v))
 

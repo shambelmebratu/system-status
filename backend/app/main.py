@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 
 from pydantic import ValidationError
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 from sqlalchemy import delete, desc, func, select
 from sqlalchemy.orm import Session
 
@@ -20,6 +22,10 @@ from .monitoring import alert_columns, server_addresses, check_service, discover
 from .routes_agent import hash_token, router as agent_router
 from .routes_audit import router as audit_router
 from .routes_db import router as db_router
+from .routes_qa import router as qa_router
+from .routes_devops import router as devops_router
+from .routes_security import router as security_router
+from .routes_ai import router as ai_router
 from .routes_enroll import router as enroll_router
 from .routes_k8s import router as k8s_router
 from .routes_logs import router as logs_router
@@ -32,7 +38,7 @@ from .stats import uptime_by_target
 from .netguard import BlockedTargetError, insecure_pull_problem, validate_host, validate_url
 from .routes_users import router as users_router, serialize_user
 from .audit import audit
-from .security import COOKIE_NAME, can_see, client_ip, create_token, ensure_access, hash_password, login_limiter, needs_rehash, require_operator, require_unrestricted, require_user, scope_ids, verify_password
+from .security import COOKIE_NAME, require_admin, can_see, client_ip, create_token, ensure_access, hash_password, login_limiter, needs_rehash, require_operator, require_unrestricted, require_user, scope_ids, verify_password
 
 settings = get_settings()
 
@@ -128,6 +134,10 @@ app.include_router(performance_router)
 app.include_router(users_router)
 app.include_router(audit_router)
 app.include_router(db_router)
+app.include_router(qa_router)
+app.include_router(devops_router)
+app.include_router(security_router)
+app.include_router(ai_router)
 app.include_router(stats_router)
 
 
@@ -218,7 +228,7 @@ def dummy_hash() -> str:
 
 
 @app.post("/api/auth/login")
-def login(payload: LoginRequest, request: Request, response: Response, db: Session = Depends(get_db)) -> dict[str, str]:
+def login(payload: LoginRequest, request: Request, response: Response, db: Session = Depends(get_db)) -> dict:
     email = payload.email.lower()
     keys = (f"ip:{client_ip(request)}", f"email:{email}")
     try:
@@ -235,21 +245,144 @@ def login(payload: LoginRequest, request: Request, response: Response, db: Sessi
         audit(db, request, "auth.login", actor=email, success=False, detail="unknown user" if not user else "wrong password" if not password_ok else "account disabled", commit=True)
         raise HTTPException(401, "Invalid email or password")
     login_limiter.reset(*keys)
-    user.last_login_at = datetime.now(timezone.utc)
     if needs_rehash(user.password_hash):   # silently upgrade an older, weaker hash now that we hold the password
         user.password_hash = hash_password(payload.password)
-    audit(db, request, "auth.login", actor=user.email, user={"email": user.email, "role": user.role}, target=f"user:{user.id}")
+    if user.totp_enabled:   # the password was right; a session is only issued after the second factor
+        db.commit()
+        return {"email": user.email, "mfa_required": True, "mfa_token": mfa_ticket(user)}
+    return _start_session(user, request, response, db, "")
+
+
+class MfaLogin(BaseModel):
+    mfa_token: str = Field(max_length=2000)
+    code: str = Field(min_length=6, max_length=20)
+
+
+class MfaCode(BaseModel):
+    code: str = Field(min_length=6, max_length=10)
+
+
+class MfaDisable(BaseModel):
+    password: str = Field(max_length=1024)
+    code: str = Field(min_length=6, max_length=10)
+
+
+class PolicyIn(BaseModel):
+    require_2fa: str = Field(pattern="^(none|admins|everyone)$")
+
+
+def mfa_ticket(user: User) -> str:
+    """A 5-minute ticket proving the password step passed. Useless on its own: it is not a session."""
+    import jwt
+    now = int(datetime.now(timezone.utc).timestamp())
+    return jwt.encode({"sub": str(user.id), "ver": user.token_version, "purpose": "mfa", "iat": now, "exp": now + 300}, settings.jwt_secret, algorithm="HS256")
+
+
+def _start_session(user: User, request: Request, response: Response, db: Session, how: str) -> dict:
+    user.last_login_at = datetime.now(timezone.utc)
+    audit(db, request, "auth.login", actor=user.email, user={"email": user.email, "role": user.role}, target=f"user:{user.id}", detail=how or None)
     db.commit()
-    response.set_cookie(
-        COOKIE_NAME,
-        create_token(user.id, user.email, user.token_version),
-        max_age=settings.session_hours * 3600,
-        httponly=True,
-        secure=cookie_secure(),
-        samesite="strict",
-        path="/api",
-    )
+    response.set_cookie(COOKIE_NAME, create_token(user.id, user.email, user.token_version), max_age=settings.session_hours * 3600, httponly=True, secure=cookie_secure(), samesite="strict", path="/api")
     return {"email": user.email}
+
+
+@app.post("/api/auth/mfa")
+def login_second_factor(payload: MfaLogin, request: Request, response: Response, db: Session = Depends(get_db)) -> dict:
+    """Step two of sign-in: the code from the authenticator app (or a one-time recovery code)."""
+    import jwt
+    from . import mfa
+    try:
+        claims = jwt.decode(payload.mfa_token, settings.jwt_secret, algorithms=["HS256"], options={"require": ["exp", "sub"]})
+    except jwt.PyJWTError as error:
+        raise HTTPException(401, "The sign-in took too long. Enter your password again.") from error
+    user = db.get(User, int(claims["sub"])) if claims.get("purpose") == "mfa" else None
+    if user is None or not user.active or not user.totp_enabled or user.token_version != claims.get("ver"):
+        raise HTTPException(401, "The sign-in took too long. Enter your password again.")
+    key = f"mfa:{user.id}"
+    login_limiter.check(key)
+    step = mfa.verify(user.totp_secret or "", payload.code, user.totp_last_step)
+    how = "with an authenticator code"
+    if step is not None:
+        user.totp_last_step = step
+    else:
+        remaining = mfa.use_recovery_code(user.recovery_codes, payload.code) if len(payload.code.strip()) > 8 else None
+        if remaining is None:
+            login_limiter.fail(key)
+            audit(db, request, "auth.login", actor=user.email, success=False, detail="wrong two-factor code", commit=True)
+            raise HTTPException(401, "That code is not valid. Codes change every 30 seconds.")
+        user.recovery_codes = remaining
+        how = f"with a recovery code ({len(json.loads(remaining))} left)"
+    login_limiter.reset(key)
+    return _start_session(user, request, response, db, how)
+
+
+@app.post("/api/auth/2fa/setup")
+def mfa_setup(request: Request, claims: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
+    """Starts (or restarts) setup: a new secret and its QR code. Nothing changes until /enable confirms a code."""
+    from . import mfa
+    account = db.get(User, claims["uid"])
+    if account.totp_enabled:
+        raise HTTPException(409, "Two-factor sign-in is already on. Turn it off first to set up a new device.")
+    account.totp_secret = mfa.new_secret()
+    db.commit()
+    link = mfa.uri(account.totp_secret, account.email, settings.company_name)
+    return {"secret": account.totp_secret, "uri": link, "qr_svg": mfa.qr_svg(link)}
+
+
+@app.post("/api/auth/2fa/enable")
+def mfa_enable(payload: MfaCode, request: Request, claims: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
+    from . import mfa
+    account = db.get(User, claims["uid"])
+    key = f"mfa-setup:{account.id}"
+    login_limiter.check(key)
+    step = mfa.verify(account.totp_secret or "", payload.code, None)
+    if account.totp_enabled or step is None:
+        login_limiter.fail(key)
+        raise HTTPException(422, "That code does not match. Check the time on your phone and try the newest code.")
+    codes, stored = mfa.new_recovery_codes()
+    account.totp_enabled, account.totp_last_step, account.recovery_codes = True, step, stored
+    account.token_version += 1   # sign out every other session: they were opened without the second factor
+    audit(db, request, "auth.2fa_enable", user=claims, target=f"user:{account.id}")
+    db.commit()
+    response = JSONResponse({"recovery_codes": codes})
+    response.set_cookie(COOKIE_NAME, create_token(account.id, account.email, account.token_version), max_age=settings.session_hours * 3600, httponly=True, secure=cookie_secure(), samesite="strict", path="/api")
+    return response
+
+
+@app.post("/api/auth/2fa/disable")
+def mfa_disable(payload: MfaDisable, request: Request, claims: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
+    from . import mfa
+    account = db.get(User, claims["uid"])
+    key = f"pw:{account.id}"
+    login_limiter.check(key)
+    if not verify_password(payload.password, account.password_hash) or mfa.verify(account.totp_secret or "", payload.code, account.totp_last_step) is None:
+        login_limiter.fail(key)
+        audit(db, request, "auth.2fa_disable", user=claims, target=f"user:{account.id}", success=False, detail="wrong password or code", commit=True)
+        raise HTTPException(403, "Wrong password or code")
+    if mfa.required_for(db, account.role):
+        raise HTTPException(409, "Two-factor sign-in is required for your role. Ask an admin.")
+    account.totp_enabled, account.totp_secret, account.recovery_codes, account.totp_last_step = False, None, None, None
+    audit(db, request, "auth.2fa_disable", user=claims, target=f"user:{account.id}")
+    db.commit()
+    return {"ok": True}
+
+
+@app.get("/api/security/policy")
+def security_policy(_: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
+    from . import mfa
+    return {"require_2fa": mfa.policy(db)}
+
+
+@app.put("/api/security/policy")
+def set_security_policy(payload: PolicyIn, request: Request, user: dict = Depends(require_admin), db: Session = Depends(get_db)) -> dict:
+    from . import mfa
+    me_account = db.get(User, user["uid"])
+    if payload.require_2fa != "none" and not me_account.totp_enabled:
+        raise HTTPException(409, "Turn on two-factor sign-in for your own account first, so you are not locked out.")
+    mfa.set_policy(db, payload.require_2fa, user["email"])
+    audit(db, request, "security.policy", user=user, detail=f"two-factor sign-in required for: {payload.require_2fa}")
+    db.commit()
+    return {"require_2fa": payload.require_2fa}
 
 
 @app.post("/api/auth/logout")
@@ -286,8 +419,9 @@ def change_password(payload: PasswordChange, request: Request, response: Respons
 
 @app.get("/api/auth/me")
 def me(user: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
+    from .mfa import required_for
     account = db.get(User, user["uid"])  # require_user guarantees it exists and is active
-    return {**serialize_user(account)}
+    return {**serialize_user(account), "mfa_setup_required": not account.totp_enabled and required_for(db, account.role)}
 
 
 @app.put("/api/auth/profile")
@@ -367,7 +501,7 @@ def alert_settings(values: dict, target_type: str, db: Session) -> dict:
 
 def routing_columns(values: dict) -> dict:
     """notify_kinds / notify_events travel as lists and are stored comma-separated (NULL = everything, also when all are ticked)."""
-    for key, everything in (("notify_kinds", 3), ("notify_events", 4)):
+    for key, everything in (("notify_kinds", 6), ("notify_events", 4)):
         chosen = values.get(key) or []
         values[key] = ",".join(chosen) if chosen and len(chosen) < everything else None
     return values
@@ -544,6 +678,7 @@ def delete_server(item_id: int, request: Request, user: dict = Depends(require_u
 def service_values(payload: ServiceCreate) -> dict:
     values = payload.model_dump()
     values["cert_alert_days"] = ",".join(str(d) for d in values["cert_alert_days"]) or None
+    values["keyword"] = (values.get("keyword") or "").strip() or None
     return values
 
 

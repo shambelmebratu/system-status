@@ -19,7 +19,7 @@ router = APIRouter(prefix="/api/users", tags=["users"])
 def serialize_user(user: User) -> dict:
     return {
         "id": user.id, "email": user.email, "name": user.name, "role": user.role, "active": user.active,
-        "must_change_password": user.must_change_password,
+        "must_change_password": user.must_change_password, "totp_enabled": bool(user.totp_enabled),
         "access": ({k: sorted(v) for k, v in scope.items()} if (scope := parse_scope(user.access_scope, user.role)) is not None else None),
         "last_login_at": aware(user.last_login_at).isoformat() if user.last_login_at else None,
         "created_at": aware(user.created_at).isoformat() if user.created_at else None,
@@ -86,6 +86,12 @@ def update_user(user_id: int, payload: UserUpdate, request: Request, me: dict = 
         if scope != user.access_scope:
             changes.append(scope_text)
             user.access_scope = scope
+    if is_self and payload.reset_2fa:
+        raise HTTPException(409, "Turn off your own two-factor sign-in under Settings: it needs your password and a code.")
+    if payload.reset_2fa and user.totp_enabled:   # a lost phone: the person sets it up again at the next sign-in
+        changes.append("two-factor sign-in reset")
+        user.totp_enabled, user.totp_secret, user.recovery_codes, user.totp_last_step = False, None, None, None
+        revoke = True
     if payload.password:
         changes.append("password reset")
         user.password_hash = hash_password(payload.password)

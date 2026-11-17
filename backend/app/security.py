@@ -180,6 +180,11 @@ def require_user(request: Request, credentials: HTTPAuthorizationCredentials | N
     # Until a temporary password is replaced, the account can do nothing except change it (or sign out).
     if account.must_change_password and request.url.path not in PASSWORD_CHANGE_PATHS:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "PASSWORD_CHANGE_REQUIRED")
+    # When an admin requires two-factor sign-in, an account without it can only set it up.
+    if not account.totp_enabled and request.url.path not in MFA_SETUP_PATHS and request.url.path not in PASSWORD_CHANGE_PATHS:
+        from .mfa import required_for
+        if required_for(db, account.role):
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "MFA_SETUP_REQUIRED")
     # The role is read from the database on EVERY request, so a demotion or deactivation takes effect immediately.
     return {**claims, "uid": account.id, "role": account.role, "name": account.name, "email": account.email, "scope": parse_scope(account.access_scope, account.role)}
 
@@ -218,6 +223,7 @@ def ensure_access(user: dict, kind: str, target_id: int) -> None:
 
 RANK = {"viewer": 1, "operator": 2, "admin": 3}
 PASSWORD_CHANGE_PATHS = {"/api/auth/me", "/api/auth/password", "/api/auth/logout"}
+MFA_SETUP_PATHS = {"/api/auth/2fa/setup", "/api/auth/2fa/enable"}
 
 
 def _at_least(minimum: str):
