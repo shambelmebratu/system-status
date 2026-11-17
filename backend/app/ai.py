@@ -206,7 +206,7 @@ def incident_context(db: Session, incident) -> str:
     if others:
         lines.append("# Other incidents within 30 minutes\n" + "\n".join(f"{aware(o.started_at):%H:%M:%S} {o.target_type} \"{o.target_name}\": {o.title}; {mask(o.detail or '')[:160]}" for o in others[:15]))
     changes = db.scalars(select(AuditEvent).where(AuditEvent.ts >= started - timedelta(hours=24), AuditEvent.ts <= started + timedelta(minutes=5), AuditEvent.success.is_(True),
-                                                 ~AuditEvent.action.in_(["auth.login", "auth.logout", "logs.read", "k8s.logs.read", "db.report"])).order_by(desc(AuditEvent.ts)).limit(20)).all()
+                                                 ~AuditEvent.action.in_(["auth.login", "auth.logout", "logs.read", "k8s.logs.read", "db.report", "ai.settings", "ai.explain", "ai.logs", "ai.ask"])).order_by(desc(AuditEvent.ts)).limit(20)).all()
     if changes:
         lines.append("# Configuration changes in SM-Watch during the 24 h before\n" + "\n".join(f"{aware(c.ts):%m-%d %H:%M} {c.action} {c.target} {mask(c.detail or '')[:120]}" for c in changes))
     windows = db.scalars(select(Maintenance).where(Maintenance.starts_at <= started + timedelta(hours=1), Maintenance.ends_at >= started - timedelta(hours=1))).all()

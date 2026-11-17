@@ -120,7 +120,7 @@ export function AiSettingsView() {
   const box = (k: keyof AiSettings, label: string, hint: string) => <label className="check"><input type="checkbox" disabled={!isAdmin} checked={Boolean(form[k])} onChange={e => set({ [k]: e.target.checked } as Partial<AiSettings>)} /><span>{label}<span className="sm muted"> — {hint}</span></span></label>;
   const keyHint = !p ? '' : keyState === 'env' ? `Set by ${p.key_env} in .env (that takes precedence).`
     : keyState === 'dashboard' ? 'A key is saved (encrypted). Type a new one to replace it.'
-    : `${p.needs_key ? 'Required.' : 'Optional.'}${p.key_prefix ? ` Starts with ${p.key_prefix}.` : ''}${p.key_env ? ` Or set ${p.key_env} in .env.` : ''}`;
+    : `${p.needs_key ? 'Required.' : 'Optional.'}${p.key_prefix ? ` Usually starts with ${p.key_prefix}.` : ''}${p.key_env ? ` Or set ${p.key_env} in .env.` : ''}`;
   return <>
     <div className="topbar"><div><h1>AI settings</h1><p className="muted sm">Choose who answers: the free provider needs no key, or use your own key with Anthropic, OpenAI, Gemini, Groq, OpenRouter, Mistral or DeepSeek, or run models privately with Ollama. Usage is billed by the provider you choose.</p></div></div>
     <div className="card form-card" style={{ maxWidth: 760 }}>

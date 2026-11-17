@@ -166,8 +166,12 @@ def test_clear_errors_for_each_provider(client, reset, server, provider, payload
 def test_key_shape_hints(client, reset):
     r = client.put("/api/ai/settings", headers=CSRF, json={"enabled": True, "provider": "groq", "api_key": "sk-ant-abc1234567890"})
     assert r.status_code == 422 and "looks like a Anthropic (Claude) key" in r.json()["detail"]
-    r = client.put("/api/ai/settings", headers=CSRF, json={"enabled": True, "provider": "openrouter", "api_key": "foo1234567890"})
-    assert r.status_code == 422 and "starts with sk-or-" in r.json()["detail"]
+    r = client.put("/api/ai/settings", headers=CSRF, json={"enabled": True, "provider": "openrouter", "api_key": "sk-ant x"})
+    assert r.status_code == 422 and "spaces" in r.json()["detail"]
+    for provider, key in (("gemini", "AQ.Ab8RN6Ktest-key_1234567890"), ("gemini", "AIzaSyTest1234567890"), ("openai", "sk-proj-abc1234567890"),
+                          ("mistral", "abc1234567890"), ("openrouter", "sk-or-v1-abc1234567890")):   # unfamiliar or new key formats are accepted
+        r = client.put("/api/ai/settings", headers=CSRF, json={"enabled": True, "provider": provider, "api_key": key})
+        assert r.status_code == 200, (provider, key, r.text)
 
 
 def test_unreachable_ollama(client, reset, monkeypatch):

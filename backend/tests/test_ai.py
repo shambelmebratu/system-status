@@ -62,7 +62,7 @@ def _enable(client, **extra):
 def test_settings_are_admin_only_and_the_key_stays_secret(client):
     sign_in(client)
     assert client.get("/api/ai/settings").json()["enabled"] is False
-    assert client.put("/api/ai/settings", headers=CSRF, json={"enabled": True, "provider": "anthropic", "api_key": "not-a-key"}).status_code == 422
+    assert client.put("/api/ai/settings", headers=CSRF, json={"enabled": True, "provider": "anthropic", "api_key": "gsk_groq_key_123456"}).status_code == 422
     s = _enable(client)
     assert s["ready"] and s["key_source"] == "dashboard" and s["model"] == "claude-opus-5-5" and "sk-ant-test" not in json.dumps(s)
     with database.SessionLocal() as db:

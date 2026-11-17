@@ -58,7 +58,7 @@ PROVIDERS: dict[str, Spec] = {s.id: s for s in (
     Spec("openai", "OpenAI", "openai", "gpt-5-mini", url="https://api.openai.com/v1/chat/completions", key_env="OPENAI_API_KEY", key_prefix="sk-",
          key_url="https://platform.openai.com/api-keys", destination="OpenAI"),
     Spec("gemini", "Google Gemini", "openai", "gemini-2.5-flash", url="https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-         key_env="GEMINI_API_KEY", key_prefix="AIza", key_url="https://aistudio.google.com/apikey", free="Has a free tier (a Google account and key are needed).",
+         key_env="GEMINI_API_KEY", key_url="https://aistudio.google.com/apikey", free="Has a free tier (a Google account and key are needed).",
          destination="Google"),
     Spec("groq", "Groq", "openai", "llama-3.3-70b-versatile", url="https://api.groq.com/openai/v1/chat/completions", key_env="GROQ_API_KEY", key_prefix="gsk_",
          key_url="https://console.groq.com/keys", free="Has a free tier (sign-up and key needed).", destination="Groq"),
@@ -95,16 +95,23 @@ def spec(provider: str) -> Spec:
     return PROVIDERS[provider]
 
 
+# Prefixes that identify a provider's keys unambiguously. Used only to catch a key pasted under the wrong provider: key formats change
+# (Google AI Studio issues both "AIza…" and "AQ.…" keys), so an unfamiliar shape is never rejected; Test connection is the real check.
+DISTINCT_PREFIXES = {"anthropic": "sk-ant-", "openrouter": "sk-or-", "groq": "gsk_"}
+
+
 def check_key_shape(provider: str, key: str) -> str | None:
-    """A helpful message when a typed key clearly belongs to another provider or has the wrong shape, else None."""
+    """A helpful message when a typed key cannot be right for this provider, else None."""
     s = spec(provider)
     if not s.accepts_key:
         return f"{s.label} does not use an API key. Leave the key empty."
-    if s.key_prefix and not key.startswith(s.key_prefix):
-        for other in PROVIDERS.values():
-            if other.key_prefix and other.key_prefix != s.key_prefix and len(other.key_prefix) > 3 and key.startswith(other.key_prefix):
-                return f"That looks like a {other.label} key, but the provider is {s.label}. Pick {other.label}, or enter a {s.label} key (it starts with {s.key_prefix})."
-        return f"That does not look like a {s.label} API key (it starts with {s.key_prefix})."
+    if any(c.isspace() for c in key):
+        return "The API key contains spaces or line breaks. Paste it again as a single line."
+    own = DISTINCT_PREFIXES.get(s.id)
+    for other_id, prefix in DISTINCT_PREFIXES.items():
+        if other_id != s.id and key.startswith(prefix) and not (own and key.startswith(own)):
+            other = PROVIDERS[other_id]
+            return f"That looks like a {other.label} key, but the provider is {s.label}. Pick {other.label}, or enter a {s.label} key."
     return None
 
 
