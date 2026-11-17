@@ -248,3 +248,18 @@ def test_agent_adopts_schedule_and_rescans(agent, monkeypatch):
     monkeypatch.setenv("AGENT_THREAT_MINUTES", "15")
     agent.adopt_security_config({"threat_minutes": 60, "updates_hours": 12, "rescan": "t1"})
     assert agent.AGENT_THREAT_MINUTES == 30                         # this server's own setting wins
+
+
+def test_recheck_one_server(client):
+    sign_in(client)
+    anon = TestClient(main.app)
+    sid, auth = _enroll(client, anon, "recheck-1")
+    other, other_auth = _enroll(client, anon, "recheck-2")
+    _report(anon, auth, hostname="recheck-1"); _report(anon, other_auth, hostname="recheck-2")
+    r = client.post("/api/security/recheck", headers=CSRF, json={"server": str(sid)}).json()
+    assert r["agents"] == 1
+    assert anon.post("/api/agent/report", headers=auth, json={**BASE, "hostname": "recheck-1"}).json()["security"]["rescan"]
+    time.sleep(2.05)
+    assert anon.post("/api/agent/report", headers=other_auth, json={**BASE, "hostname": "recheck-2"}).json()["security"]["rescan"] is None   # only the chosen server
+    assert client.post("/api/security/recheck", headers=CSRF, json={"server": str(sid)}).status_code == 429     # not twice within 30 s
+    assert any(e["action"] == "security.recheck" and "recheck-1" in e["detail"] for e in client.get("/api/audit?category=security").json())

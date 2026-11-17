@@ -344,26 +344,62 @@ function UpdatesView({ o, pick }: { o: Overview; pick: (id: number) => void }) {
 
 /* ---------------------------------------------------------------- hardening (agent data collectors) */
 function HardeningView({ server, pick }: { server: string; pick: (id: number) => void }) {
-  const d = usePoll(() => api<Hardening[]>(withQ('/security/hardening', server)), [server], 120000, true);
+  const { canOperate, toast } = useApp();
+  // server id -> the checked_at seen when "Check now" was pressed, and when; cleared once newer results arrive
+  const [pending, setPending] = useState<Record<number, { before: string | null; at: number }>>({});
+  const waiting = Object.keys(pending).length > 0;
+  const d = usePoll(() => api<Hardening[]>(withQ('/security/hardening', server)), [server, waiting], waiting ? 4000 : 120000, true);
+  useEffect(() => {
+    if (!d.value || !waiting) return;
+    const next = { ...pending };
+    let changed = false;
+    for (const h of d.value) {
+      const p = next[h.server.id];
+      if (!p) continue;
+      if (h.checked_at && h.checked_at !== p.before) { delete next[h.server.id]; changed = true; toast(`${h.server.name}: checked just now`); }
+      else if (Date.now() - p.at > 180_000) { delete next[h.server.id]; changed = true; toast(`${h.server.name}: no new results after 3 minutes. Is the agent online and version 2.15+?`, true); }
+    }
+    if (changed) setPending(next);
+  }, [d.value]);   // eslint-disable-line react-hooks/exhaustive-deps
+  const can = (h: Hardening) => h.push && atLeast(h.agent_version, 2, 15) && !/mac|darwin|windows/i.test(h.server.os ?? '');
+  async function recheck(list: Hardening[], filter: string | null) {
+    const targets = list.filter(can);
+    if (!targets.length) { toast('None of these servers can run the checks (agent 2.15+ on Linux needed)', true); return; }
+    try {
+      const r = await post<{ agents: number; interval_seconds: number }>('/security/recheck', { server: filter });
+      const now = Date.now();
+      setPending(p => ({ ...p, ...Object.fromEntries(targets.map(h => [h.server.id, { before: h.checked_at, at: now }])) }));
+      toast(`${r.agents} agent${r.agents === 1 ? '' : 's'} will re-check at the next report (within ~${Math.max(30, r.interval_seconds)} s)`);
+    } catch (e) { toast((e as Error).message, true); }
+  }
   if (!d.value) return <div className="card"><p className="muted"><span className="spinner" /> Loading…</p></div>;
+  const list = d.value;
   return (
     <div className="grid">
-      {d.value.map(h => (
-        <section key={h.server.id} className="card">
-          <div className="card-head"><h2 style={{ minWidth: 0 }}><ServerTag who={h.server} onPick={pick} /></h2><span className="grow" /><span className="muted sm">{h.checked_at ? `checked ${timeAgo(h.checked_at)}` : ''}</span></div>
-          {!h.supported ? <p className="muted sm">{h.push ? `Agent ${h.agent_version ?? ''} does not collect this yet: re-run the install command to update to 2.15+.` : 'Needs the installed agent.'}</p> : <div className="sec-hard">
-            <div><h3 className="drawer-h">Settings</h3>
-              <ul className="sec-checks">{h.checks.map(c => <li key={c.id} className={c.ok === true ? 'ok' : c.ok === false ? `fail ${c.severity}` : 'unknown'}>
-                <Icon name={c.ok === true ? 'check' : c.ok === false ? 'x' : 'alert'} size={14} /><div><b>{c.title}</b><div className="muted sm">{c.detail}</div></div></li>)}</ul></div>
-            <div><h3 className="drawer-h">Listening on every network ({h.listening.filter(l => l.all_interfaces).length})</h3>
-              {h.listening.length === 0 ? <p className="muted sm">Not readable by the agent.</p> : <div className="chips">{h.listening.map(l => <span key={`${l.port}-${l.process}`} className={`chip mono ${l.all_interfaces ? '' : 'muted'}`} title={l.all_interfaces ? 'reachable from every network the server is on' : `only on ${l.address}`}>{l.port} {l.process}{l.all_interfaces ? '' : ` (${l.address})`}</span>)}</div>}
-              <h3 className="drawer-h">SSH keys that can log in ({h.authorized_keys.length})</h3>
-              {h.authorized_keys.length === 0 ? <p className="muted sm">None found (or the agent cannot read home folders).</p>
-                : <table className="tbl"><tbody>{h.authorized_keys.map(k => <tr key={k.user + k.fingerprint}><td className="mono sm">{k.user}</td><td className="sm">{k.type.replace('ssh-', '')}</td><td className="mono sm trunc" title={k.fingerprint}>{k.fingerprint.slice(0, 22)}…</td><td className="sm muted">{k.comment}</td></tr>)}</tbody></table>}
-              {h.foreign_packages && <><h3 className="drawer-h">Packages from outside your repositories ({h.foreign_packages.total ?? h.foreign_packages.packages.length})</h3>
-                {h.foreign_packages.error ? <p className="muted sm">{h.foreign_packages.error}</p> : h.foreign_packages.packages.length ? <div className="chips">{h.foreign_packages.packages.map(p => <span key={p} className="chip mono">{p}</span>)}</div> : <p className="sm good">Every package comes from a configured repository.</p>}</>}
-            </div></div>}
-        </section>))}
+      <div className="filterbar"><span className="sm muted">Checked by each server&apos;s agent with its threat scan. Use <b>Check now</b> after changing a setting to see the result straight away.</span><span className="grow" />
+        {canOperate && list.length > 1 && <button className="btn sm primary" disabled={waiting} onClick={() => void recheck(list, server || null)}><Icon name="refresh" size={14} />{waiting ? 'Checking…' : server ? 'Re-check these' : 'Re-check all'}</button>}</div>
+      {list.map(h => {
+        const busy = !!pending[h.server.id];
+        return (
+          <section key={h.server.id} className="card">
+            <div className="card-head"><h2 style={{ minWidth: 0 }}><ServerTag who={h.server} onPick={pick} /></h2><span className="grow" />
+              <span className="muted sm">{busy ? 'waiting for the agent…' : h.checked_at ? `checked ${timeAgo(h.checked_at)}` : ''}</span>
+              {canOperate && <button className="btn sm" disabled={busy || !can(h)} title={can(h) ? 'Run the hardening checks, threat scan and update check now' : 'Needs agent 2.15+ on Linux'}
+                onClick={() => void recheck([h], String(h.server.id))}><Icon name="refresh" size={13} />{busy ? 'Checking…' : 'Check now'}</button>}</div>
+            {!h.supported ? <p className="muted sm">{!h.push ? 'Needs the installed agent.' : !atLeast(h.agent_version, 2, 15) ? `Agent ${h.agent_version ?? ''} does not collect this yet: re-run the install command to update to 2.15+.` : /mac|darwin|windows/i.test(h.server.os ?? '') ? 'These checks run on Linux servers only.' : 'Waiting for the agent\'s first check.'}</p> : <div className="sec-hard">
+              <div><h3 className="drawer-h">Settings</h3>
+                <ul className="sec-checks">{h.checks.map(c => <li key={c.id} className={c.ok === true ? 'ok' : c.ok === false ? `fail ${c.severity}` : 'unknown'}>
+                  <Icon name={c.ok === true ? 'check' : c.ok === false ? 'x' : 'alert'} size={14} /><div><b>{c.title}</b><div className="muted sm">{c.detail}</div></div></li>)}</ul></div>
+              <div><h3 className="drawer-h">Listening on every network ({h.listening.filter(l => l.all_interfaces).length})</h3>
+                {h.listening.length === 0 ? <p className="muted sm">Not readable by the agent.</p> : <div className="chips">{h.listening.map(l => <span key={`${l.port}-${l.process}`} className={`chip mono ${l.all_interfaces ? '' : 'muted'}`} title={l.all_interfaces ? 'reachable from every network the server is on' : `only on ${l.address}`}>{l.port} {l.process}{l.all_interfaces ? '' : ` (${l.address})`}</span>)}</div>}
+                <h3 className="drawer-h">SSH keys that can log in ({h.authorized_keys.length})</h3>
+                {h.authorized_keys.length === 0 ? <p className="muted sm">None found (or the agent cannot read home folders).</p>
+                  : <table className="tbl"><tbody>{h.authorized_keys.map(k => <tr key={k.user + k.fingerprint}><td className="mono sm">{k.user}</td><td className="sm">{k.type.replace('ssh-', '')}</td><td className="mono sm trunc" title={k.fingerprint}>{k.fingerprint.slice(0, 22)}…</td><td className="sm muted">{k.comment}</td></tr>)}</tbody></table>}
+                {h.foreign_packages && <><h3 className="drawer-h">Packages from outside your repositories ({h.foreign_packages.total ?? h.foreign_packages.packages.length})</h3>
+                  {h.foreign_packages.error ? <p className="muted sm">{h.foreign_packages.error}</p> : h.foreign_packages.packages.length ? <div className="chips">{h.foreign_packages.packages.map(p => <span key={p} className="chip mono">{p}</span>)}</div> : <p className="sm good">Every package comes from a configured repository.</p>}</>}
+              </div></div>}
+          </section>);
+      })}
     </div>
   );
 }

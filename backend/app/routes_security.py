@@ -300,6 +300,30 @@ def scan_all(payload: ScanAllIn, request: Request, user: dict = Depends(require_
     return {"scans": len(targets), "agents": len(agents), "job": dict(secscan.JOB)}
 
 
+_last_recheck: dict[int, float] = {}
+
+
+class RecheckIn(BaseModel):
+    server: str | None = Field(default=None, max_length=200)    # several servers: the page's filter (empty = all visible)
+
+
+@router.post("/recheck")
+def recheck(payload: RecheckIn, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+    """Asks agents to run their threat scan, hardening checks and update check at their next report (no port scan)."""
+    import time
+    servers = [s for s in visible_servers(db, user, payload.server) if s.monitor_mode == "push" and s.enabled]
+    now = time.monotonic()
+    fresh = [s for s in servers if now - _last_recheck.get(s.id, -1e9) >= 30]
+    if servers and not fresh:
+        raise HTTPException(429, "Already requested less than 30 seconds ago; the agent re-checks at its next report")
+    for s in fresh:
+        _last_recheck[s.id] = now
+    secscan.request_agent_rescan(db, [s.id for s in fresh], user["email"])
+    audit(db, request, "security.recheck", user=user, detail=f"{len(fresh)} agent(s): {', '.join(s.name for s in fresh)[:500]}")
+    db.commit()
+    return {"agents": len(fresh), "interval_seconds": max((s.check_interval_seconds or 30) for s in fresh) if fresh else 0}
+
+
 @router.post("/scan/{target_type}/{target_id}")
 async def scan_now(target_type: str, target_id: int, request: Request, user: dict = Depends(require_operator)) -> dict:
     if target_type not in ("server", "service"):

@@ -21,7 +21,7 @@ const LABELS: Record<string, string> = {
   'service.create': 'Service monitor added', 'service.update': 'Service monitor changed', 'service.delete': 'Service monitor deleted', 'channel.test': 'Channel test sent',
   'schedule.create': 'Scheduled message added', 'schedule.update': 'Scheduled message changed', 'schedule.delete': 'Scheduled message deleted', 'schedule.send_now': 'Scheduled message sent now',
   'db.connection_create': 'Database connected', 'db.connection_update': 'Database connection changed', 'db.connection_delete': 'Database connection removed',
-  'db.report': 'Database report generated', 'db.query': 'Database quick query', 'process.inspect': 'Process inspected', 'security.acknowledge': 'Security finding acknowledged', 'security.report': 'Security report viewed', 'security.scan': 'Security scan', 'security.scan_all': 'Security: scan all now', 'security.schedule': 'Security scan schedule changed', 'db.report_save': 'Database report saved', 'db.report_delete': 'Database report deleted',
+  'db.report': 'Database report generated', 'db.query': 'Database quick query', 'process.inspect': 'Process inspected', 'security.acknowledge': 'Security finding acknowledged', 'security.report': 'Security report viewed', 'security.scan': 'Security scan', 'security.scan_all': 'Security: scan all now', 'security.recheck': 'Security: agents asked to re-check', 'security.schedule': 'Security scan schedule changed', 'db.report_save': 'Database report saved', 'db.report_delete': 'Database report deleted',
   'purge.settings': 'Retention changed', 'purge.manual': 'Manual purge', 'purge.scheduled': 'Scheduled purge',
   'channel.create': 'Channel added', 'channel.update': 'Channel edited', 'channel.delete': 'Channel removed',
 };
