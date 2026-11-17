@@ -6,8 +6,14 @@ import { api, post } from '../lib/api';
 import { useApp, usePoll } from '../lib/app';
 import { timeAgo } from '../lib/format';
 
-export type AiSettings = { enabled: boolean; model: string; auto_explain: boolean; post_explanations: boolean; allow_logs: boolean; anomaly_alerts: boolean; auto_per_hour: number;
-  key_source: 'env' | 'dashboard' | null; ready: boolean; usage: { requests: number; input_tokens: number; output_tokens: number }; month: string };
+export type AiProvider = { id: string; label: string; default_model: string; needs_key: boolean; accepts_key: boolean; key_env: string | null; key_prefix: string | null;
+  key_url: string | null; base_url_editable: boolean; default_base_url: string; tools: boolean; free: string; destination: string; key_saved: boolean; key_in_env: boolean };
+export type AiSettings = { enabled: boolean; provider: string; model: string; base_url: string; auto_explain: boolean; post_explanations: boolean; allow_logs: boolean; anomaly_alerts: boolean;
+  auto_per_hour: number; key_source: 'env' | 'dashboard' | null; ready: boolean; providers: AiProvider[]; usage: { requests: number; input_tokens: number; output_tokens: number }; month: string };
+
+export function providerOf(settings: AiSettings | null | undefined): AiProvider | undefined {
+  return settings?.providers.find(p => p.id === settings.provider);
+}
 export type IncidentAnalysis = { summary: string; impact: string; likely_causes: { cause: string; evidence: string; confidence: 'low' | 'medium' | 'high' }[]; next_checks: string[]; related: string[]; error?: string };
 type LogAnalysis = { summary: string; health: 'healthy' | 'degraded' | 'failing'; groups: { title: string; severity: string; occurrences: number; example: string; meaning: string; fix: string }[];
   next_steps: string[]; model: string; lines_sent: number };

@@ -1,5 +1,6 @@
 """AI: settings, incident explanations, log analysis, the infrastructure assistant, and anomalies."""
 import json
+import re
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -9,7 +10,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
-from . import ai
+from . import ai, llm
 from .audit import audit
 from .database import SessionLocal, get_db
 from .models import Anomaly, Incident
@@ -30,22 +31,42 @@ def _rate(user: dict, what: str, per_hour: int) -> None:
 
 class AiSettingsIn(BaseModel):
     enabled: bool
-    model: str = Field(default=ai.DEFAULT_MODEL, pattern=r"^claude-[a-z0-9.-]{3,60}$")
+    provider: str | None = Field(default=None, max_length=30)         # None = keep the current provider
+    model: str | None = Field(default=None, max_length=120)           # None = keep; "" = the provider's default
+    base_url: str | None = Field(default=None, max_length=300)        # only for providers with an editable address (Ollama, custom)
     auto_explain: bool = False
     post_explanations: bool = False
     allow_logs: bool = True
     anomaly_alerts: bool = True
     auto_per_hour: int = Field(default=6, ge=1, le=60)
-    api_key: str = Field(default="", max_length=300)     # blank = keep
+    api_key: str = Field(default="", max_length=300)     # blank = keep; saved for the chosen provider
     clear_key: bool = False
+
+    @field_validator("provider")
+    @classmethod
+    def known_provider(cls, v: str | None) -> str | None:
+        if v is not None and v not in llm.PROVIDERS:
+            raise ValueError(f"Unknown provider. Choose one of: {', '.join(llm.PROVIDERS)}")
+        return v
+
+    @field_validator("model")
+    @classmethod
+    def model_shape(cls, v: str | None) -> str | None:
+        if v is not None and (v := v.strip()) and not re.fullmatch(r"[A-Za-z0-9._:/@+-]{1,120}", v):
+            raise ValueError("A model name may contain only letters, digits and . _ : / @ + -")
+        return v
+
+    @field_validator("base_url")
+    @classmethod
+    def url_shape(cls, v: str | None) -> str | None:
+        if v is not None and (v := v.strip()) and not re.fullmatch(r"https?://[^\s]+", v):
+            raise ValueError("The base URL must start with http:// or https://, for example http://ollama:11434/v1")
+        return v
 
     @field_validator("api_key")
     @classmethod
-    def key_shape(cls, v: str) -> str:
-        v = v.strip()
-        if v and not v.startswith("sk-ant-"):
-            raise ValueError("That does not look like an Anthropic API key (it starts with sk-ant-)")
-        return v
+    def key_strip(cls, v: str) -> str:
+        return v.strip()
 
 
 @router.get("/ai/settings")
@@ -57,13 +78,27 @@ def get_settings_ai(_: dict = Depends(require_user), db: Session = Depends(get_d
 def put_settings_ai(payload: AiSettingsIn, request: Request, user: dict = Depends(require_admin), db: Session = Depends(get_db)) -> dict:
     from .crypto import encrypt
     cfg = ai.load(db)
-    changes = [f"{k} {cfg.get(k)} -> {getattr(payload, k)}" for k in ai.DEFAULTS if cfg.get(k) != getattr(payload, k)]
-    for k in ai.DEFAULTS:
-        cfg[k] = getattr(payload, k)
+    new = {k: getattr(payload, k) for k in ai.DEFAULTS}
+    for k in ("provider", "model", "base_url"):
+        if new[k] is None:
+            new[k] = cfg[k]
+    if new["provider"] != cfg["provider"] and payload.model is None:
+        new["model"] = ""                                   # a model name rarely carries over between providers
+    spec = llm.PROVIDERS[new["provider"]]
+    if not spec.base_url_editable:
+        new["base_url"] = ""
+    if payload.api_key:
+        problem = llm.check_key_shape(spec.id, payload.api_key)
+        if problem:
+            raise HTTPException(422, problem)
+    changes = [f"{k} {cfg.get(k)!r} -> {new[k]!r}" for k in ai.DEFAULTS if cfg.get(k) != new[k]]
+    cfg.update(new)
+    keys = dict(cfg.get("api_keys") or {})
     if payload.clear_key:
-        cfg.pop("api_key", None); changes.append("API key removed")
+        keys.pop(spec.id, None); changes.append(f"{spec.label} API key removed")
     elif payload.api_key:
-        cfg["api_key"] = encrypt(payload.api_key); changes.append("API key set")
+        keys[spec.id] = encrypt(payload.api_key); changes.append(f"{spec.label} API key set")
+    cfg["api_keys"] = keys
     ai.save(db, cfg, user["email"])
     audit(db, request, "ai.settings", user=user, detail="; ".join(changes)[:900] or "no changes")
     db.commit()
@@ -72,18 +107,10 @@ def put_settings_ai(payload: AiSettingsIn, request: Request, user: dict = Depend
 
 @router.post("/ai/test")
 async def test_ai(request: Request, user: dict = Depends(require_admin)) -> dict:
-    """A tiny request that proves the key and model work (costs a few tokens)."""
+    """A tiny request that proves the provider, key and model work (costs a few tokens)."""
     def run():
         with SessionLocal() as db:
-            cfg = ai._ready(db)
-            client = ai._client(cfg)
-            import anthropic
-            try:
-                r = client.messages.create(model=cfg["model"], max_tokens=200, messages=[{"role": "user", "content": "Reply with the single word: ready"}])
-            except anthropic.APIError as error:
-                raise ai._api_error(error) from error
-            ai._record_usage(db, r.usage); db.commit()
-            return {"ok": True, "model": r.model, "reply": "".join(b.text for b in r.content if b.type == "text")[:50]}
+            return ai.test_connection(db)
     try:
         return await run_in_threadpool(run)
     except ai.AiError as error:

@@ -77,7 +77,7 @@ export function CodeBox({ value }: { value: string }) {
   );
 }
 
-export function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
+export function Field({ label, hint, children }: { label: string; hint?: ReactNode; children: ReactNode }) {
   return <label className="field">{label}{children}{hint && <small>{hint}</small>}</label>;
 }
 

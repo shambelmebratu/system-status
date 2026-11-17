@@ -1,71 +1,86 @@
-"""AI features (Claude, through the Anthropic API): incident explanations, log analysis, and "ask your infrastructure".
+"""AI features: incident explanations, log analysis, and "ask your infrastructure".
 
-Off until an admin turns it on. The data each feature sends is listed in the Settings page and README; recognisable secrets are masked
-before log text leaves SM-Watch. The API key comes from ANTHROPIC_API_KEY or is entered by an admin (stored encrypted)."""
+The model provider is chosen by an admin (AI → Settings): a free keyless default, Anthropic, OpenAI, Gemini, Groq, OpenRouter, Mistral,
+DeepSeek, a local Ollama, or any OpenAI-compatible API (see llm.py). Off until an admin turns it on. The data each feature sends is listed
+in the Settings page and README; recognisable secrets are masked before text leaves SM-Watch. A provider's key comes from its environment
+variable (e.g. GROQ_API_KEY) or is entered by an admin (stored encrypted, one per provider)."""
 from __future__ import annotations
 
 import json
 import os
 import re
-import time
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
+from . import llm
+from .llm import AiError, RefusedError  # noqa: F401  (AiError is part of this module's interface)
 from .models import AppSetting
 
 KEY = "ai"
-DEFAULT_MODEL = "claude-opus-5-5"
-FALLBACK_BETA = "server-side-fallback-2026-07-01"
-FALLBACK_MODELS = {"claude-fable-5-2", "claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"}
-DEFAULTS = {"enabled": False, "model": DEFAULT_MODEL, "auto_explain": False, "post_explanations": False, "allow_logs": True, "anomaly_alerts": True, "auto_per_hour": 6}
-
-
-class AiError(Exception):
-    pass
+DEFAULT_MODEL = llm.PROVIDERS["anthropic"].default_model   # kept for callers that predate providers
+DEFAULTS = {"enabled": False, "provider": llm.DEFAULT_PROVIDER, "model": "", "base_url": "", "auto_explain": False, "post_explanations": False,
+            "allow_logs": True, "anomaly_alerts": True, "auto_per_hour": 6}
 
 
 # ------------------------------------------------------------------------------------------------ settings
+def _env_provider() -> str | None:
+    """With nothing saved yet, a provider whose key is in the environment is picked over the free default."""
+    return next((s.id for s in llm.PROVIDERS.values() if s.key_env and s.needs_key and os.getenv(s.key_env)), None)
+
+
 def load(db: Session) -> dict:
     row = db.get(AppSetting, KEY)
     try:
         saved = json.loads(row.value) if row else {}
     except ValueError:
         saved = {}
-    cfg = {**DEFAULTS, **{k: v for k, v in saved.items() if k in DEFAULTS or k in ("api_key", "usage")}}
+    cfg = {**DEFAULTS, **{k: v for k, v in saved.items() if k in DEFAULTS or k in ("api_keys", "usage")}}
+    if "provider" not in saved:   # settings from before providers existed were Anthropic-only
+        legacy = bool(saved.get("api_key")) or str(saved.get("model", "")).startswith("claude-")
+        cfg["provider"] = "anthropic" if legacy else (_env_provider() or llm.DEFAULT_PROVIDER)
+    if saved.get("api_key") and not (cfg.get("api_keys") or {}).get("anthropic"):
+        cfg["api_keys"] = {**(cfg.get("api_keys") or {}), "anthropic": saved["api_key"]}
+    if cfg["provider"] not in llm.PROVIDERS:
+        cfg["provider"] = llm.DEFAULT_PROVIDER
     return cfg
 
 
 def save(db: Session, cfg: dict, user: str) -> None:
     row = db.get(AppSetting, KEY) or AppSetting(key=KEY)
-    row.value, row.updated_by = json.dumps(cfg), user
+    row.value, row.updated_by = json.dumps({k: v for k, v in cfg.items() if k != "api_key"}), user
     db.add(row)
 
 
+def provider_spec(cfg: dict) -> llm.Spec:
+    return llm.PROVIDERS[cfg["provider"]]
+
+
 def key_source(cfg: dict) -> str | None:
-    if os.getenv("ANTHROPIC_API_KEY"):
-        return "env"
-    return "dashboard" if cfg.get("api_key") else None
+    return llm.key_source(provider_spec(cfg), cfg)
+
+
+def is_ready(cfg: dict) -> bool:
+    s = provider_spec(cfg)
+    return bool(cfg["enabled"] and (key_source(cfg) or not s.needs_key) and (cfg["model"] or s.default_model) and (s.kind == "anthropic" or s.url or cfg["base_url"]))
 
 
 def public_settings(db: Session) -> dict:
     cfg = load(db)
+    s = provider_spec(cfg)
     month = datetime.now(timezone.utc).strftime("%Y-%m")
-    return {**{k: cfg[k] for k in DEFAULTS}, "key_source": key_source(cfg), "ready": bool(cfg["enabled"] and key_source(cfg)),
+    keys = cfg.get("api_keys") or {}
+    return {**{k: cfg[k] for k in DEFAULTS}, "model": cfg["model"] or s.default_model, "key_source": key_source(cfg), "ready": is_ready(cfg),
+            "providers": [{**p, "key_saved": bool(keys.get(p["id"])), "key_in_env": bool(p["key_env"] and os.getenv(p["key_env"]))} for p in llm.catalog()],
             "usage": (cfg.get("usage") or {}).get(month, {"requests": 0, "input_tokens": 0, "output_tokens": 0}), "month": month}
 
 
-def _client(cfg: dict):
-    import anthropic
+def _provider(cfg: dict) -> llm.Provider:
     from .crypto import decrypt
-    if os.getenv("ANTHROPIC_API_KEY"):
-        return anthropic.Anthropic(timeout=180.0, max_retries=2)
-    if not cfg.get("api_key"):
-        raise AiError("No Anthropic API key is set. Add ANTHROPIC_API_KEY to .env, or enter a key under AI → Settings.")
-    return anthropic.Anthropic(api_key=decrypt(cfg["api_key"]), timeout=180.0, max_retries=2)
+    return llm.build(cfg, decrypt)
 
 
 def _ready(db: Session) -> dict:
@@ -75,58 +90,39 @@ def _ready(db: Session) -> dict:
     return cfg
 
 
-def _extra(model: str) -> dict:
-    """Server-side refusal fallbacks on the models that support them (a declined request is retried on a suitable model)."""
-    return {"betas": [FALLBACK_BETA], "fallbacks": "default"} if model in FALLBACK_MODELS else {}
-
-
 def _record_usage(db: Session, usage) -> None:
     cfg = load(db)
     month = datetime.now(timezone.utc).strftime("%Y-%m")
     all_usage = cfg.get("usage") or {}
     m = all_usage.setdefault(month, {"requests": 0, "input_tokens": 0, "output_tokens": 0})
     m["requests"] += 1
-    m["input_tokens"] += int(getattr(usage, "input_tokens", 0) or 0) + int(getattr(usage, "cache_read_input_tokens", 0) or 0) + int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
+    m["input_tokens"] += int(getattr(usage, "input_tokens", 0) or 0)
     m["output_tokens"] += int(getattr(usage, "output_tokens", 0) or 0)
     cfg["usage"] = {k: all_usage[k] for k in sorted(all_usage)[-12:]}
     row = db.get(AppSetting, KEY) or AppSetting(key=KEY)
-    row.value = json.dumps(cfg)
+    row.value = json.dumps({k: v for k, v in cfg.items() if k != "api_key"})
     db.add(row)
 
 
-def _api_error(error: Exception) -> AiError:
-    import anthropic
-    if isinstance(error, anthropic.AuthenticationError):
-        return AiError("The Anthropic API key was rejected. Check it under AI → Settings.")
-    if isinstance(error, anthropic.PermissionDeniedError):
-        return AiError("The Anthropic API key may not use this model.")
-    if isinstance(error, anthropic.NotFoundError):
-        return AiError("The configured model does not exist. Check the model name under AI → Settings.")
-    if isinstance(error, anthropic.RateLimitError):
-        return AiError("The Anthropic API rate limit was reached. Try again in a minute.")
-    if isinstance(error, anthropic.APIStatusError):
-        return AiError(f"The Anthropic API returned an error ({error.status_code}).")
-    if isinstance(error, anthropic.APIConnectionError):
-        return AiError("Could not reach the Anthropic API from this server.")
-    return AiError(str(error)[:200])
-
-
 def _parse(db: Session, system: str, content: str, schema: type[BaseModel], effort: str = "medium") -> tuple[BaseModel, str]:
-    import anthropic
     cfg = _ready(db)
-    client = _client(cfg)
-    model = cfg["model"] or DEFAULT_MODEL
+    provider = _provider(cfg)
     try:
-        response = client.beta.messages.parse(model=model, max_tokens=16000, system=system, messages=[{"role": "user", "content": content}],
-                                              output_format=schema, output_config={"effort": effort}, **_extra(model))
-    except anthropic.APIError as error:
-        raise _api_error(error) from error
-    _record_usage(db, response.usage)
-    if response.stop_reason == "refusal":
-        raise AiError("The model declined to answer this request.")
-    if response.stop_reason == "max_tokens" or response.parsed_output is None:
-        raise AiError("The answer was cut off. Try again with less input.")
-    return response.parsed_output, response.model
+        parsed, model, usage = provider.structured(system, content, schema, effort)
+    except RefusedError as error:
+        _record_usage(db, error.usage)
+        raise
+    _record_usage(db, usage)
+    return parsed, model
+
+
+def test_connection(db: Session) -> dict:
+    """A tiny request that proves the provider, key and model work (costs a few tokens)."""
+    cfg = _ready(db)
+    reply = _provider(cfg).complete("Reply with the single word: ready")
+    _record_usage(db, reply.usage)
+    db.commit()
+    return {"ok": True, "provider": cfg["provider"], "model": reply.model, "reply": reply.text[:50]}
 
 
 # ------------------------------------------------------------------------------------------------ secret masking
@@ -152,6 +148,11 @@ class Cause(BaseModel):
     cause: str = Field(description="One likely cause, in one sentence")
     evidence: str = Field(description="What in the data points to it")
     confidence: Literal["low", "medium", "high"]
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _lower(cls, v):   # smaller models often answer "High" or "Error"
+        return v.strip().lower() if isinstance(v, str) else v
 
 
 class IncidentAnalysis(BaseModel):
@@ -219,7 +220,7 @@ def incident_context(db: Session, incident) -> str:
 
 def explain_incident(db: Session, incident) -> dict:
     analysis, model = _parse(db, INCIDENT_SYSTEM, incident_context(db, incident), IncidentAnalysis)
-    incident.ai_analysis, incident.ai_model, incident.ai_generated_at = analysis.model_dump_json(), model, datetime.now(timezone.utc)
+    incident.ai_analysis, incident.ai_model, incident.ai_generated_at = analysis.model_dump_json(), (model or "")[:60], datetime.now(timezone.utc)
     db.commit()
     return analysis.model_dump()
 
@@ -229,11 +230,13 @@ def auto_explain(db: Session) -> None:
     from .models import Incident
     from .monitoring import format_alert, queue_event, target_of
     cfg = load(db)
-    if not (cfg["enabled"] and cfg["auto_explain"] and key_source(cfg)):
+    if not (cfg["auto_explain"] and is_ready(cfg)):
         return
     now = datetime.now(timezone.utc)
     done = db.scalar(select(func_count()).select_from(Incident).where(Incident.ai_generated_at >= now - timedelta(hours=1))) or 0
     budget = max(0, int(cfg["auto_per_hour"]) - done)
+    if not provider_spec(cfg).tools:   # the free tier answers about once per 45 s: one per worker run keeps the worker moving
+        budget = min(budget, 1)
     for incident in db.scalars(select(Incident).where(Incident.resolved_at.is_(None), Incident.ai_generated_at.is_(None), Incident.started_at <= now - timedelta(minutes=2),
                                                        Incident.started_at >= now - timedelta(hours=2)).order_by(Incident.started_at).limit(budget)).all():
         try:
@@ -259,6 +262,11 @@ def func_count():
 class LogGroup(BaseModel):
     title: str = Field(description="Short name of this kind of message, e.g. 'Database connection refused'")
     severity: Literal["error", "warning", "info"]
+
+    @field_validator("severity", mode="before")
+    @classmethod
+    def _lower(cls, v):   # smaller models often answer "High" or "Error"
+        return v.strip().lower() if isinstance(v, str) else v
     occurrences: int = Field(description="Roughly how many lines belong to it")
     example: str = Field(description="One representative line, shortened")
     meaning: str = Field(description="What it means, in plain words")
@@ -270,6 +278,11 @@ class LogAnalysis(BaseModel):
     health: Literal["healthy", "degraded", "failing"]
     groups: list[LogGroup] = Field(description="The important kinds of messages, most serious first; at most 8")
     next_steps: list[str] = Field(description="What the operator should do next, most useful first; at most 5")
+
+    @field_validator("health", mode="before")
+    @classmethod
+    def _lower(cls, v):
+        return v.strip().lower() if isinstance(v, str) else v
 
 
 LOG_SYSTEM = """You are an experienced site reliability engineer reading application and system logs for an operator.
@@ -295,43 +308,53 @@ Use the tools to look things up; never invent values. If a tool returns nothing,
 The person asking may see only some monitors: the tools return only those. Current time: {now} UTC."""
 
 
+SNAPSHOT_SYSTEM = """You answer questions about the infrastructure monitored by SM-Watch for {company}: servers, services (websites and APIs), Kubernetes clusters, API tests, domains, cron jobs, incidents, alerts, SLOs and security findings.
+Answer only from the data snapshot below; never invent values. If the snapshot does not contain what is asked, say so and suggest where in SM-Watch to look.
+Prefer short answers with the numbers that matter; use a small markdown table when comparing several items. Current time: {now} UTC.
+
+# Data snapshot (JSON, collected just now; the person asking may see only some monitors)
+{snapshot}"""
+# What a provider without multi-step tool use gets up front, in one request: (tool, arguments)
+SNAPSHOT_TOOLS = (("list_monitors", {}), ("incidents", {"hours": 72}), ("recent_alerts", {"hours": 24}), ("slo_status", {}), ("anomalies", {"hours": 72}), ("security_summary", {}))
+SNAPSHOT_CHARS = 40_000
+
+
 def ask(db: Session, user: dict, messages: list[dict]) -> dict:
-    import anthropic
-    from anthropic import beta_tool
+    from .config import get_settings
     from .security import can_see
     cfg = _ready(db)
-    client = _client(cfg)
-    model = cfg["model"] or DEFAULT_MODEL
+    provider = _provider(cfg)
     used: list[dict] = []
     tools_impl = Toolbox(db, user, can_see)
 
     def track(name):
-        def wrap(fn):
-            def inner(*a, **k):
-                used.append({"tool": name, "input": k})
-                try:
-                    return fn(*a, **k)
-                except Exception as error:   # noqa: BLE001  (a tool failure is reported to the model, not raised)
-                    return json.dumps({"error": str(error)[:200]})
-            inner.__name__, inner.__doc__, inner.__annotations__ = fn.__name__, fn.__doc__, dict(fn.__annotations__)
-            inner.__signature__ = __import__("inspect").signature(fn)
-            return inner
-        return wrap
+        fn = getattr(tools_impl, name)
 
-    tools = [beta_tool(track(name)(getattr(tools_impl, name))) for name in Toolbox.NAMES]
-    from .config import get_settings
-    system = ASK_SYSTEM.format(company=get_settings().company_name, now=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"))
-    try:
-        runner = client.beta.messages.tool_runner(model=model, max_tokens=16000, system=system, tools=tools, messages=messages, max_iterations=10, **_extra(model))
-        final = runner.until_done()
-    except anthropic.APIError as error:
-        raise _api_error(error) from error
-    _record_usage(db, final.usage)
+        def inner(*a, **k):
+            used.append({"tool": name, "input": k})
+            try:
+                return fn(*a, **k)
+            except Exception as error:   # noqa: BLE001  (a tool failure is reported to the model, not raised)
+                return json.dumps({"error": str(error)[:200]})
+        inner.__name__, inner.__doc__, inner.__annotations__ = fn.__name__, fn.__doc__, dict(fn.__annotations__)
+        inner.__signature__ = __import__("inspect").signature(fn)
+        return inner
+
+    now, company = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"), get_settings().company_name
+    if provider.spec.tools:
+        reply = provider.chat(ASK_SYSTEM.format(company=company, now=now), messages, [track(name) for name in Toolbox.NAMES], max_iterations=10)
+    else:
+        parts, budget = [], SNAPSHOT_CHARS
+        for name, args in SNAPSHOT_TOOLS:
+            data = track(name)(**args)[: max(0, budget)]
+            budget -= len(data)
+            parts.append(f"## {name} {json.dumps(args) if args else ''}\n{data}")
+        reply = provider.chat(SNAPSHOT_SYSTEM.format(company=company, now=now, snapshot="\n".join(parts)), messages[-6:], [])
+    _record_usage(db, reply.usage)
     db.commit()
-    if final.stop_reason == "refusal":
-        return {"answer": "The model declined to answer this question.", "tools": used, "model": final.model}
-    answer = "\n\n".join(b.text for b in final.content if b.type == "text").strip()
-    return {"answer": answer or "(no answer)", "tools": used, "model": final.model}
+    if reply.refused:
+        return {"answer": "The model declined to answer this question.", "tools": used, "model": reply.model}
+    return {"answer": reply.text or "(no answer)", "tools": used, "model": reply.model}
 
 
 class Toolbox:

@@ -2,7 +2,7 @@
 
 import { FormEvent, useEffect, useRef, useState } from 'react';
 import { Empty, Field, Icon } from '../components/ui';
-import { AiSettings, Markdown } from '../components/ai';
+import { AiSettings, Markdown, providerOf } from '../components/ai';
 import { api, post, put } from '../lib/api';
 import { useApp, usePoll } from '../lib/app';
 import { timeAgo } from '../lib/format';
@@ -16,7 +16,7 @@ function NotReady({ settings }: { settings: AiSettings | null }) {
   const { isAdmin, go } = useApp();
   if (!settings) return <p className="muted">Loading…</p>;
   return <div className="card"><Empty title="AI is not set up">
-    {!settings.enabled ? 'AI features are turned off.' : 'No Anthropic API key is configured.'} {isAdmin ? <button className="lg-link" onClick={() => go('ai-settings')}>Open AI settings</button> : 'Ask an admin to set it up.'}
+    {!settings.enabled ? 'AI features are turned off.' : `${providerOf(settings)?.label ?? 'The AI provider'} is not fully configured (API key, model or address missing).`} {isAdmin ? <button className="lg-link" onClick={() => go('ai-settings')}>Open AI settings</button> : 'Ask an admin to set it up.'}
     <br /><span className="sm muted">Anomaly detection works without AI.</span>
   </Empty></div>;
 }
@@ -60,7 +60,7 @@ export function Assistant() {
           onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void send(input); } }} aria-label="Your question" />
         <button className="btn primary" disabled={busy || !input.trim()}>Ask</button>
       </form>
-      <p className="sm muted" style={{ margin: '6px 12px 10px' }}>Your question and the data the AI looks up are sent to Anthropic. AI can be wrong: check important answers.</p>
+      <p className="sm muted" style={{ margin: '6px 12px 10px' }}>Your question and the data the AI looks up are sent to {providerOf(settings)?.destination ?? 'the AI provider'}. AI can be wrong: check important answers.</p>
     </div>}
   </>;
 }
@@ -96,12 +96,20 @@ export function AiSettingsView() {
   useEffect(() => { if (value) setForm(value); }, [value]);
   if (!form) return <p className="muted">Loading…</p>;
   const set = (patch: Partial<AiSettings>) => setForm({ ...form, ...patch });
+  const p = providerOf(form);
+  const saved = value?.provider === form.provider;            // key status shown is for the provider that is saved
+  const keyState = p?.key_in_env ? 'env' : p?.key_saved ? 'dashboard' : null;
+  function pick(id: string) {
+    const next = form!.providers.find(x => x.id === id);
+    setKey('');
+    set({ provider: id, model: next?.default_model ?? '', base_url: next?.base_url_editable ? next.default_base_url : '' });
+  }
   async function save(extra: { clear_key?: boolean } = {}) {
     if (!form) return;
     setBusy(true);
     try {
-      const { enabled, model, auto_explain, post_explanations, allow_logs, anomaly_alerts, auto_per_hour } = form;
-      await put('/ai/settings', { enabled, model, auto_explain, post_explanations, allow_logs, anomaly_alerts, auto_per_hour, api_key: key, ...extra });
+      const { enabled, provider, model, base_url, auto_explain, post_explanations, allow_logs, anomaly_alerts, auto_per_hour } = form;
+      await put('/ai/settings', { enabled, provider, model, base_url, auto_explain, post_explanations, allow_logs, anomaly_alerts, auto_per_hour, api_key: key, ...extra });
       setKey(''); toast('AI settings saved'); await reload();
     } catch (e) { toast((e as Error).message, true); } finally { setBusy(false); }
   }
@@ -110,27 +118,39 @@ export function AiSettingsView() {
     try { const r = await post<{ model: string }>('/ai/test'); toast(`Connected: ${r.model} answered`); await reload(); } catch (e) { toast((e as Error).message, true); } finally { setBusy(false); }
   }
   const box = (k: keyof AiSettings, label: string, hint: string) => <label className="check"><input type="checkbox" disabled={!isAdmin} checked={Boolean(form[k])} onChange={e => set({ [k]: e.target.checked } as Partial<AiSettings>)} /><span>{label}<span className="sm muted"> — {hint}</span></span></label>;
+  const keyHint = !p ? '' : keyState === 'env' ? `Set by ${p.key_env} in .env (that takes precedence).`
+    : keyState === 'dashboard' ? 'A key is saved (encrypted). Type a new one to replace it.'
+    : `${p.needs_key ? 'Required.' : 'Optional.'}${p.key_prefix ? ` Starts with ${p.key_prefix}.` : ''}${p.key_env ? ` Or set ${p.key_env} in .env.` : ''}`;
   return <>
-    <div className="topbar"><div><h1>AI settings</h1><p className="muted sm">AI features use Claude through the Anthropic API with your own key. Billing is on your Anthropic account.</p></div></div>
+    <div className="topbar"><div><h1>AI settings</h1><p className="muted sm">Choose who answers: the free provider needs no key, or use your own key with Anthropic, OpenAI, Gemini, Groq, OpenRouter, Mistral or DeepSeek, or run models privately with Ollama. Usage is billed by the provider you choose.</p></div></div>
     <div className="card form-card" style={{ maxWidth: 760 }}>
       {box('enabled', 'Turn on AI features', 'incident explanations, log analysis and the assistant')}
-      <Field label="API key" hint={form.key_source === 'env' ? 'Set by ANTHROPIC_API_KEY in .env (that takes precedence).' : form.key_source === 'dashboard' ? 'A key is saved (encrypted). Type a new one to replace it.' : 'Starts with sk-ant-. Or set ANTHROPIC_API_KEY in .env.'}>
-        <input type="password" value={key} onChange={e => setKey(e.target.value)} disabled={!isAdmin || form.key_source === 'env'} placeholder={form.key_source ? '•••••••• (saved)' : 'sk-ant-…'} autoComplete="off" />
+      <Field label="Provider" hint={p?.free || undefined}>
+        <select value={form.provider} onChange={e => pick(e.target.value)} disabled={!isAdmin}>
+          {form.providers.map(x => <option key={x.id} value={x.id}>{x.label}</option>)}
+        </select>
       </Field>
-      <Field label="Model" hint="Default claude-opus-5-5."><input value={form.model} onChange={e => set({ model: e.target.value })} disabled={!isAdmin} /></Field>
+      {p?.id === 'free' && <p className="sm muted" style={{ margin: '0 0 10px' }}>The free provider answers simple requests well. It is slower and limited to about one reply every 45 seconds, and the assistant answers from one data snapshot instead of looking things up step by step. Data goes to a public free service, so for confidential infrastructure pick Ollama (local) or a provider with your own key.</p>}
+      {p?.accepts_key && <Field label="API key" hint={<>{keyHint}{p.key_url && <> <a href={p.key_url} target="_blank" rel="noreferrer">Get a key</a></>}</>}>
+        <input type="password" value={key} onChange={e => setKey(e.target.value)} disabled={!isAdmin || keyState === 'env'} placeholder={keyState ? '•••••••• (saved)' : p.key_prefix ? `${p.key_prefix}…` : ''} autoComplete="off" />
+      </Field>}
+      {p?.base_url_editable && <Field label="Base URL" hint={p.id === 'ollama' ? 'Where Ollama listens, ending in /v1. Inside Docker Compose use http://ollama:11434/v1; on the host, http://host.docker.internal:11434/v1.' : 'The OpenAI-compatible API address, usually ending in /v1.'}>
+        <input value={form.base_url} onChange={e => set({ base_url: e.target.value })} disabled={!isAdmin} placeholder={p.default_base_url || 'https://host/v1'} />
+      </Field>}
+      <Field label="Model" hint={p?.default_model ? `Default ${p.default_model}.` : 'Required for this provider.'}><input value={form.model} onChange={e => set({ model: e.target.value })} disabled={!isAdmin} placeholder={p?.default_model} /></Field>
       {box('auto_explain', 'Explain new incidents automatically', 'about 2 minutes after an incident opens')}
       <Field label="Automatic explanations per hour (limit)"><input type="number" min={1} max={60} value={form.auto_per_hour} onChange={e => set({ auto_per_hour: Number(e.target.value) })} disabled={!isAdmin} /></Field>
       {box('post_explanations', 'Post automatic explanations to alert channels', 'as a follow-up message')}
       {box('allow_logs', 'Allow "Analyze with AI" in the log viewer', 'operators send the lines shown, with secrets masked')}
       {box('anomaly_alerts', 'Send alerts for anomalies', 'no AI involved; uses the normal alert channels')}
       <div className="sm muted" style={{ margin: '10px 0' }}>
-        <b>What is sent to Anthropic:</b> for an explanation, the incident, its monitor's recent checks and metrics, other incidents around then, and recent SM-Watch configuration changes; for log analysis, the log lines shown; for the assistant, your question and the data it looks up. Recognisable secrets are masked first.
+        <b>What is sent to {p?.destination ?? 'the provider'}:</b> for an explanation, the incident, its monitor's recent checks and metrics, other incidents around then, and recent SM-Watch configuration changes; for log analysis, the log lines shown; for the assistant, your question and the data it looks up. Recognisable secrets are masked first.
       </div>
       <p className="sm">This month ({form.month}): <b>{form.usage.requests}</b> requests · {form.usage.input_tokens.toLocaleString()} input tokens · {form.usage.output_tokens.toLocaleString()} output tokens</p>
       {isAdmin && <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
         <button className="btn primary" disabled={busy} onClick={() => void save()}>{busy ? 'Saving…' : 'Save'}</button>
-        <button className="btn" disabled={busy || !value?.ready} onClick={() => void test()}>Test connection</button>
-        {form.key_source === 'dashboard' && <button className="btn ghost" disabled={busy} onClick={() => void save({ clear_key: true })}>Remove saved key</button>}
+        <button className="btn" disabled={busy || !value?.ready || !saved} title={!saved ? 'Save first' : undefined} onClick={() => void test()}>Test connection</button>
+        {keyState === 'dashboard' && saved && <button className="btn ghost" disabled={busy} onClick={() => void save({ clear_key: true })}>Remove saved key</button>}
       </div>}
     </div>
   </>;

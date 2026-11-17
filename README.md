@@ -27,7 +27,7 @@ The supported environment settings include `POSTGRES_DB`, `POSTGRES_USER`, `POST
 - **Quality:** multi-step API tests with assertions and run reports, content (keyword) checks on services, DNS record and domain-expiry monitors.
 - **DevOps:** cron / heartbeat monitors with ping URLs, maintenance windows (alerts muted, shown on the status page), SLOs with error budgets and burn-rate alerts.
 - **Security:** two-factor sign-in (TOTP, optionally required), SSH brute-force detection, pending security updates, open-port and TLS audits.
-- **AI (optional, your own Anthropic key):** incident explanations, log analysis, "ask your infrastructure"; plus statistical anomaly detection that needs no key.
+- **AI (optional; free keyless default, or your own key with Anthropic, OpenAI, Gemini, Groq, OpenRouter, Mistral, DeepSeek, or a local Ollama):** incident explanations, log analysis, "ask your infrastructure"; plus statistical anomaly detection that needs no key.
 - **Concurrent worker:** due checks run in parallel (`WORKER_CONCURRENCY`, default 16).
 
 ## Security model
@@ -409,14 +409,29 @@ Review the manifest first by running the `curl` alone. It creates a `smwatch` na
 
 ## AI features
 
-Optional, off by default. They use Claude through the Anthropic API with **your own key** (billed to your Anthropic account). Admins set them up in *AI → AI settings*: turn on, enter a key (stored encrypted) or set `ANTHROPIC_API_KEY` in `.env` (takes precedence), choose the model (default `claude-opus-5-5`), and use *Test connection*.
+Optional, off by default. Admins set them up in *AI → AI settings*: turn on, pick a **provider**, enter its key if it needs one (stored encrypted, one per provider, so switching back and forth keeps them) or set the provider's variable in `.env` (takes precedence), optionally change the model, and use *Test connection*.
+
+| Provider | Key | Default model | Notes |
+|---|---|---|---|
+| **Free AI (Pollinations)**, the default | none | `openai` (gpt-oss-20b) | No sign-up. About one reply per 45 s per server, so the assistant answers from one data snapshot instead of step-by-step lookups, and automatic explanations run one per worker cycle. Data goes to a public free service: not for confidential infrastructure. |
+| Anthropic (Claude) | `ANTHROPIC_API_KEY` | `claude-opus-5-5` | Structured outputs and server-side refusal fallbacks. |
+| OpenAI | `OPENAI_API_KEY` | `gpt-5-mini` | |
+| Google Gemini | `GEMINI_API_KEY` | `gemini-2.5-flash` | Free tier with a Google key. |
+| Groq | `GROQ_API_KEY` | `llama-3.3-70b-versatile` | Free tier. |
+| OpenRouter | `OPENROUTER_API_KEY` | `meta-llama/llama-3.3-70b-instruct:free` | `:free` models cost nothing. |
+| Mistral | `MISTRAL_API_KEY` | `mistral-small-latest` | Free experiment tier. |
+| DeepSeek | `DEEPSEEK_API_KEY` | `deepseek-chat` | |
+| Ollama (local) | none | `llama3.2` | Free and private: nothing leaves your network. Base URL `OLLAMA_BASE_URL` (default `http://ollama:11434/v1`). Use a model with tool support for the assistant. |
+| Other OpenAI-compatible | `AI_API_KEY` (optional) | (you set it) | Any `/v1/chat/completions` API (vLLM, LM Studio, LiteLLM, Together, …). |
+
+Model names change over time; the defaults are starting points that can be edited. Errors name the provider and say what to do: a missing key ("No API key is set for Groq. Add GROQ_API_KEY to .env, or enter a key…"), a rejected key, a key that belongs to another provider, an unknown model or wrong base URL, rate limits and quotas, and an unreachable server. Settings saved before providers existed keep working as Anthropic.
 
 - **Incident explanations:** *Explain with AI* on an incident (operators) gives a summary, likely causes with confidence and evidence, and what to check next. Optionally automatic for new incidents (at most N per hour) and posted to alert channels.
 - **Log analysis:** *Analyze with AI* in the log viewer groups the lines shown, explains them and suggests fixes (an admin can disable this).
 - **Ask AI:** a chat that answers from SM-Watch's own data through read-only lookups (monitors, uptime, incidents, metrics, response times, alerts, SLOs, security, anomalies). It only sees the monitors the asking person may see.
 - **Anomalies (no AI, nothing leaves the server):** every 5 minutes, CPU, memory, load and network of each agent server and the response time of each service are compared with the same metric's last 7 days (median and robust spread). Something far outside its normal range for 10 minutes opens an anomaly; alerts are optional.
 
-**What is sent to Anthropic:** for an explanation, the incident, its monitor's recent checks and metrics, other incidents around then and recent SM-Watch configuration changes; for log analysis, the lines shown; for the assistant, the question and the data it looks up. Recognisable secrets (passwords, tokens, keys, credentials in URLs, JWTs, private keys) are masked first. Requests are rate-limited per person, audited (category *ai*), and monthly token usage is shown in AI settings.
+**What is sent to the chosen provider:** for an explanation, the incident, its monitor's recent checks and metrics, other incidents around then and recent SM-Watch configuration changes; for log analysis, the lines shown; for the assistant, the question and the data it looks up. Recognisable secrets (passwords, tokens, keys, credentials in URLs, JWTs, private keys) are masked first. Requests are rate-limited per person, audited (category *ai*), and monthly token usage is shown in AI settings.
 
 ## Service timeout and certificate expiry
 

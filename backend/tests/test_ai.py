@@ -1,4 +1,4 @@
-"""AI features with a fake Anthropic client (no network, no cost), and statistical anomaly detection."""
+"""AI features with a fake Anthropic client (the Anthropic provider) (no network, no cost), and statistical anomaly detection."""
 import json
 import os
 import sys
@@ -11,7 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from test_api_auth import CSRF, PW, client, fresh_stats_cache, main, make_user, session_for, sign_in  # noqa: F401
-from app import ai, anomaly, database
+from app import ai, anomaly, database, llm
 from app.models import AuditEvent, CheckResult, Incident, MetricSample, Server, Service
 
 
@@ -49,12 +49,12 @@ class FakeClient:
 @pytest.fixture()
 def fake(monkeypatch):
     f = FakeClient()
-    monkeypatch.setattr(ai, "_client", lambda cfg: f)
+    monkeypatch.setattr(llm, "anthropic_client", lambda key: f)
     return f
 
 
 def _enable(client, **extra):
-    r = client.put("/api/ai/settings", headers=CSRF, json={"enabled": True, "api_key": "sk-ant-test-key-1234567890", **extra})
+    r = client.put("/api/ai/settings", headers=CSRF, json={"enabled": True, "provider": "anthropic", "api_key": "sk-ant-test-key-1234567890", **extra})
     assert r.status_code == 200, r.text
     return r.json()
 
@@ -62,9 +62,9 @@ def _enable(client, **extra):
 def test_settings_are_admin_only_and_the_key_stays_secret(client):
     sign_in(client)
     assert client.get("/api/ai/settings").json()["enabled"] is False
-    assert client.put("/api/ai/settings", headers=CSRF, json={"enabled": True, "api_key": "not-a-key"}).status_code == 422
+    assert client.put("/api/ai/settings", headers=CSRF, json={"enabled": True, "provider": "anthropic", "api_key": "not-a-key"}).status_code == 422
     s = _enable(client)
-    assert s["ready"] and s["key_source"] == "dashboard" and s["model"] == "claude-opus-5-5" and "api_key" not in json.dumps(s)
+    assert s["ready"] and s["key_source"] == "dashboard" and s["model"] == "claude-opus-5-5" and "sk-ant-test" not in json.dumps(s)
     with database.SessionLocal() as db:
         raw = db.get(ai.AppSetting, "ai").value
     assert "sk-ant-test-key" not in raw                                                             # stored encrypted
@@ -122,7 +122,7 @@ def test_logs_are_masked_and_refusals_handled(client, fake, monkeypatch):
         client.put("/api/ai/settings", headers=CSRF, json={"enabled": True, "allow_logs": False})
         assert "not allowed" in client.post("/api/ai/logs", headers=CSRF, json={"text": "x"}).json()["detail"]
         refusing = FakeClient(stop_reason="refusal")
-        monkeypatch.setattr(ai, "_client", lambda cfg: refusing)
+        monkeypatch.setattr(llm, "anthropic_client", lambda key: refusing)
         client.put("/api/ai/settings", headers=CSRF, json={"enabled": True, "allow_logs": True})
         assert "declined" in client.post("/api/ai/logs", headers=CSRF, json={"text": "x"}).json()["detail"]
     finally:
