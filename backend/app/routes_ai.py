@@ -117,6 +117,18 @@ async def test_ai(request: Request, user: dict = Depends(require_admin)) -> dict
         raise HTTPException(422, str(error)) from error
 
 
+@router.get("/ai/models")
+async def ai_models(user: dict = Depends(require_admin)) -> dict:
+    """The models the saved provider offers to the saved key."""
+    def run():
+        with SessionLocal() as db:
+            return ai.list_models(db)
+    try:
+        return await run_in_threadpool(run)
+    except ai.AiError as error:
+        raise HTTPException(422, str(error)) from error
+
+
 @router.post("/incidents/{incident_id}/explain")
 async def explain(incident_id: int, request: Request, user: dict = Depends(require_operator)) -> dict:
     with SessionLocal() as db:

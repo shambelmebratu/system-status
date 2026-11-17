@@ -57,7 +57,7 @@ PROVIDERS: dict[str, Spec] = {s.id: s for s in (
          key_url="https://console.anthropic.com/settings/keys", destination="Anthropic"),
     Spec("openai", "OpenAI", "openai", "gpt-5-mini", url="https://api.openai.com/v1/chat/completions", key_env="OPENAI_API_KEY", key_prefix="sk-",
          key_url="https://platform.openai.com/api-keys", destination="OpenAI"),
-    Spec("gemini", "Google Gemini", "openai", "gemini-2.5-flash", url="https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+    Spec("gemini", "Google Gemini", "openai", "gemini-3.8-flash", url="https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
          key_env="GEMINI_API_KEY", key_url="https://aistudio.google.com/apikey", free="Has a free tier (a Google account and key are needed).",
          destination="Google"),
     Spec("groq", "Groq", "openai", "llama-3.3-70b-versatile", url="https://api.groq.com/openai/v1/chat/completions", key_env="GROQ_API_KEY", key_prefix="gsk_",
@@ -191,6 +191,25 @@ class Provider:
     def complete(self, prompt: str) -> Reply:
         raise NotImplementedError
 
+    def list_models(self) -> list[str]:
+        """The chat models this provider offers to this key (best effort; providers that cannot list raise AiError)."""
+        raise AiError(f"{self.spec.label} cannot list its models. Enter the model name by hand.")
+
+
+_NOT_CHAT = re.compile(r"embed|tts|transcri|whisper|audio|image|imagen|veo|dall-e|moderation|rerank|aqa|realtime|speech|vision-only|guard", re.I)
+
+
+def chat_models(ids: list[str]) -> list[str]:
+    """Model ids without the 'models/' prefix (Gemini), without embedding/audio/image models, de-duplicated and sorted."""
+    return sorted({i.removeprefix("models/") for i in ids if i and not _NOT_CHAT.search(i)})
+
+
+def suggest(model: str, available: list[str], limit: int = 8) -> list[str]:
+    """The available models most like the one asked for: same family words first (e.g. 'gemini', 'flash'), newest-looking first."""
+    words = [w for w in re.split(r"[^a-z]+", model.lower()) if len(w) > 2]
+    ranked = sorted(available, key=lambda m: (-sum(w in m.lower() for w in words), "preview" in m or "exp" in m, [-int(n) for n in re.findall(r"\d+", m)][:3], m))
+    return ranked[:limit]
+
 
 # ------------------------------------------------------------------------------------------------ Anthropic
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
@@ -271,6 +290,13 @@ class AnthropicProvider(Provider):
         except anthropic.APIError as error:
             raise self._error(error) from error
         return Reply("".join(b.text for b in r.content if b.type == "text"), r.model, self._usage(r.usage))
+
+    def list_models(self):
+        import anthropic
+        try:
+            return chat_models([m.id for m in self.client.models.list(limit=100)])
+        except anthropic.APIError as error:
+            raise self._error(error) from error
 
 
 class RefusedError(AiError):
@@ -422,6 +448,13 @@ class OpenAICompatProvider(Provider):
         if code == 403:
             return AiError(f"{name} refused the request (403): the key may not use the model '{self.model}', or the account lacks access. {detail}".strip())
         if code == 404:
+            try:
+                available = self.list_models()
+            except Exception:  # noqa: BLE001  (suggestions are a bonus; the address itself may be wrong)
+                available = []
+            if available:
+                return AiError(f"{name} does not offer the model '{self.model}' (404); it may have been retired or renamed. "
+                               f"Models available to your key include: {', '.join(suggest(self.model, available))}. Change the model under AI → Settings (Load models lists them all).")
             return AiError(f"{name} does not know the model '{self.model}' or the address {_base_of(self.url)} is wrong (404). Check the model and base URL under AI → Settings.")
         if code in (402, 429):
             if self.spec.id == "free":
@@ -495,6 +528,27 @@ class OpenAICompatProvider(Provider):
                 result = call_tool(tool, fn.get("arguments")) if tool else json.dumps({"error": f"No tool named {fn.get('name')}"})
                 convo.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": result})
         return Reply("", model, usage)
+
+    def list_models(self):
+        """GET {base}/models, which OpenAI-compatible APIs (Gemini, Groq, OpenRouter, Mistral, DeepSeek, Ollama, …) offer."""
+        if self.spec.id == "free":
+            return [self.spec.default_model]
+        headers = {"Authorization": f"Bearer {self.key}"} if self.key else {}
+        try:
+            with httpx.Client(timeout=httpx.Timeout(20.0, connect=10.0), transport=self.transport) as client:
+                r = client.get(_base_of(self.url) + "/models", headers=headers)
+        except httpx.HTTPError as error:
+            raise AiError(f"Could not reach {self.spec.label} at {_base_of(self.url)}: {type(error).__name__}.") from error
+        if r.status_code in (401, 403) or (r.status_code == 400 and "key" in r.text.lower()):
+            raise AiError(f"The {self.spec.label} API key was rejected while listing models. Check it under AI → Settings.")
+        if r.status_code >= 400:
+            raise AiError(f"{self.spec.label} could not list its models ({r.status_code}). Enter the model name by hand.")
+        try:
+            data = r.json()
+        except ValueError as error:
+            raise AiError(f"{self.spec.label} did not return a model list. Enter the model name by hand.") from error
+        items = (data.get("data") or data.get("models") or []) if isinstance(data, dict) else data
+        return chat_models([str(m.get("id") or m.get("name") or "") if isinstance(m, dict) else str(m) for m in items])
 
     def complete(self, prompt):
         data = self._post({"messages": [{"role": "user", "content": prompt}]})

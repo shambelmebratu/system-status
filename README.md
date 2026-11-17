@@ -416,7 +416,7 @@ Optional, off by default. Admins set them up in *AI → AI settings*: turn on, p
 | **Free AI (Pollinations)**, the default | none | `openai` (gpt-oss-20b) | No sign-up. About one reply per 45 s per server, so the assistant answers from one data snapshot instead of step-by-step lookups, and automatic explanations run one per worker cycle. Data goes to a public free service: not for confidential infrastructure. |
 | Anthropic (Claude) | `ANTHROPIC_API_KEY` | `claude-opus-5-5` | Structured outputs and server-side refusal fallbacks. |
 | OpenAI | `OPENAI_API_KEY` | `gpt-5-mini` | |
-| Google Gemini | `GEMINI_API_KEY` | `gemini-2.5-flash` | Free tier with a Google key. |
+| Google Gemini | `GEMINI_API_KEY` | `gemini-3.8-flash` | Free tier with a Google key. |
 | Groq | `GROQ_API_KEY` | `llama-3.3-70b-versatile` | Free tier. |
 | OpenRouter | `OPENROUTER_API_KEY` | `meta-llama/llama-3.3-70b-instruct:free` | `:free` models cost nothing. |
 | Mistral | `MISTRAL_API_KEY` | `mistral-small-latest` | Free experiment tier. |

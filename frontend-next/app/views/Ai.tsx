@@ -93,7 +93,9 @@ export function AiSettingsView() {
   const [form, setForm] = useState<AiSettings | null>(null);
   const [key, setKey] = useState('');
   const [busy, setBusy] = useState(false);
+  const [models, setModels] = useState<string[]>([]);
   useEffect(() => { if (value) setForm(value); }, [value]);
+  useEffect(() => { setModels([]); }, [form?.provider]);
   if (!form) return <p className="muted">Loading…</p>;
   const set = (patch: Partial<AiSettings>) => setForm({ ...form, ...patch });
   const p = providerOf(form);
@@ -111,6 +113,14 @@ export function AiSettingsView() {
       const { enabled, provider, model, base_url, auto_explain, post_explanations, allow_logs, anomaly_alerts, auto_per_hour } = form;
       await put('/ai/settings', { enabled, provider, model, base_url, auto_explain, post_explanations, allow_logs, anomaly_alerts, auto_per_hour, api_key: key, ...extra });
       setKey(''); toast('AI settings saved'); await reload();
+    } catch (e) { toast((e as Error).message, true); } finally { setBusy(false); }
+  }
+  async function loadModels() {
+    setBusy(true);
+    try {
+      const r = await api<{ models: string[] }>('/ai/models');
+      setModels(r.models);
+      toast(r.models.length ? `${r.models.length} models available: pick one in the Model field` : 'The provider listed no models', !r.models.length);
     } catch (e) { toast((e as Error).message, true); } finally { setBusy(false); }
   }
   async function test() {
@@ -137,7 +147,11 @@ export function AiSettingsView() {
       {p?.base_url_editable && <Field label="Base URL" hint={p.id === 'ollama' ? 'Where Ollama listens, ending in /v1. Inside Docker Compose use http://ollama:11434/v1; on the host, http://host.docker.internal:11434/v1.' : 'The OpenAI-compatible API address, usually ending in /v1.'}>
         <input value={form.base_url} onChange={e => set({ base_url: e.target.value })} disabled={!isAdmin} placeholder={p.default_base_url || 'https://host/v1'} />
       </Field>}
-      <Field label="Model" hint={p?.default_model ? `Default ${p.default_model}.` : 'Required for this provider.'}><input value={form.model} onChange={e => set({ model: e.target.value })} disabled={!isAdmin} placeholder={p?.default_model} /></Field>
+      <Field label="Model" hint={<>{p?.default_model ? `Default ${p.default_model}. ` : 'Required for this provider. '}Providers retire models over time: {saved && isAdmin
+        ? <button type="button" className="lg-link" disabled={busy} onClick={() => void loadModels()}>Load models</button> : 'save, then use Load models'} to see the ones your key can use.</>}>
+        <input value={form.model} onChange={e => set({ model: e.target.value })} disabled={!isAdmin} placeholder={p?.default_model} list="ai-models" />
+        <datalist id="ai-models">{models.map(m => <option key={m} value={m} />)}</datalist>
+      </Field>
       {box('auto_explain', 'Explain new incidents automatically', 'about 2 minutes after an incident opens')}
       <Field label="Automatic explanations per hour (limit)"><input type="number" min={1} max={60} value={form.auto_per_hour} onChange={e => set({ auto_per_hour: Number(e.target.value) })} disabled={!isAdmin} /></Field>
       {box('post_explanations', 'Post automatic explanations to alert channels', 'as a follow-up message')}

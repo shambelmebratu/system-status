@@ -25,7 +25,8 @@ class Server:
         self.queue, self.requests = list(responses), []
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
-        self.requests.append({"url": str(request.url), "auth": request.headers.get("authorization"), "body": json.loads(request.content)})
+        self.requests.append({"url": str(request.url), "method": request.method, "auth": request.headers.get("authorization"),
+                              "body": json.loads(request.content) if request.content else None})
         status, body = self.queue.pop(0)
         return httpx.Response(status, json=body)
 
@@ -161,6 +162,28 @@ def test_clear_errors_for_each_provider(client, reset, server, provider, payload
         server((status, body), (status, body), (status, body))
     r = client.post("/api/ai/test", headers=CSRF)
     assert r.status_code == 422 and expect in r.json()["detail"], r.json()
+
+
+GEMINI_MODELS = {"object": "list", "data": [{"id": f"models/{m}", "object": "model"} for m in
+                 ("gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-3.8-pro", "gemini-embedding-001", "imagen-4.0-generate-001", "gemini-3.9-flash-preview")]}
+
+
+def test_retired_model_404_suggests_available_models(client, reset, server):
+    client.put("/api/ai/settings", headers=CSRF, json={"enabled": True, "provider": "gemini", "model": "gemini-2.5-flash", "api_key": "AQ.Ab8RN6Ktest_key"})
+    srv = server((404, [{"error": {"code": 404, "message": "models/gemini-2.5-flash is not found for API version v1main", "status": "NOT_FOUND"}}]), (200, GEMINI_MODELS))
+    r = client.post("/api/ai/test", headers=CSRF)
+    detail = r.json()["detail"]
+    assert r.status_code == 422 and "does not offer the model 'gemini-2.5-flash'" in detail and "retired" in detail
+    assert "gemini-3.8-flash" in detail and "embedding" not in detail and "imagen" not in detail
+    assert detail.index("gemini-3.8-flash") < detail.index("gemini-3.8-pro")                    # same family ("flash") first
+    assert srv.requests[1] == {"url": "https://generativelanguage.googleapis.com/v1beta/openai/models", "method": "GET", "auth": "Bearer AQ.Ab8RN6Ktest_key", "body": None}
+    server((200, GEMINI_MODELS))
+    r = client.get("/api/ai/models")
+    assert r.status_code == 200 and r.json() == {"provider": "gemini", "models": ["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-3.8-pro", "gemini-3.9-flash-preview"]}
+    server((400, [{"error": {"code": 400, "message": "API key not valid. Please pass a valid API key."}}]))
+    r = client.get("/api/ai/models")
+    assert r.status_code == 422 and "key was rejected" in r.json()["detail"]
+    assert client.put("/api/ai/settings", headers=CSRF, json={"enabled": True, "provider": "free"}).json()["model"] == "openai"
 
 
 def test_key_shape_hints(client, reset):

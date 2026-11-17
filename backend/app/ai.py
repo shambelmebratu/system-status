@@ -116,6 +116,13 @@ def _parse(db: Session, system: str, content: str, schema: type[BaseModel], effo
     return parsed, model
 
 
+def list_models(db: Session) -> dict:
+    """The models the saved provider offers to the saved key, for the settings page (works while AI is still turned off)."""
+    cfg = load(db)
+    provider = _provider(cfg)
+    return {"provider": cfg["provider"], "models": provider.list_models()}
+
+
 def test_connection(db: Session) -> dict:
     """A tiny request that proves the provider, key and model work (costs a few tokens)."""
     cfg = _ready(db)
