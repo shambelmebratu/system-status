@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, post } from '../lib/api';
 import { Icon } from './ui';
 import { LogViewer, LogPalette, TargetPicker, type LogFetch, type PickerOption, type PaletteGroup } from './logviewer';
@@ -41,7 +41,8 @@ const EMPTY_INVENTORY: Inventory = { files: [], journal: true, units: [], docker
 const SOURCES: { id: Source; label: string; icon: string }[] = [{ id: 'docker', label: 'Containers', icon: 'server' }, { id: 'journal', label: 'System journal', icon: 'logs' }, { id: 'file', label: 'Log files', icon: 'overview' }];
 const isMac = (inv: { platform?: string }) => inv.platform === 'macos';
 
-export function LogsPanel({ serverId }: { serverId: number }) {
+/** `lead` (e.g. a server picker) and `trail` (e.g. the log-policy button) sit in the viewer's command bar. */
+export function LogsPanel({ serverId, lead, trail }: { serverId: number; lead?: ReactNode; trail?: ReactNode }) {
   const [inventory, setInventory] = useState<Inventory | null>(null);
   const [unitsState, setUnitsState] = useState<'idle' | 'loading' | 'done'>('idle');
   const [provisional, setProvisional] = useState<Remembered | null>(null);
@@ -50,6 +51,7 @@ export function LogsPanel({ serverId }: { serverId: number }) {
   const [error, setError] = useState('');
   const invRun = useRef(0);    // newest inventory request
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [notesOpen, setNotesOpen] = useState(false);
   useEffect(() => { const k = (e: KeyboardEvent) => { if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); setPaletteOpen(o => !o); } }; window.addEventListener('keydown', k); return () => window.removeEventListener('keydown', k); }, []);
 
   // What can this server's agent read? A remembered last view is shown at once, in parallel with the inventory request.
@@ -111,11 +113,12 @@ export function LogsPanel({ serverId }: { serverId: number }) {
   }, [serverId, source, target]);
 
   if (error && !shell) return (
-    <div className="lg"><div className="lg-empty"><Icon name="alert" size={28} /><h3>Can’t reach this server’s agent</h3><p>{error}</p>
+    <div className="lgx">{(lead || trail) && <div className="lgx-cmd">{lead}<span className="grow" />{trail}</div>}<div className="lg-empty"><Icon name="alert" size={28} /><h3>Can’t reach this server’s agent</h3><p>{error}</p>
       <p className="muted sm">Logs need the SM-Watch agent (2.3+) running on the server with log access enabled. Re-run the install command on the server to update it.</p></div></div>);
   if (!shell) return (
-    <div className="lg"><div className="lg-skel">{Array.from({ length: 9 }, (_, i) => <i key={i} style={{ width: `${40 + ((i * 37) % 55)}%` }} />)}</div>
-      <div className="lg-foot"><span className="spinner" /> Asking the agent which logs it can read…</div></div>);
+    <div className="lgx">{(lead || trail) && <div className="lgx-cmd">{lead}<span className="grow" />{trail}</div>}
+      <div className="lgx-stream"><div className="lg-skel">{Array.from({ length: 12 }, (_, i) => <i key={i} style={{ width: `${40 + ((i * 37) % 55)}%` }} />)}</div></div>
+      <div className="lgx-status"><span className="lgx-state busy"><i />Connecting</span><span className="muted">Asking the agent which logs it can read…</span></div></div>);
 
   const switchTo = (src: Source) => (value: string) => { setSource(src); setTarget(value); if (src === 'journal') loadUnits(); };
   const groups: PaletteGroup[] = [
@@ -128,17 +131,22 @@ export function LogsPanel({ serverId }: { serverId: number }) {
   const noteFor = (id: Source) => (id === 'journal' ? shell.notes.find(n => /journal|systemd|macOS/i.test(n)) : id === 'file' ? shell.notes.find(n => /log files/i.test(n)) : shell.notes.find(n => /docker/i.test(n))) ?? shell.notes[0] ?? 'Not available on this server';
   const controls = (
     <>
-      <div className="lg-sources" role="tablist">
+      {lead}{lead && <span className="lgx-crumb">/</span>}
+      <div className="lgx-src" role="tablist" aria-label="Log source">
         {SOURCES.map(s => (
           <button key={s.id} role="tab" aria-selected={source === s.id} className={source === s.id ? 'on' : ''} disabled={!available[s.id]} title={available[s.id] ? '' : noteFor(s.id)} onClick={() => pick(s.id)}>
-            <Icon name={s.icon} size={15} />{s.id === 'journal' && shell.journal_label ? shell.journal_label : s.label}<span className="lg-count">{total[s.id]}</span>
+            <Icon name={s.icon} size={14} />{s.id === 'journal' && shell.journal_label ? shell.journal_label : s.label}<span>{total[s.id]}</span>
           </button>))}
       </div>
-      <TargetPicker value={target} options={targets} onChange={setTarget} icon={source === 'docker' ? 'server' : source === 'journal' ? 'logs' : 'overview'} width={340}
+      <span className="lgx-crumb">/</span>
+      <TargetPicker value={target} options={targets} onChange={setTarget} icon={source === 'docker' ? 'server' : source === 'journal' ? 'logs' : 'overview'} width={320}
         placeholder={source === 'journal' && unitsState !== 'done' ? 'Loading units…' : 'Nothing available'} disabled={targets.length === 0} />
-      <button type="button" className="btn ghost sm" onClick={() => setPaletteOpen(true)} title="Switch to any container, unit or file"><kbd>⌘K</kbd> Switch log</button>
+      <span className="grow" />
+      <button type="button" className="lgx-btn" onClick={() => setPaletteOpen(true)} title="Jump to any container, unit or file"><Icon name="logs" size={14} /><span>Jump to log</span><kbd>⌘K</kbd></button>
+      {trail}
     </>
   );
-  const banner = shell.notes.length > 0 ? <div className="lv-note">{shell.notes.map((n, i) => <p key={i}><Icon name="alert" size={14} />{n}</p>)}</div> : null;
+  const [showNotes, setShowNotes] = [notesOpen, setNotesOpen];
+  const banner = shell.notes.length > 0 ? <div className="lgx-note"><Icon name="alert" size={13} /><span className="lgx-note-text">{showNotes ? shell.notes.join(' ') : shell.notes[0]}</span>{shell.notes.length > 1 || shell.notes[0].length > 140 ? <button type="button" className="lg-link" onClick={() => setShowNotes(!showNotes)}>{showNotes ? 'less' : 'more'}</button> : null}</div> : null;
   return <><LogPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} groups={groups} title="Switch log: container, unit or file…" /><LogViewer fetcher={fetcher} fetchKey={`${serverId}|${source}|${target}`} canFetch={!!target} controls={controls} banner={banner} storageKey={`server-${serverId}`} downloadName={target || 'logs'} /></>;
 }

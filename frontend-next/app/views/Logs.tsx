@@ -13,16 +13,19 @@ export function Logs() {
   const [id, setId] = useState<number | null>(route[1] ? Number(route[1]) : null);
   useEffect(() => { if (id == null && servers.length) setId(servers[0].id); }, [id, servers]);
   if (!data) return <p className="muted">Loading…</p>;
+  const current = servers.find(s => s.id === id);
+  const picker = servers.length > 0 && (
+    <label className="lgx-server" title="Server">
+      <span className="lv-dot" data-state={current?.last_status === 'down' ? 'exited' : 'running'} />
+      <select value={id ?? ''} onChange={e => setId(Number(e.target.value))} aria-label="Server">{servers.map(s => <option key={s.id} value={s.id}>{s.name}{s.last_status === 'down' ? ' (down)' : ''}</option>)}</select>
+      <span className="caret">▾</span>
+    </label>);
   return (
     <>
-      <div className="topbar"><div><h1>Logs</h1><p className="muted sm">Read on demand from the server’s agent. Nothing is stored.</p></div><span className="grow" />
-        {isAdmin && id != null && <LogPolicyButton serverId={id} onSaved={() => setReloadKey(k => k + 1)} />}
-        {servers.length > 0 && <label className="lv-target" style={{ flex: '0 0 auto', minWidth: 260, paddingRight: 4 }}><span className="lv-dot" data-state={servers.find(s => s.id === id)?.last_status === 'down' ? 'exited' : 'running'} />
-          <select value={id ?? ''} onChange={e => setId(Number(e.target.value))} aria-label="Server" style={{ border: 0, background: 'transparent', padding: '8px 8px 8px 0', fontWeight: 600, color: 'var(--ink)', flex: 1 }}>{servers.map(s => <option key={s.id} value={s.id}>{s.name}{s.last_status === 'down' ? ' (down)' : ''}</option>)}</select></label>}
-      </div>
+      <div className="topbar lgx-top"><div><h1>Logs</h1><p className="muted sm">Read live from each server’s agent: containers, the system journal and log files. Nothing is stored.</p></div></div>
       {servers.length === 0 ? <div className="card"><Empty title="No servers with log access yet" action={<button className="btn primary" onClick={() => go('servers/new')}>Install an agent</button>}>
         Logs are read on demand by the SM-Watch agent: Docker container logs, the system journal and log files such as nginx. Install the agent on a server (the machine running SM-Watch is included automatically).</Empty></div>
-        : id != null && <LogsPanel key={`${id}-${reloadKey}`} serverId={id} />}
+        : id != null && <LogsPanel key={`${id}-${reloadKey}`} serverId={id} lead={picker} trail={isAdmin ? <LogPolicyButton serverId={id} onSaved={() => setReloadKey(k => k + 1)} /> : undefined} />}
     </>
   );
 }

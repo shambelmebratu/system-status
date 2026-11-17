@@ -177,23 +177,45 @@ function Histogram({ rows, zoom, onZoom }: { rows: LogRow[]; zoom: [number, numb
   const h = hover != null ? buckets[hover] : null;
   const fmt = (t: number) => new Date(t).toLocaleTimeString([], { hour12: false });
   return (
-    <div className="lg-hist" onMouseLeave={() => setHover(null)}>
-      <div className="lg-hist-bars" role="img" aria-label="Log volume over time">
+    <div className="lgx-hist" onMouseLeave={() => setHover(null)}>
+      <div className="lgx-hist-top">
+        <span className="lgx-hist-title">Volume</span>
+        <span className="lgx-hist-tip">{h ? <><b>{fmt(h.from)}</b> · {h.error + h.warn + h.other} lines{h.error ? <span className="e"> · {h.error} errors</span> : ''}{h.warn ? <span className="w"> · {h.warn} warnings</span> : ''}</> : zoom ? <>Zoomed to <b>{fmt(zoom[0])} – {fmt(zoom[1])}</b> <button type="button" className="lg-link" onClick={() => onZoom(null)}>reset</button></> : 'Click a bar to zoom in'}</span>
+        <span className="grow" />
+        {spike && <button type="button" className="lgx-spike" onClick={() => onZoom([spike.from, spike.to])} title="Zoom in on the busiest moment"><Icon name="zap" size={12} />Spike {fmt(spike.from)} · {(totals[peakIdx] / Math.max(1, mean)).toFixed(1)}× usual</button>}
+      </div>
+      <div className="lgx-hist-bars" role="img" aria-label="Log volume over time">
         {buckets.map((b, i) => {
           const total = b.error + b.warn + b.other;
           const selected = zoom && b.from >= zoom[0] - 1 && b.to <= zoom[1] + 1;
           return (
-            <button key={i} type="button" className={`lg-bar-col ${selected ? 'sel' : ''}`} onMouseEnter={() => setHover(i)} onClick={() => onZoom(selected ? null : [b.from, b.to])} aria-label={`${total} lines at ${fmt(b.from)}`}>
-              <span className="lg-stack" style={{ height: `${(total / max) * 100}%` }}>
+            <button key={i} type="button" className={`lgx-bar ${selected ? 'sel' : ''} ${zoom && !selected ? 'dim' : ''}`} onMouseEnter={() => setHover(i)} onClick={() => onZoom(selected ? null : [b.from, b.to])} aria-label={`${total} lines at ${fmt(b.from)}`}>
+              <span className="lgx-stack" style={{ height: `${Math.max(total ? 6 : 0, (total / max) * 100)}%` }}>
                 {b.other > 0 && <i className="o" style={{ flex: b.other }} />}{b.warn > 0 && <i className="w" style={{ flex: b.warn }} />}{b.error > 0 && <i className="e" style={{ flex: b.error }} />}
               </span>
             </button>);
         })}
       </div>
-      {spike && <button type="button" className="lg-spike" onClick={() => onZoom([spike.from, spike.to])} title="Zoom in on the busiest moment"><Icon name="zap" size={13} />Spike at {fmt(spike.from)}: {spike.error + spike.warn + spike.other} lines{spike.error ? `, ${spike.error} errors` : ''} ({(totals[peakIdx] / Math.max(1, mean)).toFixed(1)}× the usual)</button>}
-      <div className="lg-hist-axis"><span>{fmt(buckets[0].from)}</span>
-        <span className="lg-hist-tip">{h ? `${fmt(h.from)} · ${h.error + h.warn + h.other} lines${h.error ? ` · ${h.error} errors` : ''}${h.warn ? ` · ${h.warn} warnings` : ''}` : zoom ? `Zoomed to ${fmt(zoom[0])} – ${fmt(zoom[1])}` : 'Click a bar to zoom in'}</span>
-        <span>{fmt(buckets[buckets.length - 1].to)}</span></div>
+      <div className="lgx-hist-axis"><span>{fmt(buckets[0].from)}</span><span>{fmt(buckets[Math.floor(buckets.length / 2)].from)}</span><span>{fmt(buckets[buckets.length - 1].to)}</span></div>
+    </div>
+  );
+}
+
+/* ================================================================================================ popover menu */
+function Popover({ label, title, children, align = 'left', className = '' }: { label: ReactNode; title?: string; children: (close: () => void) => ReactNode; align?: 'left' | 'right'; className?: string }) {
+  const [open, setOpen] = useState(false);
+  const box = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const close = (e: MouseEvent) => { if (box.current && !box.current.contains(e.target as Node)) setOpen(false); };
+    const esc = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false); };
+    document.addEventListener('mousedown', close); document.addEventListener('keydown', esc);
+    return () => { document.removeEventListener('mousedown', close); document.removeEventListener('keydown', esc); };
+  }, [open]);
+  return (
+    <div className={`lgx-pop ${className}`} ref={box}>
+      <button type="button" className={`lgx-btn ${open ? 'on' : ''}`} onClick={() => setOpen(!open)} aria-haspopup="menu" aria-expanded={open} title={title}>{label}</button>
+      {open && <div className={`lgx-menu ${align}`} role="menu">{children(() => setOpen(false))}</div>}
     </div>
   );
 }
@@ -324,7 +346,7 @@ function LogInspector({ row, index, total, onClose, onNav, onToken, tokens, onZo
 /* ================================================================================================ the viewer */
 export type LogFetch = (q: { sinceSeconds: number; lines: number; grep: string }, isCancelled: () => boolean) => Promise<{ text: string; truncated: boolean }>;
 type Prefs = { range: string; lines: string; wrap: boolean; dense: boolean; newest: boolean; group: boolean };
-const DEFAULT_PREFS: Prefs = { range: '1h', lines: '500', wrap: true, dense: false, newest: false, group: true };
+const DEFAULT_PREFS: Prefs = { range: '1h', lines: '500', wrap: false, dense: false, newest: false, group: true };
 type Entry = { key: string; row: LogRow; items: LogRow[] };
 
 export function LogViewer({ fetcher, fetchKey, canFetch, controls, storageKey, downloadName, emptyHint, banner }: {
@@ -443,96 +465,95 @@ export function LogViewer({ fetcher, fetchKey, canFetch, controls, storageKey, d
       {r.fields.map(([k, v]) => <span key={k} className="lg-tag"><i>{k}</i>{v}</span>)}</>
   );
 
+  const viewCount = [prefs.wrap, prefs.dense, prefs.newest].filter(Boolean).length;
   return (
-    <div className="lg">
-      {controls && <div className="lg-controls">{controls}</div>}
+    <div className="lgx">
+      {controls && <div className="lgx-cmd">{controls}</div>}
       {banner}
-      <div className="lg-toolbar">
-        <div className="lg-range" role="group" aria-label="Time range">
-          <span className="lg-range-label"><Icon name="clock" size={14} /></span>
-          {RANGES.map(r => <button key={r.id} type="button" className={r.id === range.id ? 'on' : ''} title={r.long} aria-pressed={r.id === range.id} onClick={() => setPref('range', r.id)}>{r.label}</button>)}
+      <form className="lgx-query" onSubmit={e => { e.preventDefault(); setApplied(search); void (search === applied && doFetch()); }}>
+        <div className={`lgx-search ${badRegex ? 'bad' : ''}`}>
+          <Icon name="logs" size={15} />
+          <input ref={searchBox} value={search} onChange={e => setSearch(e.target.value)} placeholder={useRegex ? 'Regular expression, e.g. timeout|refused' : 'Search logs…'} maxLength={200} aria-label="Search" />
+          {(search || applied) && <button type="button" className="lgx-x" aria-label="Clear search" onClick={() => { setSearch(''); setApplied(''); }}><Icon name="x" size={13} /></button>}
+          <button type="button" className={`lgx-rx ${useRegex ? 'on' : ''}`} onClick={() => setUseRegex(!useRegex)} aria-pressed={useRegex} title="Regular expression">.*</button>
+          <span className="lgx-sep" />
+          <span className="lgx-not" title="Hide lines containing this">NOT</span>
+          <input className="lgx-excl" value={exclude} onChange={e => setExclude(e.target.value)} placeholder="exclude…" maxLength={100} aria-label="Exclude lines containing" />
+          {!search && !exclude && <kbd className="lgx-kbd">/</kbd>}
         </div>
-        <span className="grow" />
-        <button type="button" className={`lg-live ${live ? 'on' : ''}`} onClick={() => setLive(!live)} aria-pressed={live} title="Keep fetching new lines"><i />{live ? 'Live' : 'Live tail'}</button>
-        {live && <select className="lg-mini" value={liveMs} onChange={e => setLiveMs(Number(e.target.value))} aria-label="Refresh every"><option value={2000}>2 s</option><option value={3000}>3 s</option><option value={5000}>5 s</option><option value={10000}>10 s</option></select>}
-        <button type="button" className="btn sm" onClick={() => void doFetch()} disabled={busy || !canFetch}><Icon name="refresh" size={14} />{busy ? 'Loading…' : 'Refresh'}</button>
-      </div>
-
-      <form className="lg-search" onSubmit={e => { e.preventDefault(); setApplied(search); }}>
-        <label className={`lg-field grow ${badRegex ? 'bad' : ''}`}><Icon name="logs" size={15} /><input ref={searchBox} value={search} onChange={e => setSearch(e.target.value)} placeholder={useRegex ? 'Regular expression…   ( / )' : 'Search the logs…   ( / )'} maxLength={200} aria-label="Search" />
-          {(search || applied) && <button type="button" aria-label="Clear search" onClick={() => { setSearch(''); setApplied(''); }}><Icon name="x" size={14} /></button>}
-          <button type="button" className={`lg-rx ${useRegex ? 'on' : ''}`} onClick={() => setUseRegex(!useRegex)} aria-pressed={useRegex} title="Treat the search as a regular expression">.*</button></label>
-        <label className="lg-field narrow"><span className="lg-minus">−</span><input value={exclude} onChange={e => setExclude(e.target.value)} placeholder="Exclude lines containing…" maxLength={100} aria-label="Exclude" />
-          {exclude && <button type="button" aria-label="Clear exclude" onClick={() => setExclude('')}><Icon name="x" size={14} /></button>}</label>
-        <button className="btn primary sm" disabled={busy || !canFetch}>Search</button>
+        <Popover className="lgx-range" title="Time range" label={<><Icon name="clock" size={14} /><span>{range.long}</span><span className="caret">▾</span></>} align="right">
+          {close => <div className="lgx-range-grid">{RANGES.map(r => <button key={r.id} type="button" role="menuitemradio" aria-checked={r.id === range.id} className={r.id === range.id ? 'on' : ''} onClick={() => { setPref('range', r.id); close(); }}>{r.long}</button>)}</div>}
+        </Popover>
+        <button className="lgx-run" disabled={busy || !canFetch} title="Run the search (Enter)">{busy ? <span className="spinner" /> : <Icon name="refresh" size={14} />}<span>{busy ? 'Loading' : 'Run'}</span></button>
       </form>
-      {badRegex && <div className="lg-rxerr">That is not a valid regular expression, so nothing is filtered yet.</div>}
+      {badRegex && <div className="lgx-warnline">That is not a valid regular expression, so nothing is filtered yet.</div>}
 
-      <div className="lg-levels2">
-        {LEVELS.map(l => <button key={l.id} type="button" className={`lg-lvl ${l.id} ${levels.has(l.id) ? 'on' : ''}`} aria-pressed={levels.has(l.id)} onClick={() => toggleLevel(l.id)}><i />{l.label}<b>{counts[l.id].toLocaleString()}</b></button>)}
-        <button type="button" className={`lg-lvl grp ${prefs.group ? 'on' : ''}`} aria-pressed={prefs.group} onClick={() => setPref('group', !prefs.group)} title="Fold runs of lines that say the same thing into one row"><Icon name="overview" size={13} />Group similar{prefs.group && saved > 0 && <b>{saved.toLocaleString()} folded</b>}</button>
+      <div className="lgx-strip">
+        <div className="lgx-levels" role="group" aria-label="Levels">
+          {LEVELS.map(l => <button key={l.id} type="button" className={`lgx-lvl ${l.id} ${levels.has(l.id) ? 'on' : ''} ${counts[l.id] ? '' : 'zero'}`} aria-pressed={levels.has(l.id)} onClick={() => toggleLevel(l.id)}><i />{l.label}<b>{counts[l.id].toLocaleString()}</b></button>)}
+        </div>
+        {filtersOn && <div className="lgx-chips">
+          {zoom && <button type="button" className="lgx-chip" onClick={() => setZoom(null)}><Icon name="clock" size={11} />{fmtT(zoom[0])}–{fmtT(zoom[1])}<Icon name="x" size={11} /></button>}
+          {[...tokens].map(t => <button key={t} type="button" className="lgx-chip" onClick={() => toggleToken(t)} title={t}>{t.length > 32 ? `${t.slice(0, 30)}…` : t}<Icon name="x" size={11} /></button>)}
+          {needle && <button type="button" className="lgx-chip not" onClick={() => setExclude('')}>NOT {exclude}<Icon name="x" size={11} /></button>}
+          <button type="button" className="lgx-clear" onClick={clearAll}>Clear</button>
+        </div>}
         <span className="grow" />
-        <label className="lg-opt"><input type="checkbox" checked={prefs.wrap} onChange={e => setPref('wrap', e.target.checked)} />Wrap</label>
-        <label className="lg-opt"><input type="checkbox" checked={prefs.dense} onChange={e => setPref('dense', e.target.checked)} />Compact</label>
-        <label className="lg-opt"><input type="checkbox" checked={prefs.newest} onChange={e => setPref('newest', e.target.checked)} />Newest first</label>
-        <select className="lg-mini" value={prefs.lines} onChange={e => setPref('lines', e.target.value)} aria-label="Lines to load">{['100', '200', '500', '1000', '2000'].map(n => <option key={n} value={n}>{n} lines</option>)}</select>
+        <button type="button" className={`lgx-live ${live ? 'on' : ''}`} onClick={() => setLive(!live)} aria-pressed={live} title="Keep fetching new lines"><i />{live ? `Live · ${liveMs / 1000}s` : 'Live tail'}</button>
+        <Popover title="View options" align="right" label={<><Icon name="settings" size={14} /><span>View</span>{viewCount > 0 && <em>{viewCount}</em>}</>}>
+          {() => <div className="lgx-opts">
+            <label><input type="checkbox" checked={prefs.group} onChange={e => setPref('group', e.target.checked)} /><span><b>Group similar lines</b><small>{prefs.group && saved > 0 ? `${saved.toLocaleString()} repeated lines folded` : 'Fold runs of lines that say the same thing'}</small></span></label>
+            <label><input type="checkbox" checked={prefs.wrap} onChange={e => setPref('wrap', e.target.checked)} /><span><b>Wrap long lines</b></span></label>
+            <label><input type="checkbox" checked={prefs.dense} onChange={e => setPref('dense', e.target.checked)} /><span><b>Compact rows</b></span></label>
+            <label><input type="checkbox" checked={prefs.newest} onChange={e => setPref('newest', e.target.checked)} /><span><b>Newest first</b></span></label>
+            <div className="lgx-opt-row"><span>Lines to load</span><select value={prefs.lines} onChange={e => setPref('lines', e.target.value)} aria-label="Lines to load">{['100', '200', '500', '1000', '2000'].map(n => <option key={n} value={n}>{n}</option>)}</select></div>
+            <div className="lgx-opt-row"><span>Live refresh</span><select value={liveMs} onChange={e => setLiveMs(Number(e.target.value))} aria-label="Refresh every"><option value={2000}>every 2 s</option><option value={3000}>every 3 s</option><option value={5000}>every 5 s</option><option value={10000}>every 10 s</option></select></div>
+          </div>}
+        </Popover>
       </div>
-
-      {filtersOn && (
-        <div className="lg-active">
-          <span className="muted sm">Filters:</span>
-          {zoom && <button type="button" className="lg-chip" onClick={() => setZoom(null)}>time {fmtT(zoom[0])}–{fmtT(zoom[1])}<Icon name="x" size={12} /></button>}
-          {[...tokens].map(t => <button key={t} type="button" className="lg-chip" onClick={() => toggleToken(t)} title={t}>{t.length > 40 ? `${t.slice(0, 38)}…` : t}<Icon name="x" size={12} /></button>)}
-          {needle && <button type="button" className="lg-chip" onClick={() => setExclude('')}>− {exclude}<Icon name="x" size={12} /></button>}
-          {[...levels].map(l => <button key={l} type="button" className="lg-chip" onClick={() => toggleLevel(l)}>{l}<Icon name="x" size={12} /></button>)}
-          <button type="button" className="lg-clear" onClick={clearAll}>Clear all</button>
-        </div>)}
 
       <Histogram rows={rows} zoom={zoom} onZoom={setZoom} />
-      {error && <div className="lg-error" role="alert"><Icon name="alert" size={15} /><span>{error}</span><button className="btn sm" onClick={() => void doFetch()}>Retry</button></div>}
+      {error && <div className="lgx-error" role="alert"><Icon name="alert" size={15} /><span>{error}</span><button className="btn sm" onClick={() => void doFetch()}>Retry</button></div>}
 
-      <div className={`lg-body ${prefs.dense ? 'dense' : ''} ${prefs.wrap ? 'wrap' : ''}`}>
+      <div className={`lgx-stream ${prefs.dense ? 'dense' : ''} ${prefs.wrap ? 'wrap' : ''}`}>
         {text === null ? (
-          <div className="lg-skel">{Array.from({ length: 12 }, (_, i) => <i key={i} style={{ width: `${30 + ((i * 53) % 62)}%` }} />)}</div>
+          <div className="lg-skel">{Array.from({ length: 14 }, (_, i) => <i key={i} style={{ width: `${30 + ((i * 53) % 62)}%` }} />)}</div>
         ) : entries.length === 0 ? (
           <div className="lg-empty"><Icon name="logs" size={28} /><h3>{rows.length ? 'No lines match your filters' : applied ? `Nothing contains “${applied}”` : `No log lines in the ${range.long.toLowerCase()}`}</h3>
             <p>{rows.length ? <>Clear the filters to see all {rows.length.toLocaleString()} lines. <button type="button" className="lg-link" onClick={() => { clearAll(); setSearch(''); setApplied(''); }}>Reset filters</button></> : applied ? 'Try a different search term or a wider time range.' : <>This log has been quiet. {range.id !== '1mo' && <button type="button" className="lg-link" onClick={() => setPref('range', nextRange.id)}>Look back further ({nextRange.long.toLowerCase()})</button>}</>}</p>
             {emptyHint}</div>
         ) : (
-          <div className="lg-scroll" ref={scroller} onScroll={onScroll}>
-            <div className="lg-head" aria-hidden="true"><span>#</span><span>Time</span><span>Level</span><span>Message</span></div>
+          <div className="lgx-scroll" ref={scroller} onScroll={onScroll}>
             {entries.map(en => {
-              const r = en.row, many = en.items.length > 1, open = many && !folded.has(en.key);   // groups start collapsed: `folded` holds the ones the user opened
+              const r = en.row, many = en.items.length > 1;
+              const expanded = many && folded.has(en.key);   // groups start collapsed: `folded` holds the ones the user opened
               const isNew = fresh.has(`${r.t ?? ''}|${r.raw}`);
               const last = en.items[en.items.length - 1];
               return (
                 <Fragment key={en.key}>
-                  <div className={`lg-item ${r.level} ${selected === r.n ? 'sel' : ''} ${isNew ? 'new' : ''}`}>
-                    <div className="lg-row" onClick={() => setSelected(r.n)} role="button" tabIndex={0} onKeyDown={e => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), setSelected(r.n))}>
-                      <span className="lg-n">{many ? `${r.n}–${last.n}` : r.n}</span>
-                      <span className="lg-t" title={r.tsTitle}>{r.ts}</span>
-                      <span className="lg-l">{r.level ? <em className={r.level}>{LEVEL_LABEL[r.level]}</em> : null}</span>
-                      <span className="lg-m">{many && <button type="button" className="lg-group" onClick={e => { e.stopPropagation(); toggleFold(en.key); }} aria-expanded={!open}>{open ? '▾' : '▸'} {en.items.length}× similar{r.t != null && last.t != null && last.t !== r.t ? <small>{fmtT(r.t)}–{fmtT(last.t)}</small> : null}</button>}{message(r)}</span>
-                    </div>
+                  <div className={`lgx-row ${r.level || 'none'} ${selected === r.n ? 'sel' : ''} ${isNew ? 'new' : ''}`} onClick={() => setSelected(r.n)} role="button" tabIndex={0} onKeyDown={e => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), setSelected(r.n))}>
+                    <span className="lgx-n">{r.n}</span>
+                    <span className="lgx-t" title={r.tsTitle}>{r.ts || '—'}</span>
+                    <span className="lgx-m">{r.level && <em className={`lgx-lv ${r.level}`}>{LEVEL_LABEL[r.level]}</em>}{many && <button type="button" className="lgx-group" onClick={e => { e.stopPropagation(); toggleFold(en.key); }} aria-expanded={expanded} title={expanded ? 'Fold these lines' : `Show all ${en.items.length} lines`}>{expanded ? '▾' : '▸'} ×{en.items.length}{r.t != null && last.t != null && last.t !== r.t ? <small>{fmtT(r.t)}–{fmtT(last.t)}</small> : null}</button>}{message(r)}</span>
                   </div>
-                  {open && en.items.map(sub => (
-                    <div key={sub.n} className={`lg-item sub ${sub.level} ${selected === sub.n ? 'sel' : ''}`}>
-                      <div className="lg-row" onClick={() => setSelected(sub.n)} role="button" tabIndex={0}>
-                        <span className="lg-n">↳ {sub.n}</span><span className="lg-t" title={sub.tsTitle}>{sub.ts}</span><span className="lg-l" /><span className="lg-m">{message(sub)}</span></div>
-                    </div>))}
+                  {expanded && en.items.map(sub => (
+                    <div key={sub.n} className={`lgx-row sub ${sub.level || 'none'} ${selected === sub.n ? 'sel' : ''}`} onClick={() => setSelected(sub.n)} role="button" tabIndex={0}>
+                      <span className="lgx-n">{sub.n}</span><span className="lgx-t" title={sub.tsTitle}>{sub.ts || '—'}</span><span className="lgx-m"><i className="lgx-tree">└</i>{message(sub)}</span></div>))}
                 </Fragment>);
             })}
           </div>)}
-        {!stuck && entries.length > 0 && <button className="lg-jump" onClick={() => { setStuck(true); const el = scroller.current; if (el) el.scrollTop = prefs.newest ? 0 : el.scrollHeight; }}>{prefs.newest ? '↑ Jump to newest' : '↓ Jump to newest'}{fresh.size ? ` · ${fresh.size} new` : ''}</button>}
+        {!stuck && entries.length > 0 && <button className="lgx-jump" onClick={() => { setStuck(true); const el = scroller.current; if (el) el.scrollTop = prefs.newest ? 0 : el.scrollHeight; }}>{prefs.newest ? '↑' : '↓'} Newest{fresh.size ? ` · ${fresh.size} new` : ''}</button>}
       </div>
 
-      <div className="lg-foot">
+      <div className="lgx-status">
+        <span className={`lgx-state ${error ? 'bad' : live ? 'live' : busy ? 'busy' : 'ok'}`}><i />{error ? 'Error' : busy ? 'Loading' : live ? 'Live' : 'Ready'}</span>
         <span><b>{filtered.length.toLocaleString()}</b>{filtered.length !== rows.length ? ` of ${rows.length.toLocaleString()}` : ''} lines</span>
-        {truncated && <span className="warn">showing the newest part only</span>}
-        {fetchedAt && <span className="muted">{live ? 'live · ' : ''}updated {fetchedAt.toLocaleTimeString([], { hour12: false })} · {took.toFixed(1)}s</span>}
+        {counts.error > 0 && <span className="e">{counts.error.toLocaleString()} errors</span>}
+        {truncated && <span className="w">newest part only</span>}
+        {fetchedAt && <span className="muted">updated {fetchedAt.toLocaleTimeString([], { hour12: false })} · {took.toFixed(1)}s</span>}
         <span className="grow" />
-        <button type="button" className="btn ghost sm" onClick={() => copy(filtered.map(r => r.raw).join('\n'))} disabled={!filtered.length}>Copy</button>
-        <button type="button" className="btn ghost sm" onClick={download} disabled={!filtered.length}>Download</button>
+        <button type="button" className="lgx-icon" onClick={() => copy(filtered.map(r => r.raw).join('\n'))} disabled={!filtered.length} title="Copy the lines shown"><Icon name="logs" size={14} /><span>Copy</span></button>
+        <button type="button" className="lgx-icon" onClick={download} disabled={!filtered.length} title="Download the lines shown"><Icon name="external" size={14} /><span>Download</span></button>
         <LogAiButton getText={() => filtered.map(r => r.raw).join('\n')} source={downloadName} />
       </div>
       {selRow && <LogInspector row={selRow} index={selIndex} total={flat.length} onClose={() => setSelected(null)} onNav={d => { const n = flat[selIndex + d]; if (n) setSelected(n.n); }} onToken={toggleToken} tokens={tokens} onZoom={setZoom} />}

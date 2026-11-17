@@ -3,7 +3,7 @@
 import { FormEvent, useEffect, useState } from 'react';
 import { api, put } from '../lib/api';
 import { useApp } from '../lib/app';
-import { Modal } from './ui';
+import { Icon, Modal } from './ui';
 
 type Policy = {
   ssh?: { enabled: boolean; history: boolean };
@@ -125,7 +125,7 @@ export function LogPolicyButton({ serverId, onSaved }: { serverId: number; onSav
   }
   return (
     <>
-      <button className="btn" onClick={() => void open()} disabled={busy} title="Choose which kinds of logs this server exposes">Choose logs…</button>
+      <button className="lgx-btn" onClick={() => void open()} disabled={busy} title="Admins: choose which kinds of logs this server exposes"><Icon name="shield" size={14} /><span>Access</span></button>
       {initial && <PolicyEditor serverId={serverId} initial={initial} onClose={() => setInitial(null)} onSaved={() => { setInitial(null); toast('Saved. The agent applies it at its next report (within a minute).'); onSaved(); }} />}
     </>
   );
