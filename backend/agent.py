@@ -1551,6 +1551,31 @@ def check_updates() -> dict:
     return result
 
 
+_rescan_seen: dict = {"token": None}
+
+
+def adopt_security_config(cfg: dict) -> None:
+    """The dashboard's schedule for the threat scan and the update check (a value set in this server's own environment wins),
+    and "scan now": a new token makes both run at once, in the background."""
+    global AGENT_THREAT_MINUTES, AGENT_UPDATES_HOURS
+    try:
+        if not os.getenv("AGENT_THREAT_MINUTES") and cfg.get("threat_minutes"):
+            AGENT_THREAT_MINUTES = max(2.0, min(1440.0, float(cfg["threat_minutes"])))
+        if not os.getenv("AGENT_UPDATES_HOURS") and cfg.get("updates_hours"):
+            AGENT_UPDATES_HOURS = max(1.0, min(168.0, float(cfg["updates_hours"])))
+    except (TypeError, ValueError):
+        pass
+    token = cfg.get("rescan")
+    if token and token != _rescan_seen["token"]:
+        first = _rescan_seen["token"] is None and _threats["at"] == 0.0
+        _rescan_seen["token"] = token
+        if not first:                                     # a request made before this agent started is already covered by its first scan
+            _threats["at"] = _threats["pkg_at"] = 0.0
+            _updates["at"] = 0.0
+            log.info("scan requested from the dashboard: running the threat scan and update check now")
+            security_report(); updates_report()
+
+
 def tempfile_dir() -> str:
     import tempfile
     return tempfile.gettempdir()
@@ -2269,6 +2294,8 @@ def push_once() -> int:
         apply_policy(reply["log_policy"])
     if reply.get("traffic_buckets_ms"):
         adopt_traffic_bounds(reply["traffic_buckets_ms"])
+    if isinstance(reply.get("security"), dict):
+        adopt_security_config(reply["security"])
     return max(5, int(reply.get("interval_seconds", AGENT_PUSH_INTERVAL)))
 
 

@@ -1,7 +1,7 @@
 'use client';
 
-import { Fragment, useEffect, useMemo, useState } from 'react';
-import { Empty, Icon, StatusPill } from '../components/ui';
+import { FormEvent, Fragment, useEffect, useMemo, useRef, useState } from 'react';
+import { Empty, Field, Icon, Modal, StatusPill } from '../components/ui';
 import { ProcessDrawer } from '../components/process';
 import { api, post, put } from '../lib/api';
 import { useApp, usePoll } from '../lib/app';
@@ -50,6 +50,10 @@ const q = (server: string) => (server ? `server=${encodeURIComponent(server)}` :
 const withQ = (path: string, server: string) => `${path}${path.includes('?') ? '&' : '?'}${q(server)}`;
 const addr = (w: Partial<Who> | null | undefined) => [w?.hostname && w.hostname !== w?.name ? w.hostname : null, w?.public_ip ?? w?.private_ips?.[0] ?? w?.host].filter(Boolean).join(' · ');
 const FILTER_KEY = 'smw.security.server';
+const atLeast = (v: string | null | undefined, major: number, minor: number) => { const [a, b] = String(v ?? '0').split('.').map(Number); return a > major || (a === major && (b || 0) >= minor); };
+/** Why a server has no data for an agent feature: an old agent, no agent, or an OS the check does not run on (Linux only). */
+const missing = (s: { push: boolean; agent_version: string | null; os?: string | null }, major: number, minor: number) =>
+  !s.push ? 'no agent' : !atLeast(s.agent_version, major, minor) ? `agent ${major}.${minor}+ needed` : /mac|darwin|windows/i.test(s.os ?? '') ? 'Linux only' : 'waiting for the first check';
 
 /** Which server something belongs to: always the name, plus host name and address. */
 function ServerTag({ who, onPick }: { who: Partial<Who> | null | undefined; onPick?: (id: number) => void }) {
@@ -75,7 +79,8 @@ export function Security() {
   const pick = (id: number) => setServer(String(id));
   return (
     <>
-      <div className="topbar"><div><h1>Security</h1><p className="muted sm">Attacks and break-ins, signs of malware, missing patches, weak settings, what is exposed to the internet, and how people sign in.</p></div></div>
+      <div className="topbar"><div><h1>Security</h1><p className="muted sm">Attacks and break-ins, signs of malware, missing patches, weak settings, what is exposed to the internet, and how people sign in.</p></div>
+        <span className="grow" /><ScanControls server={server} onDone={data.reload} /></div>
       <ServerFilter servers={servers} value={server} onChange={setServer} />
       <div className="ktabs" role="tablist">{tabs.map(([id, label, icon]) => <button key={id} role="tab" aria-selected={tab === id} className={tab === id ? 'on' : ''} onClick={() => setTab(id)}><Icon name={icon} size={15} />{label}</button>)}</div>
       {data.error && <div className="err">{data.error}</div>}
@@ -91,6 +96,70 @@ export function Security() {
         {tab === 'signin' && !o.two_factor && <div className="card"><p className="muted">Sign-in settings apply to everyone. <button className="lg-link" onClick={() => setServer('')}>Clear the server filter</button> to see them.</p></div>}
       </>}
     </>
+  );
+}
+
+type Schedule = { scan_hours: number; threat_minutes: number; updates_hours: number; updated_by?: string | null; updated_at?: string | null; last_scan_at: string | null;
+  job: { running: boolean; total: number; done: number; failed: number; started_at: string | null; finished_at: string | null; started_by: string | null; current: string | null } };
+const every = (n: number, unit: 'min' | 'h') => (unit === 'h' ? (n === 0 ? 'only on demand' : n % 24 === 0 ? `every ${n / 24 === 1 ? 'day' : `${n / 24} days`}` : `every ${n} h`) : n % 60 === 0 ? `every ${n / 60 === 1 ? 'hour' : `${n / 60} h`}` : `every ${n} min`);
+
+/** "Scan all now" (exposure + TLS from SM-Watch, and every agent's threat scan and update check) and the schedule of each check. */
+function ScanControls({ server, onDone }: { server: string; onDone: () => Promise<void> }) {
+  const { canOperate, isAdmin, toast } = useApp();
+  const [poll, setPoll] = useState(60000);
+  const sch = usePoll(() => api<Schedule>('/security/schedule'), [poll], poll, true);   // [poll]: restart the timer when a scan starts or ends
+  const [editing, setEditing] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const job = sch.value?.job;
+  const wasRunning = useRef(false);
+  useEffect(() => {
+    setPoll(job?.running ? 2000 : 60000);
+    if (wasRunning.current && job && !job.running) { toast(`Scan finished: ${job.done - job.failed} of ${job.total} targets checked${job.failed ? `, ${job.failed} could not be reached` : ''}`); void onDone(); }
+    wasRunning.current = !!job?.running;
+  }, [job?.running]);   // eslint-disable-line react-hooks/exhaustive-deps
+  async function runAll() {
+    setBusy(true);
+    try { const r = await post<{ scans: number; agents: number }>('/security/scan-all', { server: server || null }); toast(`Scanning ${r.scans} target${r.scans === 1 ? '' : 's'}; ${r.agents} agent${r.agents === 1 ? '' : 's'} will re-check within a minute`); await sch.reload(); }
+    catch (e) { toast((e as Error).message, true); } finally { setBusy(false); }
+  }
+  const s = sch.value;
+  return (
+    <div className="sec-scan">
+      {s && <div className="sec-scan-info">{job?.running ? <><b>Scanning… {job.done}/{job.total}</b><div className="sec-scan-bar"><i style={{ width: `${(job.done / Math.max(1, job.total)) * 100}%` }} /></div><span className="muted sm trunc">{job.current ?? ''}</span></>
+        : <><span className="sm">Last scan <b>{s.last_scan_at ? timeAgo(s.last_scan_at) : 'never'}</b></span><span className="muted sm">ports & TLS {every(s.scan_hours, 'h')} · agents {every(s.threat_minutes, 'min')}</span></>}</div>}
+      <button className="btn sm" onClick={() => setEditing(true)} title="How often each check runs"><Icon name="clock" size={14} />Schedule</button>
+      {canOperate && <button className="btn sm primary" onClick={() => void runAll()} disabled={busy || !!job?.running} title={server ? 'Scan the servers matching the filter now' : 'Scan every server and https service now'}><Icon name="refresh" size={14} />{job?.running ? 'Scanning…' : server ? 'Scan these now' : 'Scan all now'}</button>}
+      {editing && s && <ScheduleForm s={s} canEdit={isAdmin} onClose={() => setEditing(false)} onSaved={async () => { setEditing(false); await sch.reload(); }} />}
+    </div>
+  );
+}
+
+function ScheduleForm({ s, canEdit, onClose, onSaved }: { s: Schedule; canEdit: boolean; onClose: () => void; onSaved: () => Promise<void> }) {
+  const { toast } = useApp();
+  const [f, setF] = useState({ scan_hours: s.scan_hours, threat_minutes: s.threat_minutes, updates_hours: s.updates_hours });
+  const [busy, setBusy] = useState(false);
+  async function save(e: FormEvent) {
+    e.preventDefault(); setBusy(true);
+    try { await put('/security/schedule', f); toast('Scan schedule saved; agents pick it up with their next report'); await onSaved(); } catch (err) { toast((err as Error).message, true); } finally { setBusy(false); }
+  }
+  const row = (key: keyof typeof f, title: string, hint: string, options: [number, string][]) => (
+    <Field label={title} hint={hint}><select value={f[key]} disabled={!canEdit} onChange={e => setF({ ...f, [key]: Number(e.target.value) })}>
+      {[...options, ...(options.some(([v]) => v === f[key]) ? [] : [[f[key], `${f[key]} (custom)`] as [number, string]])].map(([v, l]) => <option key={v} value={v}>{l}</option>)}</select></Field>);
+  return (
+    <Modal title="Scan schedule" onClose={onClose}>
+      <form className="form" onSubmit={save} style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+        {row('scan_hours', 'Open ports & TLS audit (from SM-Watch)', 'Connects to each server’s public address and each https service. Scans one target per minute to spread the load.',
+          [[0, 'Only when someone presses Scan now'], [1, 'Every hour'], [3, 'Every 3 hours'], [6, 'Every 6 hours'], [12, 'Every 12 hours'], [24, 'Every day'], [72, 'Every 3 days'], [168, 'Every week']])}
+        {row('threat_minutes', 'Threat scan (on each server, agent 2.15+)', 'Running malware, back doors, new SSH keys, hardening. Light: a few seconds of CPU each time.',
+          [[5, 'Every 5 minutes'], [10, 'Every 10 minutes'], [15, 'Every 15 minutes'], [30, 'Every 30 minutes'], [60, 'Every hour'], [360, 'Every 6 hours'], [1440, 'Every day']])}
+        {row('updates_hours', 'Pending updates and unknown packages (on each server)', 'A package-manager dry run: nothing is installed. Also re-checks packages from outside your repositories.',
+          [[1, 'Every hour'], [3, 'Every 3 hours'], [6, 'Every 6 hours'], [12, 'Every 12 hours'], [24, 'Every day']])}
+        <p className="muted sm">SSH logins and failed attempts are reported continuously with every agent report. A server whose agent sets <code>AGENT_THREAT_MINUTES</code> or <code>AGENT_UPDATES_HOURS</code> itself keeps its own value.
+          {s.updated_by ? ` Last changed by ${s.updated_by}${s.updated_at ? ` ${timeAgo(s.updated_at)}` : ''}.` : ' Defaults come from .env.'}</p>
+        {!canEdit && <p className="sm warn">Only admins can change the schedule.</p>}
+        <div style={{ display: 'flex', gap: 8 }}>{canEdit && <button className="btn primary" disabled={busy}>{busy ? 'Saving…' : 'Save'}</button>}<button type="button" className="btn ghost" onClick={onClose}>Close</button></div>
+      </form>
+    </Modal>
   );
 }
 
@@ -129,7 +198,7 @@ function SecurityOverview({ o, go, pick }: { o: Overview; go: (t: Tab) => void; 
   const weak = o.servers.reduce((a, s) => a + s.hardening.failed, 0);
   const tf = o.two_factor;
   const cards: { label: string; value: string; sub: string; tone: string; tab: Tab }[] = [
-    { label: 'Threats needing attention', value: String(crit + high), sub: crit ? `${crit} critical` : high ? `${high} high` : o.servers.some(s => s.threat_scan) ? 'no signs of compromise' : 'agent 2.15+ needed', tone: crit ? 'bad' : high ? 'warn' : 'good', tab: 'threats' },
+    { label: 'Threats needing attention', value: String(crit + high), sub: crit ? `${crit} critical` : high ? `${high} high` : o.servers.some(s => s.threat_scan) ? 'no signs of compromise' : o.servers.length ? missing(o.servers[0], 2, 15) : 'no servers', tone: crit ? 'bad' : high ? 'warn' : 'good', tab: 'threats' },
     { label: 'Failed SSH logins (24 h)', value: o.ssh.total.toLocaleString(), sub: o.ssh.top_ips.length ? `${o.ssh.top_ips.length} attacking addresses` : 'no attempts seen', tone: o.ssh.total > 500 ? 'bad' : o.ssh.total > 0 ? 'warn' : 'good', tab: 'ssh' },
     { label: 'Security updates pending', value: String(secUpdates), sub: needReboot ? `${needReboot} server${needReboot > 1 ? 's need' : ' needs'} a reboot` : 'no reboot needed', tone: secUpdates ? 'warn' : 'good', tab: 'updates' },
     { label: 'Hardening checks failed', value: String(weak), sub: `${o.servers.filter(s => s.hardening.total).length} servers checked`, tone: weak ? 'warn' : 'good', tab: 'hardening' },
@@ -143,10 +212,10 @@ function SecurityOverview({ o, go, pick }: { o: Overview; go: (t: Tab) => void; 
       <section className="card"><div className="card-head"><h2>Servers</h2></div>
         <div className="tbl-wrap"><table className="tbl"><thead><tr><th>Server</th><th>Threats</th><th className="num">SSH failures 24 h</th><th>Updates</th><th>Hardening</th><th>Exposure</th></tr></thead><tbody>
           {o.servers.map(s => <tr key={s.id}><td><div className="name"><button className="lg-link" onClick={() => pick(s.id)} title="Show only this server">{s.name}</button><small className="mono">{addr(s) || `#${s.id}`}</small><small>{s.agent_version ? `agent ${s.agent_version}` : s.push ? 'agent' : 'no agent'}</small></div></td>
-            <td className="sm">{!s.threat_scan ? <span className="muted">{s.push ? 'agent 2.15+ needed' : 'no agent'}</span> : s.threats.critical + s.threats.high + s.threats.medium === 0 ? <span className="good">none found</span>
+            <td className="sm">{!s.threat_scan ? <span className="muted">{missing(s, 2, 15)}</span> : s.threats.critical + s.threats.high + s.threats.medium === 0 ? <span className="good">none found</span>
               : <>{s.threats.critical > 0 && <span className="sev critical">{s.threats.critical} critical</span>}{s.threats.high > 0 && <span className="sev high">{s.threats.high} high</span>}{s.threats.medium > 0 && <span className="sev medium">{s.threats.medium} medium</span>}</>}</td>
             <td className="num">{s.ssh_24h.total ? <b className={s.ssh_24h.total > 100 ? 'bad' : 'warn'}>{s.ssh_24h.total.toLocaleString()}</b> : <span className="muted">0</span>}</td>
-            <td className="sm">{!s.updates ? <span className="muted">{s.push ? 'agent 2.14+ needed' : 'no agent'}</span> : s.updates.error && !s.updates.total ? <span className="muted">{s.updates.error}</span> : <>{s.updates.security ? <b className="warn">{s.updates.security} security</b> : <span className="good">up to date</span>}{s.updates.total > s.updates.security ? <span className="muted"> · {s.updates.total - s.updates.security} other</span> : null}{s.updates.reboot_required && <span className="tag warn" style={{ marginLeft: 6 }}>reboot</span>}</>}</td>
+            <td className="sm">{!s.updates ? <span className="muted">{missing(s, 2, 14)}</span> : s.updates.error && !s.updates.total ? <span className="muted">{s.updates.error}</span> : <>{s.updates.security ? <b className="warn">{s.updates.security} security</b> : <span className="good">up to date</span>}{s.updates.total > s.updates.security ? <span className="muted"> · {s.updates.total - s.updates.security} other</span> : null}{s.updates.reboot_required && <span className="tag warn" style={{ marginLeft: 6 }}>reboot</span>}</>}</td>
             <td className="sm">{s.hardening.total ? <span className={s.hardening.failed ? 'warn' : 'good'}>{s.hardening.passed}/{s.hardening.total} passed</span> : <span className="muted">–</span>}</td>
             <td className="sm">{s.scan ? <><span className={`grade ${GRADE_TONE(s.scan.grade)}`}>{s.scan.grade ?? '–'}</span> {(s.scan.results.open ?? []).filter(p => p.risk !== 'info').map(p => p.service).join(', ') || <span className="muted">only expected ports</span>}</> : <span className="muted">{s.scan_unavailable ?? 'not scanned yet'}</span>}</td></tr>)}
         </tbody></table></div>

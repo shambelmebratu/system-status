@@ -14,7 +14,7 @@ from . import secscan
 from .audit import audit
 from .database import SessionLocal, get_db
 from .models import SecurityFinding, SecurityScan, Server, Service, SshLoginEvent, User
-from .security import can_see, ensure_access, require_operator
+from .security import can_see, ensure_access, require_admin, require_operator
 from .stats import aware
 from .threats import SEVERITY_ORDER, finding_view
 
@@ -239,6 +239,65 @@ def report(request: Request, server: str | None = Query(None, max_length=200), d
     audit(db, request, "security.report", user=user, detail=f"{days} days; servers: {', '.join(i['name'] for i in infos.values())[:600] or 'none'}", commit=True)
     return {"generated_at": datetime.now(timezone.utc).isoformat(), "days": days, "since": since.isoformat(), "filter": server or None, "servers": rows,
             "ssh": {"total": ssh_data["total"], "top_ips": ssh_data["top_ips"][:15], "top_users": ssh_data["top_users"][:10]}}
+
+
+class ScheduleIn(BaseModel):
+    scan_hours: int = Field(ge=0, le=720)          # 0 = only when someone presses Scan now
+    threat_minutes: int = Field(ge=2, le=1440)
+    updates_hours: int = Field(ge=1, le=168)
+
+
+def schedule_view(db: Session) -> dict:
+    cfg = secscan.schedule(db)
+    last = db.scalar(select(func.max(SecurityScan.started_at)))
+    return {k: cfg.get(k) for k in ("scan_hours", "threat_minutes", "updates_hours", "updated_by", "updated_at")} | {"last_scan_at": aware(last).isoformat() if last else None, "job": dict(secscan.JOB)}
+
+
+@router.get("/schedule")
+def get_schedule(_: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+    return schedule_view(db)
+
+
+@router.put("/schedule")
+def put_schedule(payload: ScheduleIn, request: Request, user: dict = Depends(require_admin), db: Session = Depends(get_db)) -> dict:
+    cfg = secscan.schedule(db)
+    changes = [f"{k} {cfg.get(k)} -> {getattr(payload, k)}" for k in ("scan_hours", "threat_minutes", "updates_hours") if cfg.get(k) != getattr(payload, k)]
+    cfg.update(payload.model_dump(), updated_by=user["email"], updated_at=datetime.now(timezone.utc).isoformat())
+    secscan.save_schedule(db, cfg)
+    audit(db, request, "security.schedule", user=user, detail="; ".join(changes) or "no changes")
+    db.commit()
+    return schedule_view(db)
+
+
+class ScanAllIn(BaseModel):
+    server: str | None = Field(default=None, max_length=200)    # the page's server filter, if any
+
+
+@router.post("/scan-all")
+def scan_all(payload: ScanAllIn, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+    """Scan now: exposure scans + TLS audits from SM-Watch (in the background), and asks every agent to run its threat scan and
+    update check at its next report. Covers the servers this person can see (narrowed by the page's server filter)."""
+    import threading
+    import time
+    if secscan.JOB["running"]:
+        raise HTTPException(409, "A scan of everything is already running")
+    finished = secscan.JOB.get("finished_at")
+    if finished and time.time() - datetime.fromisoformat(finished).timestamp() < 120:
+        raise HTTPException(429, "Everything was scanned less than 2 minutes ago")
+    servers = visible_servers(db, user, payload.server)
+    ids = [s.id for s in servers]
+    services = [s for s in db.scalars(select(Service).where(Service.enabled.is_(True))).all() if can_see(user, "service", s.id) and s.url.lower().startswith("https://")]
+    if payload.server:
+        hosts = {h for s in servers for h in (server_info(s).get("hostname"), server_info(s).get("public_ip"), s.host) if h}
+        services = [s for s in services if s.server_id in ids or any(h in s.url for h in hosts)]
+    targets = [("server", s.id) for s in servers if s.enabled and secscan.server_address(s)[0]] + [("service", s.id) for s in services]
+    agents = [s.id for s in servers if s.monitor_mode == "push"]
+    secscan.request_agent_rescan(db, agents, user["email"])
+    audit(db, request, "security.scan_all", user=user, detail=f"{len(targets)} exposure/TLS scans; {len(agents)} agents asked to re-check" + (f"; filter {payload.server}" if payload.server else ""))
+    db.commit()
+    secscan.JOB.update(running=True, total=len(targets), done=0, failed=0)       # visible at once, before the thread starts
+    threading.Thread(target=secscan.scan_all, args=(targets, user["email"]), daemon=True, name="security-scan-all").start()
+    return {"scans": len(targets), "agents": len(agents), "job": dict(secscan.JOB)}
 
 
 @router.post("/scan/{target_type}/{target_id}")

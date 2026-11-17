@@ -304,10 +304,92 @@ def store(db: Session, kind: str, target, target_type: str, result: dict, starte
         queue_event(db, target_type, target, "warning", format_alert("Security", "security_finding", target.name, lines, where=where), deliver=False, state="security_finding")
 
 
+# ------------------------------------------------------------------------------------------------ schedule (admin-configurable)
+SCHEDULE_KEY = "security_scans"
+LIMITS = {"scan_hours": (0, 720), "threat_minutes": (2, 1440), "updates_hours": (1, 168)}
+
+
+def schedule(db: Session) -> dict:
+    """How often each check runs: what an admin saved in the dashboard, else the .env defaults."""
+    from .models import AppSetting
+    s = get_settings()
+    out = {"scan_hours": s.security_scan_hours, "threat_minutes": s.agent_threat_minutes, "updates_hours": s.agent_updates_hours, "rescan": {}}
+    row = db.get(AppSetting, SCHEDULE_KEY)
+    if row:
+        try:
+            saved = json.loads(row.value)
+            out.update({k: saved[k] for k in ("scan_hours", "threat_minutes", "updates_hours", "rescan", "updated_by", "updated_at") if k in saved})
+        except ValueError:
+            pass
+    return out
+
+
+def save_schedule(db: Session, data: dict) -> None:
+    from .models import AppSetting
+    row = db.get(AppSetting, SCHEDULE_KEY) or AppSetting(key=SCHEDULE_KEY)
+    row.value = json.dumps(data)
+    db.add(row)
+
+
+def request_agent_rescan(db: Session, server_ids: list[int], user: str) -> None:
+    """Asks these servers' agents to run their threat scan and update check at their next report (token per server)."""
+    cfg = schedule(db)
+    token = datetime.now(timezone.utc).isoformat()
+    cfg["rescan"] = {**{str(k): v for k, v in (cfg.get("rescan") or {}).items()}, **{str(i): token for i in server_ids}}
+    cfg["updated_by"] = cfg.get("updated_by") or user
+    save_schedule(db, cfg)
+
+
+def agent_config(db: Session, server_id: int) -> dict:
+    """Sent to an agent with every report reply: its check intervals, and a token that changes when someone asks for a scan now."""
+    cfg = schedule(db)
+    return {"threat_minutes": cfg["threat_minutes"], "updates_hours": cfg["updates_hours"], "rescan": (cfg.get("rescan") or {}).get(str(server_id))}
+
+
+# ------------------------------------------------------------------------------------------------ scan everything now
+JOB: dict = {"running": False, "total": 0, "done": 0, "failed": 0, "started_at": None, "finished_at": None, "started_by": None, "current": None}
+
+
+def scan_all(targets: list[tuple[str, int]], user: str) -> None:
+    """Runs exposure scans (servers) and TLS audits (https services) for the given targets, 4 at a time. Run in a thread."""
+    from .database import SessionLocal
+    from .models import Server, Service
+
+    def one(target: tuple[str, int]) -> None:
+        kind, tid = target
+        with SessionLocal() as db:
+            obj = db.get(Server if kind == "server" else Service, tid)
+            if obj is None:
+                return
+            JOB["current"] = obj.name
+            started = datetime.now(timezone.utc)
+            try:
+                result = run_server_scan(obj) if kind == "server" else run_service_scan(obj)
+            except Exception as error:   # noqa: BLE001  (one bad target must not stop the others)
+                result = {"error": str(error)[:200]}
+            if kind == "server" and result.get("error") and not server_address(obj)[0]:
+                JOB["failed"] += 1                               # no address known: nothing to store
+            else:
+                store(db, "ports" if kind == "server" else "tls", obj, kind, result, started)
+                db.commit()
+                if result.get("error"):
+                    JOB["failed"] += 1
+        JOB["done"] += 1
+
+    JOB.update(running=True, total=len(targets), done=0, failed=0, started_at=datetime.now(timezone.utc).isoformat(), finished_at=None, started_by=user, current=None)
+    try:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(one, targets))
+    finally:
+        JOB.update(running=False, finished_at=datetime.now(timezone.utc).isoformat(), current=None)
+
+
 def scans_due(db: Session) -> None:
-    """Worker hook: re-scan every server and https service every SECURITY_SCAN_HOURS (one target per tick, to spread the load)."""
+    """Worker hook: re-scan every server and https service every `scan_hours` (one target per tick, to spread the load)."""
     from .models import SecurityScan, Server, Service
-    hours = get_settings().security_scan_hours
+    if JOB["running"]:
+        return
+    hours = schedule(db)["scan_hours"]
     if hours <= 0:
         return
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)

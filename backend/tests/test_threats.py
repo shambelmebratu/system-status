@@ -199,3 +199,52 @@ def test_process_inspection_round_trip(client):
     old, old_auth = _enroll(client, anon, "old-agent")
     _report(anon, old_auth, hostname="old-agent", capabilities=["logs"], agent_version="2.14.0")
     assert "older than 2.15" in client.post(f"/api/servers/{old}/processes/1", headers=CSRF).json()["detail"]
+
+
+def test_scan_schedule_and_scan_all(client, monkeypatch):
+    sign_in(client)
+    anon = TestClient(main.app)
+    sid, auth = _enroll(client, anon, "sched-1")
+    first = anon.post("/api/agent/report", headers=auth, json={**BASE, "hostname": "sched-1", "ips": [{"iface": "eth0", "ip": "198.51.100.44"}]}).json()
+    assert first["security"] == {"threat_minutes": 10, "updates_hours": 6, "rescan": None}          # .env defaults
+    s = client.get("/api/security/schedule").json()
+    assert (s["scan_hours"], s["threat_minutes"], s["updates_hours"]) == (24, 10, 6) and s["job"]["running"] is False
+    make_user(client, "sched-op@example.com", "operator")
+    op = session_for("sched-op@example.com", new_password="sched-operator-1")
+    assert op.put("/api/security/schedule", headers=CSRF, json={"scan_hours": 1, "threat_minutes": 5, "updates_hours": 3}).status_code == 403
+    assert client.put("/api/security/schedule", headers=CSRF, json={"scan_hours": 6, "threat_minutes": 1, "updates_hours": 3}).status_code == 422   # below the minimum
+    r = client.put("/api/security/schedule", headers=CSRF, json={"scan_hours": 6, "threat_minutes": 30, "updates_hours": 12}).json()
+    assert (r["scan_hours"], r["threat_minutes"], r["updates_hours"]) == (6, 30, 12) and r["updated_by"]
+    # scan all now: background scans of every target with an address, and a rescan token for the agents
+    scanned = []
+    monkeypatch.setattr(secscan, "run_server_scan", lambda srv: scanned.append(srv.name) or {"address": "198.51.100.44", "open": [], "grade": "A", "findings": 0, "duration_ms": 5})
+    monkeypatch.setattr(secscan, "validate_host", lambda h: h)
+    out = client.post("/api/security/scan-all", headers=CSRF, json={"server": "sched-1"}).json()
+    assert out["scans"] == 1 and out["agents"] == 1
+    for _ in range(50):
+        if not client.get("/api/security/schedule").json()["job"]["running"]:
+            break
+        time.sleep(0.1)
+    job = client.get("/api/security/schedule").json()["job"]
+    assert scanned == ["sched-1"] and job["done"] == 1 and job["failed"] == 0
+    assert client.post("/api/security/scan-all", headers=CSRF, json={}).status_code == 429            # not again within 2 minutes
+    time.sleep(2.05)
+    reply = anon.post("/api/agent/report", headers=auth, json={**BASE, "hostname": "sched-1"}).json()
+    assert reply["security"]["threat_minutes"] == 30 and reply["security"]["rescan"]
+    assert {"security.schedule", "security.scan_all"} <= {e["action"] for e in client.get("/api/audit?category=security").json()}
+    secscan.JOB["finished_at"] = None
+
+
+def test_agent_adopts_schedule_and_rescans(agent, monkeypatch):
+    calls = []
+    monkeypatch.setattr(agent, "security_report", lambda: calls.append("threats"))
+    monkeypatch.setattr(agent, "updates_report", lambda: calls.append("updates"))
+    monkeypatch.delenv("AGENT_THREAT_MINUTES", raising=False); monkeypatch.delenv("AGENT_UPDATES_HOURS", raising=False)
+    agent._threats["at"] = 123.0                                   # it has scanned before
+    agent.adopt_security_config({"threat_minutes": 30, "updates_hours": 12, "rescan": "t1"})
+    assert agent.AGENT_THREAT_MINUTES == 30 and agent.AGENT_UPDATES_HOURS == 12 and calls == ["threats", "updates"]
+    agent.adopt_security_config({"threat_minutes": 30, "updates_hours": 12, "rescan": "t1"})
+    assert calls == ["threats", "updates"]                          # the same request is not run twice
+    monkeypatch.setenv("AGENT_THREAT_MINUTES", "15")
+    agent.adopt_security_config({"threat_minutes": 60, "updates_hours": 12, "rescan": "t1"})
+    assert agent.AGENT_THREAT_MINUTES == 30                         # this server's own setting wins

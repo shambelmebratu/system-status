@@ -89,7 +89,9 @@ class Settings(BaseSettings):
     ssh_success_after_failures: int = 5        # a successful SSH login from an address with at least this many failures (24 h) is a likely break-in
     ssh_new_source_alerts: bool = True         # alert on an SSH login from an address never seen on that server before
     threat_alert_severity: str = "high"        # agent threat findings at or above this severity send an alert: critical | high | medium | off
-    security_scan_hours: int = 24              # how often servers' open ports and services' TLS are re-checked (0 = only on demand)
+    security_scan_hours: int = 24              # how often servers' open ports and services' TLS are re-checked (0 = only on demand); admins can change it in Security → Scans
+    agent_threat_minutes: int = 10             # default for how often agents run their threat scan (admins can change it in Security → Scans)
+    agent_updates_hours: int = 6               # default for how often agents look for pending updates
     perf_default_window_minutes: int = 10      # response-time targets look at this many recent minutes unless set per monitor
     perf_min_check_samples: int = 5            # a target is not judged on fewer probes than this ...
     perf_min_requests: int = 50                # ... or fewer real requests than this (percentiles of a handful of requests mean nothing)

@@ -93,7 +93,9 @@ def report(payload: AgentReport, request: Request, authorization: str | None = H
     # deliver=False: alerts are queued and sent by the worker so ingest stays fast.
     apply_server_result(db, server, status, failures, metrics, deliver=False)
     db.commit()
-    reply["traffic_buckets_ms"] = traffic_bounds()   # the agent uses these histogram boundaries from its next report on
+    reply["traffic_buckets_ms"] = traffic_bounds()
+    from .secscan import agent_config
+    reply["security"] = agent_config(db, server.id)   # how often to run the threat scan / update check, and "scan now" requests   # the agent uses these histogram boundaries from its next report on
     reply["log_policy"] = policy_lib.compile_for_agent(policy_lib.parse(server.log_policy))   # the agent enforces this too
     return {**reply, "status": status, "interval_seconds": server.check_interval_seconds}
 
