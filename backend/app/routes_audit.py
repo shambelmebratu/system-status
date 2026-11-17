@@ -13,7 +13,7 @@ router = APIRouter(prefix="/api/audit", tags=["audit"])
 
 @router.get("")
 def list_events(
-    limit: int = Query(200, ge=1, le=1000), category: str = Query("", pattern="^(|auth|user|server|service|schedule|agent|enroll|logs|channel|k8s|purge|db|qa|devops|security|ai)$"),
+    limit: int = Query(200, ge=1, le=1000), category: str = Query("", pattern="^(|auth|user|server|service|schedule|agent|enroll|logs|channel|k8s|purge|db|qa|devops|security|ai|process)$"),
     failures: bool = False, q: str = Query("", max_length=100), _: dict = Depends(require_admin), db: Session = Depends(get_db),
 ) -> list[dict]:
     query = select(AuditEvent).order_by(desc(AuditEvent.id)).limit(limit)

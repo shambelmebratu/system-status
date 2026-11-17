@@ -94,7 +94,8 @@ def record_ssh_failures(db: Session, server, data: dict, now: datetime) -> None:
     lines = [f"{total:,} failed SSH logins in 10 minutes from {len(ips)} address{'es' if len(ips) != 1 else ''}",
              "Top sources: " + ", ".join(f"{ip} ({n})" for ip, n in top),
              "Make sure password logins are off (keys only) and consider fail2ban or limiting SSH to your VPN."]
-    queue_event(db, "server", server, "warning", format_alert("Security", "ssh_attack", server.name, lines, at=now), deliver=False, state="ssh_attack")
+    from .monitoring import server_where
+    queue_event(db, "server", server, "warning", format_alert("Security", "ssh_attack", server.name, lines, at=now, where=server_where(server)), deliver=False, state="ssh_attack")
 
 
 def ssh_summary(db: Session, hours: int = 24, server_ids: list[int] | None = None) -> dict:
@@ -130,18 +131,25 @@ def ssh_summary(db: Session, hours: int = 24, server_ids: list[int] | None = Non
 
 # ------------------------------------------------------------------------------------------------ open ports
 def server_address(server) -> tuple[str | None, str]:
-    """The address to scan: what the agent reported as public, else the configured host. ("" reason when there is none.)"""
-    metrics = json.loads(server.last_metrics or "{}") if server.last_metrics else {}
-    candidates = [metrics.get("public_ip"), server.host]
-    for candidate in candidates:
-        if not candidate:
-            continue
+    """The address to scan: the server's public address as the dashboard shows it (reported by the agent, found on its network
+    interfaces, the address its agent connects from, or this machine's own for the bundled agent), else the configured host,
+    else a private address when private targets are allowed. ("" reason when there is none.)"""
+    from .monitoring import server_addresses
+    found = server_addresses(server)
+    candidates = [found.get("public_ip"), (server.host or "").strip(), *(found.get("private_ips") or [])]
+    reason = ""
+    for candidate in dict.fromkeys(c for c in candidates if c):
         try:
             validate_host(candidate)
         except BlockedTargetError as error:
-            return None, str(error)
+            reason = reason or str(error)
+            continue
         return candidate, ""
-    return None, "SM-Watch does not know this server's address (set AGENT_PUBLIC_IP on the agent, or a host on the server)"
+    if reason:
+        return None, f"Only a private address is known for this server, and scanning private addresses is turned off ({reason})"
+    if server.monitor_mode == "push" and not server.last_seen_at:
+        return None, "Waiting for the agent's first report (its address is learned from it)"
+    return None, "No address is known for this server yet"
 
 
 def _probe(address: str, port: int, timeout: float) -> bool:
@@ -291,7 +299,9 @@ def store(db: Session, kind: str, target, target_type: str, result: dict, starte
     if new and not result.get("error"):
         what = "Exposed on the internet" if kind == "ports" and not result.get("private") else "Reachable" if kind == "ports" else "TLS problems"
         lines = [f"{what} at {result.get('address')}:"] + sorted(new)[:8]
-        queue_event(db, target_type, target, "warning", format_alert("Security", "security_finding", target.name, lines), deliver=False, state="security_finding")
+        from .monitoring import server_where
+        where = server_where(target) if target_type == "server" else target.url
+        queue_event(db, target_type, target, "warning", format_alert("Security", "security_finding", target.name, lines, where=where), deliver=False, state="security_finding")
 
 
 def scans_due(db: Session) -> None:

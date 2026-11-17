@@ -1,18 +1,22 @@
-"""Security dashboard: SSH attacks, pending updates, exposure scans, TLS audits, two-factor adoption."""
+"""Security dashboard: SSH attacks and logins, threats (malware, persistence, new keys), pending updates, hardening, exposure scans,
+TLS audits, two-factor adoption, and report data. Every list can be narrowed to one server (?server=<id, host name or IP>) and every
+item says which server it belongs to (name, host name, public and private addresses)."""
 import json
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
+from pydantic import BaseModel, Field
 from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
 from . import secscan
 from .audit import audit
 from .database import SessionLocal, get_db
-from .models import SecurityScan, Server, Service, User
+from .models import SecurityFinding, SecurityScan, Server, Service, SshLoginEvent, User
 from .security import can_see, ensure_access, require_operator
 from .stats import aware
+from .threats import SEVERITY_ORDER, finding_view
 
 router = APIRouter(prefix="/api/security", tags=["security"])
 _last_manual: dict[tuple, float] = {}
@@ -29,22 +33,81 @@ def scan_view(s: SecurityScan | None) -> dict | None:
     return {"id": s.id, "kind": s.kind, "address": s.address, "started_at": aware(s.started_at).isoformat(), "grade": s.grade, "findings": s.findings, "error": s.error, "results": json.loads(s.results)}
 
 
-@router.get("/overview")
-def overview(user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+def metrics_of(s: Server) -> dict:
+    try:
+        return json.loads(s.last_metrics or "{}") or {}
+    except ValueError:
+        return {}
+
+
+def server_info(s: Server) -> dict:
+    """Who a server is: what people search by (id, name, host name, addresses)."""
+    from .monitoring import server_addresses
+    m = metrics_of(s)
+    addr = server_addresses(s)
+    return {"id": s.id, "name": s.name, "hostname": m.get("hostname") or None, "public_ip": addr.get("public_ip"), "private_ips": addr.get("private_ips") or [],
+            "host": s.host or None, "os": m.get("os") or None}
+
+
+def matches(info: dict, needle: str) -> bool:
+    n = needle.strip().lower()
+    if not n:
+        return True
+    if n.lstrip("#").isdigit() and int(n.lstrip("#")) == info["id"]:
+        return True
+    hay = [info["name"], info.get("hostname"), info.get("public_ip"), info.get("host"), *info.get("private_ips", [])]
+    return any(h and n in str(h).lower() for h in hay)
+
+
+def visible_servers(db: Session, user: dict, server: str | None) -> list[Server]:
+    """The servers this person may see, narrowed by ?server= (an id, a name, a host name or an address; exact id wins)."""
     servers = [s for s in db.scalars(select(Server).order_by(Server.name)).all() if can_see(user, "server", s.id)]
+    if not server:
+        return servers
+    exact = [s for s in servers if server.strip().lstrip("#").isdigit() and s.id == int(server.strip().lstrip("#"))]
+    return exact or [s for s in servers if matches(server_info(s), server)]
+
+
+def open_counts(db: Session, ids: list[int]) -> dict[int, dict]:
+    out: dict[int, dict] = {}
+    rows = db.execute(select(SecurityFinding.server_id, SecurityFinding.severity, SecurityFinding.acknowledged_at.is_(None), func.count())
+                      .where(SecurityFinding.server_id.in_(ids or [0]), SecurityFinding.resolved_at.is_(None))
+                      .group_by(SecurityFinding.server_id, SecurityFinding.severity, SecurityFinding.acknowledged_at.is_(None))).all()
+    for sid, severity, unacked, n in rows:
+        entry = out.setdefault(sid, {"critical": 0, "high": 0, "medium": 0, "low": 0, "acknowledged": 0})
+        if unacked:
+            entry[severity] = entry.get(severity, 0) + n
+        else:
+            entry["acknowledged"] += n
+    return out
+
+
+@router.get("/overview")
+def overview(server: str | None = Query(None, max_length=200), user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+    servers = visible_servers(db, user, server)
+    ids = [s.id for s in servers]
     services = [s for s in db.scalars(select(Service).order_by(Service.name)).all() if can_see(user, "service", s.id) and s.url.lower().startswith("https://")]
-    ssh = secscan.ssh_summary(db, 24, [s.id for s in servers])
+    if server:   # narrowed to servers: keep the https services that run on them (same host or address)
+        hosts = {h for s in servers for h in (server_info(s).get("hostname"), server_info(s).get("public_ip"), s.host) if h}
+        services = [s for s in services if s.server_id in ids or any(h and h in s.url for h in hosts)]
+    ssh = secscan.ssh_summary(db, 24, ids)
     ports, tls = latest_scans(db, "ports", "server"), latest_scans(db, "tls", "service")
+    counts = open_counts(db, ids)
     server_rows = []
     for s in servers:
-        metrics = json.loads(s.last_metrics or "{}") if s.last_metrics else {}
+        m = metrics_of(s)
         address, reason = secscan.server_address(s)
-        server_rows.append({"id": s.id, "name": s.name, "status": s.last_status, "updates": metrics.get("updates"), "agent_version": metrics.get("agent_version"),
+        sec = m.get("security") or {}
+        checks = sec.get("hardening") or []
+        server_rows.append({**server_info(s), "status": s.last_status, "updates": m.get("updates"), "agent_version": m.get("agent_version"),
                             "ssh_24h": ssh["per_server"].get(s.id, {"total": 0, "distinct_ips": 0, "top_ips": []}), "scan": scan_view(ports.get(s.id)),
-                            "scan_address": address, "scan_unavailable": reason or None, "push": s.monitor_mode == "push"})
-    out = {"servers": server_rows, "services": [{"id": s.id, "name": s.name, "url": s.url, "tls": scan_view(tls.get(s.id))} for s in services],
-           "ssh": {k: ssh[k] for k in ("total", "top_ips", "top_users", "hourly")}}
-    if user["role"] == "admin":
+                            "scan_address": address, "scan_unavailable": reason or None, "push": s.monitor_mode == "push",
+                            "threats": counts.get(s.id, {"critical": 0, "high": 0, "medium": 0, "low": 0, "acknowledged": 0}),
+                            "threat_scan_at": sec.get("checked_at"), "threat_scan": bool(sec),
+                            "hardening": {"passed": sum(1 for c in checks if c.get("ok") is True), "failed": sum(1 for c in checks if c.get("ok") is False), "total": len(checks)}})
+    out = {"servers": server_rows, "services": [{"id": s.id, "name": s.name, "url": s.url, "server_id": s.server_id, "tls": scan_view(tls.get(s.id))} for s in services],
+           "ssh": {k: ssh[k] for k in ("total", "top_ips", "top_users", "hourly")}, "filter": server or None}
+    if user["role"] == "admin" and not server:
         from .mfa import policy
         users = db.scalars(select(User).where(User.active.is_(True))).all()
         out["two_factor"] = {"policy": policy(db), "enabled": sum(1 for u in users if u.totp_enabled), "total": len(users),
@@ -52,13 +115,130 @@ def overview(user: dict = Depends(require_operator), db: Session = Depends(get_d
     return out
 
 
+@router.get("/servers")
+def servers_list(user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> list[dict]:
+    """The server picker: every visible server with what people search by."""
+    return [server_info(s) for s in visible_servers(db, user, None)]
+
+
 @router.get("/ssh")
-def ssh(hours: int = Query(24, ge=1, le=168), user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
-    ids = [s.id for s in db.scalars(select(Server)).all() if can_see(user, "server", s.id)]
-    data = secscan.ssh_summary(db, hours, ids)
-    names = {s.id: s.name for s in db.scalars(select(Server).where(Server.id.in_(list(data["per_server"]) or [0]))).all()}
-    data["per_server"] = [{"id": sid, "name": names.get(sid, f"server {sid}"), **v} for sid, v in sorted(data["per_server"].items(), key=lambda kv: -kv[1]["total"])]
+def ssh(hours: int = Query(24, ge=1, le=168), server: str | None = Query(None, max_length=200), user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+    servers = visible_servers(db, user, server)
+    infos = {s.id: server_info(s) for s in servers}
+    data = secscan.ssh_summary(db, hours, list(infos))
+    data["per_server"] = [{**infos.get(sid, {"id": sid, "name": f"server {sid}"}), **v} for sid, v in sorted(data["per_server"].items(), key=lambda kv: -kv[1]["total"])]
+    # which servers each attacking address went after (by name, not just a count)
+    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    from .models import SshFailureSample
+    targets: dict[str, dict[int, int]] = {}
+    for sid, raw in db.execute(select(SshFailureSample.server_id, SshFailureSample.ips).where(SshFailureSample.ts >= since, SshFailureSample.server_id.in_(list(infos) or [0]))).all():
+        for ip, n in json.loads(raw or "{}").items():
+            targets.setdefault(ip, {})[sid] = targets.setdefault(ip, {}).get(sid, 0) + n
+    for row in data["top_ips"]:
+        row["targets"] = [{"id": sid, "name": infos[sid]["name"], "attempts": n} for sid, n in sorted(targets.get(row["ip"], {}).items(), key=lambda kv: -kv[1]) if sid in infos]
+    logins = db.scalars(select(SshLoginEvent).where(SshLoginEvent.ts >= since, SshLoginEvent.server_id.in_(list(infos) or [0])).order_by(desc(SshLoginEvent.ts)).limit(300)).all()
+    data["logins"] = [{"id": e.id, "server": {k: infos[e.server_id][k] for k in ("id", "name", "hostname", "public_ip")}, "ts": aware(e.ts).isoformat(), "ip": e.ip, "user": e.user,
+                       "method": e.method, "failures_before": e.failures_before, "new_source": e.new_source,
+                       "verdict": "breach" if e.failures_before >= _breach_threshold() else "new" if e.new_source else "ok"} for e in logins]
+    data["logins_supported"] = any(version_at_least(metrics_of(s).get("agent_version"), (2, 15)) for s in servers)
     return data
+
+
+def version_at_least(version: str | None, wanted: tuple[int, int]) -> bool:
+    try:
+        return tuple(int(x) for x in str(version or "0").split(".")[:2]) >= wanted
+    except ValueError:
+        return False
+
+
+def _breach_threshold() -> int:
+    from .config import get_settings
+    return get_settings().ssh_success_after_failures
+
+
+@router.get("/findings")
+def findings(server: str | None = Query(None, max_length=200), status: str = Query("open", pattern="^(open|attention|acknowledged|resolved|all)$"),
+             severity: str | None = Query(None, pattern="^(critical|high|medium|low)$"), limit: int = Query(300, ge=1, le=1000),
+             user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> list[dict]:
+    servers = visible_servers(db, user, server)
+    infos = {s.id: server_info(s) for s in servers}
+    q = select(SecurityFinding).where(SecurityFinding.server_id.in_(list(infos) or [0]))
+    if status in ("open", "attention", "acknowledged"):
+        q = q.where(SecurityFinding.resolved_at.is_(None))
+    if status == "attention":
+        q = q.where(SecurityFinding.acknowledged_at.is_(None))
+    elif status == "acknowledged":
+        q = q.where(SecurityFinding.acknowledged_at.is_not(None))
+    elif status == "resolved":
+        q = q.where(SecurityFinding.resolved_at.is_not(None))
+    if severity:
+        q = q.where(SecurityFinding.severity == severity)
+    rows = db.scalars(q.order_by(desc(SecurityFinding.last_seen)).limit(limit)).all()
+    out = [finding_view(f, infos[f.server_id]) for f in rows]
+    out.sort(key=lambda f: (f["resolved_at"] is not None, f["acknowledged_at"] is not None, SEVERITY_ORDER.get(f["severity"], 9), f["last_seen"]))
+    return out
+
+
+class AckIn(BaseModel):
+    note: str = Field(default="", max_length=500)
+
+
+@router.post("/findings/{finding_id}/acknowledge")
+def acknowledge(finding_id: int, payload: AckIn, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+    f = db.get(SecurityFinding, finding_id)
+    if not f:
+        raise HTTPException(404, "Finding not found")
+    ensure_access(user, "server", f.server_id)
+    now = datetime.now(timezone.utc)
+    f.acknowledged_by, f.acknowledged_at, f.note = user["email"], now, payload.note.strip()
+    if f.source == "smwatch":           # an event (login, new key): acknowledging closes it. Agent findings close when the agent stops seeing them.
+        f.resolved_at = f.resolved_at or now
+    server = db.get(Server, f.server_id)
+    audit(db, request, "security.acknowledge", user=user, target=f"server:{f.server_id}", detail=f"{server.name if server else f.server_id}: {f.title}" + (f" ({payload.note.strip()[:200]})" if payload.note.strip() else ""))
+    db.commit()
+    return finding_view(f, server_info(server) if server else None)
+
+
+@router.get("/hardening")
+def hardening(server: str | None = Query(None, max_length=200), user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> list[dict]:
+    out = []
+    for s in visible_servers(db, user, server):
+        m = metrics_of(s)
+        sec = m.get("security")
+        out.append({"server": server_info(s), "agent_version": m.get("agent_version"), "push": s.monitor_mode == "push", "checked_at": (sec or {}).get("checked_at"),
+                    "checks": (sec or {}).get("hardening") or [], "listening": (sec or {}).get("listening") or [], "authorized_keys": (sec or {}).get("authorized_keys") or [],
+                    "foreign_packages": (sec or {}).get("foreign_packages"), "supported": sec is not None})
+    return out
+
+
+@router.get("/report")
+def report(request: Request, server: str | None = Query(None, max_length=200), days: int = Query(7, ge=1, le=90), user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+    """Everything a security report needs, for the chosen servers and period. The page lays it out by template."""
+    servers = visible_servers(db, user, server)
+    infos = {s.id: server_info(s) for s in servers}
+    ids = list(infos)
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    ssh_data = secscan.ssh_summary(db, days * 24, ids)
+    found = db.scalars(select(SecurityFinding).where(SecurityFinding.server_id.in_(ids or [0]), (SecurityFinding.resolved_at.is_(None)) | (SecurityFinding.last_seen >= since))
+                       .order_by(desc(SecurityFinding.last_seen)).limit(1000)).all()
+    logins = db.scalars(select(SshLoginEvent).where(SshLoginEvent.server_id.in_(ids or [0]), SshLoginEvent.ts >= since).order_by(desc(SshLoginEvent.ts)).limit(1000)).all()
+    ports = latest_scans(db, "ports", "server")
+    rows = []
+    for s in servers:
+        m = metrics_of(s)
+        sec = m.get("security") or {}
+        mine = [f for f in found if f.server_id == s.id]
+        my_logins = [e for e in logins if e.server_id == s.id]
+        rows.append({"server": infos[s.id], "status": s.last_status, "agent_version": m.get("agent_version"), "updates": m.get("updates"),
+                     "ssh_failures": ssh_data["per_server"].get(s.id, {"total": 0, "distinct_ips": 0, "top_ips": []}),
+                     "logins": {"total": len(my_logins), "suspicious": sum(1 for e in my_logins if e.failures_before >= _breach_threshold()), "new_sources": sum(1 for e in my_logins if e.new_source),
+                                "users": sorted({e.user for e in my_logins})[:20], "sources": sorted({e.ip for e in my_logins})[:30]},
+                     "findings": [finding_view(f, None) for f in mine], "hardening": sec.get("hardening") or [], "listening": sec.get("listening") or [],
+                     "authorized_keys": len(sec.get("authorized_keys") or []), "foreign_packages": sec.get("foreign_packages"), "exposure": scan_view(ports.get(s.id)),
+                     "threat_scan_at": sec.get("checked_at")})
+    audit(db, request, "security.report", user=user, detail=f"{days} days; servers: {', '.join(i['name'] for i in infos.values())[:600] or 'none'}", commit=True)
+    return {"generated_at": datetime.now(timezone.utc).isoformat(), "days": days, "since": since.isoformat(), "filter": server or None, "servers": rows,
+            "ssh": {"total": ssh_data["total"], "top_ips": ssh_data["top_ips"][:15], "top_users": ssh_data["top_users"][:10]}}
 
 
 @router.post("/scan/{target_type}/{target_id}")

@@ -17,8 +17,9 @@ type Pick = { table: string; columns: string[] };
 type Saved = { id: number; name: string; selection: Pick[]; sample_rows: number; created_by: string | null; updated_at: string };
 type ColStat = { name: string; type: string; nullable: boolean; pk: boolean; sensitive: boolean; comment: string; non_null?: number; nulls?: number; null_pct?: number; distinct?: number;
   unique?: boolean; min?: unknown; max?: unknown; avg?: unknown; avg_length?: number | null; top?: { value: unknown; count: number; pct: number }[]; error?: string };
-type RelText = { from: string; to: string; from_columns: string[]; to_columns: string[]; optional: boolean; text: string };
-type Section = { table: string; schema: string; name: string; kind: string; comment: string; size_bytes: number | null; summary: string; quality: string[]; references: RelText[]; referenced_by: RelText[];
+type RelText = { from: string; to: string; from_columns: string[]; to_columns: string[]; optional: boolean; text: string; inferred?: boolean };
+type Quality = { level: 'warn' | 'info'; column: string | null; text: string };
+type Section = { table: string; schema: string; name: string; kind: string; comment: string; size_bytes: number | null; summary: string; quality: Quality[]; references: RelText[]; referenced_by: RelText[];
   primary_key: string[]; profile: { rows: number; rows_exact: boolean; columns: ColStat[]; sample: unknown[][]; notes: string[]; seconds: number } };
 type Report = { title: string; engine: string; generated_at: string; overview: string; issues: number; relations: RelText[]; tables: Section[]; database: { name: string; engine: string; database: string; server_version: string | null } };
 
@@ -117,7 +118,7 @@ function ConnectionForm({ existing, onClose, onSaved }: { existing?: Conn; onClo
 /* ---------------------------------------------------------------- one database */
 function DatabaseDetail({ conn, onEdit, reload, editing, closeEdit }: { conn: Conn; onEdit: () => void; reload: () => Promise<void>; editing: Conn | 'new' | null; closeEdit: () => void }) {
   const { go } = useApp();
-  const [tab, setTab] = useState<'graph' | 'tree' | 'report' | 'saved'>('graph');
+  const [tab, setTab] = useState<'graph' | 'tree' | 'query' | 'report' | 'saved'>('graph');
   const [schema, setSchema] = useState<Schema | null>(null);
   const [error, setError] = useState(''); const [busy, setBusy] = useState(false);
   const [picks, setPicks] = useState<Record<string, string[] | null>>({});      // table -> chosen columns (null = all)
@@ -145,12 +146,13 @@ function DatabaseDetail({ conn, onEdit, reload, editing, closeEdit }: { conn: Co
         <div className="card ssh-stat"><small>{w.rows[0].toUpperCase() + w.rows.slice(1)} (estimate)</small><b className="sm-b">{num(tables.reduce((a, t) => a + (t.rows_estimate ?? 0), 0))}</b><span className="muted sm">from the database&apos;s statistics</span></div>
         <div className="card ssh-stat"><small>Size</small><b className="sm-b">{tables.some(t => t.size_bytes != null) ? bytes(tables.reduce((a, t) => a + (t.size_bytes ?? 0), 0)) : '–'}</b><span className="muted sm">{w.table}s and indexes</span></div>
       </div>}
-      <div className="ktabs" role="tablist">{([['graph', 'Relationships', 'overview'], ['tree', w.tables, 'logs'], ['report', `Report builder${Object.keys(picks).length ? ` (${Object.keys(picks).length})` : ''}`, 'zap'], ['saved', 'Saved reports', 'star']] as const).map(([id, label, icon]) =>
+      <div className="ktabs" role="tablist">{([['graph', 'Relationships', 'overview'], ['tree', w.tables, 'logs'], ['query', 'Quick query', 'terminal'], ['report', `Report builder${Object.keys(picks).length ? ` (${Object.keys(picks).length})` : ''}`, 'zap'], ['saved', 'Saved reports', 'star']] as const).map(([id, label, icon]) =>
         <button key={id} role="tab" aria-selected={tab === id} className={tab === id ? 'on' : ''} onClick={() => setTab(id)}><Icon name={icon} size={15} />{label}</button>)}</div>
       {error && <div className="err" style={{ marginBottom: 12 }}>{error}</div>}
       {!schema ? (!error && <div className="card"><p className="muted"><span className="spinner" /> Reading the schema…</p></div>) : <>
         {tab === 'graph' && <SchemaGraph schema={schema} onAdd={addToReport} engine={conn.engine} />}
         {tab === 'tree' && <SchemaTree schema={schema} onAdd={addToReport} engine={conn.engine} />}
+        {tab === 'query' && <QueryBuilder conn={conn} schema={schema} />}
         {tab === 'report' && <ReportBuilder conn={conn} schema={schema} picks={picks} setPicks={setPicks} onReport={setReport} />}
         {tab === 'saved' && <SavedReports conn={conn} onOpen={(s) => { setPicks(Object.fromEntries(s.selection.map(p => [p.table, p.columns.length ? p.columns : null]))); setTab('report'); }} onReport={setReport} />}
       </>}
@@ -377,7 +379,7 @@ function ReportBuilder({ conn, schema, picks, setPicks, onReport }: { conn: Conn
         <h2>Report</h2>
         <Field label="Title (optional)"><input value={title} onChange={e => setTitle(e.target.value)} maxLength={120} placeholder="Orders and customers" /></Field>
         <Field label="Sample rows per table" hint="Values of password, token, card and similar columns are always masked"><select value={sample} onChange={e => setSample(Number(e.target.value))}><option value={0}>None (statistics only)</option><option value={5}>5 rows</option><option value={10}>10 rows</option><option value={20}>20 rows</option></select></Field>
-        <p className="muted sm">For each table: row count, size, keys, relationships in plain words, per-column completeness, distinct values, ranges and most common values, plus data-quality notes. Big tables are profiled on their first 100,000 rows.</p>
+        <p className="muted sm">For each table: rows, size, key and links, then one line per column: how often it is filled, distinct values, its range or most common values (as small charts), and anything worth checking. Big tables are profiled on their first 100,000 rows. For a single number (count, total, average…) use Quick query.</p>
         {error && <div className="err">{error}</div>}
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}><button className="btn primary" onClick={generate} disabled={!selection.length || !!busy}>{busy === 'run' ? 'Generating…' : 'Generate report'}</button>
           <button className="btn" onClick={save} disabled={!selection.length || !!busy}>Save selection</button>{selection.length > 0 && <button className="btn ghost" onClick={() => setPicks({})}>Clear</button>}</div>
@@ -403,57 +405,193 @@ function SavedReports({ conn, onOpen, onReport }: { conn: Conn; onOpen: (s: Save
   );
 }
 
+/* ---------------------------------------------------------------- quick queries: COUNT / SUM / AVG / MIN / MAX, grouped and filtered */
+type Fn = 'count' | 'count_distinct' | 'sum' | 'avg' | 'min' | 'max';
+type QMeasure = { fn: Fn; column: string };
+type QGroup = { column: string; bucket: string };
+type QFilter = { column: string; op: string; value: string };
+type QResult = { table: string; columns: string[]; groups: number; rows: unknown[][]; query: string; language: 'sql' | 'mongodb'; truncated: boolean; seconds: number };
+const FN_LABEL: Record<Fn, string> = { count: 'Count', count_distinct: 'Count distinct', sum: 'Sum', avg: 'Average', min: 'Minimum', max: 'Maximum' };
+const OP_LABEL: Record<string, string> = { eq: 'is', ne: 'is not', gt: '>', gte: '≥', lt: '<', lte: '≤', contains: 'contains', starts: 'starts with', in: 'is one of', is_null: 'is empty', not_null: 'is not empty' };
+const isNum = (c: Col, mongo: boolean) => (mongo ? /int|double|decimal|long/.test(c.type) : /int|numeric|decimal|real|double|float|money|serial/i.test(c.type));
+const isTime = (c: Col) => /date|time/i.test(c.type);
+
+function QueryBuilder({ conn, schema }: { conn: Conn; schema: Schema }) {
+  const { toast } = useApp();
+  const mongo = conn.engine === 'mongodb';
+  const w = words(conn.engine);
+  const tables = schema.tables;
+  const [table, setTable] = useState(tables[0]?.key ?? '');
+  const [measures, setMeasures] = useState<QMeasure[]>([{ fn: 'count', column: '' }]);
+  const [groups, setGroups] = useState<QGroup[]>([]);
+  const [filters, setFilters] = useState<QFilter[]>([]);
+  const [order, setOrder] = useState('measure_desc');
+  const [limit, setLimit] = useState(50);
+  const [result, setResult] = useState<QResult | null>(null);
+  const [busy, setBusy] = useState(false); const [error, setError] = useState('');
+  const t = tables.find(x => x.key === table);
+  const cols = t?.columns ?? [];
+  const pickTable = (k: string) => { setTable(k); setMeasures([{ fn: 'count', column: '' }]); setGroups([]); setFilters([]); setResult(null); setError(''); };
+  const colsFor = (fn: Fn) => cols.filter(c => (fn === 'sum' || fn === 'avg' ? isNum(c, mongo) && !c.sensitive : fn === 'min' || fn === 'max' ? !c.sensitive : true));
+  async function run() {
+    setBusy(true); setError('');
+    try {
+      setResult(await post<QResult>(`/databases/${conn.id}/query`, { table, measures: measures.map(m => ({ fn: m.fn, column: m.column || null })),
+        group_by: groups.filter(g => g.column).map(g => ({ column: g.column, bucket: g.bucket || null })), filters: filters.filter(f => f.column), order, limit }));
+    } catch (e) { setError((e as Error).message); } finally { setBusy(false); }
+  }
+  const csv = () => {
+    if (!result) return;
+    const esc = (v: unknown) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+    const url = URL.createObjectURL(new Blob([[result.columns.map(esc).join(','), ...result.rows.map(r => r.map(esc).join(','))].join('\n')], { type: 'text/csv' }));
+    const a = document.createElement('a'); a.href = url; a.download = `${result.table.split('.').pop()}-query.csv`; a.click(); URL.revokeObjectURL(url);
+  };
+  const preset = (m: QMeasure[], g: QGroup[] = []) => { setMeasures(m); setGroups(g); setFilters([]); setResult(null); setOrder(g.some(x => x.bucket) ? 'group_asc' : 'measure_desc'); };
+  const textish = cols.find(c => !c.pk && !c.sensitive && !isNum(c, mongo) && !isTime(c));
+  const numeric = cols.find(c => isNum(c, mongo) && !c.pk && !c.sensitive && !c.fk);
+  const when = cols.find(c => isTime(c));
+  const peak = result && result.groups ? Math.max(1, ...result.rows.map(r => Number(r[result.groups]) || 0)) : 1;
+  return (
+    <div className="db-graph-row">
+      <section className="card" style={{ flex: 1, minWidth: 0 }}>
+        <div className="card-head"><h2>Quick query</h2><span className="grow" /><span className="muted sm">read-only · stops after 15 s</span></div>
+        <div className="dq-grid">
+          <label className="dq-label">From</label>
+          <div><select value={table} onChange={e => pickTable(e.target.value)} aria-label={w.table}>{tables.map(x => <option key={x.key} value={x.key}>{x.name}{x.schema && x.schema !== conn.database ? ` (${x.schema})` : ''} · {num(x.rows_estimate)} {w.rows}</option>)}</select>
+            {t && <div className="dq-presets"><span className="muted sm">Start from:</span>
+              <button className="chip" onClick={() => preset([{ fn: 'count', column: '' }])}>How many {w.rows}?</button>
+              {textish && <button className="chip" onClick={() => preset([{ fn: 'count', column: '' }], [{ column: textish.name, bucket: '' }])}>Count by {textish.name}</button>}
+              {numeric && <button className="chip" onClick={() => preset([{ fn: 'sum', column: numeric.name }, { fn: 'avg', column: numeric.name }, { fn: 'min', column: numeric.name }, { fn: 'max', column: numeric.name }])}>Total, average, min, max of {numeric.name}</button>}
+              {when && <button className="chip" onClick={() => preset([{ fn: 'count', column: '' }], [{ column: when.name, bucket: 'month' }])}>{w.rows[0].toUpperCase() + w.rows.slice(1)} per month ({when.name})</button>}</div>}</div>
+          <label className="dq-label">Calculate</label>
+          <div className="dq-rows">{measures.map((m, i) => <div key={i} className="dq-row">
+            <select value={m.fn} onChange={e => { const fn = e.target.value as Fn; const next = [...measures]; next[i] = { fn, column: fn === 'count' ? m.column : colsFor(fn).some(c => c.name === m.column) ? m.column : colsFor(fn)[0]?.name ?? '' }; setMeasures(next); }} aria-label="Function">
+              {(Object.keys(FN_LABEL) as Fn[]).map(f => <option key={f} value={f}>{FN_LABEL[f]}</option>)}</select>
+            <span className="muted sm">of</span>
+            <select value={m.column} onChange={e => { const next = [...measures]; next[i] = { ...m, column: e.target.value }; setMeasures(next); }} aria-label="Column">
+              {m.fn === 'count' && <option value="">every {w.row}</option>}
+              {colsFor(m.fn).map(c => <option key={c.name} value={c.name}>{c.name}{c.sensitive ? ' (sensitive: count only)' : ''}</option>)}</select>
+            {measures.length > 1 && <button className="btn ghost sm" onClick={() => setMeasures(measures.filter((_, j) => j !== i))} aria-label="Remove"><Icon name="x" size={13} /></button>}</div>)}
+            {measures.length < 6 && <button className="lg-link sm" onClick={() => setMeasures([...measures, { fn: 'count', column: '' }])}>+ another calculation</button>}</div>
+          <label className="dq-label">Group by</label>
+          <div className="dq-rows">{groups.map((g, i) => { const c = cols.find(x => x.name === g.column); return <div key={i} className="dq-row">
+            <select value={g.column} onChange={e => { const next = [...groups]; next[i] = { column: e.target.value, bucket: '' }; setGroups(next); }} aria-label="Group by column">
+              {cols.filter(x => !x.sensitive).map(x => <option key={x.name} value={x.name}>{x.name}</option>)}</select>
+            {c && (isTime(c) || (mongo && c.type.includes('date'))) && <select value={g.bucket} onChange={e => { const next = [...groups]; next[i] = { ...g, bucket: e.target.value }; setGroups(next); if (e.target.value) setOrder('group_asc'); }} aria-label="Date grouping">
+              <option value="">exact value</option><option value="hour">per hour</option><option value="day">per day</option><option value="month">per month</option><option value="year">per year</option></select>}
+            <button className="btn ghost sm" onClick={() => setGroups(groups.filter((_, j) => j !== i))} aria-label="Remove"><Icon name="x" size={13} /></button></div>; })}
+            {groups.length < 2 && <button className="lg-link sm" onClick={() => setGroups([...groups, { column: cols.find(x => !x.sensitive && !x.pk)?.name ?? '', bucket: '' }])}>{groups.length ? '+ second level' : '+ group the results'}</button>}</div>
+          <label className="dq-label">Only where</label>
+          <div className="dq-rows">{filters.map((f, i) => { const set = (patch: Partial<QFilter>) => { const next = [...filters]; next[i] = { ...f, ...patch }; setFilters(next); }; const c = cols.find(x => x.name === f.column); return <div key={i} className="dq-row">
+            <select value={f.column} onChange={e => set({ column: e.target.value })} aria-label="Filter column">{cols.map(x => <option key={x.name} value={x.name}>{x.name}</option>)}</select>
+            <select value={f.op} onChange={e => set({ op: e.target.value })} aria-label="Condition">{Object.entries(OP_LABEL).filter(([op]) => !c?.sensitive || op === 'is_null' || op === 'not_null').map(([op, l]) => <option key={op} value={op}>{l}</option>)}</select>
+            {!['is_null', 'not_null'].includes(f.op) && <input value={f.value} onChange={e => set({ value: e.target.value })} placeholder={f.op === 'in' ? 'a, b, c' : c && isTime(c) ? '2026-01-31' : 'value'} aria-label="Value" />}
+            <button className="btn ghost sm" onClick={() => setFilters(filters.filter((_, j) => j !== i))} aria-label="Remove"><Icon name="x" size={13} /></button></div>; })}
+            {filters.length < 8 && <button className="lg-link sm" onClick={() => setFilters([...filters, { column: cols.find(x => !x.sensitive)?.name ?? '', op: 'eq', value: '' }])}>+ add a condition</button>}</div>
+          {groups.length > 0 && <><label className="dq-label">Sort</label>
+            <div className="dq-row"><select value={order} onChange={e => setOrder(e.target.value)} aria-label="Sort"><option value="measure_desc">biggest first</option><option value="measure_asc">smallest first</option><option value="group_asc">by group, A → Z</option><option value="group_desc">by group, Z → A</option></select>
+              <span className="muted sm">show</span><select value={limit} onChange={e => setLimit(Number(e.target.value))} aria-label="Rows">{[10, 25, 50, 100, 250, 500].map(n => <option key={n} value={n}>{n} groups</option>)}</select></div></>}
+        </div>
+        {error && <div className="err" style={{ marginTop: 10 }}>{error}</div>}
+        <div style={{ display: 'flex', gap: 8, marginTop: 14 }}><button className="btn primary" onClick={() => void run()} disabled={busy || !t}>{busy ? 'Running…' : 'Run'}</button></div>
+      </section>
+      <aside className="card db-side dq-result">
+        <div className="card-head"><h2>Result</h2><span className="grow" />{result && <><span className="muted sm">{result.seconds}s</span><button className="btn ghost sm" onClick={csv}>CSV</button></>}</div>
+        {!result ? <p className="muted sm">Choose what to calculate and press Run. Values in password, token, card and similar {w.col}s can be counted but never shown.</p> : <>
+          {result.groups === 0 ? <div className="dq-kpis">{result.columns.map((c, i) => <div key={c}><small>{c}</small><b>{shown(result.rows[0]?.[i])}</b></div>)}</div>
+            : <div className="tbl-wrap"><table className="tbl dq-table"><thead><tr>{result.columns.map((c, i) => <th key={c} className={i >= result.groups ? 'num' : ''}>{c}</th>)}</tr></thead><tbody>
+              {result.rows.map((r, n) => <tr key={n}>{r.map((v, i) => <td key={i} className={i >= result.groups ? 'num' : ''}>{i === result.groups && typeof v === 'number' ? <span className="dq-bar"><i style={{ width: `${Math.max(2, (v / peak) * 100)}%` }} />{v.toLocaleString()}</span> : v == null ? <span className="muted">empty</span> : typeof v === 'number' ? v.toLocaleString() : String(v)}</td>)}</tr>)}</tbody></table></div>}
+          {result.rows.length === 0 && <p className="muted sm">No {w.rows} match.</p>}
+          {result.truncated && <p className="muted sm">Showing the first {result.rows.length} groups.</p>}
+          <details className="dq-sql"><summary className="sm muted">{result.language === 'sql' ? 'SQL' : 'MongoDB query'} that ran</summary><code>{result.query}</code></details></>}
+      </aside>
+    </div>
+  );
+}
+
 /* ---------------------------------------------------------------- the report document */
 function toMarkdown(r: Report): string {
-  const out = [`# ${r.title}`, '', `${r.database.name} (${r.database.engine} ${r.database.server_version ?? ''}) · generated ${new Date(r.generated_at).toLocaleString()}`, '', r.overview, ''];
-  if (r.relations.length) out.push('## Relationships', '', ...r.relations.map(x => `- ${x.text}`), '');
+  const out = [`# ${r.title}`, '', `${r.database.name} (${r.database.engine} ${r.database.server_version ?? ''}) · generated ${new Date(r.generated_at).toLocaleString()}`, ''];
+  out.push(`${r.tables.length} ${words(r.engine).table}s · ${r.tables.reduce((a, s) => a + s.profile.rows, 0).toLocaleString()} ${words(r.engine).rows} · ${r.relations.length} relationships · ${r.issues} things to check`, '');
+  if (r.relations.length) out.push('## Relationships', '', ...r.relations.map(x => `- ${short(x)}${x.optional ? ' (optional)' : ''}`), '');
   for (const s of r.tables) {
-    out.push(`## ${s.schema}.${s.name}`, '', s.summary, '');
-    if (s.quality.length) out.push('**Data quality**', '', ...s.quality.map(q => `- ${q}`), '');
-    out.push('| Column | Type | Filled | Distinct | Range / common values |', '|---|---|---|---|---|');
+    out.push(`## ${s.schema}.${s.name}`, '', `${s.profile.rows.toLocaleString()} ${words(r.engine).rows} · key ${s.primary_key.join(' + ') || 'none'} · ${bytes(s.size_bytes)}`, '');
+    if (s.quality.length) out.push(...s.quality.map(q => `- ${q.level === 'warn' ? '⚠' : 'ℹ'} ${q.column ? `${q.column}: ` : ''}${q.text}`), '');
+    out.push('| Column | Type | Filled | Distinct | Values |', '|---|---|---|---|---|');
     s.profile.columns.forEach(c => out.push(`| ${c.name}${c.pk ? ' (key)' : ''} | ${c.type} | ${c.null_pct != null ? `${(100 - c.null_pct).toFixed(1)}%` : '–'} | ${c.distinct ?? '–'} | ${c.sensitive ? 'masked' : c.min != null ? `${shown(c.min)} … ${shown(c.max)}` : (c.top ?? []).map(t => `${shown(t.value)} (${t.pct}%)`).join(', ')} |`));
     out.push('');
   }
   return out.join('\n');
 }
 
+const short = (x: RelText) => `${x.from.split('.').pop()}.${x.from_columns.join('+')} → ${x.to.split('.').pop()}.${x.to_columns.join('+')}`;
+const TOP_COLORS = ['#2f6fed', '#12b76a', '#f79009', '#9e77ed', '#98a2b3'];
+
+/** What the values of one column look like, drawn rather than written. */
+function ValueCell({ c }: { c: ColStat }) {
+  if (c.error) return <span className="warn sm" title={c.error}>could not read</span>;
+  if (c.sensitive) return <span className="muted sm">hidden (sensitive)</span>;
+  if (c.top && c.top.length) {
+    const rest = Math.max(0, 100 - c.top.reduce((a, t) => a + t.pct, 0));
+    return <div className="dbr-top"><div className="dbr-stack">{c.top.map((t, i) => <i key={i} style={{ width: `${t.pct}%`, background: TOP_COLORS[i] }} title={`${shown(t.value)}: ${t.pct}%`} />)}{rest > 0.5 && <i style={{ width: `${rest}%`, background: '#eaecf0' }} title={`other: ${rest.toFixed(1)}%`} />}</div>
+      <div className="dbr-legend">{c.top.slice(0, 3).map((t, i) => <span key={i}><i style={{ background: TOP_COLORS[i] }} />{shown(t.value)} <b>{Math.round(t.pct)}%</b></span>)}{c.top.length > 3 && <span className="muted">+{c.top.length - 3}</span>}</div></div>;
+  }
+  if (c.min != null) return <div className="dbr-range"><span>{shown(c.min)}</span><span className="dbr-line">{c.avg != null && <em title="average">avg {shown(c.avg)}</em>}</span><span>{shown(c.max)}</span></div>;
+  if (c.avg_length != null) return <span className="muted sm">text, ~{Math.round(c.avg_length)} characters</span>;
+  return <span className="muted sm">–</span>;
+}
+
 function ReportView({ report, onClose }: { report: Report; onClose: () => void }) {
+  const w = words(report.engine);
+  const [samples, setSamples] = useState(false);
   const download = () => { const url = URL.createObjectURL(new Blob([toMarkdown(report)], { type: 'text/markdown' })); const a = document.createElement('a'); a.href = url; a.download = `${report.title.replace(/[^A-Za-z0-9_-]+/g, '_').slice(0, 60) || 'report'}.md`; a.click(); URL.revokeObjectURL(url); };
   useEffect(() => { const k = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); }; window.addEventListener('keydown', k); return () => window.removeEventListener('keydown', k); }, [onClose]);
+  useEffect(() => {   // closed sections would be left out of a printout: open them all first
+    const open = () => document.querySelectorAll<HTMLDetailsElement>('.dbr-sec').forEach(d => { d.open = true; });
+    window.addEventListener('beforeprint', open); return () => window.removeEventListener('beforeprint', open);
+  }, []);
+  const warnings = report.tables.flatMap(s => s.quality.filter(q => q.level === 'warn').map(q => ({ table: s, q })));
+  const hasSamples = report.tables.some(s => s.profile.sample.length > 0);
   return (
     <div className="db-report-overlay">
-      <div className="db-report-bar no-print"><b>{report.title}</b><span className="grow" /><button className="btn sm" onClick={() => window.print()}>Print / save as PDF</button><button className="btn sm" onClick={download}>Download Markdown</button><button className="btn sm ghost" onClick={onClose} aria-label="Close"><Icon name="x" /></button></div>
-      <article className="db-report">
+      <div className="db-report-bar no-print"><b>{report.title}</b><span className="grow" />{hasSamples && <label className="check" style={{ color: '#fff' }}><input type="checkbox" checked={samples} onChange={e => setSamples(e.target.checked)} />sample {w.rows}</label>}
+        <button className="btn sm" onClick={() => window.print()}>Print / save as PDF</button><button className="btn sm" onClick={download}>Download Markdown</button><button className="btn sm ghost" onClick={onClose} aria-label="Close"><Icon name="x" /></button></div>
+      <article className="db-report dbr">
         <header><div className="muted sm">{report.database.name} · {ENGINE_LABEL[report.database.engine as Conn['engine']] ?? report.database.engine} {report.database.server_version ?? ''} · {report.database.database}</div>
-          <h1>{report.title}</h1><div className="muted sm">Generated {new Date(report.generated_at).toLocaleString()} · read-only snapshot</div></header>
-        <section className="db-r-summary"><p>{report.overview}</p>
-          <div className="db-r-kpis"><div><b>{report.tables.length}</b><small>{words(report.engine).table}s</small></div><div><b>{num(report.tables.reduce((a, s) => a + s.profile.rows, 0))}</b><small>{words(report.engine).rows}</small></div><div><b>{report.relations.length}</b><small>relationships</small></div><div><b className={report.issues ? 'warn' : 'good'}>{report.issues}</b><small>quality notes</small></div></div>
-          {report.relations.length > 0 && <><h2>How the {words(report.engine).table}s relate</h2><ul>{report.relations.map((x, i) => <li key={i}>{x.text}</li>)}</ul></>}
-          <h2>Contents</h2><ol className="db-r-toc">{report.tables.map(s => <li key={s.table}><a href={`#t-${s.table}`}>{s.name}</a> <span className="muted">· {num(s.profile.rows)} {words(report.engine).rows}{s.quality.length ? ` · ${s.quality.length} note${s.quality.length > 1 ? 's' : ''}` : ''}</span></li>)}</ol>
-        </section>
-        {report.tables.map(s => (
-          <section key={s.table} id={`t-${s.table}`} className="db-r-table">
-            <h2>{s.name} <span className="muted">{s.schema}{s.kind === 'view' ? ' · view' : ''}</span></h2>
-            {s.comment && <p className="db-r-comment">{s.comment}</p>}
-            <p>{s.summary}</p>
-            <div className="db-r-facts"><span>{words(report.engine).rows[0].toUpperCase() + words(report.engine).rows.slice(1)} <b>{num(s.profile.rows)}{s.profile.rows_exact ? '' : ' (estimate)'}</b></span><span>Size <b>{bytes(s.size_bytes)}</b></span><span>Key <b>{s.primary_key.join(' + ') || 'none'}</b></span><span>Read in <b>{s.profile.seconds}s</b></span></div>
-            {(s.references.length > 0 || s.referenced_by.length > 0) && <ul className="db-r-rels">{[...s.references, ...s.referenced_by].map((x, i) => <li key={i}>{x.text}</li>)}</ul>}
-            {s.quality.length > 0 && <div className="db-r-quality"><b>Data quality</b><ul>{s.quality.map((q, i) => <li key={i}>{q}</li>)}</ul></div>}
-            <table className="db-r-cols"><thead><tr><th>{words(report.engine).col[0].toUpperCase() + words(report.engine).col.slice(1)}</th><th>Type</th><th>Filled</th><th className="num">Distinct</th><th>Values</th></tr></thead><tbody>
-              {s.profile.columns.map(c => <tr key={c.name}>
-                <td><b>{c.name}</b>{c.pk && <span className="tag">key</span>}{c.unique && !c.pk && <span className="tag">unique</span>}{c.comment && <div className="muted sm">{c.comment}</div>}</td>
-                <td className="mono sm">{c.type}{!c.nullable && <div className="muted sm">required</div>}</td>
-                <td>{c.error ? '–' : <><div className="db-fill"><i style={{ width: `${100 - (c.null_pct ?? 0)}%` }} className={(c.null_pct ?? 0) >= 50 ? 'warn' : ''} /></div><span className="sm">{(100 - (c.null_pct ?? 0)).toFixed(1)}%{c.nulls ? <span className="muted"> · {num(c.nulls)} empty</span> : null}</span></>}</td>
-                <td className="num">{num(c.distinct)}</td>
-                <td className="sm">{c.error ? <span className="warn">{c.error}</span> : c.sensitive ? <span className="muted">values hidden (sensitive)</span> : <>
-                  {c.min != null && <div>{shown(c.min)} → {shown(c.max)}{c.avg != null && <span className="muted"> · avg {shown(c.avg)}</span>}</div>}
-                  {c.avg_length != null && c.min == null && !c.top && <div className="muted">avg length {c.avg_length}</div>}
-                  {c.top && <div className="db-top">{c.top.map((t, i) => <span key={i}><b>{shown(t.value)}</b> {t.pct}%</span>)}</div>}</>}</td></tr>)}
-            </tbody></table>
-            {s.profile.sample.length > 0 && <><h3>Sample {words(report.engine).rows}</h3><div className="tbl-wrap"><table className="db-r-sample"><thead><tr>{s.profile.columns.map(c => <th key={c.name}>{c.name}</th>)}</tr></thead><tbody>
-              {s.profile.sample.map((row, i) => <tr key={i}>{row.map((v, j) => <td key={j}>{v == null ? <span className="muted">null</span> : String(v)}</td>)}</tr>)}</tbody></table></div></>}
-            {s.profile.notes.map((n, i) => <p key={i} className="muted sm">{n}</p>)}
-          </section>))}
+          <h1>{report.title}</h1><div className="muted sm">{new Date(report.generated_at).toLocaleString()} · read-only snapshot</div></header>
+        <div className="db-r-kpis"><div><b>{report.tables.length}</b><small>{w.table}s</small></div><div><b>{num(report.tables.reduce((a, s) => a + s.profile.rows, 0))}</b><small>{w.rows}</small></div>
+          <div><b>{report.relations.length}</b><small>relationships</small></div><div><b className={report.issues ? 'warn' : 'good'}>{report.issues}</b><small>things to check</small></div></div>
+        <div className="dbr-two">
+          <section><h2>Things to check</h2>{warnings.length === 0 ? <p className="good sm">Nothing stands out.</p> : <ul className="dbr-flags">{warnings.slice(0, 20).map(({ table, q }, i) => <li key={i}><a href={`#t-${table.table}`}>{table.name}{q.column ? `.${q.column}` : ''}</a> {q.text}</li>)}{warnings.length > 20 && <li className="muted">+ {warnings.length - 20} more below</li>}</ul>}</section>
+          <section><h2>Relationships</h2>{report.relations.length === 0 ? <p className="muted sm">None between these {w.table}s.</p> : <ul className="dbr-rels">{report.relations.map((x, i) => <li key={i} title={x.text}><span className="mono">{short(x)}</span>{x.optional && <span className="tag">optional</span>}{x.inferred && <span className="tag">inferred</span>}</li>)}</ul>}</section>
+        </div>
+        <h2>{w.tables}</h2>
+        <table className="db-r-cols dbr-index"><thead><tr><th>{w.table}</th><th className="num">{w.rows}</th><th className="num">{w.cols}</th><th className="num">Size</th><th>Key</th><th className="num">Flags</th></tr></thead><tbody>
+          {report.tables.map(s => <tr key={s.table}><td><a href={`#t-${s.table}`}><b>{s.name}</b></a> <span className="muted sm">{s.schema}{s.kind === 'view' ? ' · view' : ''}</span></td><td className="num">{num(s.profile.rows)}{s.profile.rows_exact ? '' : '*'}</td><td className="num">{s.profile.columns.length}</td>
+            <td className="num">{bytes(s.size_bytes)}</td><td className="mono sm">{s.primary_key.join(' + ') || <span className="warn">none</span>}</td><td className="num">{s.quality.filter(q => q.level === 'warn').length || ''}</td></tr>)}</tbody></table>
+        {report.tables.map((s, n) => {
+          const flags = new Map<string, string[]>();
+          s.quality.forEach(q => { if (q.column) flags.set(q.column, [...(flags.get(q.column) ?? []), q.text]); });
+          return (
+            <details key={s.table} id={`t-${s.table}`} className="db-r-table dbr-sec" open={n < 3 || report.tables.length <= 4}>
+              <summary><b>{s.name}</b><span className="muted">{s.schema}</span><span className="dbr-chips"><span>{num(s.profile.rows)} {w.rows}</span><span>{s.profile.columns.length} {w.cols.toLowerCase()}</span>{s.size_bytes != null && <span>{bytes(s.size_bytes)}</span>}
+                {s.references.length + s.referenced_by.length > 0 && <span>{s.references.length + s.referenced_by.length} link{s.references.length + s.referenced_by.length === 1 ? '' : 's'}</span>}{s.quality.filter(q => q.level === 'warn').length > 0 && <span className="warn">⚠ {s.quality.filter(q => q.level === 'warn').length}</span>}</span></summary>
+              {s.comment && <p className="db-r-comment">{s.comment}</p>}
+              {s.quality.filter(q => !q.column).map((q, i) => <p key={i} className={`dbr-note ${q.level}`}>{q.text}</p>)}
+              <table className="db-r-cols dbr-cols"><thead><tr><th>{w.col}</th><th>Filled</th><th className="num">Distinct</th><th>Values</th></tr></thead><tbody>
+                {s.profile.columns.map(c => <tr key={c.name}>
+                  <td><b>{c.name}</b>{c.pk && <span className="tag">key</span>}{c.unique && !c.pk && <span className="tag">unique</span>}<div className="muted sm mono">{c.type}{c.nullable ? '' : ' · required'}</div>
+                    {flags.get(c.name)?.map((f, i) => <div key={i} className="dbr-flag">⚠ {f}</div>)}</td>
+                  <td>{c.error ? '–' : <div className="dbr-fill" title={c.nulls ? `${num(c.nulls)} empty` : 'never empty'}><div className="db-fill"><i style={{ width: `${100 - (c.null_pct ?? 0)}%` }} className={(c.null_pct ?? 0) >= 50 ? 'warn' : ''} /></div><span className="sm">{Math.round(100 - (c.null_pct ?? 0))}%</span></div>}</td>
+                  <td className="num">{num(c.distinct)}</td>
+                  <td><ValueCell c={c} /></td></tr>)}
+              </tbody></table>
+              {samples && s.profile.sample.length > 0 && <><h3>Sample {w.rows}</h3><div className="tbl-wrap"><table className="db-r-sample"><thead><tr>{s.profile.columns.map(c => <th key={c.name}>{c.name}</th>)}</tr></thead><tbody>
+                {s.profile.sample.map((row, i) => <tr key={i}>{row.map((v, j) => <td key={j}>{v == null ? <span className="muted">null</span> : String(v)}</td>)}</tr>)}</tbody></table></div></>}
+              {s.profile.notes.length > 0 && <p className="muted sm">{s.profile.notes.join(' ')}</p>}
+            </details>);
+        })}
+        {report.tables.some(s => !s.profile.rows_exact) && <p className="muted sm">* estimated by the database</p>}
       </article>
     </div>
   );

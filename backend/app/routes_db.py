@@ -205,6 +205,50 @@ def run_report(c: DbConnection, db: Session, payload: ReportIn) -> dict:
     return report
 
 
+class Measure(BaseModel):
+    fn: str = Field(pattern="^(count|count_distinct|sum|avg|min|max)$")
+    column: str | None = Field(default=None, max_length=300)
+
+
+class GroupBy(BaseModel):
+    column: str = Field(max_length=300)
+    bucket: str | None = Field(default=None, pattern="^(hour|day|month|year)$")
+
+
+class Filter(BaseModel):
+    column: str = Field(max_length=300)
+    op: str = Field(pattern="^(eq|ne|gt|gte|lt|lte|contains|starts|in|is_null|not_null)$")
+    value: str = Field(default="", max_length=500)
+
+
+class QueryIn(BaseModel):
+    table: str = Field(max_length=300)
+    measures: list[Measure] = Field(default_factory=lambda: [Measure(fn="count")], min_length=1, max_length=6)
+    group_by: list[GroupBy] = Field(default_factory=list, max_length=2)
+    filters: list[Filter] = Field(default_factory=list, max_length=8)
+    order: str = Field(default="measure_desc", pattern="^(measure_desc|measure_asc|group_asc|group_desc)$")
+    limit: int = Field(default=50, ge=1, le=500)
+
+
+@router.post("/databases/{cid}/query")
+def quick_query(cid: int, payload: QueryIn, request: Request, user: dict = Depends(require_admin), db: Session = Depends(get_db)) -> dict:
+    """COUNT / SUM / AVG / MIN / MAX ... built from a form (no typed SQL), read-only, with a time limit."""
+    from . import dbquery
+    c = get_conn(db, cid)
+    _data, tables, _relations = load_schema(c, db)
+    table = next((t for t in tables if t.key == payload.table), None)
+    if table is None:
+        raise HTTPException(422, "Unknown table")
+    spec = payload.model_dump()
+    try:
+        dbquery.validate(table, spec)                      # a wrong choice in the form is the user's to fix (422), before connecting
+    except dbinspect.DbError as error:
+        raise HTTPException(422, str(error)) from error
+    _, result = with_session(c, lambda i: dbquery.run(i, table, spec))
+    audit(db, request, "db.query", user=user, target=f"database:{c.id}", detail=f"{c.name}: {result['query'][:700]}", commit=True)
+    return result
+
+
 @router.post("/databases/{cid}/report")
 def report(cid: int, payload: ReportIn, request: Request, user: dict = Depends(require_admin), db: Session = Depends(get_db)) -> dict:
     c = get_conn(db, cid)

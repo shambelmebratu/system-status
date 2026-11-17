@@ -572,3 +572,39 @@ class Anomaly(Base):
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     alerted: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class SshLoginEvent(Base):
+    """A successful SSH login an agent saw (agent 2.15+): who, from where, how, and whether it looked suspicious."""
+    __tablename__ = "ssh_login_events"
+    __table_args__ = (Index("ix_ssh_logins_server_ip", "server_id", "ip"), Index("ix_ssh_logins_time", "ts"))
+    id: Mapped[int] = mapped_column(primary_key=True)
+    server_id: Mapped[int] = mapped_column(ForeignKey("servers.id", ondelete="CASCADE"))
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    ip: Mapped[str] = mapped_column(String(45))
+    user: Mapped[str] = mapped_column(String(64), default="")
+    method: Mapped[str] = mapped_column(String(30), default="")
+    failures_before: Mapped[int] = mapped_column(Integer, default=0)      # failed attempts from the same address in the 24 h before
+    new_source: Mapped[bool] = mapped_column(Boolean, default=False)       # first login from this address on this server
+
+
+class SecurityFinding(Base):
+    """A sign of compromise on one server: from the agent's threat scan, or derived by SM-Watch (suspicious login, new SSH key).
+    Open while it is still seen; agent findings resolve themselves when they disappear, the others when someone acknowledges them."""
+    __tablename__ = "security_findings"
+    __table_args__ = (Index("ix_findings_server_key", "server_id", "key", "resolved_at"), Index("ix_findings_open", "resolved_at", "severity"))
+    id: Mapped[int] = mapped_column(primary_key=True)
+    server_id: Mapped[int] = mapped_column(ForeignKey("servers.id", ondelete="CASCADE"))
+    key: Mapped[str] = mapped_column(String(200))
+    source: Mapped[str] = mapped_column(String(10), default="agent")      # agent | smwatch
+    kind: Mapped[str] = mapped_column(String(40))
+    severity: Mapped[str] = mapped_column(String(10))
+    title: Mapped[str] = mapped_column(String(200))
+    detail: Mapped[str] = mapped_column(Text, default="")
+    evidence: Mapped[str] = mapped_column(Text, default="{}")             # JSON: pid, process, path, user, ip, ...
+    first_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    acknowledged_by: Mapped[str | None] = mapped_column(String(320))
+    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    note: Mapped[str] = mapped_column(Text, default="")

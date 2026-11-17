@@ -62,6 +62,11 @@ def report(payload: AgentReport, request: Request, authorization: str | None = H
     metrics = payload.model_dump()
     traffic = metrics.pop("traffic", None)   # stored in its own table, not in the host metrics JSON
     failures_seen = metrics.pop("ssh_failures", None)
+    previous_security = None
+    try:
+        previous_security = (json.loads(server.last_metrics or "{}") or {}).get("security")
+    except ValueError:
+        pass
     metrics["received_at"] = now.isoformat()
     try:
         status, failures = evaluate_metrics(server, metrics)
@@ -75,6 +80,12 @@ def report(payload: AgentReport, request: Request, authorization: str | None = H
     if failures_seen and failures_seen["total"]:
         from .secscan import record_ssh_failures
         record_ssh_failures(db, server, failures_seen, now)
+    if failures_seen and failures_seen.get("accepted"):
+        from .threats import record_logins
+        record_logins(db, server, failures_seen["accepted"], now)
+    if metrics.get("security"):
+        from .threats import sync_threats
+        sync_threats(db, server, metrics["security"], previous_security, now)
     slow = measure_server_traffic(db, server) if server.perf_threshold_ms else None   # this server's response-time target (real traffic)
     if slow and slow["breaching"]:
         failures = [*failures, breach_text(slow, "responses")]

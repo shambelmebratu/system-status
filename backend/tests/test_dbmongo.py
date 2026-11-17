@@ -74,4 +74,23 @@ def test_report_profiles_and_masks(insp):
     pay_cols = [c["name"] for c in sec["payments"]["profile"]["columns"]]
     assert "4111111111111111" not in str(rep) and sec["payments"]["profile"]["sample"][0][pay_cols.index("order")].startswith("orders/")
     assert "is a collection with 300 documents" in sec["customers"]["summary"]
-    assert not any("name is unique" in q for q in sec["customers"]["quality"])           # objects are never suggested as keys
+    assert not any(q["column"] == "name" and "Unique" in q["text"] for q in sec["customers"]["quality"])           # objects are never suggested as keys
+
+
+def test_quick_queries(insp):
+    from app import dbquery
+    tables, _ = insp.schema()
+    orders = next(t for t in tables if t.name == "orders")
+    r = dbquery.run(insp, orders, {"measures": [{"fn": "count"}, {"fn": "avg", "column": "total"}, {"fn": "max", "column": "total"}]})
+    assert r["rows"][0][0] == 900 and r["rows"][0][2] == 59.0 and r["language"] == "mongodb" and r["query"].startswith("db.orders.aggregate(")
+    g = dbquery.run(insp, orders, {"measures": [{"fn": "count"}], "group_by": [{"column": "status"}], "order": "group_asc"})
+    assert g["rows"] == [["paid", 450], ["shipped", 450]]
+    f = dbquery.run(insp, orders, {"measures": [{"fn": "count"}], "filters": [{"column": "total", "op": "gte", "value": "50"}, {"column": "status", "op": "eq", "value": "paid"}]})
+    assert f["rows"][0][0] == 90
+    customers = next(t for t in tables if t.name == "customers")
+    d = dbquery.run(insp, customers, {"measures": [{"fn": "count_distinct", "column": "country"}]})
+    assert d["rows"][0][0] == 3
+    inj = dbquery.run(insp, customers, {"measures": [{"fn": "count"}], "filters": [{"column": "country", "op": "eq", "value": '{"$ne": null}'}]})
+    assert inj["rows"] == [] or inj["rows"][0][0] == 0                       # a value is a plain value, never an operator
+    with pytest.raises(dbinspect.DbError, match="sensitive"):
+        dbquery.run(insp, customers, {"measures": [{"fn": "min", "column": "password_hash"}]})

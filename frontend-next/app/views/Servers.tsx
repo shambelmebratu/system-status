@@ -1,5 +1,6 @@
 'use client';
 
+import { ProcessDrawer } from '../components/process';
 import { useCallback, FormEvent, useEffect, useState } from 'react';
 import { AvailabilityPanel } from '../components/availability';
 import { AreaChart, Ring } from '../components/charts';
@@ -67,6 +68,8 @@ function ServerDetail({ server }: { server: Server }) {
   const [tab, setTab] = useState<'overview' | 'logs' | 'ssh'>('overview');
   const canLogs = canOperate && server.monitor_mode === 'push' && !!server.last_metrics?.capabilities?.includes('logs');
   const canSsh = canOperate && server.monitor_mode === 'push' && !!server.last_metrics?.capabilities?.includes('ssh');
+  const canInspect = canOperate && server.monitor_mode === 'push' && !!server.last_metrics?.capabilities?.includes('process');
+  const [proc, setProc] = useState<{ pid: number; name: string } | null>(null);
   // The report carries a count that can be up to one report interval old; once the SSH tab has asked the agent directly, that
   // fresher number is shown until the next report arrives (so the tab and the list never disagree).
   const [sshFresh, setSshFresh] = useState<{ n: number; report: string | null } | null>(null);
@@ -206,12 +209,14 @@ function ServerDetail({ server }: { server: Server }) {
             </tbody></table>
           </section>
           {server.monitor_mode !== 'ping' && <section className="card">
-            <div className="card-head"><h2>Top processes</h2></div>
+            <div className="card-head"><h2>Top processes</h2>{canInspect && <><span className="grow" /><span className="muted sm">click one for details</span></>}</div>
             {m?.processes?.length ? <table className="tbl"><thead><tr><th>Process</th><th className="num">CPU</th><th className="num">Mem</th></tr></thead><tbody>
-              {m.processes.slice(0, 8).map(p => <tr key={`${p.pid}-${p.name}`}><td><div className="name">{p.name}<small>PID {p.pid}</small></div></td><td className="num">{pct(p.cpu, 1)}</td><td className="num">{p.memory != null ? pct(p.memory, 1) : '–'}</td></tr>)}
+              {m.processes.slice(0, 8).map(p => <tr key={`${p.pid}-${p.name}`} className={canInspect ? 'link' : ''} tabIndex={canInspect ? 0 : undefined} title={canInspect ? 'Show what this process is' : undefined}
+                onClick={() => canInspect && setProc({ pid: p.pid, name: p.name })} onKeyDown={e => canInspect && e.key === 'Enter' && setProc({ pid: p.pid, name: p.name })}><td><div className="name">{p.name}<small>PID {p.pid}</small></div></td><td className="num">{pct(p.cpu, 1)}</td><td className="num">{p.memory != null ? pct(p.memory, 1) : '–'}</td></tr>)}
             </tbody></table> : <p className="muted sm">No process data.</p>}
           </section>}
           {canLogs && <LogPolicyCard serverId={server.id} />}
+          {proc && <ProcessDrawer serverId={server.id} pid={proc.pid} name={proc.name} onClose={() => setProc(null)} />}
           <section className="card"><div className="card-head"><h2>Incidents</h2></div>{mine.length ? <IncidentList items={mine} onSelect={() => undefined} /> : <p className="muted sm">No incidents recorded.</p>}</section>
         </div>
       </div>

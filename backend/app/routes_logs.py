@@ -127,6 +127,32 @@ def request_logs(server_id: int, payload: LogQuery, request: Request, user: dict
     return {"id": item.id, "status": item.status}
 
 
+@router.post("/api/servers/{server_id}/processes/{pid}")
+def inspect_process(server_id: int, pid: int, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+    """Queues an on-demand look at one process (like ps -o ..., /proc/PID/{cmdline,cwd,exe,status,cgroup}). Read the answer with
+    GET /api/servers/{id}/logs/{request id}. Environment values are never sent, only their names."""
+    ensure_access(user, "server", server_id)
+    server = db.get(Server, server_id)
+    if not server:
+        raise HTTPException(404, "Server not found")
+    if server.monitor_mode != "push":
+        raise HTTPException(422, "Process details need the installed agent")
+    if "process" not in capabilities(server):
+        raise HTTPException(422, "This server's agent cannot show process details: it is older than 2.15 or has AGENT_SECURITY=off. Re-run the install command to update it.")
+    if not 0 < pid < 2**31:
+        raise HTTPException(422, "Invalid process id")
+    now = datetime.now(timezone.utc)
+    pending = db.scalar(select(func.count()).select_from(LogRequest).where(LogRequest.server_id == server_id, LogRequest.status.in_(("pending", "running")), LogRequest.created_at >= now - pickup_timeout())) or 0
+    if pending >= get_settings().log_max_pending_per_server:
+        raise HTTPException(429, "Too many requests are already waiting for this server")
+    item = LogRequest(server_id=server_id, query=json.dumps({"source": "process", "target": str(pid), "lines": 1}))
+    db.add(item)
+    audit(db, request, "process.inspect", user=user, target=f"server:{server_id}", detail=f"{server.name}: PID {pid}")
+    db.commit(); db.refresh(item)
+    _wake(_task_waiters, server_id)
+    return {"id": item.id, "status": item.status}
+
+
 def _read(server_id: int, request_id: int) -> dict:
     with SessionLocal() as db:   # short-lived session: never held while waiting
         item = db.get(LogRequest, request_id)

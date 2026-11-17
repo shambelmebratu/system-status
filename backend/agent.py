@@ -39,7 +39,7 @@ from typing import Any
 
 import psutil
 
-AGENT_VERSION = "2.14.0"
+AGENT_VERSION = "2.15.0"
 _ENV_TOKEN = os.getenv("AGENT_TOKEN", "")                      # the token supplied by configuration; a rotation may supersede it (see _load_state)
 AGENT_TOKEN = ""                                                # the token in use: resolved by ensure_token() (saved state first, then configuration)
 AGENT_ALLOW_INSECURE = os.getenv("AGENT_ALLOW_INSECURE", "") == "1"   # permit http:// to a public address (not recommended)
@@ -170,10 +170,11 @@ def collect() -> dict[str, Any]:
         "net_rx_bps": rx,
         "net_tx_bps": tx,
         "processes": processes[:AGENT_PROCESS_TOP_N],
-        "capabilities": (["logs"] if AGENT_LOGS != "off" else []) + (["ssh"] if AGENT_SSH != "off" else []) + (["ssh_history"] if AGENT_SSH == "on" else []),
+        "capabilities": (["logs"] if AGENT_LOGS != "off" else []) + (["ssh"] if AGENT_SSH != "off" else []) + (["ssh_history"] if AGENT_SSH == "on" else []) + (["process"] if AGENT_SECURITY != "off" else []),
         "ssh_sessions": ssh_count(),
         "ssh_failures": ssh_failures(),
         "updates": updates_report(),
+        "security": security_report(),
         "ips": local_addresses(),
         "public_ip": public_address(),
         "install": install_kind(),
@@ -1407,6 +1408,7 @@ SSH_FAIL_PATTERNS = [
     re.compile(r"maximum authentication attempts exceeded for (?:invalid user )?(?P<user>\S*) from (?P<ip>[0-9a-fA-F:.]+)"),
     re.compile(r"Did not receive identification string from (?P<ip>[0-9a-fA-F:.]+)"),
 ]
+SSH_ACCEPTED = re.compile(r"Accepted (?P<method>password|publickey|keyboard-interactive/pam|gssapi-with-mic|hostbased) for (?P<user>\S+) from (?P<ip>[0-9a-fA-F:.]+) port \d+")
 _journal_since: dict = {"t": None}
 
 
@@ -1421,9 +1423,21 @@ def _auth_log() -> str | None:
 def parse_ssh_failures(lines: list[str]) -> dict:
     ips: dict[str, int] = {}
     users: dict[str, int] = {}
+    accepted: list[dict] = []
     total = 0
+    now = time.time()
     for line in lines:
         if "sshd" not in line and "Failed password" not in line:
+            continue
+        ok = SSH_ACCEPTED.search(line)
+        if ok:   # a successful login: who, from where and how (the dashboard decides whether it looks suspicious)
+            try:
+                ip = str(ipaddress.ip_address(ok.group("ip")))
+            except ValueError:
+                continue
+            when = line_time(line, now)
+            accepted.append({"ip": ip, "user": "".join(ch for ch in ok.group("user") if ch.isprintable())[:40], "method": ok.group("method").split("/")[0],
+                             "ts": datetime.fromtimestamp(when if when and abs(when - now) < 7 * 86400 else now, timezone.utc).isoformat()})
             continue
         for pattern in SSH_FAIL_PATTERNS:
             match = pattern.search(line)
@@ -1440,7 +1454,7 @@ def parse_ssh_failures(lines: list[str]) -> dict:
                     users[user] = users.get(user, 0) + 1
                 break
     top = lambda d, n: dict(sorted(d.items(), key=lambda kv: -kv[1])[:n])   # noqa: E731
-    return {"total": total, "ips": top(ips, 25), "users": top(users, 15), "distinct_ips": len(ips)}
+    return {"total": total, "ips": top(ips, 25), "users": top(users, 15), "distinct_ips": len(ips), "accepted": accepted[-50:]}
 
 
 def ssh_failures() -> dict | None:
@@ -1456,9 +1470,9 @@ def ssh_failures() -> dict | None:
     now = time.time()
     since, _journal_since["t"] = _journal_since["t"], now
     if since is None:
-        return {"total": 0, "ips": {}, "users": {}, "distinct_ips": 0}
+        return {"total": 0, "ips": {}, "users": {}, "distinct_ips": 0, "accepted": []}
     try:
-        out = subprocess.run(base + ["--no-pager", "-o", "cat", "-u", "ssh.service", "-u", "sshd.service", "--since", f"@{int(since)}", "--until", f"@{int(now)}"],
+        out = subprocess.run(base + ["--no-pager", "-o", "short-iso", "-u", "ssh.service", "-u", "sshd.service", "--since", f"@{int(since)}", "--until", f"@{int(now)}"],
                              capture_output=True, text=True, timeout=15, errors="replace").stdout
     except (OSError, subprocess.SubprocessError):
         return None
@@ -1560,6 +1574,516 @@ def updates_report() -> dict | None:
     return _updates["value"]
 
 
+# ------------------------------------------------------------------------------------------------ threat scan and hardening
+# Every AGENT_THREAT_MINUTES (10) the agent looks for signs of compromise: running malware (deleted or fileless programs, programs
+# running from temporary folders, crypto-miners, reverse shells, fake kernel threads), persistence (library preloading, cron jobs
+# that download and run code, systemd units started from temporary folders, extra root accounts, SSH keys) and checks a few
+# hardening settings. Heuristics, not an antivirus: each finding says why it was raised. Only findings and short facts are sent
+# (paths, process names, user names, key fingerprints); never file contents or environment values. AGENT_SECURITY=off turns it off.
+AGENT_THREAT_MINUTES = max(2.0, float(os.getenv("AGENT_THREAT_MINUTES", "10")))
+TEMP_DIRS = ("/tmp/", "/var/tmp/", "/dev/shm/", "/run/shm/")
+MINER_NAMES = {"xmrig", "xmr-stak", "xmr-stak-cpu", "minerd", "cpuminer", "cpuminer-multi", "kdevtmpfsi", "kinsing", "kworkerds", "dbused", "ddgs", "sysupdate",
+               "networkservice", "sysguard", "watchbog", "t-rex", "nbminer", "lolminer", "phoenixminer", "ethminer", "nanominer", "srbminer", "teamredminer", "xmrigdaemon"}
+MINER_ARGS = re.compile(r"stratum\+(?:tcp|ssl)://|--donate-level|--coin[= ]monero|nicehash|minexmr|supportxmr|nanopool\.org|moneroocean|hashvault|c3pool|xmrpool", re.I)
+REVERSE_SHELL = re.compile(r"/dev/(?:tcp|udp)/|\bbash -i\b.*[>&]|\bn(?:c|cat|etcat)\b.*\s-(?:e|c)\s|socat\b.*exec:|import pty.*spawn|pty\.spawn\(|socket\.socket\(.*connect|perl -e .*socket|php -r .*fsockopen|mkfifo .*\bnc\b", re.I)
+MINING_PORTS = {3333, 4444, 5555, 6666, 7777, 9999, 14433, 14444, 45560, 45700}
+HIDDEN_OK = (".vscode-server", ".cursor-server", ".nvm", ".pyenv", ".cargo", ".rustup", ".bun", ".deno", ".rbenv", ".sdkman", ".linuxbrew", ".local", ".npm", ".volta",
+             ".asdf", ".goenv", ".jenv", ".nodenv", ".docker", ".windsurf-server", ".jetbrains", ".cache/JetBrains", ".dotnet", ".fly", ".claude")
+SAFE_ENV = {"PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TERM", "PWD", "HOSTNAME", "TZ", "container", "INVOCATION_ID", "JOURNAL_STREAM", "NODE_ENV",
+            "PYTHONUNBUFFERED", "JAVA_HOME", "VIRTUAL_ENV", "XDG_RUNTIME_DIR", "SHLVL"}
+_threats: dict = {"at": 0.0, "value": None, "running": False, "pkg_at": 0.0, "pkg": None}
+
+
+def _read(path: str, limit: int = 200_000) -> str:
+    try:
+        with open(_host_path(path), "rb") as handle:
+            return handle.read(limit).decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _proc_exe(pid: int) -> str:
+    """Where the program of `pid` lives on disk, as the kernel reports it (" (deleted)" when it was removed after starting)."""
+    try:
+        return os.readlink(os.path.join(AGENT_PROCFS_PATH, str(pid), "exe"))
+    except OSError:
+        return ""
+
+
+def _hidden_dir(path: str) -> bool:
+    parts = [p for p in path.split("/")[:-1] if p]
+    for n, part in enumerate(parts):
+        if part.startswith(".") and part not in (".", ".."):
+            rest = "/".join(parts[n:])
+            return not any(rest.startswith(ok) for ok in HIDDEN_OK)
+    return False
+
+
+def process_flags(pid: int, name: str, exe: str, cmdline: str) -> list[tuple[str, str, str]]:
+    """(severity, kind, reason) for one process; empty when nothing looks wrong. Each reason reads after "This process ..."."""
+    flags: list[tuple[str, str, str]] = []
+    real = exe.replace(" (deleted)", "")
+    base = os.path.basename(real).lower() or name.lower()
+    if exe.startswith("/memfd:") or exe.startswith("memfd:"):
+        flags.append(("critical", "fileless", "runs from memory only (memfd), a technique malware uses to leave no file behind"))
+    elif exe.endswith(" (deleted)"):
+        if real.startswith(TEMP_DIRS) or "/." in real or real.startswith(("/home/", "/root/")):
+            flags.append(("critical", "deleted_exe", f"runs a program that was deleted after it started ({real}), typical for malware hiding its tracks"))
+        else:
+            flags.append(("low", "deleted_exe_update", f"runs an old version of {real} that an update replaced: restart it to load the new one"))
+    if real.startswith(TEMP_DIRS):
+        flags.append(("critical", "temp_exe", f"runs a program from a temporary folder ({real})"))
+    elif real and _hidden_dir(real):
+        flags.append(("high", "hidden_exe", f"runs a program from a hidden folder ({real})"))
+    if base in MINER_NAMES or name.lower() in MINER_NAMES or MINER_ARGS.search(cmdline):
+        flags.append(("critical", "miner", "looks like a crypto-currency miner (its name or mining-pool arguments)"))
+    if REVERSE_SHELL.search(cmdline):
+        flags.append(("critical", "reverse_shell", "has a command line that looks like a reverse shell (remote control of this server)"))
+    if cmdline.startswith("[") and cmdline.rstrip().endswith("]") and exe:
+        flags.append(("critical", "fake_kthread", "pretends to be a kernel thread (its name is in brackets) but runs a program"))
+    flags.sort(key=lambda f: ("critical", "high", "medium", "low").index(f[0]))
+    return flags
+
+
+_SystemConn = __import__("collections").namedtuple("_SystemConn", "fd family type laddr raddr status pid")   # same shape as psutil.net_connections()
+
+
+def _connections() -> list:
+    """Every inet socket with its process. In a container that watches the host (AGENT_PROCFS_PATH set), the system-wide list would
+    show the container's own network, so sockets are read per process instead (each from the process's own network namespace)."""
+    if AGENT_PROCFS_PATH == "/proc":
+        return psutil.net_connections(kind="inet")
+    found = []
+    for process in psutil.process_iter():
+        try:
+            conns = process.net_connections(kind="inet") if hasattr(process, "net_connections") else process.connections(kind="inet")
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
+            continue
+        found += [_SystemConn(c.fd, c.family, c.type, c.laddr, c.raddr, c.status, process.pid) for c in conns]
+    return found
+
+
+def _scan_processes(findings: list[dict]) -> None:
+    for process in psutil.process_iter(["pid", "name", "username", "cmdline", "ppid"]):
+        try:
+            pid, name = process.info["pid"], process.info["name"] or ""
+            if pid <= 2:
+                continue
+            exe = _proc_exe(pid) if not IS_MAC else (process.exe() or "")
+            cmd = " ".join(process.info["cmdline"] or [])[:2000]
+            flags = process_flags(pid, name, exe, cmd)
+            if not flags:
+                continue
+            severity, kind, _ = flags[0]                          # one finding per program, with every reason, at the worst severity
+            where = exe.replace(" (deleted)", "") or name
+            title = f"{name or where} needs a restart after an update" if kind == "deleted_exe_update" else f"Suspicious process: {name or where}"
+            findings.append({"key": f"proc:{where}"[:200], "kind": f"process_{kind}", "severity": severity, "title": title,
+                             "detail": f"{name} (PID {pid}, user {process.info['username'] or '?'}) " + "; it ".join(r for _, _, r in flags) + ".", "pid": pid, "process": name[:100],
+                             "user": (process.info["username"] or "")[:60], "path": where[:300], "command": redact_command(cmd)[:300]})
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+    try:
+        connections = _connections()
+    except (psutil.AccessDenied, OSError, RuntimeError):
+        connections = []
+    for c in connections:
+        if c.status == "ESTABLISHED" and c.raddr and c.raddr.port in MINING_PORTS and c.pid:
+            try:
+                name = psutil.Process(c.pid).name()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                name = "?"
+            findings.append({"key": f"net:mining:{name}:{c.raddr.port}"[:200], "kind": "mining_connection", "severity": "high", "title": f"Connection to a mining-pool port ({c.raddr.port})",
+                             "detail": f"{name} (PID {c.pid}) is connected to {c.raddr.ip}:{c.raddr.port}, a port commonly used by crypto-mining pools.", "pid": c.pid, "process": name[:100], "remote": f"{c.raddr.ip}:{c.raddr.port}"})
+
+
+def _executables_in_temp(findings: list[dict]) -> None:
+    found = []
+    for top in ("/tmp", "/var/tmp", "/dev/shm"):
+        root = _host_path(top)
+        seen = 0
+        for dirpath, dirnames, filenames in os.walk(root):
+            depth = dirpath[len(root):].count(os.sep)
+            if depth >= 2:
+                dirnames[:] = []
+            dirnames[:] = [d for d in dirnames if not d.startswith(("systemd-private-", "snap-private-tmp", ".X11-unix", ".ICE-unix", "tmux-"))]
+            for f in filenames:
+                seen += 1
+                if seen > 3000:
+                    break
+                path = os.path.join(dirpath, f)
+                try:
+                    st = os.lstat(path)
+                    if not (st.st_mode & 0o111) or not os.path.isfile(path) or st.st_size < 1024:
+                        continue
+                    with open(path, "rb") as handle:
+                        magic = handle.read(4)
+                except OSError:
+                    continue
+                if magic == b"\x7fELF":     # a compiled program (scripts are common in /tmp and not flagged)
+                    found.append(("/" + os.path.relpath(path, AGENT_HOST_ROOT)) if AGENT_HOST_ROOT not in ("", "/") else path)
+    for path in found[:15]:
+        findings.append({"key": f"file:temp_elf:{path}"[:200], "kind": "temp_executable", "severity": "high", "title": "Program file in a temporary folder",
+                         "detail": f"{path} is a compiled program stored in a temporary folder. Attackers often drop their tools there.", "path": path[:300]})
+
+
+DOWNLOAD_AND_RUN = re.compile(r"(?:curl|wget|fetch)\b[^\n|;]*\|\s*(?:ba|da|z|k)?sh\b|base64\s+(?:-d|--decode)[^\n]*\|\s*(?:ba)?sh|/dev/tcp/|\b(?:curl|wget)\b[^\n;]*(?:-o|-O)\s*/(?:tmp|dev/shm|var/tmp)/[^\n;]*;\s*(?:chmod|/tmp|/dev/shm|sh )", re.I)
+
+
+def _persistence(findings: list[dict]) -> None:
+    preload = _read("/etc/ld.so.preload").strip()
+    if preload:
+        findings.append({"key": "file:ld_so_preload", "kind": "ld_preload", "severity": "critical", "title": "Library preloading is configured (/etc/ld.so.preload)",
+                         "detail": f"Every program loads {preload.splitlines()[0][:200]} first. Rootkits use this to hide; legitimate use is rare.", "path": "/etc/ld.so.preload"})
+    cron_files = ["/etc/crontab"] + [p for d in ("/etc/cron.d", "/var/spool/cron/crontabs", "/var/spool/cron", "/etc/cron.hourly", "/etc/cron.daily") for p in _list_host(d)]
+    for path in cron_files[:300]:
+        text = _read(path, 100_000)
+        for line in text.splitlines():
+            if line.strip().startswith("#"):
+                continue
+            if DOWNLOAD_AND_RUN.search(line):
+                findings.append({"key": f"cron:{path}:{hashlib.sha256(line.encode()).hexdigest()[:12]}", "kind": "cron_download", "severity": "critical",
+                                 "title": "Scheduled task downloads and runs code", "detail": f"{path}: {redact_command(line.strip())[:240]}", "path": path})
+                break
+    for path in _list_host("/etc/systemd/system")[:500] + _list_host("/lib/systemd/system")[:0]:
+        if not path.endswith((".service", ".timer")):
+            continue
+        for line in _read(path, 50_000).splitlines():
+            if line.startswith(("ExecStart", "ExecStartPre")):
+                command = line.split("=", 1)[-1].strip().lstrip("-@+!")
+                program = command.split()[0] if command.split() else ""
+                if program.startswith(TEMP_DIRS) or DOWNLOAD_AND_RUN.search(command) or (program and _hidden_dir(program)):
+                    findings.append({"key": f"unit:{path}", "kind": "systemd_suspicious", "severity": "high", "title": f"Service started from an unusual place ({os.path.basename(path)})",
+                                     "detail": f"{path}: {redact_command(line.strip())[:240]}", "path": path})
+                    break
+    for row in _read("/etc/passwd").splitlines():
+        f = row.split(":")
+        if len(f) >= 7 and f[2] == "0" and f[0] != "root":
+            findings.append({"key": f"user:uid0:{f[0]}", "kind": "extra_root", "severity": "critical", "title": f"Extra administrator account: {f[0]}",
+                             "detail": f"The account {f[0]} has user id 0, which gives it full root powers. Attackers add such accounts as a back door.", "user": f[0][:60]})
+
+
+def _list_host(directory: str) -> list[str]:
+    real = _host_path(directory)
+    try:
+        names = sorted(os.listdir(real))
+    except OSError:
+        return []
+    return [os.path.join(directory, n) for n in names if os.path.isfile(os.path.join(real, n))]
+
+
+def authorized_keys() -> list[dict]:
+    """Every key allowed to log in over SSH: user, type, SHA256 fingerprint (as ssh-keygen -l shows it) and comment. Never the key."""
+    import base64
+    keys = []
+    for user, home in _home_dirs():
+        for name in ("authorized_keys", "authorized_keys2"):
+            path = os.path.join(home, ".ssh", name)
+            for line in _read(path, 400_000).splitlines():
+                parts = line.strip().split()
+                idx = next((i for i, p in enumerate(parts) if p.startswith(("ssh-", "ecdsa-", "sk-"))), None)
+                if idx is None or idx + 1 >= len(parts):
+                    continue
+                try:
+                    blob = base64.b64decode(parts[idx + 1])
+                except ValueError:
+                    continue
+                fp = "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
+                keys.append({"user": user[:60], "type": parts[idx][:30], "fingerprint": fp, "comment": " ".join(parts[idx + 2:])[:80], "options": idx > 0, "file": path[:200]})
+    return keys[:200]
+
+
+def _sshd_option(name: str) -> str | None:
+    """The effective value of an sshd_config option (first occurrence wins, including Include'd files read in order)."""
+    texts = [_read("/etc/ssh/sshd_config")]
+    texts += [_read(p) for p in _list_host("/etc/ssh/sshd_config.d") if p.endswith(".conf")]
+    ordered = [texts[0].split("\n")]
+    if any(line.strip().lower().startswith("include") for line in texts[0].splitlines()):
+        ordered = [t.split("\n") for t in texts[1:]] + ordered      # Debian/Ubuntu include sshd_config.d at the top
+    for lines in ordered:
+        for line in lines:
+            parts = line.strip().split(None, 1)
+            if len(parts) == 2 and parts[0].lower() == name.lower() and not parts[0].startswith("#"):
+                if line.strip().lower().startswith("match"):
+                    break
+                return parts[1].strip().split()[0].lower()
+    return None
+
+
+def _running(*names: str) -> bool:
+    for process in psutil.process_iter(["name"]):
+        if (process.info["name"] or "") in names:
+            return True
+    return False
+
+
+def hardening() -> list[dict]:
+    checks: list[dict] = []
+    add = lambda cid, title, ok, detail, severity="medium": checks.append({"id": cid, "title": title, "ok": ok, "detail": detail, "severity": severity})   # noqa: E731
+    if _read("/etc/ssh/sshd_config"):
+        pw = _sshd_option("PasswordAuthentication")
+        add("ssh_passwords", "SSH password logins are off", pw == "no", "PasswordAuthentication is " + (pw or "not set (default: yes)") + ". Use keys only.", "high")
+        root = _sshd_option("PermitRootLogin")
+        add("ssh_root", "Root cannot log in with a password over SSH", root in ("no", "prohibit-password", "without-password", "forced-commands-only") or (root is None),
+            "PermitRootLogin is " + (root or "not set (default: prohibit-password)") + ".", "high")
+    else:
+        add("ssh_passwords", "SSH password logins are off", None, "The SSH server configuration could not be read.", "high")
+    ufw = _read("/etc/ufw/ufw.conf")
+    firewalld = _running("firewalld")
+    nft = bool(_read("/etc/nftables.conf").count("table")) and _running("nft")
+    if "ENABLED=yes" in ufw:
+        add("firewall", "A firewall is active", True, "ufw is enabled.")
+    elif firewalld:
+        add("firewall", "A firewall is active", True, "firewalld is running.")
+    elif ufw or os.path.isdir(_host_path("/etc/firewalld")):
+        add("firewall", "A firewall is active", False, "A firewall is installed but not enabled.")
+    else:
+        add("firewall", "A firewall is active", None if nft else None, "No ufw or firewalld found (nftables/iptables rules or a cloud firewall cannot be checked from here).")
+    add("fail2ban", "Brute-force protection (fail2ban) runs", _running("fail2ban-server") or None, "fail2ban blocks addresses that keep failing to log in." if _running("fail2ban-server") else "fail2ban is not running (a cloud firewall or CrowdSec may do the same job).", "low")
+    auto = _read("/etc/apt/apt.conf.d/20auto-upgrades")
+    if os.path.exists(_host_path("/var/lib/dpkg/status")):
+        on = 'Unattended-Upgrade "1"' in auto
+        add("auto_updates", "Security updates install automatically", on, "unattended-upgrades is " + ("on." if on else "off: security fixes wait for someone to install them."))
+    elif os.path.exists(_host_path("/etc/dnf/automatic.conf")):
+        on = "apply_updates = yes" in _read("/etc/dnf/automatic.conf").replace("\t", " ")
+        add("auto_updates", "Security updates install automatically", on, "dnf-automatic " + ("applies updates." if on else "is installed but does not apply updates."))
+    shadow = _read("/etc/shadow")
+    if shadow:
+        empty = [f[0] for f in (r.split(":") for r in shadow.splitlines()) if len(f) > 1 and f[1] == ""]
+        add("empty_passwords", "No account has an empty password", not empty, ("Accounts without a password: " + ", ".join(empty[:10])) if empty else "Every account has a password or is locked.", "critical")
+    root_users = [f[0] for f in (r.split(":") for r in _read("/etc/passwd").splitlines()) if len(f) >= 3 and f[2] == "0"]
+    if root_users:
+        add("uid0", "Only root has administrator user id 0", root_users == ["root"], "Accounts with id 0: " + ", ".join(root_users[:10]), "critical")
+    return checks
+
+
+def listening() -> list[dict]:
+    """Services accepting connections, and on which address (0.0.0.0 / :: = every network)."""
+    try:
+        connections = _connections()
+    except (psutil.AccessDenied, OSError, RuntimeError):
+        return []
+    out: dict[tuple, dict] = {}
+    for c in connections:
+        if c.status != "LISTEN" or not c.laddr:
+            continue
+        try:
+            name = psutil.Process(c.pid).name() if c.pid else ""
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            name = ""
+        everywhere = c.laddr.ip in ("0.0.0.0", "::", "")
+        if ipaddress.ip_address(c.laddr.ip or "0.0.0.0").is_loopback:
+            continue
+        out[(c.laddr.port, name)] = {"port": c.laddr.port, "address": c.laddr.ip, "all_interfaces": everywhere, "process": name[:60]}
+    return sorted(out.values(), key=lambda r: r["port"])[:80]
+
+
+def foreign_packages() -> dict:
+    """Installed packages that no configured repository provides (installed from a file or an unknown source)."""
+    root = AGENT_HOST_ROOT if AGENT_HOST_ROOT not in ("", "/") else ""
+    status = _host_path("/var/lib/dpkg/status")
+    if os.path.exists(status):
+        installed: dict[str, str] = {}
+        name = version = None
+        ok = False
+        try:
+            with open(status, errors="replace") as handle:
+                for line in handle:
+                    if line.startswith("Package: "):
+                        name, version, ok = line[9:].strip(), None, False
+                    elif line.startswith("Version: "):
+                        version = line[9:].strip()
+                    elif line.startswith("Status: "):
+                        ok = line.strip().endswith("install ok installed")
+                    elif not line.strip() and name and version and ok:
+                        installed[name] = version
+                        name = None
+            if name and version and ok:
+                installed[name] = version
+        except OSError:
+            return {"manager": "apt", "packages": [], "error": "cannot read the dpkg database"}
+        available: set[tuple[str, str]] = set()
+        lists = glob.glob(os.path.join(root, "var/lib/apt/lists", "*_Packages")) if root else glob.glob("/var/lib/apt/lists/*_Packages")
+        if not lists:
+            return {"manager": "apt", "packages": [], "error": "no package lists (run apt-get update)"}
+        for path in lists:
+            try:
+                with open(path, errors="replace") as handle:
+                    pkg = None
+                    for line in handle:
+                        if line.startswith("Package: "):
+                            pkg = line[9:].strip()
+                        elif line.startswith("Version: ") and pkg in installed:
+                            available.add((pkg, line[9:].strip()))
+            except OSError:
+                continue
+        foreign = sorted(n for n, v in installed.items() if (n, v) not in available)
+        return {"manager": "apt", "packages": foreign[:60], "total": len(foreign), "error": None}
+    tool = shutil.which("dnf") or shutil.which("yum")
+    if tool and not root:
+        code, out = _run([tool, "-q", "-C", "list", "installed"], 120)
+        foreign = sorted({line.split()[0].rsplit(".", 1)[0] for line in out.splitlines() if len(line.split()) >= 3 and line.split()[2] in ("@commandline", "@System")})
+        return {"manager": os.path.basename(tool), "packages": foreign[:60], "total": len(foreign), "error": None if code in (0, 1) else "the package cache is empty"}
+    return {"manager": None, "packages": [], "error": "not supported on this system"}
+
+
+def threat_scan() -> dict:
+    findings: list[dict] = []
+    started = time.monotonic()
+    for step in (_scan_processes, _executables_in_temp, _persistence):
+        try:
+            step(findings)
+        except Exception as error:   # noqa: BLE001  (one failing check must not hide the others)
+            log.debug("threat check %s failed: %s", step.__name__, error)
+    if time.time() - _threats["pkg_at"] > AGENT_UPDATES_HOURS * 3600:
+        _threats["pkg_at"] = time.time()
+        try:
+            _threats["pkg"] = foreign_packages()
+        except Exception as error:   # noqa: BLE001
+            _threats["pkg"] = {"manager": None, "packages": [], "error": str(error)[:200]}
+    pkg = _threats["pkg"] or {}
+    if pkg.get("packages"):
+        findings.append({"key": "pkg:foreign", "kind": "foreign_packages", "severity": "medium", "title": f"{pkg.get('total', len(pkg['packages']))} package(s) installed from outside your repositories",
+                         "detail": "Not provided by any configured package source (installed from a file, or the source was removed): " + ", ".join(pkg["packages"][:25]) + ". Check you know where each came from.",
+                         "packages": pkg["packages"][:60]})
+    seen, unique = set(), []
+    for f in findings:
+        if f["key"] not in seen:
+            seen.add(f["key"]); unique.append(f)
+    unique.sort(key=lambda f: ("critical", "high", "medium", "low").index(f["severity"]))
+    return {"checked_at": datetime.now(timezone.utc).isoformat(), "findings": unique[:60], "hardening": _safe(hardening, []), "listening": _safe(listening, []),
+            "authorized_keys": _safe(authorized_keys, []), "foreign_packages": pkg or None, "seconds": round(time.monotonic() - started, 2)}
+
+
+def _safe(fn, default):
+    try:
+        return fn()
+    except Exception as error:   # noqa: BLE001
+        log.debug("%s failed: %s", fn.__name__, error)
+        return default
+
+
+def security_report() -> dict | None:
+    """The cached threat scan; refreshed in the background every AGENT_THREAT_MINUTES."""
+    if AGENT_SECURITY == "off" or IS_MAC or os.name == "nt":
+        return None
+    if not _threats["running"] and time.time() - _threats["at"] > AGENT_THREAT_MINUTES * 60:
+        _threats["running"] = True
+
+        def work():
+            try:
+                _threats["value"] = threat_scan()
+            finally:
+                _threats["at"], _threats["running"] = time.time(), False
+        threading.Thread(target=work, daemon=True, name="threat-scan").start()
+    return _threats["value"]
+
+
+# ------------------------------------------------------------------------------------------------ process detail (on demand)
+def _status_fields(pid: int) -> dict:
+    keep = ("State", "Tgid", "PPid", "Uid", "Gid", "FDSize", "VmPeak", "VmSize", "VmRSS", "VmSwap", "Threads", "voluntary_ctxt_switches", "nonvoluntary_ctxt_switches",
+            "Seccomp", "NoNewPrivs", "CapEff")
+    out = {}
+    try:
+        with open(os.path.join(AGENT_PROCFS_PATH, str(pid), "status")) as handle:
+            for line in handle:
+                k, _, v = line.partition(":")
+                if k in keep:
+                    out[k] = " ".join(v.split())[:80]
+    except OSError:
+        pass
+    return out
+
+
+def _container_of(cgroup: str) -> dict | None:
+    m = re.search(r"(?:docker[-/]|containerd[-/]|cri-containerd-|crio-|libpod-)([0-9a-f]{12,64})", cgroup)
+    if not m:
+        return None
+    cid = m.group(1)
+    info = {"id": cid[:12], "runtime": "docker" if "docker" in cgroup else "containerd" if "containerd" in cgroup else "crio" if "crio" in cgroup else "podman" if "libpod" in cgroup else ""}
+    if "kubepods" in cgroup:
+        info["kubernetes"] = True
+    try:
+        if docker_available():
+            data = json.loads(_docker(f"/containers/{cid}/json"))
+            info["name"] = (data.get("Name") or "").lstrip("/")[:100]
+            info["image"] = (data.get("Config") or {}).get("Image", "")[:200]
+    except Exception:   # noqa: BLE001
+        pass
+    return info
+
+
+def process_detail(pid_text: str) -> str:
+    """An overview of one process, like `ps -o ...`, /proc/PID/{cmdline,cwd,exe,status,cgroup}. Environment: names only (values hold secrets)."""
+    if not pid_text.isdigit():
+        raise ValueError("A process id is a number")
+    pid = int(pid_text)
+    try:
+        p = psutil.Process(pid)
+        with p.oneshot():
+            info = {"pid": pid, "ppid": p.ppid(), "name": p.name(), "status": p.status(), "user": _try(p.username), "started": datetime.fromtimestamp(p.create_time(), timezone.utc).isoformat(),
+                    "elapsed_seconds": int(time.time() - p.create_time()), "cpu_percent": _try(lambda: round(p.cpu_percent(interval=0.3), 1)), "memory_percent": _try(lambda: round(p.memory_percent(), 2)),
+                    "rss_bytes": _try(lambda: p.memory_info().rss), "threads": _try(p.num_threads), "nice": _try(p.nice), "fds": _try(p.num_fds) if not IS_MAC else None,
+                    "terminal": _try(p.terminal)}
+            uids, gids = _try(p.uids), _try(p.gids)
+            info["uid"], info["gid"] = (uids.real if uids else None), (gids.real if gids else None)
+            info["group"] = _group_name(info["gid"])
+            cmd = _try(p.cmdline) or []
+            info["cmdline"] = redact_command(" ".join(cmd))[:4000]
+            info["exe"] = (_proc_exe(pid) if not IS_MAC else _try(p.exe)) or None
+            info["cwd"] = _try(p.cwd)
+            env = _try(p.environ) or {}
+            info["environment"] = [{"name": k[:80], "value": (v[:200] if k in SAFE_ENV else None)} for k, v in sorted(env.items())][:200]
+    except psutil.NoSuchProcess:
+        raise ValueError(f"There is no process {pid} any more (it may have finished)") from None
+    except psutil.AccessDenied:
+        raise ValueError(f"The agent is not allowed to inspect process {pid}") from None
+    cgroup = _read_proc(pid, "cgroup")
+    info["cgroup"] = cgroup.strip().splitlines()[-1][:300] if cgroup.strip() else None
+    info["container"] = _container_of(cgroup)
+    info["proc_status"] = _status_fields(pid)
+    try:
+        parent = psutil.Process(info["ppid"])
+        info["parent"] = {"pid": parent.pid, "name": parent.name(), "cmdline": redact_command(" ".join(_try(parent.cmdline) or []))[:300]}
+    except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError):
+        info["parent"] = None
+    try:
+        info["children"] = [{"pid": c.pid, "name": c.name()} for c in p.children()[:25]]
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        info["children"] = []
+    try:
+        conns = p.net_connections(kind="inet") if hasattr(p, "net_connections") else p.connections(kind="inet")
+        info["connections"] = [{"status": c.status, "local": f"{c.laddr.ip}:{c.laddr.port}" if c.laddr else "", "remote": f"{c.raddr.ip}:{c.raddr.port}" if c.raddr else ""} for c in conns[:40]]
+    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+        info["connections"] = None
+    info["flags"] = [{"severity": s, "kind": k, "reason": r} for s, k, r in process_flags(pid, info["name"], info["exe"] or "", " ".join(cmd))]
+    return json.dumps(info, default=str)
+
+
+def _try(fn):
+    try:
+        return fn()
+    except (psutil.Error, OSError, AttributeError, NotImplementedError):
+        return None
+
+
+def _read_proc(pid: int, name: str) -> str:
+    try:
+        with open(os.path.join(AGENT_PROCFS_PATH, str(pid), name), errors="replace") as handle:
+            return handle.read(20_000)
+    except OSError:
+        return ""
+
+
+def _group_name(gid) -> str | None:
+    if gid is None:
+        return None
+    for row in _read("/etc/group").splitlines():
+        f = row.split(":")
+        if len(f) >= 3 and f[2] == str(gid):
+            return f[0]
+    return None
+
+
 def fetch_logs(task: dict) -> tuple[str, bool]:
     """Runs one validated log request. Returns (text, truncated)."""
     source = task.get("source")
@@ -1568,10 +2092,18 @@ def fetch_logs(task: dict) -> tuple[str, bool]:
     since = max(0, min(31 * 86400, max(int(task.get("since_seconds") or 0), int(task.get("since_minutes") or 0) * 60)))   # seconds; 0 = no time limit
     needle = str(task.get("grep") or "")[:200].lower()
     priority = task.get("priority") or ""
+    if AGENT_LOGS == "off" and source in ("inventory", "docker", "journal", "file"):
+        raise ValueError("Log access is turned off on this server (AGENT_LOGS=off)")
+    if AGENT_SSH == "off" and source == "ssh":
+        raise ValueError("SSH activity is turned off on this server (AGENT_SSH=off)")
     if source == "inventory":
         return json.dumps(apply_policy_to_inventory(dict(log_inventory(units=target == "units")))), False
     if source == "ssh":
         return ssh_answer(target, lines), False
+    if source == "process":
+        if AGENT_SECURITY == "off":
+            raise ValueError("Process inspection is turned off on this server (AGENT_SECURITY=off)")
+        return process_detail(target), False
     if not TARGET_RE.match(target) or ".." in target:
         raise ValueError("Invalid log target")
     if not policy_allows(str(source), target):
@@ -1783,7 +2315,7 @@ def push_loop() -> None:
             log.warning("cannot register yet (%s); retrying in 15s", error)
         time.sleep(15)
     log.info("push mode: reporting to %s (agent %s)", SMWATCH_URL, AGENT_VERSION)
-    if AGENT_LOGS != "off":
+    if AGENT_LOGS != "off" or AGENT_SSH != "off" or AGENT_SECURITY != "off":   # on-demand work: logs, SSH activity, process details
         threading.Thread(target=task_loop, daemon=True, name="tasks").start()
     while True:
         started = time.monotonic()

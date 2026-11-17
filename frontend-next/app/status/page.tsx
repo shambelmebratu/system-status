@@ -50,7 +50,6 @@ export default function StatusPage() {
           <UptimeBar days={s.daily} />
         </section>
       ))}
-      {data.services.length === 0 && <div className="card muted">Nothing is published here yet. Enable “Show on the public status page” on a server or service.</div>}
       <section className="card">
         <div className="card-head"><h2>Past {data.days} days</h2></div>
         {data.incidents.length === 0 ? <p className="muted sm">No incidents reported.</p> : (

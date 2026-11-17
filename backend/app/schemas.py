@@ -183,11 +183,30 @@ class TrafficStatus(BaseModel):
         return [{"path": _printable(str(d.get("path", "")))[:200], "timing": bool(d.get("timing"))} for d in v if isinstance(d, dict)]
 
 
+class SshLogin(BaseModel):
+    ip: str = Field(max_length=45)
+    user: str = Field(default="", max_length=64)
+    method: str = Field(default="", max_length=30)
+    ts: str = Field(default="", max_length=40)
+
+    @field_validator("ip")
+    @classmethod
+    def is_ip(cls, v: str) -> str:
+        import ipaddress
+        return str(ipaddress.ip_address(v.strip()))
+
+    @field_validator("user", "method", "ts")
+    @classmethod
+    def clean(cls, v: str) -> str:
+        return _printable(v)
+
+
 class SshFailures(BaseModel):
     total: int = Field(default=0, ge=0, le=10_000_000)
     ips: dict[str, int] = Field(default_factory=dict)
     users: dict[str, int] = Field(default_factory=dict)
     distinct_ips: int = Field(default=0, ge=0)
+    accepted: list[SshLogin] = Field(default_factory=list, max_length=60)      # successful logins (agent 2.15+)
 
     @field_validator("ips", "users")
     @classmethod
@@ -213,6 +232,73 @@ class UpdatesReport(BaseModel):
     lists_age_hours: float | None = None
 
 
+class ThreatFinding(BaseModel):
+    """One sign of compromise found by the agent's threat scan. Free text is shown escaped; nothing here is ever executed."""
+    key: str = Field(max_length=200)
+    kind: str = Field(max_length=40, pattern=r"^[a-z0-9_]+$")
+    severity: str = Field(pattern="^(critical|high|medium|low)$")
+    title: str = Field(max_length=200)
+    detail: str = Field(default="", max_length=1000)
+    pid: int | None = Field(default=None, ge=0, le=2**31)
+    process: str = Field(default="", max_length=100)
+    user: str = Field(default="", max_length=64)
+    path: str = Field(default="", max_length=300)
+    command: str = Field(default="", max_length=300)
+    remote: str = Field(default="", max_length=80)
+    packages: list[str] = Field(default_factory=list, max_length=60)
+
+    @field_validator("key", "title", "detail", "process", "user", "path", "command", "remote")
+    @classmethod
+    def clean(cls, v: str) -> str:
+        return _printable(v)
+
+
+class HardeningCheck(BaseModel):
+    id: str = Field(max_length=40, pattern=r"^[a-z0-9_]+$")
+    title: str = Field(max_length=200)
+    ok: bool | None = None
+    detail: str = Field(default="", max_length=500)
+    severity: str = Field(default="medium", pattern="^(critical|high|medium|low)$")
+
+
+class ListeningPort(BaseModel):
+    port: int = Field(ge=0, le=65535)
+    address: str = Field(default="", max_length=60)
+    all_interfaces: bool = False
+    process: str = Field(default="", max_length=60)
+
+
+class AuthorizedKey(BaseModel):
+    user: str = Field(max_length=64)
+    type: str = Field(max_length=30)
+    fingerprint: str = Field(max_length=80, pattern=r"^SHA256:[A-Za-z0-9+/]+$")
+    comment: str = Field(default="", max_length=80)
+    options: bool = False
+    file: str = Field(default="", max_length=200)
+
+    @field_validator("user", "comment", "file")
+    @classmethod
+    def clean(cls, v: str) -> str:
+        return _printable(v)
+
+
+class ForeignPackages(BaseModel):
+    manager: str | None = Field(default=None, max_length=20)
+    packages: list[str] = Field(default_factory=list, max_length=60)
+    total: int = Field(default=0, ge=0, le=100000)
+    error: str | None = Field(default=None, max_length=300)
+
+
+class SecurityReport(BaseModel):
+    checked_at: str = Field(max_length=40)
+    findings: list[ThreatFinding] = Field(default_factory=list, max_length=60)
+    hardening: list[HardeningCheck] = Field(default_factory=list, max_length=30)
+    listening: list[ListeningPort] = Field(default_factory=list, max_length=80)
+    authorized_keys: list[AuthorizedKey] = Field(default_factory=list, max_length=200)
+    foreign_packages: ForeignPackages | None = None
+    seconds: float = Field(default=0, ge=0)
+
+
 class AgentReport(BaseModel):
     cpu: float = Field(ge=0, le=100)
     cpu_peak: float | None = Field(default=None, ge=0, le=100)
@@ -234,7 +320,8 @@ class AgentReport(BaseModel):
     capabilities: list[str] = Field(default_factory=list, max_length=20)
     ssh_sessions: int | None = Field(default=None, ge=0, le=100000)
     ssh_failures: SshFailures | None = None
-    updates: UpdatesReport | None = None   # open SSH sessions right now (a count only: no names or addresses)
+    updates: UpdatesReport | None = None
+    security: SecurityReport | None = None   # threat scan and hardening checks (agent 2.15+)
     ips: list[IpEntry] = Field(default_factory=list, max_length=10)
     public_ip: str = Field(default="", max_length=45)
     install: str = Field(default="", max_length=20)

@@ -86,6 +86,9 @@ class Settings(BaseSettings):
     dns_resolvers: str = ""                    # DNS monitors: resolvers to ask (comma-separated IPs); empty = the system resolver
     test_run_retention_days: int = 30          # API test run history is kept this long
     ssh_attack_threshold: int = 30             # failed SSH logins on one server within 10 minutes that count as an attack
+    ssh_success_after_failures: int = 5        # a successful SSH login from an address with at least this many failures (24 h) is a likely break-in
+    ssh_new_source_alerts: bool = True         # alert on an SSH login from an address never seen on that server before
+    threat_alert_severity: str = "high"        # agent threat findings at or above this severity send an alert: critical | high | medium | off
     security_scan_hours: int = 24              # how often servers' open ports and services' TLS are re-checked (0 = only on demand)
     perf_default_window_minutes: int = 10      # response-time targets look at this many recent minutes unless set per monitor
     perf_min_check_samples: int = 5            # a target is not judged on fewer probes than this ...

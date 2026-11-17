@@ -444,7 +444,7 @@ def build_report(insp: Inspector, tables: list[Table], relations: list[Relation]
     overview = (f"This report covers {_plural(len(sections), table_word)} with {_plural(total_rows, row_word)} in total. "
                 f"The largest is {biggest['name']} ({_plural(biggest['profile']['rows'], row_word)}). "
                 + (f"{_plural(len(inside), 'relationship')} connect the selected {table_word}s." if inside else f"None of the selected {table_word}s reference each other."))
-    issues = sum(len(s["quality"]) for s in sections)
+    issues = sum(1 for s in sections for q in s["quality"] if q["level"] == "warn")
     return {"title": title or f"Data report: {', '.join(s['name'] for s in sections[:4])}{' …' if len(sections) > 4 else ''}", "engine": insp.engine,
             "generated_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z", "overview": overview, "issues": issues,
             "relations": [relation_sentence(r, by_key, "out") for r in inside], "tables": sections}
@@ -477,28 +477,30 @@ def relation_sentence(r: Relation, by_key: dict, direction: str) -> dict:
     return {"name": r.name, "from": r.from_table, "from_columns": r.from_columns, "to": r.to_table, "to_columns": r.to_columns, "optional": optional, "text": text, "inferred": r.inferred}
 
 
-def quality_notes(t: Table, cols: list[Column], profile: dict, outgoing: list[Relation]) -> list[str]:
-    notes = []
+def quality_notes(t: Table, cols: list[Column], profile: dict, outgoing: list[Relation]) -> list[dict]:
+    """Short, structured observations: {"level": "warn" | "info", "column": name or None, "text": one short sentence}."""
+    notes: list[dict] = []
+    add = lambda level, column, text: notes.append({"level": level, "column": column, "text": text})   # noqa: E731
+    row = "document" if t.kind == "collection" else "row"
     if t.kind == "table" and not any(c.pk for c in t.columns):
-        notes.append("This table has no primary key, so rows cannot be told apart reliably.")
+        add("warn", None, "No primary key: rows cannot be told apart reliably.")
     if profile["rows"] == 0:
-        notes.append("The collection is empty." if row == "document" else "The table is empty.")
+        add("info", None, "Empty: no " + row + "s yet.")
         return notes
     fk_cols = {c for r in outgoing for c in r.from_columns}
-    row = "document" if t.kind == "collection" else "row"
     complex_type = re.compile(r"object|array|\[\]|json|dbref", re.I)
     for s in profile["columns"]:
         if "error" in s:
             continue
         if s.get("non_null", 0) == 0 and profile["rows"]:
-            notes.append(f"{s['name']} is always empty.")
+            add("warn", s["name"], "Always empty.")
         elif s.get("null_pct", 0) >= 50:
-            notes.append(f"{s['name']} is empty in {s['null_pct']}% of {row}s.")
+            add("warn", s["name"], f"Empty in {s['null_pct']}% of {row}s.")
         if s["name"] in fk_cols and s.get("nulls"):
-            notes.append(f"{s['name']} links to another {'collection' if row == 'document' else 'table'} but is missing in {_plural(s['nulls'], row)}.")
+            add("warn", s["name"], f"Link missing in {_plural(s['nulls'], row)}.")
         if s.get("distinct") == 1 and s.get("non_null", 0) > 1:
-            notes.append(f"{s['name']} has the same value in every {row}{' that has it' if s.get('nulls') else ''}.")
+            add("info", s["name"], "Same value everywhere" + (" it is set." if s.get("nulls") else "."))
         if (s.get("unique") and not s.get("pk") and not s.get("sensitive") and not s.get("nullable") and s.get("non_null", 0) > 10 and s["name"] not in fk_cols
                 and not TEMPORAL.search(s.get("type", "")) and not NUMERIC.search(s.get("type", "")) and not complex_type.search(s.get("type", ""))) and s.get("null_pct", 0) == 0:
-            notes.append(f"{s['name']} is unique in every {row}: it could serve as a key.")
+            add("info", s["name"], "Unique everywhere: could serve as a key.")
     return notes[:12]

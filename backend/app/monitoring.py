@@ -129,6 +129,8 @@ def redact(text: str, channel: Channel) -> str:
 # Telegram gets real bold text, Slack gets *bold*, webhooks and WhatsApp get plain text.
 _STATE = {"anomaly": ("📈", "UNUSUAL BEHAVIOUR"), "ai_note": ("🤖", "AI ANALYSIS"),
           "ssh_attack": ("🛡", "SSH BRUTE-FORCE ATTACK"), "security_finding": ("🛡", "SECURITY FINDING"),
+          "ssh_login_breach": ("🚨", "POSSIBLE BREAK-IN: SSH LOGIN AFTER FAILED ATTEMPTS"), "ssh_login_new": ("🔑", "SSH LOGIN FROM A NEW ADDRESS"),
+          "threat": ("🚨", "POSSIBLE COMPROMISE"), "ssh_key_added": ("🔑", "NEW SSH KEY AUTHORIZED"),
           "slo_fast": ("🔥", "ERROR BUDGET BURNING FAST"), "slo_slow": ("🟠", "ERROR BUDGET BURNING"), "slo_exhausted": ("⛔", "ERROR BUDGET EXHAUSTED"),
           "dns_changed": ("🧭", "DNS CHANGED"), "domain": ("🌐", "DOMAIN EXPIRES SOON"), "domain_expired": ("⛔", "DOMAIN EXPIRED"), "domain_renewed": ("✅", "DOMAIN RENEWED"),
           "cert": ("🔐", "CERTIFICATE EXPIRES SOON"), "cert_expired": ("⛔", "CERTIFICATE EXPIRED"), "cert_renewed": ("✅", "CERTIFICATE RENEWED"),
@@ -246,7 +248,7 @@ def event_category(state: str | None) -> str | None:
     """down / alert / recovered / reminder (a repeat while something is still failing). None for events from before routing existed."""
     if not state:
         return None
-    if state.startswith(("cert", "domain", "dns_", "slo_", "ssh_attack", "security_", "anomaly", "ai_")):   # certificate / domain / DNS warnings travel with "over a limit" alerts; renewals with recoveries
+    if state.startswith(("cert", "domain", "dns_", "slo_", "ssh_attack", "ssh_login", "ssh_key", "threat", "security_", "anomaly", "ai_")):   # certificate / domain / DNS warnings travel with "over a limit" alerts; renewals with recoveries
         return "recovered" if state.endswith("_renewed") else "alert"
     return "reminder" if state.startswith("still_") else state
 

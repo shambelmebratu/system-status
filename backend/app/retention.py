@@ -18,7 +18,7 @@ from sqlalchemy import delete, func, select, text
 from sqlalchemy.orm import Session
 
 from .config import get_settings
-from .models import TrafficSample, AlertEvent, AppSetting, AuditEvent, CheckResult, ClusterSample, Enrollment, Incident, K8sRequest, LogRequest, MetricSample
+from .models import SecurityFinding, SshFailureSample, SshLoginEvent, TrafficSample, AlertEvent, AppSetting, AuditEvent, CheckResult, ClusterSample, Enrollment, Incident, K8sRequest, LogRequest, MetricSample
 
 KEY = "retention"
 CATEGORIES = {
@@ -83,11 +83,14 @@ def _delete_older(db: Session, category: str, cutoff: datetime | None) -> int:
     elif category == "metrics":
         n = db.execute(delete(MetricSample).where(*older(MetricSample.ts))).rowcount or 0
         n += db.execute(delete(TrafficSample).where(*older(TrafficSample.ts))).rowcount or 0
+        n += db.execute(delete(SshFailureSample).where(*older(SshFailureSample.ts))).rowcount or 0
         return n + (db.execute(delete(ClusterSample).where(*older(ClusterSample.ts))).rowcount or 0)
     elif category == "alerts":
         stmt = delete(AlertEvent).where(*older(AlertEvent.created_at))
     elif category == "incidents":
-        stmt = delete(Incident).where(Incident.resolved_at.is_not(None), *older(Incident.resolved_at))
+        n = db.execute(delete(SecurityFinding).where(SecurityFinding.resolved_at.is_not(None), *older(SecurityFinding.resolved_at))).rowcount or 0
+        n += db.execute(delete(SshLoginEvent).where(*older(SshLoginEvent.ts))).rowcount or 0
+        return n + (db.execute(delete(Incident).where(Incident.resolved_at.is_not(None), *older(Incident.resolved_at))).rowcount or 0)
     elif category == "audit":
         stmt = delete(AuditEvent).where(*older(AuditEvent.ts))
     elif category == "links":
@@ -158,9 +161,9 @@ def stats(db: Session) -> dict:
     """Row counts, oldest entry and (on PostgreSQL) disk size for each kind."""
     spec = {
         "checks": [(CheckResult, CheckResult.checked_at)],
-        "metrics": [(MetricSample, MetricSample.ts), (TrafficSample, TrafficSample.ts), (ClusterSample, ClusterSample.ts)],
+        "metrics": [(MetricSample, MetricSample.ts), (TrafficSample, TrafficSample.ts), (ClusterSample, ClusterSample.ts), (SshFailureSample, SshFailureSample.ts)],
         "alerts": [(AlertEvent, AlertEvent.created_at)],
-        "incidents": [(Incident, Incident.started_at)],
+        "incidents": [(Incident, Incident.started_at), (SecurityFinding, SecurityFinding.first_seen), (SshLoginEvent, SshLoginEvent.ts)],
         "audit": [(AuditEvent, AuditEvent.ts)],
         "links": [(Enrollment, Enrollment.created_at)],
         "transient": [(LogRequest, LogRequest.created_at), (K8sRequest, K8sRequest.created_at)],
