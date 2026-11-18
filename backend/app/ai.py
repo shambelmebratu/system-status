@@ -22,8 +22,15 @@ from .models import AppSetting
 
 KEY = "ai"
 DEFAULT_MODEL = llm.PROVIDERS["anthropic"].default_model   # kept for callers that predate providers
-DEFAULTS = {"enabled": False, "provider": llm.DEFAULT_PROVIDER, "model": "", "base_url": "", "auto_explain": False, "post_explanations": False,
-            "allow_logs": True, "anomaly_alerts": True, "auto_per_hour": 6}
+TIERS = ("dev", "confidential")
+TIER_LABEL = {"dev": "Development tier", "confidential": "Confidential tier"}
+# Every feature sends production data (incidents with configuration changes, raw logs, metrics and security findings), so each one
+# uses the Confidential tier unless an admin explicitly moves it to the Development tier.
+FEATURES = {"incidents": "Incident explanations", "logs": "Log analysis", "assistant": "Ask AI (assistant)"}
+TIER_DEFAULTS = {"dev": {"enabled": False, "provider": llm.DEFAULT_PROVIDER, "model": "", "base_url": ""},
+                 "confidential": {"enabled": False, "provider": "ollama", "model": "", "base_url": "", "zdr_confirmed_by": None, "zdr_confirmed_at": None}}
+DEFAULTS = {"auto_explain": False, "post_explanations": False, "allow_logs": True, "anomaly_alerts": True, "auto_per_hour": 6, "security_on_dev": False}
+TIER_FIELDS = ("enabled", "provider", "model", "base_url")
 
 
 # ------------------------------------------------------------------------------------------------ settings
@@ -32,20 +39,41 @@ def _env_provider() -> str | None:
     return next((s.id for s in llm.PROVIDERS.values() if s.key_env and s.needs_key and os.getenv(s.key_env)), None)
 
 
+def _migrate(saved: dict) -> dict:
+    """Settings from before tiers had one provider. A local or zero-retention-capable provider becomes the Confidential tier (an admin
+    still has to confirm the account's terms before it serves anything); a provider whose terms allow data reuse becomes the
+    Development tier. Features stay on the Confidential tier: moving them to shared data takes an explicit decision."""
+    provider = saved.get("provider")
+    if not provider:   # settings from before providers existed were Anthropic-only
+        provider = "anthropic" if saved.get("api_key") or str(saved.get("model", "")).startswith("claude-") else None
+    tiers = {t: dict(TIER_DEFAULTS[t]) for t in TIERS}
+    if provider in llm.PROVIDERS:
+        old = {"enabled": bool(saved.get("enabled")), "provider": provider, "model": saved.get("model") or "", "base_url": saved.get("base_url") or ""}
+        tiers["dev" if llm.PROVIDERS[provider].privacy == "shared" else "confidential"].update(old)
+    else:
+        env = _env_provider()
+        if env:
+            tiers["confidential"]["provider"] = env
+    keys = dict(saved.get("api_keys") or {})
+    if saved.get("api_key") and not keys.get("anthropic"):
+        keys["anthropic"] = saved["api_key"]
+    return {"tiers": tiers, "features": {f: "confidential" for f in FEATURES}, "api_keys": keys}
+
+
 def load(db: Session) -> dict:
     row = db.get(AppSetting, KEY)
     try:
         saved = json.loads(row.value) if row else {}
     except ValueError:
         saved = {}
-    cfg = {**DEFAULTS, **{k: v for k, v in saved.items() if k in DEFAULTS or k in ("api_keys", "usage")}}
-    if "provider" not in saved:   # settings from before providers existed were Anthropic-only
-        legacy = bool(saved.get("api_key")) or str(saved.get("model", "")).startswith("claude-")
-        cfg["provider"] = "anthropic" if legacy else (_env_provider() or llm.DEFAULT_PROVIDER)
-    if saved.get("api_key") and not (cfg.get("api_keys") or {}).get("anthropic"):
-        cfg["api_keys"] = {**(cfg.get("api_keys") or {}), "anthropic": saved["api_key"]}
-    if cfg["provider"] not in llm.PROVIDERS:
-        cfg["provider"] = llm.DEFAULT_PROVIDER
+    base = saved if "tiers" in saved else {**saved, **_migrate(saved)}
+    cfg = {**DEFAULTS, **{k: v for k, v in base.items() if k in DEFAULTS or k in ("api_keys", "usage", "shared_ack")}}
+    cfg["tiers"] = {t: {**TIER_DEFAULTS[t], **((base.get("tiers") or {}).get(t) or {})} for t in TIERS}
+    for t in TIERS:
+        if cfg["tiers"][t]["provider"] not in llm.PROVIDERS:
+            cfg["tiers"][t]["provider"] = TIER_DEFAULTS[t]["provider"]
+    cfg["features"] = {f: v if (v := (base.get("features") or {}).get(f)) in ("confidential", "dev", "off") else "confidential" for f in FEATURES}
+    cfg.setdefault("api_keys", {})
     return cfg
 
 
@@ -55,81 +83,139 @@ def save(db: Session, cfg: dict, user: str) -> None:
     db.add(row)
 
 
-def provider_spec(cfg: dict) -> llm.Spec:
-    return llm.PROVIDERS[cfg["provider"]]
+def tier_cfg(cfg: dict, tier: str) -> dict:
+    """One tier's provider settings together with the stored keys (keys are kept per provider and shared by both tiers)."""
+    return {**cfg["tiers"][tier], "api_keys": cfg.get("api_keys") or {}}
 
 
-def key_source(cfg: dict) -> str | None:
-    return llm.key_source(provider_spec(cfg), cfg)
+def provider_spec(cfg: dict, tier: str = "confidential") -> llm.Spec:
+    return llm.PROVIDERS[cfg["tiers"][tier]["provider"]]
 
 
-def is_ready(cfg: dict) -> bool:
-    s = provider_spec(cfg)
-    return bool(cfg["enabled"] and (key_source(cfg) or not s.needs_key) and (cfg["model"] or s.default_model) and (s.kind == "anthropic" or s.url or cfg["base_url"]))
+def key_source(cfg: dict, tier: str = "confidential") -> str | None:
+    return llm.key_source(provider_spec(cfg, tier), tier_cfg(cfg, tier))
+
+
+def tier_problem(cfg: dict, tier: str) -> str | None:
+    """Why a tier cannot serve requests right now, in words an admin can act on; None when it can."""
+    t, s = cfg["tiers"][tier], provider_spec(cfg, tier)
+    if not t["enabled"]:
+        return f"The {TIER_LABEL[tier]} is turned off."
+    if tier == "confidential" and s.privacy == "shared":
+        return f"{s.label} cannot serve the Confidential tier: its terms allow prompts to be logged or reused."
+    if tier == "confidential" and s.privacy != "local" and not t.get("zdr_confirmed_at"):
+        return f"An admin has not confirmed that the {s.label} account has zero data retention / no training (a paid or enterprise plan)."
+    if s.needs_key and not key_source(cfg, tier):
+        return f"No API key is set for {s.label}."
+    if not (t["model"] or s.default_model):
+        return f"No model is set for {s.label}."
+    if s.kind != "anthropic" and not (s.url or t["base_url"]):
+        return f"No API address is set for {s.label}."
+    return None
+
+
+def feature_problem(cfg: dict, feature: str) -> str | None:
+    tier = cfg["features"][feature]
+    if tier == "off":
+        return f"{FEATURES[feature]} with AI is turned off (AI → Settings)."
+    problem = tier_problem(cfg, tier)
+    if problem is None:
+        return None
+    hint = (" An admin can set it up under AI → Settings (a local Ollama, or a paid provider with zero data retention), or explicitly allow the Development tier for this feature."
+            if tier == "confidential" else " An admin can turn it on under AI → Settings.")
+    return f"{FEATURES[feature]} uses the {TIER_LABEL[tier]}. {problem}{hint}"
+
+
+def feature_ready(cfg: dict, feature: str) -> bool:
+    return feature_problem(cfg, feature) is None
+
+
+def is_ready(cfg: dict, feature: str = "incidents") -> bool:   # kept for older callers
+    return feature_ready(cfg, feature)
+
+
+def _empty_usage() -> dict:
+    return {"requests": 0, "input_tokens": 0, "output_tokens": 0}
 
 
 def public_settings(db: Session) -> dict:
     cfg = load(db)
-    s = provider_spec(cfg)
     month = datetime.now(timezone.utc).strftime("%Y-%m")
     keys = cfg.get("api_keys") or {}
-    return {**{k: cfg[k] for k in DEFAULTS}, "model": cfg["model"] or s.default_model, "key_source": key_source(cfg), "ready": is_ready(cfg),
+    usage = (cfg.get("usage") or {}).get(month) or {}
+    tiers = {}
+    for t in TIERS:
+        s = provider_spec(cfg, t)
+        tiers[t] = {**{k: cfg["tiers"][t][k] for k in TIER_FIELDS}, "model": cfg["tiers"][t]["model"] or s.default_model, "key_source": key_source(cfg, t),
+                    "ready": tier_problem(cfg, t) is None, "problem": tier_problem(cfg, t), "usage": (usage.get("tiers") or {}).get(t) or _empty_usage()}
+        if t == "confidential":
+            tiers[t].update(zdr_confirmed_by=cfg["tiers"][t].get("zdr_confirmed_by"), zdr_confirmed_at=cfg["tiers"][t].get("zdr_confirmed_at"))
+    features = {f: {"label": FEATURES[f], "tier": cfg["features"][f], "ready": feature_ready(cfg, f), "problem": feature_problem(cfg, f),
+                    "destination": provider_spec(cfg, cfg["features"][f]).destination if cfg["features"][f] != "off" else None} for f in FEATURES}
+    return {**{k: cfg[k] for k in DEFAULTS}, "tiers": tiers, "features": features, "shared_ack": cfg.get("shared_ack"),
+            "ready": any(v["ready"] for v in features.values()),
             "providers": [{**p, "key_saved": bool(keys.get(p["id"])), "key_in_env": bool(p["key_env"] and os.getenv(p["key_env"]))} for p in llm.catalog()],
-            "usage": (cfg.get("usage") or {}).get(month, {"requests": 0, "input_tokens": 0, "output_tokens": 0}), "month": month}
+            "usage": {k: usage.get(k, 0) for k in ("requests", "input_tokens", "output_tokens")}, "month": month}
 
 
-def _provider(cfg: dict) -> llm.Provider:
+def _provider(cfg: dict, tier: str = "confidential") -> llm.Provider:
     from .crypto import decrypt
-    return llm.build(cfg, decrypt)
+    return llm.build(tier_cfg(cfg, tier), decrypt, confidential=tier == "confidential")
 
 
-def _ready(db: Session) -> dict:
+def _ready(db: Session, feature: str) -> tuple[dict, str]:
+    """(settings, tier) for a feature, or AiError saying exactly what is missing."""
     cfg = load(db)
-    if not cfg["enabled"]:
-        raise AiError("AI features are turned off. An admin can turn them on under AI → Settings.")
-    return cfg
+    problem = feature_problem(cfg, feature)
+    if problem:
+        raise AiError(problem)
+    return cfg, cfg["features"][feature]
 
 
-def _record_usage(db: Session, usage) -> None:
+def _record_usage(db: Session, usage, tier: str | None = None) -> None:
     cfg = load(db)
     month = datetime.now(timezone.utc).strftime("%Y-%m")
     all_usage = cfg.get("usage") or {}
-    m = all_usage.setdefault(month, {"requests": 0, "input_tokens": 0, "output_tokens": 0})
-    m["requests"] += 1
-    m["input_tokens"] += int(getattr(usage, "input_tokens", 0) or 0)
-    m["output_tokens"] += int(getattr(usage, "output_tokens", 0) or 0)
+    m = all_usage.setdefault(month, _empty_usage())
+    buckets = [m] + ([m.setdefault("tiers", {}).setdefault(tier, _empty_usage())] if tier else [])
+    for b in buckets:
+        b["requests"] = b.get("requests", 0) + 1
+        b["input_tokens"] = b.get("input_tokens", 0) + int(getattr(usage, "input_tokens", 0) or 0)
+        b["output_tokens"] = b.get("output_tokens", 0) + int(getattr(usage, "output_tokens", 0) or 0)
     cfg["usage"] = {k: all_usage[k] for k in sorted(all_usage)[-12:]}
     row = db.get(AppSetting, KEY) or AppSetting(key=KEY)
     row.value = json.dumps({k: v for k, v in cfg.items() if k != "api_key"})
     db.add(row)
 
 
-def _parse(db: Session, system: str, content: str, schema: type[BaseModel], effort: str = "medium") -> tuple[BaseModel, str]:
-    cfg = _ready(db)
-    provider = _provider(cfg)
+def _parse(db: Session, feature: str, system: str, content: str, schema: type[BaseModel], effort: str = "medium") -> tuple[BaseModel, str, str]:
+    cfg, tier = _ready(db, feature)
+    provider = _provider(cfg, tier)
     try:
         parsed, model, usage = provider.structured(system, content, schema, effort)
     except RefusedError as error:
-        _record_usage(db, error.usage)
+        _record_usage(db, error.usage, tier)
         raise
-    _record_usage(db, usage)
-    return parsed, model
+    _record_usage(db, usage, tier)
+    return parsed, model, tier
 
 
-def list_models(db: Session) -> dict:
-    """The models the saved provider offers to the saved key, for the settings page (works while AI is still turned off)."""
+def list_models(db: Session, tier: str) -> dict:
+    """The models a tier's provider offers to the saved key, for the settings page (works while the tier is still turned off)."""
     cfg = load(db)
-    provider = _provider(cfg)
-    return {"provider": cfg["provider"], "models": provider.list_models()}
+    return {"tier": tier, "provider": cfg["tiers"][tier]["provider"], "models": _provider(cfg, tier).list_models()}
 
 
-def test_connection(db: Session) -> dict:
-    """A tiny request that proves the provider, key and model work (costs a few tokens)."""
-    cfg = _ready(db)
-    reply = _provider(cfg).complete("Reply with the single word: ready")
-    _record_usage(db, reply.usage)
+def test_connection(db: Session, tier: str) -> dict:
+    """A tiny request that proves a tier's provider, key and model work (costs a few tokens)."""
+    cfg = load(db)
+    problem = tier_problem(cfg, tier)
+    if problem:
+        raise AiError(problem)
+    reply = _provider(cfg, tier).complete("Reply with the single word: ready")
+    _record_usage(db, reply.usage, tier)
     db.commit()
-    return {"ok": True, "provider": cfg["provider"], "model": reply.model, "reply": reply.text[:50]}
+    return {"ok": True, "tier": tier, "provider": cfg["tiers"][tier]["provider"], "model": reply.model, "reply": reply.text[:50]}
 
 
 # ------------------------------------------------------------------------------------------------ secret masking
@@ -226,7 +312,7 @@ def incident_context(db: Session, incident) -> str:
 
 
 def explain_incident(db: Session, incident) -> dict:
-    analysis, model = _parse(db, INCIDENT_SYSTEM, incident_context(db, incident), IncidentAnalysis)
+    analysis, model, _tier = _parse(db, "incidents", INCIDENT_SYSTEM, incident_context(db, incident), IncidentAnalysis)
     incident.ai_analysis, incident.ai_model, incident.ai_generated_at = analysis.model_dump_json(), (model or "")[:60], datetime.now(timezone.utc)
     db.commit()
     return analysis.model_dump()
@@ -237,12 +323,12 @@ def auto_explain(db: Session) -> None:
     from .models import Incident
     from .monitoring import format_alert, queue_event, target_of
     cfg = load(db)
-    if not (cfg["auto_explain"] and is_ready(cfg)):
+    if not (cfg["auto_explain"] and feature_ready(cfg, "incidents")):
         return
     now = datetime.now(timezone.utc)
     done = db.scalar(select(func_count()).select_from(Incident).where(Incident.ai_generated_at >= now - timedelta(hours=1))) or 0
     budget = max(0, int(cfg["auto_per_hour"]) - done)
-    if not provider_spec(cfg).tools:   # the free tier answers about once per 45 s: one per worker run keeps the worker moving
+    if not provider_spec(cfg, cfg["features"]["incidents"]).tools:   # the free provider answers about once per 45 s: one per worker run keeps the worker moving
         budget = min(budget, 1)
     for incident in db.scalars(select(Incident).where(Incident.resolved_at.is_(None), Incident.ai_generated_at.is_(None), Incident.started_at <= now - timedelta(minutes=2),
                                                        Incident.started_at >= now - timedelta(hours=2)).order_by(Incident.started_at).limit(budget)).all():
@@ -298,15 +384,15 @@ Values replaced with *** were masked on purpose. Say so when the excerpt is too 
 
 
 def analyze_logs(db: Session, text: str, source: str) -> dict:
-    cfg = _ready(db)
+    cfg, _ = _ready(db, "logs")
     if not cfg["allow_logs"]:
         raise AiError("An admin has not allowed sending logs to the AI (AI → Settings).")
     lines = text.splitlines()
     excerpt = "\n".join(lines[-3000:])[-150_000:]
     content = f"Log source: {source}\nLines in this excerpt: {min(len(lines), 3000)} (newest last)\n\n{mask(excerpt)}"
-    analysis, model = _parse(db, LOG_SYSTEM, content, LogAnalysis)
+    analysis, model, tier = _parse(db, "logs", LOG_SYSTEM, content, LogAnalysis)
     db.commit()
-    return {**analysis.model_dump(), "model": model, "lines_sent": min(len(lines), 3000)}
+    return {**analysis.model_dump(), "model": model, "tier": tier, "lines_sent": min(len(lines), 3000)}
 
 
 # ------------------------------------------------------------------------------------------------ one log line
@@ -330,15 +416,15 @@ Be concrete and short; say plainly when the line is routine. Values replaced wit
 
 
 def explain_log_line(db: Session, line: str, before: list[str], after: list[str], source: str) -> dict:
-    cfg = _ready(db)
+    cfg, _ = _ready(db, "logs")
     if not cfg["allow_logs"]:
         raise AiError("An admin has not allowed sending logs to the AI (AI → Settings).")
     before, after = [b[:2000] for b in before[-20:]], [a[:2000] for a in after[:10]]
     content = (f"Log source: {source or 'unknown'}\n\n# The line to explain\n{mask(line[:8000])}\n\n"
                f"# Lines just before it (oldest first)\n{mask(chr(10).join(before)) or '(none)'}\n\n# Lines just after it\n{mask(chr(10).join(after)) or '(none)'}")
-    analysis, model = _parse(db, LINE_SYSTEM, content, LineExplanation, effort="low")
+    analysis, model, tier = _parse(db, "logs", LINE_SYSTEM, content, LineExplanation, effort="low")
     db.commit()
-    return {**analysis.model_dump(), "model": model, "context_lines": len(before) + len(after)}
+    return {**analysis.model_dump(), "model": model, "tier": tier, "context_lines": len(before) + len(after)}
 
 
 # ------------------------------------------------------------------------------------------------ ask your infrastructure
@@ -361,10 +447,12 @@ SNAPSHOT_CHARS = 40_000
 def ask(db: Session, user: dict, messages: list[dict]) -> dict:
     from .config import get_settings
     from .security import can_see
-    cfg = _ready(db)
-    provider = _provider(cfg)
+    cfg, tier = _ready(db, "assistant")
+    provider = _provider(cfg, tier)
     used: list[dict] = []
     tools_impl = Toolbox(db, user, can_see)
+    # Security findings (attackers, open ports, unpatched servers) never go to the Development tier unless an admin allowed it explicitly.
+    names = [n for n in Toolbox.NAMES if n not in SECURITY_TOOLS or tier == "confidential" or cfg["security_on_dev"]]
 
     def track(name):
         fn = getattr(tools_impl, name)
@@ -381,19 +469,29 @@ def ask(db: Session, user: dict, messages: list[dict]) -> dict:
 
     now, company = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"), get_settings().company_name
     if provider.spec.tools:
-        reply = provider.chat(ASK_SYSTEM.format(company=company, now=now), messages, [track(name) for name in Toolbox.NAMES], max_iterations=10)
+        reply = provider.chat(ASK_SYSTEM.format(company=company, now=now) + _no_security_note(names), messages, [track(name) for name in names], max_iterations=10)
     else:
         parts, budget = [], SNAPSHOT_CHARS
-        for name, args in SNAPSHOT_TOOLS:
+        for name, args in [(n, a) for n, a in SNAPSHOT_TOOLS if n in names]:
             data = track(name)(**args)[: max(0, budget)]
             budget -= len(data)
             parts.append(f"## {name} {json.dumps(args) if args else ''}\n{data}")
-        reply = provider.chat(SNAPSHOT_SYSTEM.format(company=company, now=now, snapshot="\n".join(parts)), messages[-6:], [])
-    _record_usage(db, reply.usage)
+        reply = provider.chat(SNAPSHOT_SYSTEM.format(company=company, now=now, snapshot="\n".join(parts)) + _no_security_note(names), messages[-6:], [])
+    _record_usage(db, reply.usage, tier)
     db.commit()
     if reply.refused:
-        return {"answer": "The model declined to answer this question.", "tools": used, "model": reply.model}
-    return {"answer": reply.text or "(no answer)", "tools": used, "model": reply.model}
+        return {"answer": "The model declined to answer this question.", "tools": used, "model": reply.model, "tier": tier}
+    return {"answer": reply.text or "(no answer)", "tools": used, "model": reply.model, "tier": tier}
+
+
+SECURITY_TOOLS = ("security_summary",)
+
+
+def _no_security_note(names: list[str]) -> str:
+    if all(t in names for t in SECURITY_TOOLS):
+        return ""
+    return ("\nSecurity findings are not available to you here (this assistant runs on a shared-data provider). If asked about security, say that "
+            "the Security page has them, or that an admin can move the assistant to the Confidential tier.")
 
 
 class Toolbox:

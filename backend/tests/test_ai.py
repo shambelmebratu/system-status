@@ -54,25 +54,26 @@ def fake(monkeypatch):
 
 
 def _enable(client, **extra):
-    r = client.put("/api/ai/settings", headers=CSRF, json={"enabled": True, "provider": "anthropic", "api_key": "sk-ant-test-key-1234567890", **extra})
+    r = client.put("/api/ai/settings", headers=CSRF, json={"tiers": {"confidential": {"enabled": True, "provider": "anthropic", "zdr_confirmed": True}},
+                                                            "keys": {"anthropic": "sk-ant-test-key-1234567890"}, **extra})
     assert r.status_code == 200, r.text
     return r.json()
 
 
 def test_settings_are_admin_only_and_the_key_stays_secret(client):
     sign_in(client)
-    assert client.get("/api/ai/settings").json()["enabled"] is False
-    assert client.put("/api/ai/settings", headers=CSRF, json={"enabled": True, "provider": "anthropic", "api_key": "gsk_groq_key_123456"}).status_code == 422
+    assert client.get("/api/ai/settings").json()["tiers"]["confidential"]["enabled"] is False
+    assert client.put("/api/ai/settings", headers=CSRF, json={"keys": {"anthropic": "gsk_groq_key_123456"}}).status_code == 422
     s = _enable(client)
-    assert s["ready"] and s["key_source"] == "dashboard" and s["model"] == "claude-opus-5-5" and "sk-ant-test" not in json.dumps(s)
+    assert s["ready"] and s["tiers"]["confidential"]["key_source"] == "dashboard" and s["tiers"]["confidential"]["model"] == "claude-opus-5-5" and "sk-ant-test" not in json.dumps(s)
     with database.SessionLocal() as db:
         raw = db.get(ai.AppSetting, "ai").value
     assert "sk-ant-test-key" not in raw                                                             # stored encrypted
     make_user(client, "ai-op@example.com", "operator")
     op = session_for("ai-op@example.com", new_password="ai-operator-pass-1")
-    assert op.put("/api/ai/settings", headers=CSRF, json={"enabled": False}).status_code == 403
+    assert op.put("/api/ai/settings", headers=CSRF, json={"allow_logs": False}).status_code == 403
     assert any(e["action"] == "ai.settings" and "API key set" in e["detail"] for e in client.get("/api/audit?category=ai").json())
-    client.put("/api/ai/settings", headers=CSRF, json={"enabled": False, "clear_key": True})
+    client.put("/api/ai/settings", headers=CSRF, json={"tiers": {"confidential": {"enabled": False}}, "clear_keys": ["anthropic"]})
 
 
 def test_explain_incident_with_context(client, fake):
@@ -103,7 +104,7 @@ def test_explain_incident_with_context(client, fake):
         assert listed["ai_analysis"]["summary"].startswith("The checkout service")
         assert client.get("/api/ai/settings").json()["usage"]["requests"] >= 1
     finally:
-        client.put("/api/ai/settings", headers=CSRF, json={"enabled": False, "clear_key": True})
+        client.put("/api/ai/settings", headers=CSRF, json={"tiers": {"confidential": {"enabled": False}}, "clear_keys": ["anthropic"]})
         with database.SessionLocal() as db:   # leave no open incidents behind for other tests
             for i in db.query(Incident).filter(Incident.resolved_at.is_(None), Incident.target_name.in_(["checkout", "api-gateway"])).all():
                 i.resolved_at = datetime.now(timezone.utc)
@@ -119,14 +120,14 @@ def test_logs_are_masked_and_refusals_handled(client, fake, monkeypatch):
         assert r.status_code == 200 and r.json()["health"] == "failing" and r.json()["lines_sent"] == 5
         sent = fake.sent[-1]["messages"][0]["content"]
         assert "s3cr3t" not in sent and "abcdefghijklmnop" not in sent and "pw123" not in sent and "ECONNREFUSED" in sent
-        client.put("/api/ai/settings", headers=CSRF, json={"enabled": True, "allow_logs": False})
+        client.put("/api/ai/settings", headers=CSRF, json={"allow_logs": False})
         assert "not allowed" in client.post("/api/ai/logs", headers=CSRF, json={"text": "x"}).json()["detail"]
         refusing = FakeClient(stop_reason="refusal")
         monkeypatch.setattr(llm, "anthropic_client", lambda key: refusing)
-        client.put("/api/ai/settings", headers=CSRF, json={"enabled": True, "allow_logs": True})
+        client.put("/api/ai/settings", headers=CSRF, json={"allow_logs": True})
         assert "declined" in client.post("/api/ai/logs", headers=CSRF, json={"text": "x"}).json()["detail"]
     finally:
-        client.put("/api/ai/settings", headers=CSRF, json={"enabled": False, "clear_key": True})
+        client.put("/api/ai/settings", headers=CSRF, json={"tiers": {"confidential": {"enabled": False}}, "clear_keys": ["anthropic"]})
 
 
 def test_assistant_tools_respect_access(client, fake):
@@ -148,7 +149,7 @@ def test_assistant_tools_respect_access(client, fake):
         assert client.post("/api/ai/ask", headers=CSRF, json={"messages": [{"role": "assistant", "content": "hi"}]}).status_code == 422
         assert any(e["action"] == "ai.ask" and "list services" in e["detail"] for e in client.get("/api/audit?category=ai").json())
     finally:
-        client.put("/api/ai/settings", headers=CSRF, json={"enabled": False, "clear_key": True})
+        client.put("/api/ai/settings", headers=CSRF, json={"tiers": {"confidential": {"enabled": False}}, "clear_keys": ["anthropic"]})
 
 
 def test_ai_off_by_default_gives_a_clear_message(client):

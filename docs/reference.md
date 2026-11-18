@@ -421,6 +421,14 @@ Review the manifest first by running the `curl` alone. It creates a `smwatch` na
 
 ## AI features
 
+
+**Two tiers.** *AI → Settings* has a **Confidential / Production tier** and a **Development / Testing tier**, each with its own on/off switch, provider, model and key:
+
+- **Confidential tier.** Only providers that run locally (Ollama) or offer zero data retention and no training are allowed. Anthropic, OpenAI, Gemini (paid), Groq, OpenRouter, Mistral (paid) and custom endpoints qualify only after an admin confirms the account has those terms; the confirmation is recorded. Providers whose terms allow data reuse (the free Pollinations service, DeepSeek) cannot be chosen. Where an API supports it, SM-Watch also asks for no data collection: OpenRouter is told to use only hosts that do not collect data, and OpenAI not to store completions.
+- **Development tier.** Free or keyless providers for testing and non-sensitive work. It is clearly marked: data sent through it may be logged, retained or used for model training.
+- **Which tier each feature uses.** Incident explanations, log analysis (including "Explain this line") and the assistant all use the Confidential tier by default. Moving one to the Development tier needs an explicit confirmation, which is written to the audit log. On the Development tier, the assistant does not receive security findings unless an admin allows that separately. Results produced on the Development tier carry a "shared data" badge.
+- Each provider's data-handling summary links to its terms. The summaries reflect the providers' published terms at the time of writing; check the linked terms for your plan.
+
 Optional, off by default. Admins set them up in *AI → AI settings*: turn on, pick a **provider**, enter its key if it needs one (stored encrypted, one per provider, so switching back and forth keeps them) or set the provider's variable in `.env` (takes precedence), optionally change the model, and use *Test connection*.
 
 | Provider | Key | Default model | Notes |

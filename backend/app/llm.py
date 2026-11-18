@@ -47,33 +47,55 @@ class Spec:
     free: str = ""                  # short note shown in the UI about cost
     destination: str = ""           # who receives the data (shown in the UI)
     retry_wait_max: int = 10        # wait at most this many seconds for a rate limit to clear before giving up
+    privacy: str = "zdr_possible"   # local | zdr_possible | shared  (see PRIVACY below)
+    policy: str = ""                # what the provider's published terms say about retention and training (shown in the UI)
+    policy_url: str = ""            # the terms themselves
+
+
+# Data handling classes, from each provider's published terms. SM-Watch cannot tell a free key from a paid one, or see a zero-data-
+# retention agreement, so "zdr_possible" providers may serve the Confidential tier only after an admin confirms the account has one.
+PRIVACY = {
+    "local": "Runs on your own infrastructure: nothing leaves your network.",
+    "zdr_possible": "Zero data retention / no training is available on paid or enterprise plans, or by agreement. Confirm your account has it.",
+    "shared": "The terms allow prompts to be logged, retained or used to improve the service. Development tier only.",
+}
 
 
 PROVIDERS: dict[str, Spec] = {s.id: s for s in (
     Spec("free", "Free AI (Pollinations, no key)", "openai", "openai", url="https://text.pollinations.ai/openai", needs_key=False, accepts_key=False,
          tools=False, retry_wait_max=60, free="Free, no key or sign-up. Limited to about one reply every 45 seconds per server; fine for simple work.",
-         destination="Pollinations.ai, a public free service (do not use it for infrastructure you must keep confidential)"),
+         destination="Pollinations.ai, a public free service (do not use it for infrastructure you must keep confidential)", privacy="shared",
+         policy="Public free service with no data-protection agreement: prompts may be logged and retained.", policy_url="https://pollinations.ai"),
     Spec("anthropic", "Anthropic (Claude)", "anthropic", "claude-opus-5-5", key_env="ANTHROPIC_API_KEY", key_prefix="sk-ant-",
-         key_url="https://console.anthropic.com/settings/keys", destination="Anthropic"),
+         key_url="https://console.anthropic.com/settings/keys", destination="Anthropic", privacy="zdr_possible",
+         policy="Commercial API terms: inputs and outputs are not used to train models by default. Zero data retention is available by agreement with Anthropic.", policy_url="https://www.anthropic.com/legal/commercial-terms"),
     Spec("openai", "OpenAI", "openai", "gpt-5-mini", url="https://api.openai.com/v1/chat/completions", key_env="OPENAI_API_KEY", key_prefix="sk-",
-         key_url="https://platform.openai.com/api-keys", destination="OpenAI"),
+         key_url="https://platform.openai.com/api-keys", destination="OpenAI", privacy="zdr_possible",
+         policy="API data is not used for training by default and is kept for a limited time for abuse monitoring. Zero data retention is available to approved organisations.", policy_url="https://openai.com/enterprise-privacy/"),
     Spec("gemini", "Google Gemini", "openai", "gemini-3.8-flash", url="https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
          key_env="GEMINI_API_KEY", key_url="https://aistudio.google.com/apikey", free="Has a free tier (a Google account and key are needed).",
-         destination="Google"),
+         destination="Google", privacy="zdr_possible",
+         policy="Free tier: prompts may be used to improve Google's products and reviewed by people. Paid tier (billing enabled): not used for training.", policy_url="https://ai.google.dev/gemini-api/terms"),
     Spec("groq", "Groq", "openai", "llama-3.3-70b-versatile", url="https://api.groq.com/openai/v1/chat/completions", key_env="GROQ_API_KEY", key_prefix="gsk_",
-         key_url="https://console.groq.com/keys", free="Has a free tier (sign-up and key needed).", destination="Groq"),
+         key_url="https://console.groq.com/keys", free="Has a free tier (sign-up and key needed).", destination="Groq", privacy="zdr_possible",
+         policy="Groq states it does not train on API data; check the retention terms of your plan (zero retention can be enabled for organisations).", policy_url="https://console.groq.com/docs/your-data"),
     Spec("openrouter", "OpenRouter", "openai", "meta-llama/llama-3.3-70b-instruct:free", url="https://openrouter.ai/api/v1/chat/completions",
          key_env="OPENROUTER_API_KEY", key_prefix="sk-or-", key_url="https://openrouter.ai/keys", free="Models ending in :free cost nothing (key needed).",
-         destination="OpenRouter and the model's host"),
+         destination="OpenRouter and the model's host", privacy="zdr_possible",
+         policy="Depends on the host serving the model; many free models log or train on prompts. In the Confidential tier SM-Watch asks OpenRouter to route only to hosts that do not collect data.", policy_url="https://openrouter.ai/docs/features/privacy-and-logging"),
     Spec("mistral", "Mistral", "openai", "mistral-small-latest", url="https://api.mistral.ai/v1/chat/completions", key_env="MISTRAL_API_KEY",
-         key_url="https://console.mistral.ai/api-keys", free="Has a free experiment tier (key needed).", destination="Mistral AI"),
+         key_url="https://console.mistral.ai/api-keys", free="Has a free experiment tier (key needed).", destination="Mistral AI", privacy="zdr_possible",
+         policy="Free (Experiment) plan: data may be used to train models. Paid plans can opt out of training; zero retention by agreement.", policy_url="https://mistral.ai/terms"),
     Spec("deepseek", "DeepSeek", "openai", "deepseek-chat", url="https://api.deepseek.com/v1/chat/completions", key_env="DEEPSEEK_API_KEY", key_prefix="sk-",
-         key_url="https://platform.deepseek.com/api_keys", destination="DeepSeek"),
+         key_url="https://platform.deepseek.com/api_keys", destination="DeepSeek", privacy="shared",
+         policy="Data is processed and stored in the People's Republic of China and may be used to improve the service; no zero-retention option.", policy_url="https://platform.deepseek.com"),
     Spec("ollama", "Ollama (local, private)", "openai", "llama3.2", url=os.getenv("OLLAMA_BASE_URL", "http://ollama:11434/v1").rstrip("/") + "/chat/completions",
          needs_key=False, base_url_editable=True, retry_wait_max=0, free="Free and private: runs on your own machine, nothing leaves your network.",
-         destination="your own Ollama server (nothing leaves your network)"),
+         destination="your own Ollama server (nothing leaves your network)", privacy="local",
+         policy="Runs on your own machine: prompts never leave your network.", policy_url="https://ollama.com"),
     Spec("custom", "Other OpenAI-compatible API", "openai", "", key_env="AI_API_KEY", needs_key=False, base_url_editable=True,
-         destination="the endpoint you configure"),
+         destination="the endpoint you configure", privacy="zdr_possible",
+         policy="Depends entirely on who runs the endpoint. Self-hosted (vLLM, LM Studio, LiteLLM in front of your own models) keeps data in your network.", policy_url=""),
 )}
 DEFAULT_PROVIDER = "free"
 
@@ -82,7 +104,8 @@ def catalog() -> list[dict]:
     """What the settings page needs to know about each provider (never any key)."""
     return [{"id": s.id, "label": s.label, "default_model": s.default_model, "needs_key": s.needs_key, "accepts_key": s.accepts_key, "key_env": s.key_env,
              "key_prefix": s.key_prefix, "key_url": s.key_url, "base_url_editable": s.base_url_editable, "default_base_url": _base_of(s.url),
-             "tools": s.tools, "free": s.free, "destination": s.destination} for s in PROVIDERS.values()]
+             "tools": s.tools, "free": s.free, "destination": s.destination, "privacy": s.privacy, "privacy_text": PRIVACY[s.privacy], "policy": s.policy,
+             "policy_url": s.policy_url} for s in PROVIDERS.values()]
 
 
 def _base_of(url: str) -> str:
@@ -140,9 +163,12 @@ def _missing_key(s: Spec) -> AiError:
     return AiError(f"No API key is set for {s.label}. {where}{get}. Or switch to the free provider, which needs no key.")
 
 
-def build(cfg: dict, decrypt: Callable[[str], str]) -> "Provider":
-    """The provider chosen in the AI settings, with its key (environment first, then the dashboard) and model."""
+def build(cfg: dict, decrypt: Callable[[str], str], confidential: bool = False) -> "Provider":
+    """The provider chosen in the AI settings, with its key (environment first, then the dashboard) and model. confidential=True adds
+    the provider's no-retention request options where its API has them, and refuses providers whose terms allow data reuse."""
     s = spec(cfg.get("provider") or DEFAULT_PROVIDER)
+    if confidential and s.privacy == "shared":
+        raise AiError(f"{s.label} cannot serve the Confidential tier: its terms allow prompts to be logged or reused. Choose another provider under AI → Settings.")
     key = resolve_key(s, cfg, decrypt)
     if s.needs_key and not key:
         raise _missing_key(s)
@@ -157,7 +183,17 @@ def build(cfg: dict, decrypt: Callable[[str], str]) -> "Provider":
         url = base if base.endswith("/chat/completions") else base + "/chat/completions"
     if not url:
         raise AiError(f"No API address is set for {s.label}. Enter its base URL (for example https://host/v1) under AI → Settings.")
-    return OpenAICompatProvider(s, model, key, url)
+    provider = OpenAICompatProvider(s, model, key, url)
+    if confidential:
+        provider.extra_body = CONFIDENTIAL_OPTIONS.get(s.id, {})
+    return provider
+
+
+# Request options that ask a provider not to keep or share data, where its API has them (sent in the Confidential tier only).
+CONFIDENTIAL_OPTIONS = {
+    "openrouter": {"provider": {"data_collection": "deny"}},   # route only to hosts that do not store or train on prompts
+    "openai": {"store": False},                                 # do not keep completions for evals / distillation
+}
 
 
 def resolve_key(s: Spec, cfg: dict, decrypt: Callable[[str], str]) -> str:
@@ -386,6 +422,7 @@ class OpenAICompatProvider(Provider):
 
     def __init__(self, s: Spec, model: str, key: str, url: str):
         self.spec, self.model, self.key, self.url = s, model, key, url
+        self.extra_body: dict = {}
 
     # --------------------------------------------------------------------- HTTP
     def _post(self, body: dict) -> dict:
@@ -394,7 +431,7 @@ class OpenAICompatProvider(Provider):
             headers["Authorization"] = f"Bearer {self.key}"
         if self.spec.id == "openrouter":
             headers["X-Title"] = "SM-Watch"
-        body = {"model": self.model, **body}
+        body = {"model": self.model, **self.extra_body, **body}
         waited = 0.0
         for attempt in range(3):
             try:

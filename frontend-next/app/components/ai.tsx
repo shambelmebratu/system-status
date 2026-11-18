@@ -7,16 +7,30 @@ import { useApp, usePoll } from '../lib/app';
 import { timeAgo } from '../lib/format';
 
 export type AiProvider = { id: string; label: string; default_model: string; needs_key: boolean; accepts_key: boolean; key_env: string | null; key_prefix: string | null;
-  key_url: string | null; base_url_editable: boolean; default_base_url: string; tools: boolean; free: string; destination: string; key_saved: boolean; key_in_env: boolean };
-export type AiSettings = { enabled: boolean; provider: string; model: string; base_url: string; auto_explain: boolean; post_explanations: boolean; allow_logs: boolean; anomaly_alerts: boolean;
-  auto_per_hour: number; key_source: 'env' | 'dashboard' | null; ready: boolean; providers: AiProvider[]; usage: { requests: number; input_tokens: number; output_tokens: number }; month: string };
+  key_url: string | null; base_url_editable: boolean; default_base_url: string; tools: boolean; free: string; destination: string; key_saved: boolean; key_in_env: boolean;
+  privacy: 'local' | 'zdr_possible' | 'shared'; privacy_text: string; policy: string; policy_url: string };
+export type Tier = 'dev' | 'confidential';
+export type Feature = 'incidents' | 'logs' | 'assistant';
+type Usage = { requests: number; input_tokens: number; output_tokens: number };
+export type AiTier = { enabled: boolean; provider: string; model: string; base_url: string; key_source: 'env' | 'dashboard' | null; ready: boolean; problem: string | null; usage: Usage;
+  zdr_confirmed_by?: string | null; zdr_confirmed_at?: string | null };
+export type AiFeature = { label: string; tier: Tier | 'off'; ready: boolean; problem: string | null; destination: string | null };
+export type AiSettings = { auto_explain: boolean; post_explanations: boolean; allow_logs: boolean; anomaly_alerts: boolean; auto_per_hour: number; security_on_dev: boolean;
+  tiers: Record<Tier, AiTier>; features: Record<Feature, AiFeature>; shared_ack: { by: string; at: string; what: string[] } | null; ready: boolean;
+  providers: AiProvider[]; usage: Usage; month: string };
 
-export function providerOf(settings: AiSettings | null | undefined): AiProvider | undefined {
-  return settings?.providers.find(p => p.id === settings.provider);
+export function providerOf(settings: AiSettings | null | undefined, tier: Tier): AiProvider | undefined {
+  return settings?.providers.find(p => p.id === settings.tiers[tier].provider);
+}
+
+/** Shown next to anything produced on the Development tier: the provider may keep or learn from what was sent. */
+export function SharedBadge({ tier }: { tier?: string }) {
+  if (tier !== 'dev') return null;
+  return <span className="ai-shared" title="Sent through the Development tier: the provider may log, retain or train on this data">shared data</span>;
 }
 export type IncidentAnalysis = { summary: string; impact: string; likely_causes: { cause: string; evidence: string; confidence: 'low' | 'medium' | 'high' }[]; next_checks: string[]; related: string[]; error?: string };
 type LogAnalysis = { summary: string; health: 'healthy' | 'degraded' | 'failing'; groups: { title: string; severity: string; occurrences: number; example: string; meaning: string; fix: string }[];
-  next_steps: string[]; model: string; lines_sent: number };
+  next_steps: string[]; model: string; tier?: string; lines_sent: number };
 
 export function useAi() {
   return usePoll(() => api<AiSettings>('/ai/settings'), [], 120000).value;
@@ -94,10 +108,10 @@ export function IncidentAi({ incidentId, analysis, model, generatedAt, onDone }:
         <ul className="ai-causes">{analysis.likely_causes.map((c, i) => <li key={i}><span className={`ai-conf ${c.confidence}`}>{c.confidence}</span><div><b>{c.cause}</b><div className="sm muted">{c.evidence}</div></div></li>)}</ul>
         <h4>Check next</h4><ol>{analysis.next_checks.map((c, i) => <li key={i}><Markdown text={c} /></li>)}</ol>
         {analysis.related.length > 0 && <><h4>Related</h4><ul>{analysis.related.map((r, i) => <li key={i}>{r}</li>)}</ul></>}
-        <p className="sm muted">{model} · {generatedAt ? timeAgo(generatedAt) : ''} · AI can be wrong: check before acting.{canOperate && settings?.ready && <> <button className="lg-link" onClick={explain} disabled={busy}>{busy ? 'Thinking…' : 'Explain again'}</button></>}</p>
+        <p className="sm muted">{model} · {generatedAt ? timeAgo(generatedAt) : ''} · AI can be wrong: check before acting.{canOperate && settings?.features.incidents.ready && <> <button className="lg-link" onClick={explain} disabled={busy}>{busy ? 'Thinking…' : 'Explain again'}</button></>}</p>
       </div>}
     </div>);
-  if (!canOperate || !settings?.ready) return null;
+  if (!canOperate || !settings?.features.incidents.ready) return null;
   return <div className="ai-box" onClick={e => e.stopPropagation()}>
     <button type="button" className="btn sm" onClick={explain} disabled={busy}><Icon name="zap" size={13} />{busy ? 'Thinking… (up to a minute)' : 'Explain with AI'}</button>
     {analysis?.error && <span className="sm warn" style={{ marginLeft: 8 }}>Last attempt failed: {analysis.error}</span>}
@@ -110,7 +124,7 @@ export function LogAiButton({ getText, source }: { getText: () => string; source
   const { canOperate, toast } = useApp();
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<LogAnalysis | null>(null);
-  if (!canOperate || !settings?.ready || !settings.allow_logs) return null;
+  if (!canOperate || !settings?.features.logs.ready || !settings.allow_logs) return null;
   async function run() {
     const text = getText();
     if (!text.trim()) { toast('There are no lines to analyse', true); return; }
@@ -127,7 +141,7 @@ export function LogAiButton({ getText, source }: { getText: () => string; source
           {result.groups.map((g, i) => <div key={i} className={`ai-group ${g.severity}`}><div className="ai-group-head"><b>{g.title}</b><span className="tag">~{g.occurrences.toLocaleString()}×</span></div>
             <code className="ai-example">{g.example}</code><p className="sm">{g.meaning}</p>{g.fix && <p className="sm"><b>Fix:</b> {g.fix}</p>}</div>)}
           {result.next_steps.length > 0 && <><h3 className="drawer-h">Next steps</h3><ol>{result.next_steps.map((s, i) => <li key={i}><Markdown text={s} /></li>)}</ol></>}
-          <p className="sm muted">{result.lines_sent.toLocaleString()} lines sent with secrets masked · {result.model} · AI can be wrong.</p>
+          <p className="sm muted">{result.lines_sent.toLocaleString()} lines sent with secrets masked · {result.model} <SharedBadge tier={result.tier} /> · AI can be wrong.</p>
         </div>
       </aside>
     </div>}
@@ -135,7 +149,7 @@ export function LogAiButton({ getText, source }: { getText: () => string; source
 }
 
 /* ---------------------------------------------------------------- one log line */
-type LineExplanation = { summary: string; severity: 'error' | 'warning' | 'info'; meaning: string; likely_causes: string[]; fix: string[]; needs_attention: boolean; model: string; context_lines: number };
+type LineExplanation = { summary: string; severity: 'error' | 'warning' | 'info'; meaning: string; likely_causes: string[]; fix: string[]; needs_attention: boolean; model: string; tier?: string; context_lines: number };
 
 /** "Explain with AI" for the line open in the log inspector. The surrounding lines go along as context; secrets are masked on the server. */
 export function LogLineAi({ line, before, after, source }: { line: string; before: string[]; after: string[]; source: string }) {
@@ -145,7 +159,7 @@ export function LogLineAi({ line, before, after, source }: { line: string; befor
   const [error, setError] = useState('');
   const [result, setResult] = useState<LineExplanation | null>(null);
   const [forLine, setForLine] = useState('');
-  if (!canOperate || !settings?.ready || !settings.allow_logs) return null;
+  if (!canOperate || !settings?.features.logs.ready || !settings.allow_logs) return null;
   const shown = forLine === line ? result : null;          // moving to another line hides the old explanation
   async function run() {
     setBusy(true); setError('');
@@ -161,7 +175,7 @@ export function LogLineAi({ line, before, after, source }: { line: string; befor
       <p className="sm">{shown.meaning}</p>
       {shown.likely_causes.length > 0 && <><h4 className="drawer-h">Likely causes</h4><ul className="sm">{shown.likely_causes.map((c, i) => <li key={i}><Markdown text={c} /></li>)}</ul></>}
       {shown.fix.length > 0 && <><h4 className="drawer-h">What to do</h4><ol className="sm">{shown.fix.map((f, i) => <li key={i}><Markdown text={f} /></li>)}</ol></>}
-      <p className="sm muted">{shown.model} · {shown.context_lines} surrounding lines sent as context, secrets masked · AI can be wrong. <button type="button" className="lg-link" onClick={run} disabled={busy}>{busy ? 'Thinking…' : 'Ask again'}</button></p>
+      <p className="sm muted">{shown.model} <SharedBadge tier={shown.tier} /> · {shown.context_lines} surrounding lines sent as context, secrets masked · AI can be wrong. <button type="button" className="lg-link" onClick={run} disabled={busy}>{busy ? 'Thinking…' : 'Ask again'}</button></p>
     </div>}
   </div>;
 }

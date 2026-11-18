@@ -29,18 +29,13 @@ def _rate(user: dict, what: str, per_hour: int) -> None:
     _calls[(user["uid"], what)] = hits + [now]
 
 
-class AiSettingsIn(BaseModel):
-    enabled: bool
-    provider: str | None = Field(default=None, max_length=30)         # None = keep the current provider
-    model: str | None = Field(default=None, max_length=120)           # None = keep; "" = the provider's default
-    base_url: str | None = Field(default=None, max_length=300)        # only for providers with an editable address (Ollama, custom)
-    auto_explain: bool = False
-    post_explanations: bool = False
-    allow_logs: bool = True
-    anomaly_alerts: bool = True
-    auto_per_hour: int = Field(default=6, ge=1, le=60)
-    api_key: str = Field(default="", max_length=300)     # blank = keep; saved for the chosen provider
-    clear_key: bool = False
+class TierIn(BaseModel):
+    """One tier's provider. Omitted fields keep their saved value."""
+    enabled: bool | None = None
+    provider: str | None = Field(default=None, max_length=30)
+    model: str | None = Field(default=None, max_length=120)         # "" = the provider's default
+    base_url: str | None = Field(default=None, max_length=300)      # only for providers with an editable address (Ollama, custom)
+    zdr_confirmed: bool | None = None                               # Confidential tier: the admin confirms the account's no-retention terms
 
     @field_validator("provider")
     @classmethod
@@ -63,10 +58,43 @@ class AiSettingsIn(BaseModel):
             raise ValueError("The base URL must start with http:// or https://, for example http://ollama:11434/v1")
         return v
 
-    @field_validator("api_key")
+
+class AiSettingsIn(BaseModel):
+    """Every field is optional: what is omitted keeps its saved value."""
+    tiers: dict[str, TierIn] = Field(default_factory=dict)
+    features: dict[str, str] = Field(default_factory=dict)          # feature -> confidential | dev | off
+    acknowledge_shared: bool = False                                # required to move a feature (or security data) to the Development tier
+    security_on_dev: bool | None = None
+    auto_explain: bool | None = None
+    post_explanations: bool | None = None
+    allow_logs: bool | None = None
+    anomaly_alerts: bool | None = None
+    auto_per_hour: int | None = Field(default=None, ge=1, le=60)
+    keys: dict[str, str] = Field(default_factory=dict, max_length=12)       # provider -> new API key (stored encrypted)
+    clear_keys: list[str] = Field(default_factory=list, max_length=12)
+
+    @field_validator("tiers")
     @classmethod
-    def key_strip(cls, v: str) -> str:
-        return v.strip()
+    def known_tiers(cls, v: dict) -> dict:
+        if set(v) - set(ai.TIERS):
+            raise ValueError("Tiers are 'dev' and 'confidential'")
+        return v
+
+    @field_validator("features")
+    @classmethod
+    def known_features(cls, v: dict) -> dict:
+        for f, t in v.items():
+            if f not in ai.FEATURES or t not in ("confidential", "dev", "off"):
+                raise ValueError(f"Features are {', '.join(ai.FEATURES)}; each uses 'confidential', 'dev' or 'off'")
+        return v
+
+    @field_validator("keys", "clear_keys")
+    @classmethod
+    def known_key_providers(cls, v):
+        for p in v:
+            if p not in llm.PROVIDERS:
+                raise ValueError(f"Unknown provider '{p}'")
+        return {p: k.strip() for p, k in v.items()} if isinstance(v, dict) else v
 
 
 @router.get("/ai/settings")
@@ -76,53 +104,99 @@ def get_settings_ai(_: dict = Depends(require_user), db: Session = Depends(get_d
 
 @router.put("/ai/settings")
 def put_settings_ai(payload: AiSettingsIn, request: Request, user: dict = Depends(require_admin), db: Session = Depends(get_db)) -> dict:
+    """Saves the two tiers, which tier each feature uses, and the shared options. The privacy rules are enforced here, not only in the page:
+    the Confidential tier never runs on a provider whose terms allow data reuse, needs a recorded confirmation of the account's
+    no-retention terms (except a local Ollama), and features move to the Development tier only with an explicit acknowledgement."""
     from .crypto import encrypt
     cfg = ai.load(db)
-    new = {k: getattr(payload, k) for k in ai.DEFAULTS}
-    for k in ("provider", "model", "base_url"):
-        if new[k] is None:
-            new[k] = cfg[k]
-    if new["provider"] != cfg["provider"] and payload.model is None:
-        new["model"] = ""                                   # a model name rarely carries over between providers
-    spec = llm.PROVIDERS[new["provider"]]
-    if not spec.base_url_editable:
-        new["base_url"] = ""
-    if payload.api_key:
-        problem = llm.check_key_shape(spec.id, payload.api_key)
+    before = json.loads(json.dumps({k: cfg[k] for k in ("tiers", "features", *ai.DEFAULTS)}))
+    now = datetime.now(timezone.utc).isoformat()
+    changes: list[str] = []
+    for tier, t in payload.tiers.items():
+        cur = cfg["tiers"][tier]
+        new_provider = t.provider if t.provider is not None else cur["provider"]
+        spec = llm.PROVIDERS[new_provider]
+        if new_provider != cur["provider"]:
+            cur["provider"] = new_provider
+            cur["model"] = t.model if t.model is not None else ""          # a model name rarely carries over between providers
+            cur["base_url"] = ""
+            if tier == "confidential":
+                cur["zdr_confirmed_by"] = cur["zdr_confirmed_at"] = None   # a confirmation belongs to one provider account
+        if t.model is not None:
+            cur["model"] = t.model
+        if t.base_url is not None:
+            cur["base_url"] = t.base_url if spec.base_url_editable else ""
+        if tier == "confidential":
+            if spec.privacy == "shared" and (t.provider is not None or t.enabled):
+                raise HTTPException(422, f"{spec.label} cannot be used in the Confidential tier: {spec.policy} Use it in the Development tier, or choose a local Ollama "
+                                         "or a provider that offers zero data retention.")
+            if t.zdr_confirmed is True and spec.privacy == "zdr_possible" and not cur.get("zdr_confirmed_at"):
+                cur["zdr_confirmed_by"], cur["zdr_confirmed_at"] = user["email"], now
+                changes.append(f"confirmed zero data retention / no training for {spec.label}")
+            elif t.zdr_confirmed is False and cur.get("zdr_confirmed_at"):
+                cur["zdr_confirmed_by"] = cur["zdr_confirmed_at"] = None
+                changes.append(f"withdrew the zero-retention confirmation for {spec.label}")
+            if t.enabled and spec.privacy == "zdr_possible" and not cur.get("zdr_confirmed_at"):
+                raise HTTPException(422, f"Before the Confidential tier can use {spec.label}, confirm that your account has zero data retention / no training on your data "
+                                         f"(a paid or enterprise plan, or a signed agreement). SM-Watch cannot check this from the key. {spec.policy}")
+        if t.enabled is not None:
+            cur["enabled"] = t.enabled
+    newly_shared = [f for f, t in payload.features.items() if t == "dev" and cfg["features"][f] != "dev"]
+    if payload.security_on_dev and not cfg["security_on_dev"]:
+        newly_shared.append("security findings for the assistant")
+    if newly_shared and not payload.acknowledge_shared:
+        raise HTTPException(422, f"Moving {', '.join(ai.FEATURES.get(f, f) for f in newly_shared)} to the Development tier sends production data to a provider that may log, "
+                                 "retain or train on it. Confirm that you accept this (acknowledge_shared) to continue.")
+    cfg["features"].update(payload.features)
+    for k in ai.DEFAULTS:
+        if getattr(payload, k) is not None:
+            cfg[k] = getattr(payload, k)
+    if newly_shared:
+        cfg["shared_ack"] = {"by": user["email"], "at": now, "what": newly_shared}
+        changes.append(f"accepted shared-data processing for {', '.join(newly_shared)}")
+    keys = dict(cfg.get("api_keys") or {})
+    for provider in payload.clear_keys:
+        if keys.pop(provider, None):
+            changes.append(f"{llm.PROVIDERS[provider].label} API key removed")
+    for provider, key in payload.keys.items():
+        if not key:
+            continue
+        problem = llm.check_key_shape(provider, key)
         if problem:
             raise HTTPException(422, problem)
-    changes = [f"{k} {cfg.get(k)!r} -> {new[k]!r}" for k in ai.DEFAULTS if cfg.get(k) != new[k]]
-    cfg.update(new)
-    keys = dict(cfg.get("api_keys") or {})
-    if payload.clear_key:
-        keys.pop(spec.id, None); changes.append(f"{spec.label} API key removed")
-    elif payload.api_key:
-        keys[spec.id] = encrypt(payload.api_key); changes.append(f"{spec.label} API key set")
+        keys[provider] = encrypt(key); changes.append(f"{llm.PROVIDERS[provider].label} API key set")
     cfg["api_keys"] = keys
+    after = {k: cfg[k] for k in ("tiers", "features", *ai.DEFAULTS)}
+    for tier in ai.TIERS:
+        for k in ai.TIER_FIELDS:
+            if before["tiers"][tier][k] != after["tiers"][tier][k]:
+                changes.append(f"{tier}.{k} {before['tiers'][tier][k]!r} -> {after['tiers'][tier][k]!r}")
+    changes += [f"{f} tier {before['features'][f]} -> {after['features'][f]}" for f in ai.FEATURES if before["features"][f] != after["features"][f]]
+    changes += [f"{k} {before[k]!r} -> {after[k]!r}" for k in ai.DEFAULTS if before[k] != after[k]]
     ai.save(db, cfg, user["email"])
     audit(db, request, "ai.settings", user=user, detail="; ".join(changes)[:900] or "no changes")
     db.commit()
     return ai.public_settings(db)
 
 
-@router.post("/ai/test")
-async def test_ai(request: Request, user: dict = Depends(require_admin)) -> dict:
-    """A tiny request that proves the provider, key and model work (costs a few tokens)."""
+@router.get("/ai/models")
+async def ai_models(tier: str = Query("confidential", pattern="^(dev|confidential)$"), user: dict = Depends(require_admin)) -> dict:
+    """The models a tier's saved provider offers to the saved key."""
     def run():
         with SessionLocal() as db:
-            return ai.test_connection(db)
+            return ai.list_models(db, tier)
     try:
         return await run_in_threadpool(run)
     except ai.AiError as error:
         raise HTTPException(422, str(error)) from error
 
 
-@router.get("/ai/models")
-async def ai_models(user: dict = Depends(require_admin)) -> dict:
-    """The models the saved provider offers to the saved key."""
+@router.post("/ai/test")
+async def test_ai(request: Request, tier: str = Query("confidential", pattern="^(dev|confidential)$"), user: dict = Depends(require_admin)) -> dict:
+    """A tiny request that proves a tier's provider, key and model work (costs a few tokens)."""
     def run():
         with SessionLocal() as db:
-            return ai.list_models(db)
+            return ai.test_connection(db, tier)
     try:
         return await run_in_threadpool(run)
     except ai.AiError as error:
