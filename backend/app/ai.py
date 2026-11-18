@@ -213,7 +213,7 @@ def incident_context(db: Session, incident) -> str:
     if others:
         lines.append("# Other incidents within 30 minutes\n" + "\n".join(f"{aware(o.started_at):%H:%M:%S} {o.target_type} \"{o.target_name}\": {o.title}; {mask(o.detail or '')[:160]}" for o in others[:15]))
     changes = db.scalars(select(AuditEvent).where(AuditEvent.ts >= started - timedelta(hours=24), AuditEvent.ts <= started + timedelta(minutes=5), AuditEvent.success.is_(True),
-                                                 ~AuditEvent.action.in_(["auth.login", "auth.logout", "logs.read", "k8s.logs.read", "db.report", "ai.settings", "ai.explain", "ai.logs", "ai.ask"])).order_by(desc(AuditEvent.ts)).limit(20)).all()
+                                                 ~AuditEvent.action.in_(["auth.login", "auth.logout", "logs.read", "k8s.logs.read", "db.report", "ai.settings", "ai.explain", "ai.logs", "ai.ask", "ai.log_line"])).order_by(desc(AuditEvent.ts)).limit(20)).all()
     if changes:
         lines.append("# Configuration changes in SM-Watch during the 24 h before\n" + "\n".join(f"{aware(c.ts):%m-%d %H:%M} {c.action} {c.target} {mask(c.detail or '')[:120]}" for c in changes))
     windows = db.scalars(select(Maintenance).where(Maintenance.starts_at <= started + timedelta(hours=1), Maintenance.ends_at >= started - timedelta(hours=1))).all()
@@ -307,6 +307,38 @@ def analyze_logs(db: Session, text: str, source: str) -> dict:
     analysis, model = _parse(db, LOG_SYSTEM, content, LogAnalysis)
     db.commit()
     return {**analysis.model_dump(), "model": model, "lines_sent": min(len(lines), 3000)}
+
+
+# ------------------------------------------------------------------------------------------------ one log line
+class LineExplanation(BaseModel):
+    summary: str = Field(description="What this line says, in one plain sentence")
+    severity: Literal["error", "warning", "info"] = Field(description="How serious the line is")
+    meaning: str = Field(description="What it means technically: the component, the error code or message, and what happened; two or three sentences")
+    likely_causes: list[str] = Field(description="The most likely causes, most likely first; at most 4")
+    fix: list[str] = Field(description="Concrete steps to fix or investigate, most useful first; include commands where helpful; at most 5; empty when nothing is needed")
+    needs_attention: bool = Field(description="True when someone should act on it, false for routine or harmless lines")
+
+    @field_validator("severity", mode="before")
+    @classmethod
+    def _lower(cls, v):
+        return v.strip().lower() if isinstance(v, str) else v
+
+
+LINE_SYSTEM = """You are an experienced site reliability engineer. An operator clicked one line in a log viewer and wants to know what it means.
+Explain that line: what it says, how serious it is, the likely causes and what to do. Use the surrounding lines only as context.
+Be concrete and short; say plainly when the line is routine. Values replaced with *** were masked on purpose."""
+
+
+def explain_log_line(db: Session, line: str, before: list[str], after: list[str], source: str) -> dict:
+    cfg = _ready(db)
+    if not cfg["allow_logs"]:
+        raise AiError("An admin has not allowed sending logs to the AI (AI → Settings).")
+    before, after = [b[:2000] for b in before[-20:]], [a[:2000] for a in after[:10]]
+    content = (f"Log source: {source or 'unknown'}\n\n# The line to explain\n{mask(line[:8000])}\n\n"
+               f"# Lines just before it (oldest first)\n{mask(chr(10).join(before)) or '(none)'}\n\n# Lines just after it\n{mask(chr(10).join(after)) or '(none)'}")
+    analysis, model = _parse(db, LINE_SYSTEM, content, LineExplanation, effort="low")
+    db.commit()
+    return {**analysis.model_dump(), "model": model, "context_lines": len(before) + len(after)}
 
 
 # ------------------------------------------------------------------------------------------------ ask your infrastructure

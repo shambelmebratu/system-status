@@ -16,7 +16,7 @@ from .database import SessionLocal, get_db
 from .models import LogRequest, Server
 from .routes_agent import hash_token
 from .schemas import LogQuery, LogResult
-from .security import agent_gate, ensure_access, login_limiter, require_admin, require_operator
+from .security import agent_gate, ensure_access, login_limiter, require_admin, require_operator, require_user
 from .stats import aware
 
 router = APIRouter(tags=["logs"])
@@ -66,9 +66,10 @@ class _Waiter:
             self.table.pop(self.key, None)
 
 
-def agent_server(authorization: str | None, db: Session) -> Server:
+def agent_server(authorization: str | None, db: Session, request: Request | None = None) -> Server:
+    from .routes_agent import server_for_token
     token = authorization[7:] if authorization and authorization.startswith("Bearer ") else ""
-    server = db.scalar(select(Server).where(Server.token_hash == hash_token(token), Server.monitor_mode == "push")) if token else None
+    server = server_for_token(db, request, hash_token(token), pending=False) if token else None
     if server is None:
         raise HTTPException(401, "Invalid agent token")
     if not server.enabled:
@@ -153,6 +154,66 @@ def inspect_process(server_id: int, pid: int, request: Request, user: dict = Dep
     return {"id": item.id, "status": item.status}
 
 
+SYNC_MIN_SECONDS = 5
+
+
+@router.post("/api/servers/{server_id}/sync")
+def sync_now(server_id: int, request: Request, user: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
+    """"Sync now": asks the agent for a live one-second measurement (CPU and where it goes, memory, disk, load, the busiest processes).
+    The agent answers within seconds over its open task channel; the answer replaces the server's latest metrics (graphs keep the
+    regular reports). Read it with GET /api/servers/{id}/logs/{request id}."""
+    ensure_access(user, "server", server_id)
+    server = db.get(Server, server_id)
+    if not server:
+        raise HTTPException(404, "Server not found")
+    if server.monitor_mode != "push":
+        raise HTTPException(422, "Sync now needs the installed agent (this server is monitored by ping or pull)")
+    if not server.enabled:
+        raise HTTPException(422, "This server monitor is disabled")
+    if "sync" not in capabilities(server):
+        raise HTTPException(422, "This server's agent is older than 2.16 and cannot measure on demand. Update the agent (Servers → this server → Update agent) to use Sync now.")
+    now = datetime.now(timezone.utc)
+    recent = db.scalar(select(LogRequest).where(LogRequest.server_id == server_id, LogRequest.created_at >= now - timedelta(seconds=SYNC_MIN_SECONDS),
+                                              LogRequest.query.like('%"source": "snapshot"%')).order_by(LogRequest.id.desc()).limit(1))
+    if recent is not None:   # several people pressing the button at once share one measurement
+        return {"id": recent.id, "status": recent.status}
+    pending = db.scalar(select(func.count()).select_from(LogRequest).where(LogRequest.server_id == server_id, LogRequest.status.in_(("pending", "running")), LogRequest.created_at >= now - pickup_timeout())) or 0
+    if pending >= get_settings().log_max_pending_per_server:
+        raise HTTPException(429, "Too many requests are already waiting for this server")
+    item = LogRequest(server_id=server_id, query=json.dumps({"source": "snapshot", "target": "", "lines": 1, "seconds": 1}))
+    db.add(item)
+    db.commit(); db.refresh(item)
+    _wake(_task_waiters, server_id)
+    return {"id": item.id, "status": item.status}
+
+
+def apply_snapshot(db: Session, server: Server, output: str, now: datetime) -> str | None:
+    """Validates a live snapshot from the agent and makes it the server's latest metrics. Returns an error text, or None."""
+    from pydantic import ValidationError
+    from .schemas import LiveSnapshot
+    try:
+        snap = LiveSnapshot.model_validate_json(output)
+    except (ValidationError, ValueError):
+        return "The agent's measurement was not in the expected format"
+    try:
+        metrics = json.loads(server.last_metrics or "{}") or {}
+    except ValueError:
+        metrics = {}
+    for key in ("cpu_breakdown", "process_cpu_total", "process_count", "forks_per_sec", "procs_running", "procs_blocked"):
+        metrics.pop(key, None)                  # never mix an old breakdown with the new figures
+    metrics.update({k: v for k, v in snap.model_dump().items() if v is not None and k != "sample_seconds"})
+    metrics["cpu_peak"] = None                  # a one-second measurement has no separate peak
+    metrics["synced_at"], metrics["sync_sample_seconds"] = now.isoformat(), snap.sample_seconds
+    server.last_metrics = json.dumps(metrics)
+    return None
+
+
+def _source_of(server_id: int, request_id: int) -> str | None:
+    with SessionLocal() as db:
+        item = db.get(LogRequest, request_id)
+        return json.loads(item.query).get("source") if item and item.server_id == server_id else None
+
+
 def _read(server_id: int, request_id: int) -> dict:
     with SessionLocal() as db:   # short-lived session: never held while waiting
         item = db.get(LogRequest, request_id)
@@ -170,9 +231,14 @@ def _read(server_id: int, request_id: int) -> dict:
 
 
 @router.get("/api/servers/{server_id}/logs/{request_id}")
-async def read_logs(server_id: int, request_id: int, wait: int = Query(0, ge=0, le=20), user: dict = Depends(require_operator)) -> dict:
-    """Result of a log request. With ?wait=N the call returns as soon as the agent has answered (up to N seconds)."""
+async def read_logs(server_id: int, request_id: int, wait: int = Query(0, ge=0, le=20), user: dict = Depends(require_user)) -> dict:
+    """Result of a log request. With ?wait=N the call returns as soon as the agent has answered (up to N seconds).
+    Viewers may read only "Sync now" measurements; logs, SSH activity and process details need the operator role."""
     ensure_access(user, "server", server_id)
+    if user["role"] not in ("admin", "operator"):
+        source = await run_in_threadpool(_source_of, server_id, request_id)
+        if source != "snapshot":
+            raise HTTPException(403, "Operator role required")
     loop = asyncio.get_running_loop()
     deadline = loop.time() + wait
     with _Waiter(_result_waiters, request_id) as event:
@@ -280,6 +346,10 @@ def agent_task_result(request_id: int, payload: LogResult, request: Request, aut
     item.status = "done" if payload.ok else "error"
     item.output, item.error, item.truncated = payload.output, payload.error or None, payload.truncated
     item.completed_at = datetime.now(timezone.utc)
+    if payload.ok and json.loads(item.query).get("source") == "snapshot":
+        problem = apply_snapshot(db, server, payload.output, item.completed_at)
+        if problem:
+            item.status, item.error = "error", problem
     db.commit()
     _wake(_result_waiters, request_id)   # the dashboard's open long-poll returns immediately
     return {"ok": True}

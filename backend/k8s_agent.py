@@ -24,7 +24,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-AGENT_VERSION = "1.2.0"
+AGENT_VERSION = "1.3.0"
 SMWATCH_URL = os.getenv("SMWATCH_URL", "").rstrip("/")
 _TOKEN = os.getenv("SMWATCH_TOKEN", "")                       # this cluster's agent token (from the Secret the manifest created)
 AGENT_ALLOW_INSECURE = os.getenv("AGENT_ALLOW_INSECURE", "") == "1"
@@ -619,6 +619,142 @@ def usage_totals(nodes: list[dict]) -> dict:
         return {"usage_available": False, "cpu_m": None, "mem_mib": None, "cpu_alloc_m": round(alloc_cpu, 1), "mem_alloc_mib": round(alloc_mem, 1)}
 
 
+# ----------------------------------------------------------------------------------------------- security checks
+# Signs of a risky or compromised cluster, judged from object specs the agent already reads (no exec, no Secrets): privileged or
+# host-level pods, mounts of the node's filesystem or container runtime socket, dangerous capabilities, crypto miners and reverse
+# shells in container commands, images pulled from bare IP addresses, unowned pods hiding in kube-system, and RBAC bindings that
+# give cluster-admin to workloads or anyone to anonymous users.
+SYSTEM_NAMESPACES = {"kube-system", "kube-public", "kube-node-lease", "kube-flannel", "calico-system", "calico-apiserver", "tigera-operator", "cilium", "cilium-system",
+                     "longhorn-system", "metallb-system", "cert-manager", "ingress-nginx", "istio-system", "linkerd", "gatekeeper-system", "kyverno", "openebs", "rook-ceph",
+                     "local-path-storage", "cattle-system", "cattle-fleet-system", "monitoring", "kube-prometheus-stack", "gke-managed-system", "gmp-system",
+                     "amazon-cloudwatch", "aws-observability", "azure-arc", "smwatch"} | {n.strip() for n in os.getenv("SMWATCH_TRUSTED_NAMESPACES", "").split(",") if n.strip()}
+SENSITIVE_HOST_PATHS = {"/": "critical", "/var/run/docker.sock": "critical", "/run/docker.sock": "critical", "/run/containerd/containerd.sock": "critical",
+                        "/var/run/containerd/containerd.sock": "critical", "/var/run/crio/crio.sock": "critical", "/run/crio/crio.sock": "critical",
+                        "/etc": "high", "/root": "high", "/home": "high", "/var/lib/kubelet": "high", "/etc/kubernetes": "high", "/proc": "high", "/sys": "high",
+                        "/boot": "high", "/var/run": "high", "/run": "high", "/var/lib/docker": "high", "/var/lib/containerd": "high", "/dev": "high"}
+RISKY_CAPS = {"SYS_ADMIN", "ALL", "SYS_PTRACE", "SYS_MODULE", "DAC_READ_SEARCH", "BPF", "SYS_RAWIO", "NET_ADMIN"}
+MINER = re.compile(r"xmrig|xmr-stak|cpuminer|minerd|kdevtmpfsi|kinsing|ethminer|nbminer|t-rex|lolminer|phoenixminer|stratum\+(?:tcp|ssl)://|--donate-level|"
+                   r"nicehash|minexmr|supportxmr|nanopool\.org|moneroocean|hashvault|c3pool|xmrpool|--coin[= ]monero", re.I)
+REVERSE_SHELL = re.compile(r"/dev/(?:tcp|udp)/|\bbash -i\b.*[>&]|\bn(?:c|cat|etcat)\b.*\s-(?:e|c)\s|socat\b.*exec:|pty\.spawn\(|"
+                           r"(?:curl|wget)\b[^|;]*\|\s*(?:ba|da|z)?sh\b|base64\s+(?:-d|--decode)[^|]*\|\s*(?:ba)?sh", re.I)
+IP_REGISTRY = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?/")
+SEVERITY_DOWN = {"critical": "high", "high": "low", "medium": "low", "low": "low"}
+_rbac_cache: dict = {"at": 0.0, "findings": [], "checked": False, "error": None}
+
+
+def workload_of(pod: dict) -> tuple[str, str]:
+    """The controller a pod belongs to, as kubectl users name it: Deployment/web, not ReplicaSet/web-5d8f7c9b6 or the pod itself."""
+    refs = meta(pod).get("ownerReferences") or []
+    if not refs:
+        return "Pod", meta(pod).get("name", "")
+    kind, name = refs[0].get("kind", ""), refs[0].get("name", "")
+    template_hash = (meta(pod).get("labels") or {}).get("pod-template-hash")
+    if kind == "ReplicaSet" and template_hash and name.endswith("-" + template_hash):
+        return "Deployment", name[: -len(template_hash) - 1]
+    if kind == "Job" and re.search(r"-\d{8,}$", name):
+        return "CronJob", re.sub(r"-\d{8,}$", "", name)
+    return kind, name
+
+
+def _container_findings(ns: str, workload: str, spec: dict, created_at: str | None, system: bool) -> list[dict]:
+    out: list[dict] = []
+
+    def add(rule: str, severity: str, title: str, detail: str, container: str = "", image: str = "", **evidence) -> None:
+        if system and rule not in ("miner", "reverse_shell", "ip_registry"):
+            severity, title, detail = SEVERITY_DOWN[severity], f"{title} (system namespace)", detail + " It runs in a system namespace, where this is common for cluster components: check that it is one you installed."
+        out.append({"key": f"{rule}:{ns}/{workload}:{container}", "kind": f"k8s_{rule}", "severity": severity, "title": title[:200], "detail": detail[:1000], "namespace": ns,
+                    "object": workload, "container": container, "image": image[:300], "created": created_at, **{k: str(v)[:300] for k, v in evidence.items() if v}})
+
+    where = f"{workload} in namespace {ns}"
+    if spec.get("hostPID"):
+        add("host_pid", "high", f"{workload} shares the node's process namespace (hostPID)", f"{where} can see and signal every process on its node, including other containers.")
+    if spec.get("hostIPC"):
+        add("host_ipc", "high", f"{workload} shares the node's IPC namespace (hostIPC)", f"{where} can read shared memory of other processes on its node.")
+    if spec.get("hostNetwork"):
+        add("host_network", "medium", f"{workload} uses the node's network (hostNetwork)", f"{where} bypasses network policies and can listen on, or reach, any address of its node.")
+    for volume in spec.get("volumes") or []:
+        path = ((volume.get("hostPath") or {}).get("path") or "").rstrip("/") or ("/" if volume.get("hostPath") else "")
+        if path in SENSITIVE_HOST_PATHS:
+            runtime = path.endswith(".sock")
+            add("host_path", SENSITIVE_HOST_PATHS[path], f"{workload} mounts {'the container runtime socket' if runtime else 'the node path ' + path}",
+                f"{where} mounts {path} from its node" + (": whoever controls this pod controls every container on the node (and usually the node itself)." if runtime or path == "/" else ", which exposes the node's files to the container."),
+                path=path)
+    containers = [(c, "") for c in spec.get("containers") or []] + [(c, "init ") for c in spec.get("initContainers") or []] + [(c, "debug ") for c in spec.get("ephemeralContainers") or []]
+    for c, role in containers:
+        name, image = c.get("name", ""), c.get("image", "")
+        sc = c.get("securityContext") or {}
+        if sc.get("privileged"):
+            add("privileged", "high", f"{workload}: {role}container {name} is privileged", f"Container {name} of {where} runs privileged: it has every capability and full access to the node's devices; escaping to the node is trivial.", name, image)
+        caps = sorted({str(x).upper().removeprefix("CAP_") for x in ((sc.get("capabilities") or {}).get("add") or [])} & RISKY_CAPS)
+        if caps:
+            add("capabilities", "high", f"{workload}: {role}container {name} adds {', '.join(caps)}", f"Container {name} of {where} adds Linux capabilities ({', '.join(caps)}) that allow escaping the container or spying on the node.", name, image, capabilities=", ".join(caps))
+        command = " ".join(str(x) for x in (c.get("command") or []) + (c.get("args") or []))[:2000]
+        if MINER.search(image) or MINER.search(command):
+            add("miner", "critical", f"Crypto miner in {workload}", f"Container {name} of {where} looks like a cryptocurrency miner (image or command matches known miners or mining pools). Unless you run it on purpose, the cluster is compromised: delete the workload, find how it was created (audit log) and rotate credentials.", name, image, command=command)
+        if REVERSE_SHELL.search(command):
+            add("reverse_shell", "critical", f"Suspicious command in {workload}", f"Container {name} of {where} starts with a reverse shell or downloads and runs a script. Check who created it.", name, image, command=command)
+        if IP_REGISTRY.match(image):
+            add("ip_registry", "medium", f"{workload} pulls an image from a bare IP address", f"Container {name} of {where} uses {image}: images from an IP address instead of a named registry are a common sign of an attacker's workload.", name, image)
+    return out
+
+
+def _rbac_findings() -> tuple[list[dict], bool, str | None]:
+    """cluster-admin given to workloads (service accounts outside kube-system) or anything given to anonymous / all users.
+    Needs read access to (Cluster)RoleBindings; without it (older install manifest) the check is skipped and the reason reported."""
+    now = time.monotonic()
+    if now - _rbac_cache["at"] < 300:
+        return _rbac_cache["findings"], _rbac_cache["checked"], _rbac_cache["error"]
+    found: list[dict] = []
+    try:
+        bindings = [("ClusterRoleBinding", b) for b in klist("/apis/rbac.authorization.k8s.io/v1/clusterrolebindings", cap=5000)[0]]
+        bindings += [("RoleBinding", b) for b in klist("/apis/rbac.authorization.k8s.io/v1/rolebindings", cap=20000)[0]]
+        checked, error = True, None
+    except K8sError as err:
+        bindings, checked = [], False
+        error = "the agent may not read RBAC bindings: re-apply the install manifest (it now grants read-only access to them)" if err.status in (401, 403) else str(err)[:200]
+    for kind, b in bindings:
+        name, ns = meta(b).get("name", ""), meta(b).get("namespace", "")
+        role = (b.get("roleRef") or {}).get("name", "")
+        for subject in b.get("subjects") or []:
+            sk, sn, sns = subject.get("kind", ""), subject.get("name", ""), subject.get("namespace", ns)
+            label = f"{sk} {sns + '/' if sk == 'ServiceAccount' and sns else ''}{sn}"
+            if sn in ("system:anonymous", "system:unauthenticated") or (sn == "system:authenticated" and role == "cluster-admin"):
+                found.append({"key": f"rbac_anonymous:{kind}/{ns}/{name}:{sn}", "kind": "k8s_rbac_anonymous", "severity": "critical", "namespace": ns, "object": f"{kind}/{name}",
+                              "title": f"{kind} {name} grants {role} to {sn}", "detail": f"{kind} {ns + '/' if ns else ''}{name} gives the role {role} to {sn}: anyone who can reach the API server gets these rights without a valid account.",
+                              "created": created(b), "subject": label, "role": role})
+            elif kind == "ClusterRoleBinding" and role == "cluster-admin" and sk == "ServiceAccount" and sns not in SYSTEM_NAMESPACES:
+                found.append({"key": f"rbac_admin:{name}:{sns}/{sn}", "kind": "k8s_rbac_cluster_admin", "severity": "high", "namespace": sns, "object": f"ClusterRoleBinding/{name}",
+                              "title": f"Service account {sns}/{sn} is cluster-admin", "detail": f"ClusterRoleBinding {name} makes service account {sns}/{sn} cluster-admin: any pod running as it (or anyone who steals its token) controls the whole cluster.",
+                              "created": created(b), "subject": label, "role": role})
+    _rbac_cache.update(at=now, findings=found[:100], checked=checked, error=error)
+    return found[:100], checked, error
+
+
+def security_scan(pods: list[dict]) -> dict:
+    findings: dict[str, dict] = {}
+    for pod in pods:
+        phase = (pod.get("status") or {}).get("phase", "")
+        if phase in ("Succeeded", "Failed"):
+            continue
+        ns = meta(pod).get("namespace", "")
+        kind, name = workload_of(pod)
+        workload = f"{kind}/{name}"
+        system = ns in SYSTEM_NAMESPACES
+        for f in _container_findings(ns, workload, pod.get("spec") or {}, created(pod), system):
+            findings.setdefault(f["key"], {**f, "pods": 0})["pods"] += 1        # one finding per workload, not per replica
+        if kind == "Pod" and ns == "kube-system" and not (meta(pod).get("annotations") or {}).get("kubernetes.io/config.mirror"):
+            key = f"bare_pod:{ns}/{name}"
+            findings.setdefault(key, {"key": key, "kind": "k8s_bare_pod_system", "severity": "high", "namespace": ns, "object": workload, "container": "", "pods": 1, "created": created(pod),
+                                      "title": f"Unmanaged pod {name} in kube-system", "image": ", ".join(c.get("image", "") for c in (pod.get("spec") or {}).get("containers") or [])[:300],
+                                      "detail": f"Pod {name} in kube-system has no controller (not part of a Deployment, DaemonSet or static pod). Attackers drop pods there to hide among system components."})
+    rbac, rbac_checked, rbac_error = _rbac_findings()
+    for f in rbac:
+        findings.setdefault(f["key"], f)
+    order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    items = sorted(findings.values(), key=lambda f: (order.get(f["severity"], 9), f["key"]))[:300]
+    return {"checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "findings": items, "rbac_checked": rbac_checked, "rbac_error": rbac_error}
+
+
 def summary() -> dict:
     version = kapi("/version").get("gitVersion", "")
     nodes, _ = klist("/api/v1/nodes", cap=1000)
@@ -657,7 +793,7 @@ def summary() -> dict:
         "deployments_total": workloads["deployments"][0], "deployments_unavailable": workloads["deployments"][1],
         "statefulsets_total": workloads["statefulsets"][0], "statefulsets_unavailable": workloads["statefulsets"][1],
         "daemonsets_total": workloads["daemonsets"][0], "daemonsets_unavailable": workloads["daemonsets"][1], "hpa_total": len(hpas),
-        "problems": [p[:200] for p in problems[:30]], **usage_totals(nodes),
+        "problems": [p[:200] for p in problems[:30]], **usage_totals(nodes), "security": security_scan(pods),
     }
 
 

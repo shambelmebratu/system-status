@@ -1020,3 +1020,9 @@ kbd{font:600 11px var(--mono);border:1px solid var(--line);background:var(--surf
 .sec-scan-bar{width:180px;height:5px;border-radius:99px;background:var(--surface-2);overflow:hidden}.sec-scan-bar i{display:block;height:100%;background:var(--accent);transition:width .4s}
 @media (max-width:760px){.sec-scan{justify-content:flex-start;width:100%}.sec-scan-info{align-items:flex-start;text-align:left}}
 .topbar .sec-scan{margin-left:auto}
+.ai-line{margin-bottom:12px}
+.cpu-bar{display:flex;height:14px;border-radius:7px;overflow:hidden;background:var(--panel-2, rgba(127,127,127,.12));margin:4px 0 10px}
+.cpu-bar i{display:block;height:100%}
+.cpu-legend{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:12px}
+.cpu-legend span{display:inline-flex;align-items:center;gap:5px}
+.cpu-legend i{width:10px;height:10px;border-radius:3px;display:inline-block}

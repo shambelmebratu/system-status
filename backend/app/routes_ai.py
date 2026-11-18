@@ -171,6 +171,29 @@ async def analyze_logs(payload: LogsIn, request: Request, user: dict = Depends(r
         raise HTTPException(422, str(error)) from error
 
 
+class LogLineIn(BaseModel):
+    line: str = Field(min_length=1, max_length=8000)
+    before: list[str] = Field(default_factory=list, max_length=20)
+    after: list[str] = Field(default_factory=list, max_length=10)
+    source: str = Field(default="", max_length=200)
+
+
+@router.post("/ai/log-line")
+async def explain_log_line(payload: LogLineIn, request: Request, user: dict = Depends(require_operator)) -> dict:
+    """Explains one log line (with a few surrounding lines as context). Secrets are masked before anything is sent."""
+    _rate(user, "log-line", 120)
+
+    def run():
+        with SessionLocal() as db:
+            result = ai.explain_log_line(db, payload.line, payload.before, payload.after, payload.source)
+            audit(db, request, "ai.log_line", user=user, detail=f"{payload.source[:120]}: {ai.mask(payload.line)[:200]}", commit=True)
+            return result
+    try:
+        return await run_in_threadpool(run)
+    except ai.AiError as error:
+        raise HTTPException(422, str(error)) from error
+
+
 class ChatMessage(BaseModel):
     role: str = Field(pattern="^(user|assistant)$")
     content: str = Field(min_length=1, max_length=8000)

@@ -14,10 +14,45 @@ import { CodeBox, Empty, Field, Icon, Meter, Modal, StatusPill } from '../compon
 import { api, del, post, put } from '../lib/api';
 import { pollFor, useApp, useLimits, useNow, usePoll } from '../lib/app';
 import { bytesPerSecond, duration, isOlder, ms, pct, timeAgo } from '../lib/format';
-import type { Incident, Mode, Point, Range, Server, ServerHistory } from '../lib/types';
+import type { CpuBreakdown, Incident, Metrics, Mode, Point, Range, Server, ServerHistory } from '../lib/types';
 import { IncidentList } from './Overview';
 
 const MODE_LABEL: Record<Mode, string> = { push: 'Agent · push', agent: 'Agent · pull', ping: 'Ping only' };
+
+const CPU_KINDS: { key: keyof CpuBreakdown; label: string; color: string; hint: string }[] = [
+  { key: 'user', label: 'Programs', color: 'var(--c1)', hint: 'user time: application code' },
+  { key: 'nice', label: 'Low priority', color: 'var(--c3)', hint: 'niced programs (backups, indexing)' },
+  { key: 'system', label: 'Kernel', color: 'var(--c2)', hint: 'system calls on behalf of programs' },
+  { key: 'irq', label: 'Interrupts', color: 'var(--c5)', hint: 'hardware interrupts: charged to no process' },
+  { key: 'softirq', label: 'Soft interrupts', color: '#f97316', hint: 'network and disk packet handling: charged to no process' },
+  { key: 'steal', label: 'Steal', color: '#ef4444', hint: 'time the hypervisor gave to other virtual machines' },
+  { key: 'iowait', label: 'Waiting for disk', color: 'var(--border)', hint: 'idle, waiting for I/O (not counted as busy)' },
+];
+
+/** Where the CPU time went, and why a high CPU figure may not show up in the process list. */
+function CpuExplain({ m }: { m: Metrics }) {
+  const b = m.cpu_breakdown ?? {};
+  const v = (k: keyof CpuBreakdown) => b[k] ?? 0;
+  const busy = m.cpu ?? 0;
+  const procs = m.process_cpu_total ?? null;
+  const unaccounted = procs != null ? Math.max(0, busy - procs) : 0;
+  const notes: string[] = [];
+  if (v('steal') >= 10) notes.push(`${v('steal').toFixed(0)}% of the CPU time was taken by the hypervisor for other virtual machines (steal). This is not caused by anything on this server: the host is oversubscribed. Ask the provider, or move to a dedicated or larger plan.`);
+  if (v('irq') + v('softirq') >= 10) notes.push(`${(v('irq') + v('softirq')).toFixed(0)}% went to interrupt handling (usually network or disk traffic). Interrupt time is never charged to a process. Check the Network chart for a traffic spike or flood.`);
+  if (procs != null && unaccounted >= 15 && (m.forks_per_sec ?? 0) >= 20) notes.push(`${(m.forks_per_sec ?? 0).toFixed(0)} new processes are started every second. Short-lived processes (cron jobs, scripts, health checks, crash-looping containers) use CPU between two measurements and are gone before the list is taken.`);
+  else if (procs != null && unaccounted >= 15 && v('steal') < 10 && v('irq') + v('softirq') < 10) notes.push(`About ${unaccounted.toFixed(0)}% of CPU is not explained by the processes listed: short-lived processes started and finished between measurements. Use Sync now a few times to catch them.`);
+  if (v('iowait') >= 20) notes.push(`${v('iowait').toFixed(0)}% of the time the CPU was idle waiting for the disk: storage is the bottleneck, not the processor.`);
+  if (busy >= 50 && !notes.length && procs != null) notes.push('The processes listed account for the CPU use.');
+  return (
+    <section className="card">
+      <div className="card-head"><h2>Where the CPU time goes</h2><span className="grow" /><span className="muted sm">CPU {pct(busy, 1)} busy{procs != null ? ` · processes ${pct(procs, 1)}` : ''}{m.forks_per_sec != null ? ` · ${m.forks_per_sec} new processes/s` : ''}</span></div>
+      <div className="cpu-bar" role="img" aria-label="CPU time by kind">{CPU_KINDS.filter(k => v(k.key) > 0.2).map(k => <i key={k.key} style={{ width: `${v(k.key)}%`, background: k.color }} title={`${k.label}: ${v(k.key).toFixed(1)}% (${k.hint})`} />)}</div>
+      <div className="cpu-legend">{CPU_KINDS.filter(k => v(k.key) >= 0.5).map(k => <span key={k.key} title={k.hint}><i style={{ background: k.color }} />{k.label} <b>{v(k.key).toFixed(1)}%</b></span>)}<span><i style={{ background: 'transparent', border: '1px solid var(--border)' }} />Idle <b>{v('idle').toFixed(1)}%</b></span></div>
+      {notes.map((n, i) => <p key={i} className="sm" style={{ margin: '8px 0 0' }}>{n}</p>)}
+      {(m.procs_blocked ?? 0) > 0 && <p className="sm muted" style={{ margin: '8px 0 0' }}>{m.procs_blocked} process{m.procs_blocked === 1 ? ' is' : 'es are'} blocked waiting for I/O right now.</p>}
+    </section>
+  );
+}
 
 export function Servers() {
   const { data, route, go, canOperate, canManage } = useApp();
@@ -89,6 +124,22 @@ function ServerDetail({ server }: { server: Server }) {
   const latestAgent = data?.agents?.latest;
   const outdated = server.monitor_mode === 'push' && isOlder(m?.agent_version, latestAgent);
 
+  const canSync = server.monitor_mode === 'push' && !!m?.capabilities?.includes('sync');
+  const [syncing, setSyncing] = useState(false);
+  const synced = m?.synced_at && (!server.last_seen_at || new Date(m.synced_at) >= new Date(server.last_seen_at)) ? m.synced_at : null;
+  async function syncNow() {
+    setSyncing(true);
+    try {
+      const { id } = await post<{ id: number }>(`/servers/${server.id}/sync`);
+      for (let i = 0; i < 3; i++) {
+        const r = await api<{ status: string; error: string | null }>(`/servers/${server.id}/logs/${id}?wait=15`);
+        if (r.status === 'done') { await refresh(); toast('Live metrics and processes updated'); return; }
+        if (r.status === 'error') { toast(r.error ?? 'The agent could not measure', true); return; }
+      }
+      toast('The agent did not answer in time. Is it running?', true);
+    } catch (e) { toast((e as Error).message, true); } finally { setSyncing(false); }
+  }
+
   async function remove() {
     if (!(await confirm(`Remove ${server.name}?\n\nIts history is deleted too. This cannot be undone.`))) return;
     try { await del(`/servers/${server.id}`); toast('Server removed'); await refresh(); go('servers'); } catch (e) { toast((e as Error).message, true); }
@@ -133,7 +184,9 @@ function ServerDetail({ server }: { server: Server }) {
       <div className="grid g-side" style={tab !== 'overview' ? { display: 'none' } : undefined}>
         <div className="grid">
           <section className="card">
-            <div className="card-head"><h2>Current</h2><span className="grow" /><span className={`liveflag ${fresh ? 'on' : ''}`} title={fresh ? 'The agent is reporting on schedule' : 'No report for a while'}><i />{server.monitor_mode === 'push' ? `${fresh ? 'live · ' : ''}last report ${ago(server.last_seen_at)}` : `checked ${ago(server.last_checked_at)}`}<span className="muted"> · every {server.check_interval_seconds}s</span></span></div>
+            <div className="card-head"><h2>Current</h2><span className="grow" /><span className={`liveflag ${fresh ? 'on' : ''}`} title={fresh ? 'The agent is reporting on schedule' : 'No report for a while'}><i />{server.monitor_mode === 'push' ? (synced ? `synced ${ago(synced)} (live ${m?.sync_sample_seconds ?? 1}s sample)` : `${fresh ? 'live · ' : ''}last report ${ago(server.last_seen_at)}`) : `checked ${ago(server.last_checked_at)}`}<span className="muted"> · every {server.check_interval_seconds}s</span></span>
+              {server.monitor_mode === 'push' && server.last_seen_at && <button className="btn sm" onClick={() => void syncNow()} disabled={syncing || !canSync}
+                title={canSync ? 'Measure CPU, memory, disk, load and the busiest processes right now' : 'Needs agent 2.16 or newer: update the agent to use Sync now'}><Icon name="refresh" size={14} />{syncing ? 'Syncing…' : 'Sync now'}</button>}</div>
             {m?.cpu != null ? (
               <div className="rings">
                 <Ring label="CPU" value={m.cpu} threshold={server.cpu_threshold} />
@@ -150,6 +203,8 @@ function ServerDetail({ server }: { server: Server }) {
               </div>
             ) : <p className="muted">No metrics yet.</p>}
           </section>
+
+          {m?.cpu_breakdown && <CpuExplain m={m} />}
 
           {server.monitor_mode === 'ping' && (
             <>
@@ -210,7 +265,8 @@ function ServerDetail({ server }: { server: Server }) {
           </section>
           {server.monitor_mode !== 'ping' && <section className="card">
             <div className="card-head"><h2>Top processes</h2>{canInspect && <><span className="grow" /><span className="muted sm">click one for details</span></>}</div>
-            {m?.processes?.length ? <table className="tbl"><thead><tr><th>Process</th><th className="num">CPU</th><th className="num">Mem</th></tr></thead><tbody>
+            {m?.process_cpu_total != null && <p className="sm muted" style={{ margin: '0 0 8px' }}>CPU is % of <b>one core</b> ({m.cpu_count ?? '?'} cores = {(m.cpu_count ?? 1) * 100}%). All {m.process_count ?? ''} processes together: <b>{pct(m.process_cpu_total, 1)}</b> of the machine{synced ? ', measured live' : ', averaged since the previous report'}.</p>}
+            {m?.processes?.length ? <table className="tbl"><thead><tr><th>Process</th><th className="num" title="% of one CPU core">CPU</th><th className="num">Mem</th></tr></thead><tbody>
               {m.processes.slice(0, 8).map(p => <tr key={`${p.pid}-${p.name}`} className={canInspect ? 'link' : ''} tabIndex={canInspect ? 0 : undefined} title={canInspect ? 'Show what this process is' : undefined}
                 onClick={() => canInspect && setProc({ pid: p.pid, name: p.name })} onKeyDown={e => canInspect && e.key === 'Enter' && setProc({ pid: p.pid, name: p.name })}><td><div className="name">{p.name}<small>PID {p.pid}</small></div></td><td className="num">{pct(p.cpu, 1)}</td><td className="num">{p.memory != null ? pct(p.memory, 1) : '–'}</td></tr>)}
             </tbody></table> : <p className="muted sm">No process data.</p>}

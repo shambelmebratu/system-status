@@ -18,7 +18,7 @@ from sqlalchemy import delete, func, select, text
 from sqlalchemy.orm import Session
 
 from .config import get_settings
-from .models import SecurityFinding, SshFailureSample, SshLoginEvent, TrafficSample, AlertEvent, AppSetting, AuditEvent, CheckResult, ClusterSample, Enrollment, Incident, K8sRequest, LogRequest, MetricSample
+from .models import ClusterFinding, SecurityFinding, SshFailureSample, SshLoginEvent, TrafficSample, AlertEvent, AppSetting, AuditEvent, CheckResult, ClusterSample, Enrollment, Incident, K8sRequest, LogRequest, MetricSample
 
 KEY = "retention"
 CATEGORIES = {
@@ -89,6 +89,7 @@ def _delete_older(db: Session, category: str, cutoff: datetime | None) -> int:
         stmt = delete(AlertEvent).where(*older(AlertEvent.created_at))
     elif category == "incidents":
         n = db.execute(delete(SecurityFinding).where(SecurityFinding.resolved_at.is_not(None), *older(SecurityFinding.resolved_at))).rowcount or 0
+        n += db.execute(delete(ClusterFinding).where(ClusterFinding.resolved_at.is_not(None), *older(ClusterFinding.resolved_at))).rowcount or 0
         n += db.execute(delete(SshLoginEvent).where(*older(SshLoginEvent.ts))).rowcount or 0
         return n + (db.execute(delete(Incident).where(Incident.resolved_at.is_not(None), *older(Incident.resolved_at))).rowcount or 0)
     elif category == "audit":
@@ -163,7 +164,7 @@ def stats(db: Session) -> dict:
         "checks": [(CheckResult, CheckResult.checked_at)],
         "metrics": [(MetricSample, MetricSample.ts), (TrafficSample, TrafficSample.ts), (ClusterSample, ClusterSample.ts), (SshFailureSample, SshFailureSample.ts)],
         "alerts": [(AlertEvent, AlertEvent.created_at)],
-        "incidents": [(Incident, Incident.started_at), (SecurityFinding, SecurityFinding.first_seen), (SshLoginEvent, SshLoginEvent.ts)],
+        "incidents": [(Incident, Incident.started_at), (SecurityFinding, SecurityFinding.first_seen), (ClusterFinding, ClusterFinding.first_seen), (SshLoginEvent, SshLoginEvent.ts)],
         "audit": [(AuditEvent, AuditEvent.ts)],
         "links": [(Enrollment, Enrollment.created_at)],
         "transient": [(LogRequest, LogRequest.created_at), (K8sRequest, K8sRequest.created_at)],

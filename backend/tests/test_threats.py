@@ -121,7 +121,7 @@ def test_suspicious_logins_threats_and_keys(client, monkeypatch):
     _report(anon, auth, hostname="web-threat", ips=WEB_IPS, security=scan)                              # the same scan re-sent: nothing changes
     with database.SessionLocal() as db:
         assert db.query(SecurityFinding).filter_by(server_id=sid, source="agent", resolved_at=None).count() == 2
-        assert db.query(AlertEvent).filter_by(state="threat").count() == 2
+        assert db.query(AlertEvent).filter_by(state="threat", target_type="server").count() == 2
     # 3. next scan: the miner is gone (resolved), a new SSH key appeared (finding + alert)
     scan2 = {**scan, "checked_at": "2026-11-17T10:10:00+00:00", "findings": scan["findings"][1:], "authorized_keys": [key, {**key, "fingerprint": "SHA256:bbbbbbbb", "comment": "unknown"}]}
     _report(anon, auth, hostname="web-threat", ips=WEB_IPS, security=scan2)

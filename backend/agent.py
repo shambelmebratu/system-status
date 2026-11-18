@@ -39,7 +39,7 @@ from typing import Any
 
 import psutil
 
-AGENT_VERSION = "2.15.0"
+AGENT_VERSION = "2.16.0"
 _ENV_TOKEN = os.getenv("AGENT_TOKEN", "")                      # the token supplied by configuration; a rotation may supersede it (see _load_state)
 AGENT_TOKEN = ""                                                # the token in use: resolved by ensure_token() (saved state first, then configuration)
 AGENT_ALLOW_INSECURE = os.getenv("AGENT_ALLOW_INSECURE", "") == "1"   # permit http:// to a public address (not recommended)
@@ -102,8 +102,47 @@ def _cpu_sampler() -> None:
             _cpu_window["peak"] = max(_cpu_window["peak"], value)
 
 
-def cpu_window() -> tuple[float, float | None]:
-    """(average, peak) CPU % since the previous call. Before the first interval has elapsed, a short direct sample."""
+# Kernel counters behind the CPU figure. Linux counts time spent in interrupts (irq, softirq) and time the hypervisor gave to other
+# virtual machines (steal) as busy, but never charges it to any process; short-lived processes (cron jobs, scripts, crash-looping
+# containers) burn CPU between two reports and are gone before the process list is taken. These explain "CPU 90 % but every
+# process is low", so each report carries them.
+CPU_FIELDS = ("user", "nice", "system", "idle", "iowait", "irq", "softirq", "steal")
+_cpu_mark: dict = {"times": None, "stat": None, "t": None}
+
+
+def proc_stat() -> dict:
+    """Counters from /proc/stat: processes started since boot, and processes running / blocked on I/O right now (Linux only)."""
+    out: dict = {}
+    try:
+        with open(os.path.join(getattr(psutil, "PROCFS_PATH", "/proc"), "stat")) as handle:
+            for line in handle:
+                key, _, value = line.partition(" ")
+                if key in ("processes", "procs_running", "procs_blocked"):
+                    out[key] = int(value.split()[0])
+    except (OSError, ValueError, IndexError):
+        pass
+    return out
+
+
+def cpu_breakdown(before, after) -> dict | None:
+    """% of all CPU time per kind between two psutil.cpu_times() readings. guest time is already inside user/nice on Linux."""
+    if before is None or after is None:
+        return None
+    deltas = {f: max(0.0, getattr(after, f) - getattr(before, f)) for f in after._fields}
+    total = sum(v for f, v in deltas.items() if f not in ("guest", "guest_nice"))
+    if total <= 0:
+        return None
+    return {f: round(100.0 * deltas[f] / total, 1) for f in CPU_FIELDS if f in deltas}
+
+
+def busy_percent(breakdown: dict) -> float:
+    """Busy = everything except idle and iowait (iowait is idle time spent waiting for disks): the same rule as psutil and htop."""
+    return max(0.0, min(100.0, 100.0 - (breakdown.get("idle") or 0.0) - (breakdown.get("iowait") or 0.0)))
+
+
+def cpu_window() -> tuple[float, float | None, dict]:
+    """(average, peak, detail) since the previous call. The average is exact (kernel counters over the whole window); the peak is
+    the highest of the sampler's readings. Before the first window exists, a short direct sample."""
     global _cpu_thread
     if _cpu_thread is None:
         _cpu_thread = threading.Thread(target=_cpu_sampler, daemon=True, name="cpu")
@@ -111,10 +150,20 @@ def cpu_window() -> tuple[float, float | None]:
     with _cpu_lock:
         n, total, peak = _cpu_window["n"], _cpu_window["sum"], _cpu_window["peak"]
         _cpu_window.update(sum=0.0, n=0, peak=0.0)
+    now_times, now_stat, now_t = psutil.cpu_times(), proc_stat(), time.monotonic()
+    previous = dict(_cpu_mark)
+    _cpu_mark.update(times=now_times, stat=now_stat, t=now_t)
+    detail: dict = {"procs_running": now_stat.get("procs_running"), "procs_blocked": now_stat.get("procs_blocked")}
+    breakdown = cpu_breakdown(previous["times"], now_times)
+    if previous["t"] and now_t > previous["t"] and "processes" in now_stat and "processes" in (previous["stat"] or {}):
+        detail["forks_per_sec"] = round(max(0, now_stat["processes"] - previous["stat"]["processes"]) / (now_t - previous["t"]), 2)
+    if breakdown:
+        detail["cpu_breakdown"] = breakdown
+        average = busy_percent(breakdown)
+        return average, (max(peak, average) if n else None), detail
     if n == 0:
-        value = psutil.cpu_percent(interval=0.25)
-        return value, None
-    return total / n, peak
+        return psutil.cpu_percent(interval=0.25), None, detail
+    return total / n, peak, detail
 
 
 _procs_primed = False
@@ -133,20 +182,70 @@ def process_rows() -> list[dict]:
         time.sleep(AGENT_PROCESS_SAMPLE_SECONDS)
         _procs_primed = True
     rows = []
-    for process in psutil.process_iter(["pid", "name", "username", "memory_percent"]):
+    # Fields are read into a local dict, never through process.info: psutil shares its cached process objects between threads, and
+    # the threat scan iterating at the same moment with other fields would replace .info mid-loop (KeyError -> a lost report).
+    for process in psutil.process_iter():
         try:
-            rows.append({"pid": process.info["pid"], "name": (process.info["name"] or "unknown")[:100], "user": (process.info["username"] or "unknown")[:100], "cpu": round(process.cpu_percent(interval=None), 1), "memory": round(min(100.0, process.info["memory_percent"] or 0), 1)})
+            info = process.as_dict(["pid", "name", "username", "memory_percent"])
+            rows.append({"pid": info["pid"], "name": (info["name"] or "unknown")[:100], "user": (info["username"] or "unknown")[:100], "cpu": round(process.cpu_percent(interval=None), 1), "memory": round(min(100.0, info["memory_percent"] or 0), 1)})
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
     rows.sort(key=lambda item: item["cpu"], reverse=True)
     return rows
 
 
+def process_cpu_total(rows: list[dict]) -> float:
+    """All processes together as % of the whole machine (a process's own figure is % of ONE core, so 4 busy cores = 400 %)."""
+    return round(sum(r["cpu"] for r in rows) / (psutil.cpu_count() or 1), 1)
+
+
+def live_snapshot(seconds: float = 1.0) -> dict[str, Any]:
+    """"Sync now": measures right now, over `seconds`, without touching the report counters (the per-report CPU window, the cached
+    process objects, network rates and log offsets all stay as they are, so the next regular report is unaffected)."""
+    seconds = max(0.2, min(3.0, seconds))
+
+    def proc_times() -> dict[int, tuple[float, str, str, float]]:
+        out = {}
+        for pid in psutil.pids():
+            try:
+                p = psutil.Process(pid)        # a fresh object: psutil's cached ones keep the report's own CPU baseline
+                with p.oneshot():
+                    t = p.cpu_times()
+                    out[pid] = (t.user + t.system, p.name(), _try(p.username) or "unknown", p.memory_percent())
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+        return out
+
+    t1, s1, p1, m1 = psutil.cpu_times(), proc_stat(), proc_times(), time.monotonic()
+    time.sleep(seconds)
+    t2, s2, p2, m2 = psutil.cpu_times(), proc_stat(), proc_times(), time.monotonic()
+    elapsed = max(0.001, m2 - m1)
+    rows = []
+    for pid, (cpu2, name, user, mem) in p2.items():
+        used = cpu2 - p1[pid][0] if pid in p1 else cpu2      # a process that started during the sample used all its CPU inside it
+        rows.append({"pid": pid, "name": (name or "unknown")[:100], "user": str(user)[:100], "cpu": round(max(0.0, used) / elapsed * 100, 1), "memory": round(min(100.0, mem or 0), 1)})
+    rows.sort(key=lambda r: (r["cpu"], r["memory"]), reverse=True)
+    breakdown = cpu_breakdown(t1, t2) or {}
+    memory, swap = psutil.virtual_memory(), psutil.swap_memory()
+    try:
+        load = os.getloadavg()[0]
+    except (AttributeError, OSError):
+        load = 0.0
+    out = {"cpu": round(busy_percent(breakdown), 1) if breakdown else psutil.cpu_percent(interval=0.2), "cpu_breakdown": breakdown or None, "cpu_count": psutil.cpu_count() or 1,
+           "memory": round(memory.percent, 1), "swap": round(swap.percent, 1), "disk": round(psutil.disk_usage(AGENT_DISK_PATH).percent, 1), "load": round(load, 2),
+           "uptime_seconds": max(0, int(time.time() - psutil.boot_time())), "processes": rows[:AGENT_PROCESS_TOP_N], "process_count": len(rows),
+           "process_cpu_total": process_cpu_total(rows), "procs_running": s2.get("procs_running"), "procs_blocked": s2.get("procs_blocked"),
+           "sample_seconds": round(elapsed, 2)}
+    if "processes" in s1 and "processes" in s2:
+        out["forks_per_sec"] = round(max(0, s2["processes"] - s1["processes"]) / elapsed, 2)
+    return out
+
+
 def collect() -> dict[str, Any]:
     memory = psutil.virtual_memory()
     swap = psutil.swap_memory()
     processes = process_rows()
-    cpu, cpu_peak = cpu_window()
+    cpu, cpu_peak, cpu_detail = cpu_window()
     try:
         load = os.getloadavg()[0]
     except (AttributeError, OSError):  # Windows
@@ -170,7 +269,10 @@ def collect() -> dict[str, Any]:
         "net_rx_bps": rx,
         "net_tx_bps": tx,
         "processes": processes[:AGENT_PROCESS_TOP_N],
-        "capabilities": (["logs"] if AGENT_LOGS != "off" else []) + (["ssh"] if AGENT_SSH != "off" else []) + (["ssh_history"] if AGENT_SSH == "on" else []) + (["process"] if AGENT_SECURITY != "off" else []),
+        "process_count": len(processes),
+        "process_cpu_total": process_cpu_total(processes),
+        **{k: v for k, v in cpu_detail.items() if v is not None},
+        "capabilities": ["sync"] + (["logs"] if AGENT_LOGS != "off" else []) + (["ssh"] if AGENT_SSH != "off" else []) + (["ssh_history"] if AGENT_SSH == "on" else []) + (["process"] if AGENT_SECURITY != "off" else []),
         "ssh_sessions": ssh_count(),
         "ssh_failures": ssh_failures(),
         "updates": updates_report(),
@@ -1689,13 +1791,14 @@ def _connections() -> list:
 
 
 def _scan_processes(findings: list[dict]) -> None:
-    for process in psutil.process_iter(["pid", "name", "username", "cmdline", "ppid"]):
+    for process in psutil.process_iter():
         try:
-            pid, name = process.info["pid"], process.info["name"] or ""
+            info = process.as_dict(["pid", "name", "username", "cmdline", "ppid"])   # local copy: see process_rows
+            pid, name = info["pid"], info["name"] or ""
             if pid <= 2:
                 continue
             exe = _proc_exe(pid) if not IS_MAC else (process.exe() or "")
-            cmd = " ".join(process.info["cmdline"] or [])[:2000]
+            cmd = " ".join(info["cmdline"] or [])[:2000]
             flags = process_flags(pid, name, exe, cmd)
             if not flags:
                 continue
@@ -1703,8 +1806,8 @@ def _scan_processes(findings: list[dict]) -> None:
             where = exe.replace(" (deleted)", "") or name
             title = f"{name or where} needs a restart after an update" if kind == "deleted_exe_update" else f"Suspicious process: {name or where}"
             findings.append({"key": f"proc:{where}"[:200], "kind": f"process_{kind}", "severity": severity, "title": title,
-                             "detail": f"{name} (PID {pid}, user {process.info['username'] or '?'}) " + "; it ".join(r for _, _, r in flags) + ".", "pid": pid, "process": name[:100],
-                             "user": (process.info["username"] or "")[:60], "path": where[:300], "command": redact_command(cmd)[:300]})
+                             "detail": f"{name} (PID {pid}, user {info['username'] or '?'}) " + "; it ".join(r for _, _, r in flags) + ".", "pid": pid, "process": name[:100],
+                             "user": (info["username"] or "")[:60], "path": where[:300], "command": redact_command(cmd)[:300]})
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
     try:
@@ -1835,9 +1938,12 @@ def _sshd_option(name: str) -> str | None:
 
 
 def _running(*names: str) -> bool:
-    for process in psutil.process_iter(["name"]):
-        if (process.info["name"] or "") in names:
-            return True
+    for process in psutil.process_iter():
+        try:
+            if (process.name() or "") in names:
+                return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
     return False
 
 
@@ -2117,6 +2223,8 @@ def fetch_logs(task: dict) -> tuple[str, bool]:
     since = max(0, min(31 * 86400, max(int(task.get("since_seconds") or 0), int(task.get("since_minutes") or 0) * 60)))   # seconds; 0 = no time limit
     needle = str(task.get("grep") or "")[:200].lower()
     priority = task.get("priority") or ""
+    if source == "snapshot":
+        return json.dumps(live_snapshot(float(task.get("seconds") or 1.0))), False
     if AGENT_LOGS == "off" and source in ("inventory", "docker", "journal", "file"):
         raise ValueError("Log access is turned off on this server (AGENT_LOGS=off)")
     if AGENT_SSH == "off" and source == "ssh":
@@ -2342,8 +2450,7 @@ def push_loop() -> None:
             log.warning("cannot register yet (%s); retrying in 15s", error)
         time.sleep(15)
     log.info("push mode: reporting to %s (agent %s)", SMWATCH_URL, AGENT_VERSION)
-    if AGENT_LOGS != "off" or AGENT_SSH != "off" or AGENT_SECURITY != "off":   # on-demand work: logs, SSH activity, process details
-        threading.Thread(target=task_loop, daemon=True, name="tasks").start()
+    threading.Thread(target=task_loop, daemon=True, name="tasks").start()   # on-demand work: "Sync now", logs, SSH activity, process details
     while True:
         started = time.monotonic()
         try:

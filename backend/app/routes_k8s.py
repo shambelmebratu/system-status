@@ -20,6 +20,7 @@ from .agent_versions import is_outdated, latest_k8s_agent
 from .audit import audit
 from .config import get_settings, resolved_k8s_agent_image
 from .database import SessionLocal, get_db
+from .k8s_security import K8sSecurity, sync_cluster_findings
 from .schemas import AlertPrefs
 from .models import Channel, CheckResult, Cluster, ClusterSample, Incident, K8sRequest
 from .monitoring import alert_columns, csv_list, format_alert, reminder_minutes, outage_seconds, queue_event, record_result, should_notify_again, sync_incident
@@ -89,6 +90,7 @@ class K8sReport(BaseModel):
     mem_mib: float | None = Field(default=None, ge=0)
     mem_alloc_mib: float | None = Field(default=None, ge=0)
     problems: list[str] = Field(default_factory=list, max_length=30)
+    security: K8sSecurity | None = None    # security checks (agent 1.3+)
 
     @field_validator("problems", "not_ready_nodes")
     @classmethod
@@ -249,6 +251,11 @@ rules:
     verbs: [get, list, watch]
   - apiGroups: [metrics.k8s.io]
     resources: [pods, nodes]
+    verbs: [get, list]
+  # Security checks: who is bound to which role (e.g. cluster-admin given to a workload, or rights given to anonymous users).
+  # Bindings only name subjects and roles; they hold no secrets.
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [clusterrolebindings, rolebindings]
     verbs: [get, list]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -412,7 +419,13 @@ def agent_report(payload: K8sReport, request: Request, authorization: str | None
         audit(db, request, "agent.ip_changed", actor=f"agent:{cluster.name}", target=f"cluster:{cluster.id}", detail=f"{cluster.last_agent_ip} -> {ip}")
     cluster.last_agent_ip, cluster.last_seen_at = ip, now
     cluster.agent_version, cluster.k8s_version = payload.agent_version or cluster.agent_version, payload.k8s_version or cluster.k8s_version
-    cluster.summary = payload.model_dump_json()
+    stored = payload.model_dump(mode="json", exclude={"security"})        # findings live in their own table; keep only when / how they were checked
+    if payload.security is not None:
+        stored["security_scan"] = {"checked_at": payload.security.checked_at, "rbac_checked": payload.security.rbac_checked, "rbac_error": payload.security.rbac_error,
+                                   "findings": len(payload.security.findings)}
+    cluster.summary = json.dumps(stored)
+    if payload.security is not None and not payload.error:
+        sync_cluster_findings(db, cluster, payload.security, now)
     if not payload.error:
         db.add(ClusterSample(cluster_id=cluster.id, ts=now, nodes_ready=payload.nodes_ready, nodes_total=payload.nodes_total, pods_running=payload.pods_running, pods_total=payload.pods_total,
                              pods_failing=payload.pods_crashloop + payload.pods_failed, cpu_m=payload.cpu_m, cpu_alloc_m=payload.cpu_alloc_m, mem_mib=payload.mem_mib, mem_alloc_mib=payload.mem_alloc_mib))

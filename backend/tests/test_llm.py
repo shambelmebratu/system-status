@@ -266,3 +266,19 @@ def test_tool_schema_and_call_tool():
     assert "not valid JSON" in llm.call_tool(sample, "{oops")
     assert "error" in llm.call_tool(sample, "{}")            # missing required argument is reported, not raised
     assert llm.extract_json("<think>hmm</think> sure: {\"a\": 1} done") == {"a": 1}
+
+
+def test_explain_one_log_line_masks_secrets_and_uses_context(client, reset, server):
+    client.put("/api/ai/settings", headers=CSRF, json={"enabled": True, "provider": "free"})
+    answer = {"summary": "Postgres refused the connection.", "severity": "Error", "meaning": "The app could not open a TCP connection to the database.",
+              "likely_causes": ["Postgres is down"], "fix": ["systemctl status postgresql"], "needs_attention": True}
+    srv = server(ok(json.dumps(answer), model="gpt-oss-20b"))
+    r = client.post("/api/ai/log-line", headers=CSRF, json={"line": "ERROR connect ECONNREFUSED 10.0.0.5:5432 password=hunter2", "before": ["INFO start", "DB_PASSWORD=s3cr3t"],
+                                                            "after": ["WARN retrying"], "source": "container api on web-01"})
+    assert r.status_code == 200, r.text
+    assert r.json()["severity"] == "error" and r.json()["needs_attention"] and r.json()["context_lines"] == 3 and r.json()["model"] == "gpt-oss-20b"
+    sent = json.dumps(srv.requests[0]["body"])
+    assert "hunter2" not in sent and "s3cr3t" not in sent and "ECONNREFUSED" in sent and "WARN retrying" in sent and "container api on web-01" in sent
+    assert client.post("/api/ai/log-line", headers=CSRF, json={"line": ""}).status_code == 422
+    client.put("/api/ai/settings", headers=CSRF, json={"enabled": True, "allow_logs": False})
+    assert "not allowed" in client.post("/api/ai/log-line", headers=CSRF, json={"line": "x"}).json()["detail"]

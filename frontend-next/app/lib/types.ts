@@ -6,7 +6,10 @@ export type Metrics = {
   hostname?: string; platform?: string; agent_version?: string; cpu?: number; cpu_count?: number; memory?: number; disk?: number;
   load?: number; swap?: number; uptime_seconds?: number; net_rx_bps?: number | null; net_tx_bps?: number | null;
   latency_ms?: number; reachability?: string; processes?: ProcessSample[]; capabilities?: string[]; ssh_sessions?: number | null; os?: string; kernel?: string; arch?: string; install?: 'systemd' | 'macos' | 'docker' | 'bundled' | '';
+  cpu_peak?: number | null; cpu_breakdown?: CpuBreakdown | null; process_cpu_total?: number | null; process_count?: number | null; forks_per_sec?: number | null;
+  procs_running?: number | null; procs_blocked?: number | null; synced_at?: string; sync_sample_seconds?: number; received_at?: string;
 };
+export type CpuBreakdown = { user?: number; nice?: number; system?: number; idle?: number; iowait?: number; irq?: number; softirq?: number; steal?: number };
 
 export type Server = {
   id: number; name: string; host: string; monitor_mode: Mode; check_interval_seconds: number; endpoint: string;

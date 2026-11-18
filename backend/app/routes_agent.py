@@ -28,12 +28,39 @@ def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
+def token_owner(db: Session, token: str, exclude_server: int | None = None) -> str | None:
+    """Who already uses this agent token (a server or a Kubernetes cluster, current or staged), or None. Every agent must have its
+    own token: reports are matched to a server by token alone, so a shared one would file one machine's data under another."""
+    from .models import Cluster
+    digest = hash_token(token)
+    server = db.scalar(select(Server).where(or_(Server.token_hash == digest, Server.pending_token_hash == digest), Server.id != (exclude_server or 0)).limit(1))
+    if server is not None:
+        return f"server '{server.name}'"
+    cluster = db.scalar(select(Cluster).where(or_(Cluster.token_hash == digest, Cluster.pending_token_hash == digest)).limit(1))
+    return f"Kubernetes cluster '{cluster.name}'" if cluster is not None else None
+
+
+def server_for_token(db: Session, request: Request, digest: str | None, *, pending: bool = True) -> Server | None:
+    """The push server this token belongs to. A token that matches more than one server (possible only with hand-typed tokens from
+    before uniqueness was enforced) is refused outright rather than guessing: that would mix two machines' data."""
+    if not digest:
+        return None
+    match = or_(Server.token_hash == digest, Server.pending_token_hash == digest) if pending else Server.token_hash == digest
+    servers = db.scalars(select(Server).where(match, Server.monitor_mode == "push").limit(3)).all()
+    if len(servers) > 1:
+        names = ", ".join(s.name for s in servers)
+        if request is not None and login_limiter.first_time(f"shared-token:{digest}"):
+            audit(db, request, "agent.token_shared", actor="agent:unknown", detail=f"one agent token is configured on several servers ({names}); reports refused until each has its own token", success=False, commit=True)
+        raise HTTPException(409, f"This agent token is configured on several servers ({names}). Rotate the token of each of them in the dashboard so every agent has its own.")
+    return servers[0] if servers else None
+
+
 @router.post("/report")
 def report(payload: AgentReport, request: Request, authorization: str | None = Header(default=None), db: Session = Depends(get_db)) -> dict:
     gate = agent_gate(request, "agent")   # throttles token guessing; valid agents never increment it
     token = authorization[7:] if authorization and authorization.startswith("Bearer ") else ""
     digest = hash_token(token) if token else None
-    server = db.scalar(select(Server).where(or_(Server.token_hash == digest, Server.pending_token_hash == digest), Server.monitor_mode == "push")) if digest else None
+    server = server_for_token(db, request, digest)
     if server is None:
         if login_limiter.fail_unique(gate, digest or ""):   # one audit line per wrong token, not one per request (no log flooding)
             audit(db, request, "agent.auth_failed", actor="agent:unknown", detail="report with an unknown token", success=False, commit=True)

@@ -133,3 +133,36 @@ export function LogAiButton({ getText, source }: { getText: () => string; source
     </div>}
   </>;
 }
+
+/* ---------------------------------------------------------------- one log line */
+type LineExplanation = { summary: string; severity: 'error' | 'warning' | 'info'; meaning: string; likely_causes: string[]; fix: string[]; needs_attention: boolean; model: string; context_lines: number };
+
+/** "Explain with AI" for the line open in the log inspector. The surrounding lines go along as context; secrets are masked on the server. */
+export function LogLineAi({ line, before, after, source }: { line: string; before: string[]; after: string[]; source: string }) {
+  const settings = useAi();
+  const { canOperate } = useApp();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [result, setResult] = useState<LineExplanation | null>(null);
+  const [forLine, setForLine] = useState('');
+  if (!canOperate || !settings?.ready || !settings.allow_logs) return null;
+  const shown = forLine === line ? result : null;          // moving to another line hides the old explanation
+  async function run() {
+    setBusy(true); setError('');
+    try { setResult(await post<LineExplanation>('/ai/log-line', { line, before, after, source })); setForLine(line); }
+    catch (e) { setError((e as Error).message); } finally { setBusy(false); }
+  }
+  return <div className="ai-line">
+    {!shown && <button type="button" className="btn sm" onClick={run} disabled={busy} title="Send this line and a few around it (secrets masked) to the AI">
+      <Icon name="zap" size={13} />{busy ? 'Thinking…' : 'Explain this line with AI'}</button>}
+    {error && <div className="err sm" style={{ marginTop: 8 }}>{error}</div>}
+    {shown && <div className={`ai-group ${shown.severity}`}>
+      <div className="ai-group-head"><b>{shown.summary}</b><span className="tag">{shown.needs_attention ? 'needs attention' : 'routine'}</span></div>
+      <p className="sm">{shown.meaning}</p>
+      {shown.likely_causes.length > 0 && <><h4 className="drawer-h">Likely causes</h4><ul className="sm">{shown.likely_causes.map((c, i) => <li key={i}><Markdown text={c} /></li>)}</ul></>}
+      {shown.fix.length > 0 && <><h4 className="drawer-h">What to do</h4><ol className="sm">{shown.fix.map((f, i) => <li key={i}><Markdown text={f} /></li>)}</ol></>}
+      <p className="sm muted">{shown.model} · {shown.context_lines} surrounding lines sent as context, secrets masked · AI can be wrong. <button type="button" className="lg-link" onClick={run} disabled={busy}>{busy ? 'Thinking…' : 'Ask again'}</button></p>
+    </div>}
+  </div>;
+}
+

@@ -21,7 +21,8 @@ type ServerRow = Who & { status: string; updates: Updates | null; agent_version:
   hardening: { passed: number; failed: number; total: number } };
 type Overview = { servers: ServerRow[]; services: { id: number; name: string; url: string; tls: Scan | null }[]; filter: string | null;
   ssh: { total: number; top_ips: { ip: string; attempts: number; servers: number }[]; top_users: [string, number][]; hourly: { t: string; attempts: number }[] };
-  two_factor?: { policy: 'none' | 'admins' | 'everyone'; enabled: number; total: number; without: { id: number; email: string; role: string }[] } };
+  two_factor?: { policy: 'none' | 'admins' | 'everyone'; enabled: number; total: number; without: { id: number; email: string; role: string }[] };
+  kubernetes?: Counts & { clusters: number; scanned: number } };
 type Severity = 'critical' | 'high' | 'medium' | 'low';
 type Finding = { id: number; server_id: number; server: Who | null; source: 'agent' | 'smwatch'; kind: string; severity: Severity; title: string; detail: string;
   evidence: { pid?: number; process?: string; user?: string; path?: string; command?: string; remote?: string; ip?: string; method?: string; fingerprint?: string; packages?: string[]; failed_attempts_24h?: number };
@@ -32,7 +33,11 @@ type Key = { user: string; type: string; fingerprint: string; comment: string; o
 type Foreign = { manager: string | null; packages: string[]; total?: number; error: string | null } | null;
 type Hardening = { server: Who; agent_version: string | null; push: boolean; checked_at: string | null; checks: Check[]; listening: Listen[]; authorized_keys: Key[]; foreign_packages: Foreign; supported: boolean };
 type Login = { id: number; server: Pick<Who, 'id' | 'name' | 'hostname' | 'public_ip'>; ts: string; ip: string; user: string; method: string; failures_before: number; new_source: boolean; verdict: 'breach' | 'new' | 'ok' };
-type Tab = 'overview' | 'threats' | 'ssh' | 'updates' | 'hardening' | 'exposure' | 'reports' | 'signin';
+type Tab = 'overview' | 'threats' | 'kubernetes' | 'ssh' | 'updates' | 'hardening' | 'exposure' | 'reports' | 'signin';
+type K8sFinding = { id: number; cluster_id: number; cluster: { id: number; name: string } | null; key: string; kind: string; severity: Severity; namespace: string; object: string; title: string; detail: string;
+  evidence: { container?: string; image?: string; command?: string; path?: string; capabilities?: string; subject?: string; role?: string; pods?: number; created?: string };
+  first_seen: string; last_seen: string; resolved_at: string | null; acknowledged_by: string | null; acknowledged_at: string | null; note: string };
+type K8sCluster = { id: number; name: string; agent_version: string | null; last_seen_at: string | null; supported: boolean; scan: { checked_at: string | null; rbac_checked: boolean; rbac_error: string | null; findings: number } | null };
 
 const GRADE_TONE = (g: string | null | undefined) => (!g ? 'none' : g.startsWith('A') ? 'good' : g === 'B' ? 'info' : g === 'C' ? 'warn' : 'bad');
 const RISK_LABEL = { critical: 'Critical', high: 'High', medium: 'Check', info: 'Expected' };
@@ -73,8 +78,11 @@ export function Security() {
   const [tab, setTab] = useState<Tab>('overview');
   const o = data.value;
   const attention = (o?.servers ?? []).reduce((a, s) => a + s.threats.critical + s.threats.high, 0);
+  const k8s = o?.kubernetes;
+  const k8sAttention = k8s ? k8s.critical + k8s.high : 0;
   const tabs: [Tab, string, string][] = [['overview', 'Overview', 'shield'], ['threats', `Threats${attention ? ` (${attention})` : ''}`, 'alert'], ['ssh', 'SSH access', 'terminal'], ['updates', 'Updates', 'refresh'],
     ['hardening', 'Hardening', 'check'], ['exposure', 'Exposure & TLS', 'globe'], ['reports', 'Reports', 'logs']];
+  if (k8s?.clusters) tabs.splice(2, 0, ['kubernetes', `Kubernetes${k8sAttention ? ` (${k8sAttention})` : ''}`, 'k8s']);
   if (isAdmin) tabs.push(['signin', 'Sign-in', 'users']);
   const pick = (id: number) => setServer(String(id));
   return (
@@ -87,6 +95,7 @@ export function Security() {
       {!o ? <div className="card"><p className="muted"><span className="spinner" /> Loading…</p></div> : o.servers.length === 0 && server ? <div className="card"><Empty title="No server matches">Nothing matches “{server}”. Search by name, host name, IP address or server number. <button className="lg-link" onClick={() => setServer('')}>Show all servers</button></Empty></div> : <>
         {tab === 'overview' && <SecurityOverview o={o} go={setTab} pick={pick} />}
         {tab === 'threats' && <Threats server={server} pick={pick} reload={data.reload} />}
+        {tab === 'kubernetes' && <KubernetesSecurity reload={data.reload} />}
         {tab === 'ssh' && <SshAccess server={server} pick={pick} />}
         {tab === 'updates' && <UpdatesView o={o} pick={pick} />}
         {tab === 'hardening' && <HardeningView server={server} pick={pick} />}
@@ -205,6 +214,8 @@ function SecurityOverview({ o, go, pick }: { o: Overview; go: (t: Tab) => void; 
     { label: 'Risky ports exposed', value: String(exposed.length), sub: exposed.length ? exposed.slice(0, 2).map(e => `${e.service} on ${e.server}`).join(', ') : 'none found', tone: exposed.some(e => e.risk === 'critical') ? 'bad' : exposed.length ? 'warn' : 'good', tab: 'exposure' },
     { label: 'TLS problems', value: String(badTls.length), sub: `${o.services.filter(s => s.tls).length} https services audited`, tone: badTls.length ? 'bad' : 'good', tab: 'exposure' },
   ];
+  const k = o.kubernetes;
+  if (k?.clusters) cards.splice(1, 0, { label: 'Kubernetes risks', value: String(k.critical + k.high), sub: !k.scanned ? 'cluster agent 1.3+ needed' : k.critical ? `${k.critical} critical` : k.high ? `${k.high} high` : `${k.scanned} cluster${k.scanned === 1 ? '' : 's'} checked`, tone: k.critical ? 'bad' : k.high ? 'warn' : 'good', tab: 'kubernetes' });
   if (tf) cards.push({ label: 'Two-factor sign-in', value: `${tf.enabled}/${tf.total}`, sub: tf.policy === 'none' ? 'not required' : `required for ${tf.policy}`, tone: tf.enabled === tf.total ? 'good' : 'warn', tab: 'signin' });
   return (
     <>
@@ -275,6 +286,71 @@ function Threats({ server, pick, reload }: { server: string; pick: (id: number) 
                 <button className="btn sm primary">Acknowledge</button><button type="button" className="btn sm ghost" onClick={() => setAcking(null)}>Cancel</button></form>}</div>}
           </article>))}</div>}
       {proc && <ProcessDrawer serverId={proc.serverId} pid={proc.pid} name={proc.name} onClose={() => setProc(null)} />}
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------- Kubernetes */
+const K8S_GROUPS: { id: string; label: string; hint: string; kinds: string[] }[] = [
+  { id: 'malware', label: 'Malicious workloads', hint: 'crypto miners, reverse shells, images from bare IP addresses, unmanaged pods in kube-system', kinds: ['k8s_miner', 'k8s_reverse_shell', 'k8s_ip_registry', 'k8s_bare_pod_system'] },
+  { id: 'escape', label: 'Can take over the node', hint: 'privileged containers, risky capabilities, host PID / IPC / network, mounts of the node or the container runtime', kinds: ['k8s_privileged', 'k8s_capabilities', 'k8s_host_pid', 'k8s_host_ipc', 'k8s_host_network', 'k8s_host_path'] },
+  { id: 'rbac', label: 'Too much access', hint: 'cluster-admin given to workloads, rights given to anonymous users', kinds: ['k8s_rbac_cluster_admin', 'k8s_rbac_anonymous'] },
+];
+
+function KubernetesSecurity({ reload }: { reload: () => Promise<void> }) {
+  const { canOperate, toast } = useApp();
+  const [status, setStatus] = useState<'attention' | 'acknowledged' | 'resolved' | 'all'>('attention');
+  const [group, setGroup] = useState('');
+  const [cluster, setCluster] = useState('');
+  const [acking, setAcking] = useState<number | null>(null);
+  const [note, setNote] = useState('');
+  const data = usePoll(() => api<{ clusters: K8sCluster[]; findings: K8sFinding[] }>(`/security/kubernetes?status=${status}${cluster ? `&cluster=${cluster}` : ''}`), [status, cluster], 30000, true);
+  const all = data.value?.findings ?? [];
+  const shown = group ? all.filter(f => K8S_GROUPS.find(g => g.id === group)?.kinds.includes(f.kind)) : all;
+  const clusters = data.value?.clusters ?? [];
+  async function ack(f: K8sFinding) {
+    try { await post(`/security/kubernetes/${f.id}/acknowledge`, { note }); setAcking(null); setNote(''); toast('Acknowledged: it stays listed until the agent stops seeing it'); await data.reload(); await reload(); }
+    catch (e) { toast((e as Error).message, true); }
+  }
+  return (
+    <div className="grid">
+      <div className="sec-groups">{K8S_GROUPS.map(g => { const n = all.filter(f => g.kinds.includes(f.kind)).length; return <button key={g.id} className={`card sec-group ${group === g.id ? 'on' : ''} ${n ? 'bad' : 'good'}`} onClick={() => setGroup(group === g.id ? '' : g.id)} title={g.hint}>
+        <small>{g.label}</small><b>{n}</b><span className="muted sm">{g.hint}</span></button>; })}</div>
+      <div className="card"><table className="tbl"><thead><tr><th>Cluster</th><th>Agent</th><th>Last check</th><th>RBAC check</th></tr></thead><tbody>
+        {clusters.map(c => <tr key={c.id} className="link" onClick={() => setCluster(cluster === String(c.id) ? '' : String(c.id))} title="Show only this cluster">
+          <td><b>{c.name}</b>{cluster === String(c.id) && <span className="tag" style={{ marginLeft: 6 }}>filtered</span>}</td><td>{c.agent_version ? `v${c.agent_version}` : '–'}</td>
+          <td>{!c.supported ? <span className="warn sm">agent 1.3+ needed: re-apply the install manifest</span> : c.scan?.checked_at ? timeAgo(c.scan.checked_at) : 'waiting'}</td>
+          <td className="sm">{!c.supported ? '–' : c.scan?.rbac_checked ? 'checked' : <span className="warn">{c.scan?.rbac_error ?? 'not checked'}</span>}</td></tr>)}
+      </tbody></table></div>
+      <div className="filterbar"><div className="seg">{([['attention', 'Needs attention'], ['acknowledged', 'Acknowledged'], ['resolved', 'Resolved'], ['all', 'All']] as const).map(([id, l]) => <button key={id} className={status === id ? 'on' : ''} onClick={() => setStatus(id)}>{l}</button>)}</div>
+        {group && <span className="chip">{K8S_GROUPS.find(g => g.id === group)?.label} <button className="lg-link" onClick={() => setGroup('')}><Icon name="x" size={12} /></button></span>}
+        <span className="grow" /><span className="muted sm">{shown.length} finding{shown.length === 1 ? '' : 's'} · checked with every cluster report</span></div>
+      {data.error && <div className="err">{data.error}</div>}
+      {!data.value ? <div className="card"><p className="muted"><span className="spinner" /> Loading…</p></div> : shown.length === 0 ? <div className="card"><Empty title={status === 'attention' ? 'No risky workloads found' : 'Nothing here'}>
+        {status === 'attention' ? 'Cluster agents 1.3+ check every pod and role binding for miners, reverse shells, privileged or host-level access, and cluster-admin grants. Findings appear here and alert your channels.' : 'No findings match.'}</Empty></div>
+        : <div className="sec-findings">{shown.map(f => (
+          <article key={f.id} className={`sec-finding ${f.severity} ${f.resolved_at ? 'resolved' : f.acknowledged_at ? 'acked' : ''}`}>
+            <div className="sec-finding-head"><span className={`sev ${f.severity}`}>{SEV_LABEL[f.severity]}</span><b className="grow">{f.title}</b>
+              {f.resolved_at ? <span className="tag good">resolved {timeAgo(f.resolved_at)}</span> : f.acknowledged_at ? <span className="tag">acknowledged</span> : null}</div>
+            <div className="sec-finding-meta"><span className="chip"><Icon name="k8s" size={12} /> {f.cluster?.name ?? `cluster ${f.cluster_id}`}</span>{f.namespace && <span className="chip mono">ns {f.namespace}</span>}<span className="chip mono">{f.object}</span>
+              <span className="muted sm">first seen {timeAgo(f.first_seen)}{f.evidence.created ? ` · created ${timeAgo(f.evidence.created)}` : ''}</span></div>
+            <p className="sm">{f.detail}</p>
+            <div className="chips">
+              {f.evidence.container && <span className="chip mono">container {f.evidence.container}</span>}
+              {f.evidence.image && <span className="chip mono" title={f.evidence.image}>{f.evidence.image}</span>}
+              {f.evidence.path && <span className="chip mono">{f.evidence.path}</span>}
+              {f.evidence.capabilities && <span className="chip mono">{f.evidence.capabilities}</span>}
+              {f.evidence.subject && <span className="chip mono">{f.evidence.subject} → {f.evidence.role}</span>}
+              {(f.evidence.pods ?? 0) > 1 && <span className="chip">{f.evidence.pods} pods</span>}
+            </div>
+            {f.evidence.command && <code className="proc-cmd sm">{f.evidence.command}</code>}
+            {f.note && <p className="sm muted">Note from {f.acknowledged_by}: {f.note}</p>}
+            {canOperate && !f.resolved_at && !f.acknowledged_at && <div className="sec-finding-actions">
+              {acking !== f.id && <button className="btn sm ghost" onClick={() => { setAcking(f.id); setNote(''); }}>Expected: acknowledge</button>}
+              {acking === f.id && <form className="sec-ack" onSubmit={e => { e.preventDefault(); void ack(f); }}>
+                <input value={note} onChange={e => setNote(e.target.value)} maxLength={500} placeholder="Note (optional): why this is expected" autoFocus aria-label="Note" />
+                <button className="btn sm primary">Acknowledge</button><button type="button" className="btn sm ghost" onClick={() => setAcking(null)}>Cancel</button></form>}</div>}
+          </article>))}</div>}
     </div>
   );
 }

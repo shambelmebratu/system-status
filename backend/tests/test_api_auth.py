@@ -1950,9 +1950,10 @@ def test_pull_endpoint_must_be_https_on_public_addresses(client):
     body = {"name": "pull", "host": "93.184.216.34", "monitor_mode": "agent", "agent_token": "t" * 40}
     r = client.post("/api/servers", headers=CSRF, json={**body, "endpoint": "http://93.184.216.34:9100"})
     assert r.status_code == 422 and "unencrypted" in r.json()["detail"]
+    # every agent has its own token
     assert client.post("/api/servers", headers=CSRF, json={**body, "name": "pull-tls", "endpoint": "https://93.184.216.34:9100"}).status_code == 200
-    assert client.post("/api/servers", headers=CSRF, json={**body, "name": "pull-lan", "host": "10.0.0.5", "endpoint": "http://10.0.0.5:9100"}).status_code == 200
-    assert client.post("/api/servers", headers=CSRF, json={**body, "name": "pull-vpn", "host": "100.100.1.5", "endpoint": "http://100.100.1.5:9100"}).status_code == 200
+    assert client.post("/api/servers", headers=CSRF, json={**body, "name": "pull-lan", "host": "10.0.0.5", "endpoint": "http://10.0.0.5:9100", "agent_token": "l" * 40}).status_code == 200
+    assert client.post("/api/servers", headers=CSRF, json={**body, "name": "pull-vpn", "host": "100.100.1.5", "endpoint": "http://100.100.1.5:9100", "agent_token": "v" * 40}).status_code == 200
 
 
 def test_services_and_schedules_are_audited(client):

@@ -3,6 +3,7 @@ import importlib
 import json
 import os
 import sys
+import threading
 
 import pytest
 
@@ -525,17 +526,66 @@ def test_cpu_is_the_average_and_peak_of_the_interval_not_one_snapshot(tmp_path, 
     a = importlib.import_module("agent")
     try:
         a._cpu_thread = object()                                          # do not start the real sampler in this test
+        monkeypatch.setattr(a, "proc_stat", lambda: {})
+        monkeypatch.setattr(a.psutil, "cpu_percent", lambda interval=None: 12.5)
+        assert a.cpu_window()[:2] == (12.5, None)                         # before one interval has passed: a short direct sample, no peak yet
         with a._cpu_lock:
             for value in (10.0, 20.0, 90.0, 20.0):                        # four 5-second readings, one short spike
                 a._cpu_window["sum"] += value; a._cpu_window["n"] += 1; a._cpu_window["peak"] = max(a._cpu_window["peak"], value)
-        avg, peak = a.cpu_window()
+        a._cpu_mark["times"] = None                                       # no kernel counters to compare with: the average of the readings
+        avg, peak, _ = a.cpu_window()
         assert round(avg, 1) == 35.0 and peak == 90.0                     # a snapshot taken at any one moment would show 10, 20 or 90
         assert a._cpu_window == {"sum": 0.0, "n": 0, "peak": 0.0}         # the next report starts a fresh window
-        monkeypatch.setattr(a.psutil, "cpu_percent", lambda interval=None: 12.5)
-        assert a.cpu_window() == (12.5, None)                             # before one interval has passed: a short direct sample, no peak yet
         monkeypatch.undo()
         report = a.collect()
         assert 0 <= report["cpu"] <= 100 and report["cpu_peak"] is None or report["cpu_peak"] >= report["cpu"] - 0.1
+    finally:
+        sys.modules.pop("agent", None)
+
+
+def test_cpu_breakdown_explains_busy_time_no_process_shows(monkeypatch):
+    """CPU 90 % with quiet processes: the hypervisor's steal time and interrupt time are busy but belong to no process."""
+    from collections import namedtuple
+    sys.path.insert(0, ROOT); sys.modules.pop("agent", None)
+    a = importlib.import_module("agent")
+    try:
+        T = namedtuple("scputimes", "user nice system idle iowait irq softirq steal guest guest_nice")
+        before, after = T(100, 0, 50, 1000, 10, 0, 5, 0, 0, 0), T(105, 0, 55, 1010, 20, 0, 15, 60, 4, 0)   # 100 s of CPU time passed (guest is inside user)
+        b = a.cpu_breakdown(before, after)
+        assert b == {"user": 5.0, "nice": 0.0, "system": 5.0, "idle": 10.0, "iowait": 10.0, "irq": 0.0, "softirq": 10.0, "steal": 60.0}
+        assert a.busy_percent(b) == 80.0                                  # iowait counts as idle; steal and softirq as busy
+        a._cpu_thread = object()
+        seq = iter([(before, {"processes": 1000, "procs_running": 2, "procs_blocked": 0}), (after, {"processes": 1600, "procs_running": 9, "procs_blocked": 1})])
+        clock = iter([100.0, 130.0])
+        def step():
+            times, stat = next(seq)
+            monkeypatch.setattr(a.psutil, "cpu_times", lambda: times)
+            monkeypatch.setattr(a, "proc_stat", lambda: stat)
+        monkeypatch.setattr(a.time, "monotonic", lambda: next(clock))
+        step(); a.cpu_window()
+        step(); avg, _, detail = a.cpu_window()
+        assert avg == 80.0 and detail["forks_per_sec"] == 20.0 and detail["procs_running"] == 9 and detail["cpu_breakdown"]["steal"] == 60.0
+        assert a.process_cpu_total([{"cpu": 150.0}, {"cpu": 50.0}]) == round(200 / (a.psutil.cpu_count() or 1), 1)   # % of ONE core each
+    finally:
+        sys.modules.pop("agent", None)
+
+
+def test_live_snapshot_is_independent_of_the_report_counters(monkeypatch):
+    sys.path.insert(0, ROOT); sys.modules.pop("agent", None)
+    a = importlib.import_module("agent")
+    try:
+        a._cpu_mark.update(times="untouched", stat={"processes": 1}, t=1.0)
+        snap = json.loads(a.fetch_logs({"source": "snapshot", "seconds": 0.2})[0])
+        assert a._cpu_mark["times"] == "untouched"                        # the next regular report still covers its whole interval
+        a._cpu_mark.update(times=None, stat=None, t=None)
+        assert 0 <= snap["cpu"] <= 100 and snap["processes"] and snap["process_count"] >= len(snap["processes"]) and snap["sample_seconds"] >= 0.2
+        assert any(p["pid"] == os.getpid() for p in snap["processes"]) or snap["process_count"] > a.AGENT_PROCESS_TOP_N
+        from app.schemas import LiveSnapshot
+        LiveSnapshot.model_validate(snap)
+        monkeypatch.setattr(a, "AGENT_LOGS", "off")
+        assert json.loads(a.fetch_logs({"source": "snapshot", "seconds": 0.2})[0])["cpu"] >= 0   # works whatever logs/ssh/security toggles say
+        a._cpu_thread = object()                                          # no real sampler thread: it would outlive this test
+        assert "sync" in a.collect()["capabilities"]
     finally:
         sys.modules.pop("agent", None)
 
@@ -547,7 +597,8 @@ def test_process_cpu_is_measured_between_reports_not_in_a_150ms_blip(monkeypatch
         monkeypatch.setattr(a, "AGENT_PROCESS_SAMPLE_SECONDS", 0.05)
         slept = []
         real_sleep = a.time.sleep
-        monkeypatch.setattr(a.time, "sleep", lambda s: (slept.append(s), real_sleep(0.01))[1])
+        me = threading.get_ident()   # sampler threads left by other tests also sleep: count only this test's own calls
+        monkeypatch.setattr(a.time, "sleep", lambda s: (slept.append(s) if threading.get_ident() == me else None, real_sleep(0.01))[1])
         first = a.process_rows()
         assert a._procs_primed and slept == [0.05] and first                # the first report primes the counters and waits once
         second = a.process_rows()

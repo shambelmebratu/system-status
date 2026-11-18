@@ -2,7 +2,7 @@
 
 import { Fragment, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Icon } from './ui';
-import { LogAiButton } from './ai';
+import { LogAiButton, LogLineAi } from './ai';
 
 /* ================================================================================================ time ranges */
 export const RANGES: { id: string; label: string; seconds: number; long: string }[] = [
@@ -298,7 +298,7 @@ export function LogPalette({ open, onClose, groups, title }: { open: boolean; on
 }
 
 /* ================================================================================================ inspector */
-function LogInspector({ row, index, total, onClose, onNav, onToken, tokens, onZoom }: { row: LogRow; index: number; total: number; onClose: () => void; onNav: (d: number) => void; onToken: (t: string) => void; tokens: Set<string>; onZoom: (z: [number, number]) => void }) {
+function LogInspector({ row, index, total, onClose, onNav, onToken, tokens, onZoom, context, source }: { row: LogRow; index: number; total: number; onClose: () => void; onNav: (d: number) => void; onToken: (t: string) => void; tokens: Set<string>; onZoom: (z: [number, number]) => void; context: { before: string[]; after: string[] }; source: string }) {
   const [copied, setCopied] = useState('');
   const copy = (what: string, value: string) => { void navigator.clipboard?.writeText(value); setCopied(what); setTimeout(() => setCopied(''), 1500); };
   const hint = hintFor(row.raw);
@@ -326,6 +326,7 @@ function LogInspector({ row, index, total, onClose, onNav, onToken, tokens, onZo
           {row.t != null && <button className="btn sm" onClick={() => { onZoom([row.t! - 30000, row.t! + 30000]); onClose(); }} title="Show only the surrounding minute">Context ± 30 s</button>}
         </div>
         <div className="drawer-body">
+          <LogLineAi line={row.raw} before={context.before} after={context.after} source={source} />
           {hint && (
             <div className="lg-hint"><div className="lg-hint-head"><Icon name="zap" size={14} /><b>{hint.title}</b><span className="muted sm">pattern-based hint</span></div>
               <p>{hint.text}</p>{hint.fix && <pre>{hint.fix}</pre>}</div>)}
@@ -341,6 +342,13 @@ function LogInspector({ row, index, total, onClose, onNav, onToken, tokens, onZo
       </aside>
     </div>
   );
+}
+
+/** The lines around one line, in log order (not the filtered view): what the AI needs to judge it. */
+function lineContext(rows: LogRow[], n: number): { before: string[]; after: string[] } {
+  const i = rows.findIndex(r => r.n === n);
+  if (i < 0) return { before: [], after: [] };
+  return { before: rows.slice(Math.max(0, i - 15), i).map(r => r.raw), after: rows.slice(i + 1, i + 6).map(r => r.raw) };
 }
 
 /* ================================================================================================ the viewer */
@@ -556,7 +564,8 @@ export function LogViewer({ fetcher, fetchKey, canFetch, controls, storageKey, d
         <button type="button" className="lgx-icon" onClick={download} disabled={!filtered.length} title="Download the lines shown"><Icon name="external" size={14} /><span>Download</span></button>
         <LogAiButton getText={() => filtered.map(r => r.raw).join('\n')} source={downloadName} />
       </div>
-      {selRow && <LogInspector row={selRow} index={selIndex} total={flat.length} onClose={() => setSelected(null)} onNav={d => { const n = flat[selIndex + d]; if (n) setSelected(n.n); }} onToken={toggleToken} tokens={tokens} onZoom={setZoom} />}
+      {selRow && <LogInspector row={selRow} index={selIndex} total={flat.length} onClose={() => setSelected(null)} onNav={d => { const n = flat[selIndex + d]; if (n) setSelected(n.n); }} onToken={toggleToken} tokens={tokens} onZoom={setZoom}
+        context={lineContext(rows, selRow.n)} source={downloadName} />}
     </div>
   );
 }

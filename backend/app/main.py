@@ -148,6 +148,13 @@ def purge_history(db: Session, kind: str, target_id: int) -> None:
     clear_cache()
 
 
+def ensure_unique_token(db: Session, token: str | None, exclude_server: int | None = None) -> None:
+    from .routes_agent import token_owner
+    owner = token_owner(db, token, exclude_server) if token else None
+    if owner:
+        raise HTTPException(409, f"That agent token is already used by {owner}. Every agent needs its own token: leave the field empty to generate one.")
+
+
 def set_token(item: Server, token: str | None) -> None:
     changed = (token or None) != item.agent_token
     item.agent_token = token or None
@@ -445,6 +452,16 @@ def update_profile(payload: ProfileUpdate, request: Request, user: dict = Depend
     return serialize_user(account)
 
 
+def dashboard_metrics(metrics: dict, user: dict) -> dict:
+    """The dashboard is open to every signed-in person, including viewers. The agent's security report (threat findings with command
+    lines and paths, listening ports, SSH key fingerprints, hardening gaps) is served only by the Security API, which needs the
+    operator role; viewers also do not get the list of packages waiting for updates (a map of what is unpatched)."""
+    out = {k: v for k, v in metrics.items() if k != "security"}
+    if user["role"] not in ("admin", "operator") and isinstance(out.get("updates"), dict):
+        out["updates"] = {k: v for k, v in out["updates"].items() if k not in ("packages", "reboot_packages")}
+    return out
+
+
 @app.get("/api/dashboard")
 def dashboard(user: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
     servers = [s for s in db.scalars(select(Server).order_by(Server.name)).all() if can_see(user, "server", s.id)]
@@ -456,7 +473,10 @@ def dashboard(user: dict = Depends(require_user), db: Session = Depends(get_db))
     uptime = uptime_by_target(db, 24)
 
     def with_uptime(kind: str, item) -> dict:
-        return {**serialize(item), "uptime_24h": uptime.get((kind, item.id))}
+        row = {**serialize(item), "uptime_24h": uptime.get((kind, item.id))}
+        if kind == "server" and isinstance(row.get("last_metrics"), dict):
+            row["last_metrics"] = dashboard_metrics(row["last_metrics"], user)
+        return row
 
     if restricted:
         open_incidents = sum(1 for i in db.scalars(select(Incident).where(Incident.resolved_at.is_(None))).all() if i.target_type in ("server", "service", "cluster") and can_see(user, i.target_type, i.target_id))
@@ -598,6 +618,7 @@ def create_server(payload: ServerCreate, request: Request, user: dict = Depends(
         values["endpoint"] = ""
     if payload.monitor_mode in ("agent", "push") and len(token) < 32:
         raise HTTPException(422, "Agent token must be at least 32 characters")
+    ensure_unique_token(db, token if payload.monitor_mode != "ping" else None)
     validate_server_targets(payload)
     item = Server(**alert_settings(values, "server", db))
     set_token(item, token if payload.monitor_mode != "ping" else None)
@@ -626,6 +647,8 @@ def update_server(item_id: int, payload: ServerCreate, request: Request, user: d
         values["endpoint"] = ""
     if values["monitor_mode"] in ("agent", "push") and len(token or "") < 32:
         raise HTTPException(422, "Agent token must be at least 32 characters")
+    if token and token != item.agent_token:
+        ensure_unique_token(db, token, exclude_server=item.id)
     for key, value in alert_settings(values, "server", db).items():
         setattr(item, key, value)
     set_token(item, token)

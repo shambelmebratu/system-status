@@ -608,3 +608,27 @@ class SecurityFinding(Base):
     acknowledged_by: Mapped[str | None] = mapped_column(String(320))
     acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     note: Mapped[str] = mapped_column(Text, default="")
+
+
+class ClusterFinding(Base):
+    """A security problem in one Kubernetes cluster, from the cluster agent's checks (privileged or host-level workloads, risky mounts,
+    miners, reverse shells, cluster-admin given to workloads, ...). One finding per workload and rule, not per pod replica; it
+    resolves itself when the agent stops seeing it. Acknowledging keeps it listed as known until it disappears."""
+    __tablename__ = "cluster_findings"
+    __table_args__ = (Index("ix_cluster_findings_key", "cluster_id", "key", "resolved_at"), Index("ix_cluster_findings_open", "resolved_at", "severity"))
+    id: Mapped[int] = mapped_column(primary_key=True)
+    cluster_id: Mapped[int] = mapped_column(ForeignKey("clusters.id", ondelete="CASCADE"))
+    key: Mapped[str] = mapped_column(String(300))
+    kind: Mapped[str] = mapped_column(String(40))
+    severity: Mapped[str] = mapped_column(String(10))
+    namespace: Mapped[str] = mapped_column(String(253), default="")
+    object: Mapped[str] = mapped_column(String(300), default="")
+    title: Mapped[str] = mapped_column(String(200))
+    detail: Mapped[str] = mapped_column(Text, default="")
+    evidence: Mapped[str] = mapped_column(Text, default="{}")             # JSON: container, image, command, path, subject, role, pods, created
+    first_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    acknowledged_by: Mapped[str | None] = mapped_column(String(320))
+    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    note: Mapped[str] = mapped_column(Text, default="")

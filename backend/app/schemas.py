@@ -299,7 +299,46 @@ class SecurityReport(BaseModel):
     seconds: float = Field(default=0, ge=0)
 
 
-class AgentReport(BaseModel):
+CPU_FIELDS = ("user", "nice", "system", "idle", "iowait", "irq", "softirq", "steal")
+
+
+class CpuBreakdown(BaseModel):
+    """Where the CPU time went over the measured window, in % of all CPU time (agent 2.16+). irq/softirq/steal are never shown
+    against any process, and iowait is idle time: these explain a high CPU figure next to a quiet process list."""
+    user: float | None = Field(default=None, ge=0, le=100)
+    nice: float | None = Field(default=None, ge=0, le=100)
+    system: float | None = Field(default=None, ge=0, le=100)
+    idle: float | None = Field(default=None, ge=0, le=100)
+    iowait: float | None = Field(default=None, ge=0, le=100)
+    irq: float | None = Field(default=None, ge=0, le=100)
+    softirq: float | None = Field(default=None, ge=0, le=100)
+    steal: float | None = Field(default=None, ge=0, le=100)
+
+
+class CpuDetail(BaseModel):
+    """Fields that let the dashboard explain CPU use (agent 2.16+)."""
+    cpu_breakdown: CpuBreakdown | None = None
+    process_cpu_total: float | None = Field(default=None, ge=0, le=100000)   # all processes together, % of the whole machine
+    process_count: int | None = Field(default=None, ge=0, le=10_000_000)
+    forks_per_sec: float | None = Field(default=None, ge=0, le=10_000_000)   # new processes started per second (short-lived ones never show in the list)
+    procs_running: int | None = Field(default=None, ge=0, le=1_000_000)
+    procs_blocked: int | None = Field(default=None, ge=0, le=1_000_000)
+
+
+class LiveSnapshot(CpuDetail):
+    """What the agent measures on demand ("Sync now"): one second of CPU, memory, disk, load and the busiest processes."""
+    cpu: float = Field(ge=0, le=100)
+    memory: float = Field(ge=0, le=100)
+    disk: float = Field(ge=0, le=100)
+    load: float = Field(ge=0, le=100000)
+    swap: float = Field(ge=0, le=100)
+    cpu_count: int | None = Field(default=None, ge=1, le=4096)
+    uptime_seconds: int | None = Field(default=None, ge=0)
+    processes: list["ProcessSample"] = Field(default_factory=list, max_length=100)
+    sample_seconds: float = Field(default=1.0, ge=0, le=120)       # the sleep plus one pass over every process (slow on very busy hosts)
+
+
+class AgentReport(CpuDetail):
     cpu: float = Field(ge=0, le=100)
     cpu_peak: float | None = Field(default=None, ge=0, le=100)
     memory: float = Field(ge=0, le=100)

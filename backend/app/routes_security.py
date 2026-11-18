@@ -107,6 +107,8 @@ def overview(server: str | None = Query(None, max_length=200), user: dict = Depe
                             "hardening": {"passed": sum(1 for c in checks if c.get("ok") is True), "failed": sum(1 for c in checks if c.get("ok") is False), "total": len(checks)}})
     out = {"servers": server_rows, "services": [{"id": s.id, "name": s.name, "url": s.url, "server_id": s.server_id, "tls": scan_view(tls.get(s.id))} for s in services],
            "ssh": {k: ssh[k] for k in ("total", "top_ips", "top_users", "hourly")}, "filter": server or None}
+    if not server:
+        out["kubernetes"] = kubernetes_counts(db, user)
     if user["role"] == "admin" and not server:
         from .mfa import policy
         users = db.scalars(select(User).where(User.active.is_(True))).all()
@@ -354,3 +356,80 @@ async def scan_now(target_type: str, target_id: int, request: Request, user: dic
 def scan_history(target_type: str, target_id: int, limit: int = Query(10, ge=1, le=50), user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> list[dict]:
     ensure_access(user, target_type, target_id)
     return [scan_view(s) for s in db.scalars(select(SecurityScan).where(SecurityScan.target_type == target_type, SecurityScan.target_id == target_id).order_by(desc(SecurityScan.id)).limit(limit)).all()]
+
+
+# ------------------------------------------------------------------------------------------------ Kubernetes
+def visible_clusters(db: Session, user: dict, cluster: str | None = None) -> list:
+    from .models import Cluster
+    clusters = [c for c in db.scalars(select(Cluster).order_by(Cluster.name)).all() if can_see(user, "cluster", c.id)]
+    if cluster:
+        needle = cluster.strip().lower()
+        clusters = [c for c in clusters if (needle.isdigit() and c.id == int(needle)) or needle in c.name.lower()]
+    return clusters
+
+
+def cluster_scan(c) -> dict:
+    try:
+        summary = json.loads(c.summary or "{}") or {}
+    except ValueError:
+        summary = {}
+    return {"id": c.id, "name": c.name, "agent_version": c.agent_version, "last_seen_at": aware(c.last_seen_at).isoformat() if c.last_seen_at else None,
+            "scan": summary.get("security_scan"), "supported": "security_scan" in summary}
+
+
+def kubernetes_counts(db: Session, user: dict) -> dict:
+    from .models import ClusterFinding
+    clusters = visible_clusters(db, user)
+    ids = [c.id for c in clusters] or [0]
+    rows = db.execute(select(ClusterFinding.severity, ClusterFinding.acknowledged_at.is_(None), func.count()).where(ClusterFinding.cluster_id.in_(ids), ClusterFinding.resolved_at.is_(None))
+                      .group_by(ClusterFinding.severity, ClusterFinding.acknowledged_at.is_(None))).all()
+    out = {"clusters": len(clusters), "scanned": sum(1 for c in clusters if cluster_scan(c)["supported"]), "critical": 0, "high": 0, "medium": 0, "low": 0, "acknowledged": 0}
+    for severity, unacked, n in rows:
+        if unacked:
+            out[severity] = out.get(severity, 0) + n
+        else:
+            out["acknowledged"] += n
+    return out
+
+
+@router.get("/kubernetes")
+def kubernetes_findings(cluster: str | None = Query(None, max_length=200), status: str = Query("open", pattern="^(open|attention|acknowledged|resolved|all)$"),
+                        severity: str | None = Query(None, pattern="^(critical|high|medium|low)$"), limit: int = Query(500, ge=1, le=2000),
+                        user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+    """Security findings from the Kubernetes agents (1.3+), with each cluster's scan status."""
+    from .k8s_security import finding_view as k8s_view
+    from .models import ClusterFinding
+    clusters = visible_clusters(db, user, cluster)
+    infos = {c.id: {"id": c.id, "name": c.name} for c in clusters}
+    q = select(ClusterFinding).where(ClusterFinding.cluster_id.in_(list(infos) or [0]))
+    if status in ("open", "attention", "acknowledged"):
+        q = q.where(ClusterFinding.resolved_at.is_(None))
+    if status == "attention":
+        q = q.where(ClusterFinding.acknowledged_at.is_(None))
+    elif status == "acknowledged":
+        q = q.where(ClusterFinding.acknowledged_at.is_not(None))
+    elif status == "resolved":
+        q = q.where(ClusterFinding.resolved_at.is_not(None))
+    if severity:
+        q = q.where(ClusterFinding.severity == severity)
+    rows = db.scalars(q.order_by(desc(ClusterFinding.last_seen)).limit(limit)).all()
+    findings = [k8s_view(f, infos[f.cluster_id]) for f in rows]
+    findings.sort(key=lambda f: (f["resolved_at"] is not None, f["acknowledged_at"] is not None, SEVERITY_ORDER.get(f["severity"], 9), f["namespace"], f["object"]))
+    return {"clusters": [cluster_scan(c) for c in clusters], "findings": findings}
+
+
+@router.post("/kubernetes/{finding_id}/acknowledge")
+def acknowledge_k8s(finding_id: int, payload: AckIn, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+    """Marks a Kubernetes finding as known (it stays listed until the agent stops seeing it)."""
+    from .k8s_security import finding_view as k8s_view
+    from .models import Cluster, ClusterFinding
+    f = db.get(ClusterFinding, finding_id)
+    if not f:
+        raise HTTPException(404, "Finding not found")
+    ensure_access(user, "cluster", f.cluster_id)
+    f.acknowledged_by, f.acknowledged_at, f.note = user["email"], datetime.now(timezone.utc), payload.note.strip()
+    cluster = db.get(Cluster, f.cluster_id)
+    audit(db, request, "security.acknowledge", user=user, target=f"cluster:{f.cluster_id}", detail=f"{cluster.name if cluster else f.cluster_id}: {f.title}" + (f" ({payload.note.strip()[:200]})" if payload.note.strip() else ""))
+    db.commit()
+    return k8s_view(f, {"id": cluster.id, "name": cluster.name} if cluster else None)
+
