@@ -108,8 +108,12 @@ def report(payload: AgentReport, request: Request, authorization: str | None = H
         from .secscan import record_ssh_failures
         record_ssh_failures(db, server, failures_seen, now)
     if failures_seen and failures_seen.get("accepted"):
-        from .threats import record_logins
+        from .threats import check_daily_logins, record_logins
         record_logins(db, server, failures_seen["accepted"], now)
+        check_daily_logins(db, server, now)
+    if failures_seen and failures_seen.get("transfers"):
+        from .threats import record_transfers
+        record_transfers(db, server, failures_seen["transfers"], now)
     if metrics.get("security"):
         from .threats import sync_threats
         sync_threats(db, server, metrics["security"], previous_security, now)

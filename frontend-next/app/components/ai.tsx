@@ -32,8 +32,11 @@ export type IncidentAnalysis = { summary: string; impact: string; likely_causes:
 type LogAnalysis = { summary: string; health: 'healthy' | 'degraded' | 'failing'; groups: { title: string; severity: string; occurrences: number; example: string; meaning: string; fix: string }[];
   next_steps: string[]; model: string; tier?: string; lines_sent: number };
 
+/** The AI settings, or null when AI is switched off for this installation (AI_ENABLED=false): then no AI control is shown anywhere. */
 export function useAi() {
-  return usePoll(() => api<AiSettings>('/ai/settings'), [], 120000).value;
+  const { me } = useApp();
+  const on = me.features?.ai !== false;
+  return usePoll(() => (on ? api<AiSettings>('/ai/settings') : Promise.resolve(null)), [on], on ? 120000 : 0).value ?? null;
 }
 
 /* ---------------------------------------------------------------- tiny, safe markdown (no HTML is ever injected) */

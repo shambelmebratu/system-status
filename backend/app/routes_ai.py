@@ -21,6 +21,12 @@ router = APIRouter(prefix="/api", tags=["ai"])
 _calls: dict[tuple[int, str], list[float]] = {}
 
 
+def require_ai() -> None:
+    from .config import get_settings
+    if not get_settings().ai_enabled:
+        raise HTTPException(404, "AI features are turned off on this installation (AI_ENABLED=false)")
+
+
 def _rate(user: dict, what: str, per_hour: int) -> None:
     now = time.monotonic()
     hits = [t for t in _calls.get((user["uid"], what), []) if now - t < 3600]
@@ -97,12 +103,12 @@ class AiSettingsIn(BaseModel):
         return {p: k.strip() for p, k in v.items()} if isinstance(v, dict) else v
 
 
-@router.get("/ai/settings")
+@router.get("/ai/settings", dependencies=[Depends(require_ai)])
 def get_settings_ai(_: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
     return ai.public_settings(db)
 
 
-@router.put("/ai/settings")
+@router.put("/ai/settings", dependencies=[Depends(require_ai)])
 def put_settings_ai(payload: AiSettingsIn, request: Request, user: dict = Depends(require_admin), db: Session = Depends(get_db)) -> dict:
     """Saves the two tiers, which tier each feature uses, and the shared options. The privacy rules are enforced here, not only in the page:
     the Confidential tier never runs on a provider whose terms allow data reuse, needs a recorded confirmation of the account's
@@ -203,7 +209,7 @@ async def test_ai(request: Request, tier: str = Query("confidential", pattern="^
         raise HTTPException(422, str(error)) from error
 
 
-@router.post("/incidents/{incident_id}/explain")
+@router.post("/incidents/{incident_id}/explain", dependencies=[Depends(require_ai)])
 async def explain(incident_id: int, request: Request, user: dict = Depends(require_operator)) -> dict:
     with SessionLocal() as db:
         incident = db.get(Incident, incident_id)
@@ -230,7 +236,7 @@ class LogsIn(BaseModel):
     source: str = Field(default="", max_length=200)
 
 
-@router.post("/ai/logs")
+@router.post("/ai/logs", dependencies=[Depends(require_ai)])
 async def analyze_logs(payload: LogsIn, request: Request, user: dict = Depends(require_operator)) -> dict:
     _rate(user, "logs", 30)
 
@@ -284,7 +290,7 @@ class AskIn(BaseModel):
         return v
 
 
-@router.post("/ai/ask")
+@router.post("/ai/ask", dependencies=[Depends(require_ai)])
 async def ask(payload: AskIn, request: Request, user: dict = Depends(require_user)) -> dict:
     _rate(user, "ask", 40)
 

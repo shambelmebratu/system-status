@@ -586,6 +586,10 @@ class SshLoginEvent(Base):
     method: Mapped[str] = mapped_column(String(30), default="")
     failures_before: Mapped[int] = mapped_column(Integer, default=0)      # failed attempts from the same address in the 24 h before
     new_source: Mapped[bool] = mapped_column(Boolean, default=False)       # first login from this address on this server
+    kind: Mapped[str] = mapped_column(String(10), default="login")        # login | sftp (a file-transfer session)
+    key_type: Mapped[str] = mapped_column(String(30), default="")
+    fingerprint: Mapped[str] = mapped_column(String(80), default="")      # SHA256 fingerprint of the key used (never the key)
+    key_name: Mapped[str] = mapped_column(String(80), default="")         # the key's comment, usually the device (sam@laptop)
 
 
 class SecurityFinding(Base):

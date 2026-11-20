@@ -64,9 +64,10 @@ def record_logins(db: Session, server, accepted: list[dict], now: datetime) -> N
         seen_before = db.scalar(select(func.count()).select_from(SshLoginEvent).where(SshLoginEvent.server_id == server.id, SshLoginEvent.ip == ip)) or 0
         tried = failures.get(ip, 0)
         new_source = has_baseline and not seen_before
-        db.add(SshLoginEvent(server_id=server.id, ts=ts, ip=ip, user=user, method=method, failures_before=tried, new_source=new_source))
+        key = {k: (login.get(k) or "")[:80] for k in ("key_type", "fingerprint", "key_name")}
+        db.add(SshLoginEvent(server_id=server.id, ts=ts, ip=ip, user=user, method=method, failures_before=tried, new_source=new_source, kind="login", **key))
         db.flush()
-        evidence = {"ip": ip, "user": user, "method": method, "failed_attempts_24h": tried, "at": ts.isoformat()}
+        evidence = {"ip": ip, "user": user, "method": method, "failed_attempts_24h": tried, "at": ts.isoformat(), **{k: v for k, v in key.items() if v}}
         if tried >= settings.ssh_success_after_failures:
             finding, is_new = open_finding(db, server, f"login_breach:{ip}:{user}", kind="ssh_login_after_failures", severity="critical", source="smwatch", now=now,
                                            title=f"SSH login by {user or '?'} from {ip} after {tried} failed attempts",
@@ -82,6 +83,55 @@ def record_logins(db: Session, server, accepted: list[dict], now: datetime) -> N
                                            detail=f"First SSH login on this server from {ip}. Acknowledge it if it was you or a colleague.", evidence=evidence)
             if is_new:
                 _alert(db, server, "ssh_login_new", [f"User {user or '?'} logged in from {ip} ({method})", "No login came from this address before."])
+
+
+def check_daily_logins(db: Session, server, now: datetime) -> None:
+    """More SSH logins on one server today than the configured limit (even legitimate ones): one finding and one alert per day."""
+    from .models import SshLoginEvent
+    from .secscan import schedule
+    limit = int(schedule(db).get("daily_login_alert") or 0)
+    if limit <= 0:
+        return
+    day = now.astimezone(timezone.utc).date()
+    start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+    rows = db.execute(select(SshLoginEvent.user, SshLoginEvent.ip, SshLoginEvent.key_name).where(
+        SshLoginEvent.server_id == server.id, SshLoginEvent.kind == "login", SshLoginEvent.ts >= start)).all()
+    if len(rows) <= limit:
+        return
+    who: dict[str, int] = {}
+    for user, ip, key_name in rows:
+        label = f"{user or '?'} from {ip}" + (f" ({key_name})" if key_name else "")
+        who[label] = who.get(label, 0) + 1
+    top = sorted(who.items(), key=lambda kv: -kv[1])
+    detail = f"{len(rows)} SSH logins today (UTC), more than the limit of {limit}: " + ", ".join(f"{k} ×{n}" for k, n in top[:8]) + ". Even if they are legitimate, check they are expected."
+    finding, is_new = open_finding(db, server, f"many_logins:{day.isoformat()}", kind="ssh_many_logins", severity="medium", source="smwatch", now=now,
+                                   title=f"{len(rows)} SSH logins today (limit {limit})", detail=detail, evidence={"count": len(rows), "limit": limit, "by": dict(top[:20])})
+    if is_new:
+        _alert(db, server, "ssh_login_many", [f"{len(rows)} SSH logins today, more than the limit of {limit}"] + [f"{k}: {n}" for k, n in top[:5]])
+
+
+def record_transfers(db: Session, server, transfers: list[dict], now: datetime) -> None:
+    """File-transfer (SFTP / scp) sessions: stored like logins, and one finding per user and address per day, counting the sessions."""
+    from .models import SshLoginEvent
+    for t in transfers[:60]:
+        try:
+            ts = aware(datetime.fromisoformat(t.get("ts") or ""))
+            ts = ts if abs((ts - now).total_seconds()) < 7 * 86400 else now
+        except ValueError:
+            ts = now
+        ip, user = t.get("ip") or "", t.get("user") or ""
+        db.add(SshLoginEvent(server_id=server.id, ts=ts, ip=ip or "?", user=user, method=t.get("kind") or "sftp", kind="sftp"))
+        day = ts.date().isoformat()
+        row, is_new = open_finding(db, server, f"transfer:{day}:{user}:{ip}", kind="file_transfer", severity="low", source="smwatch", now=now,
+                                   title=f"File transfer session by {user or '?'}" + (f" from {ip}" if ip else ""),
+                                   detail=f"{user or 'Someone'} opened an SFTP/scp file-transfer session" + (f" from {ip}" if ip else "") + " (files sent to or taken from this server). Acknowledge it if expected.",
+                                   evidence={"user": user, "ip": ip, "sessions": 1, "day": day})
+        if not is_new:
+            ev = json.loads(row.evidence or "{}")
+            ev["sessions"] = int(ev.get("sessions", 1)) + 1
+            row.evidence = json.dumps(ev)
+            row.detail = f"{user or 'Someone'} opened {ev['sessions']} SFTP/scp file-transfer sessions" + (f" from {ip}" if ip else "") + f" on {day}. Acknowledge them if expected."
+    db.flush()
 
 
 # ------------------------------------------------------------------------------------------------ agent threat scan

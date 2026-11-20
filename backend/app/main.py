@@ -428,7 +428,8 @@ def change_password(payload: PasswordChange, request: Request, response: Respons
 def me(user: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
     from .mfa import required_for
     account = db.get(User, user["uid"])  # require_user guarantees it exists and is active
-    return {**serialize_user(account), "mfa_setup_required": not account.totp_enabled and required_for(db, account.role)}
+    return {**serialize_user(account), "mfa_setup_required": not account.totp_enabled and required_for(db, account.role),
+            "features": {"ai": get_settings().ai_enabled}}
 
 
 @app.put("/api/auth/profile")

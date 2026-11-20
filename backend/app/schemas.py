@@ -188,6 +188,10 @@ class SshLogin(BaseModel):
     user: str = Field(default="", max_length=64)
     method: str = Field(default="", max_length=30)
     ts: str = Field(default="", max_length=40)
+    key_type: str = Field(default="", max_length=30)                                   # agent 2.15.1+: which key (never the key itself)
+    fingerprint: str = Field(default="", max_length=80, pattern=r"^(|SHA256:[A-Za-z0-9+/]+)$")
+    key_name: str = Field(default="", max_length=80)                                   # the key's comment in authorized_keys, e.g. sam@laptop
+    port: int | None = Field(default=None, ge=0, le=65535)
 
     @field_validator("ip")
     @classmethod
@@ -195,7 +199,19 @@ class SshLogin(BaseModel):
         import ipaddress
         return str(ipaddress.ip_address(v.strip()))
 
-    @field_validator("user", "method", "ts")
+    @field_validator("user", "method", "ts", "key_type", "key_name")
+    @classmethod
+    def clean(cls, v: str) -> str:
+        return _printable(v)
+
+
+class SshTransfer(BaseModel):
+    ip: str = Field(default="", max_length=45)
+    user: str = Field(default="", max_length=64)
+    kind: str = Field(default="sftp", pattern="^(sftp|scp)$")
+    ts: str = Field(default="", max_length=40)
+
+    @field_validator("user", "ts")
     @classmethod
     def clean(cls, v: str) -> str:
         return _printable(v)
@@ -207,6 +223,7 @@ class SshFailures(BaseModel):
     users: dict[str, int] = Field(default_factory=dict)
     distinct_ips: int = Field(default=0, ge=0)
     accepted: list[SshLogin] = Field(default_factory=list, max_length=60)      # successful logins (agent 2.15+)
+    transfers: list[SshTransfer] = Field(default_factory=list, max_length=60)  # file-transfer (SFTP) sessions (agent 2.15.1+)
 
     @field_validator("ips", "users")
     @classmethod

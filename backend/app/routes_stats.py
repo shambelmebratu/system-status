@@ -38,7 +38,7 @@ def serialize_incident(item: Incident) -> dict:
         "severity": item.severity, "title": item.title, "detail": item.detail,
         "started_at": started.isoformat(), "resolved_at": resolved.isoformat() if resolved else None,
         "duration_seconds": int(((resolved or datetime.now(timezone.utc)) - started).total_seconds()),
-        "ai_analysis": json.loads(item.ai_analysis) if item.ai_analysis else None, "ai_model": item.ai_model,
+        "ai_analysis": json.loads(item.ai_analysis) if item.ai_analysis and get_settings().ai_enabled else None, "ai_model": item.ai_model if get_settings().ai_enabled else None,
         "ai_generated_at": aware(item.ai_generated_at).isoformat() if item.ai_generated_at else None,
     }
 

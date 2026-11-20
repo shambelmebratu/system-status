@@ -87,8 +87,10 @@ class Settings(BaseSettings):
     test_run_retention_days: int = 30          # API test run history is kept this long
     ssh_attack_threshold: int = 30             # failed SSH logins on one server within 10 minutes that count as an attack
     ssh_success_after_failures: int = 5        # a successful SSH login from an address with at least this many failures (24 h) is a likely break-in
-    ssh_new_source_alerts: bool = True         # alert on an SSH login from an address never seen on that server before
+    ssh_new_source_alerts: bool = True
+    ssh_daily_login_alert: int = 4             # alert when one server has more SSH logins than this in a day, even legitimate ones (0 = off; admins can change it)         # alert on an SSH login from an address never seen on that server before
     threat_alert_severity: str = "high"        # agent threat findings at or above this severity send an alert: critical | high | medium | off
+    ai_enabled: bool = True                     # AI_ENABLED=false removes every AI feature: menu, Ask AI, explanations, log analysis, and their API
     security_scan_hours: int = 24              # how often servers' open ports and services' TLS are re-checked (0 = only on demand); admins can change it in Security → Scans
     agent_threat_minutes: int = 10             # default for how often agents run their threat scan (admins can change it in Security → Scans)
     agent_updates_hours: int = 6               # default for how often agents look for pending updates

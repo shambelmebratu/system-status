@@ -3,9 +3,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Icon } from './ui';
 import { runQuery } from './logs';
+import { api } from '../lib/api';
+import { usePoll } from '../lib/app';
 
-type Session = { user: string; ip: string; tty: string; since: number | null };
-type Login = { user: string; ip: string; tty: string; login: number | null; logout: number | null; end: 'logout' | 'reboot' | 'active' | 'unknown' };
+type How = { method?: string; key_type?: string; fingerprint?: string; key_name?: string; port?: number; transfers?: number };   // agent 2.16+: from the auth log
+type Session = How & { user: string; ip: string; tty: string; since: number | null };
+type Login = How & { user: string; ip: string; tty: string; login: number | null; logout: number | null; end: 'logout' | 'reboot' | 'active' | 'unknown' };
 type SessionsAnswer = { sessions: Session[]; logins: Login[]; notes: string[]; now: number; history_available: boolean };
 type Command = { cmd: string; ts: number | null };
 type UserHistory = { user: string; shell: string; file: string; modified: number; total: number; commands: Command[] };
@@ -19,6 +22,14 @@ function span(seconds: number): string {
   const m = Math.floor(seconds / 60), h = Math.floor(m / 60), d = Math.floor(h / 24);
   return d ? `${d}d ${h % 24}h` : h ? `${h}h ${m % 60}m` : `${m}m`;
 }
+/** "Signed in with": the key's name (usually the device, e.g. sam@laptop), else its type and fingerprint, or "password". */
+function SignedInWith({ h }: { h: How }) {
+  if (!h.method) return <span className="muted sm" title="Agent 2.16+ reads this from the server's auth log">–</span>;
+  if (h.method !== 'publickey') return <span className="ssh-how pw"><Icon name="shield" size={12} />{h.method === 'keyboard-interactive' ? 'password (PAM)' : h.method}</span>;
+  return <span className="ssh-how key" title={`${h.key_type ?? ''} ${h.fingerprint ?? ''}${h.port ? ` · source port ${h.port}` : ''}`}><Icon name="star" size={12} />
+    <span><b>{h.key_name || `${(h.key_type || 'key').replace('ssh-', '')} key`}</b><small className="mono">{h.key_name ? `${(h.key_type ?? '').replace('ssh-', '')} ` : ''}{h.fingerprint ? `${h.fingerprint.slice(0, 19)}…` : ''}</small></span></span>;
+}
+
 const END_LABEL: Record<Login['end'], [string, string]> = { active: ['Logged in', 'good'], logout: ['Logged out', 'muted'], reboot: ['Ended by reboot', 'warn'], unknown: ['No logout record', 'muted'] };
 
 /** Who is on this server over SSH, who was, and what they typed. Everything is read on demand from the agent and every read is audited. */
@@ -43,9 +54,11 @@ export function SshPanel({ serverId, liveCount, canHistory, onCount }: { serverI
 
   const logins = useMemo(() => {
     const n = loginFilter.trim().toLowerCase();
-    return (sessions?.logins ?? []).filter(l => !n || `${l.user} ${l.ip} ${l.tty}`.toLowerCase().includes(n));
+    return (sessions?.logins ?? []).filter(l => !n || `${l.user} ${l.ip} ${l.tty} ${l.key_name ?? ''} ${l.fingerprint ?? ''} ${l.method ?? ''}`.toLowerCase().includes(n));
   }, [sessions, loginFilter]);
   const ips = useMemo(() => new Set((sessions?.logins ?? []).map(l => l.ip)).size, [sessions]);
+  const limit = usePoll(() => api<{ daily_login_alert?: number }>('/security/schedule').catch(() => ({ daily_login_alert: 0 })), [], 0).value?.daily_login_alert ?? 0;
+  const today = useMemo(() => { const start = new Date(); start.setUTCHours(0, 0, 0, 0); return (sessions?.logins ?? []).filter(l => l.login && l.login * 1000 >= start.getTime()).length; }, [sessions]);
   const active = sessions?.sessions.length ?? liveCount ?? null;
   const now = sessions?.now ?? Date.now() / 1000;
 
@@ -53,6 +66,7 @@ export function SshPanel({ serverId, liveCount, canHistory, onCount }: { serverI
     <div className="ssh">
       <div className="ssh-stats">
         <div className="card ssh-stat"><small>Active SSH sessions</small><b className={active ? 'good' : ''}>{active ?? '–'}</b><span className="muted sm">{active ? `${new Set(sessions?.sessions.map(s => s.user)).size || ''} ${sessions ? 'user(s) connected' : 'right now'}` : 'nobody connected'}</span></div>
+        <div className={`card ssh-stat ${limit && today > limit ? 'warn' : ''}`}><small>Logins today (UTC)</small><b className={limit && today > limit ? 'warn' : ''}>{sessions ? today : '–'}</b><span className="muted sm">{limit ? (today > limit ? `over the daily limit of ${limit}: an alert was sent` : `alert above ${limit} a day`) : 'no daily limit set'}</span></div>
         <div className="card ssh-stat"><small>Logins on record</small><b>{sessions ? sessions.logins.length : '–'}</b><span className="muted sm">newest {sessions?.logins.length ?? 0} kept by the server</span></div>
         <div className="card ssh-stat"><small>Source addresses</small><b>{sessions ? ips : '–'}</b><span className="muted sm">distinct IPs in the history</span></div>
         <div className="card ssh-stat"><small>Last login</small><b className="sm-b">{sessions?.logins[0] ? `${span(now - (sessions.logins[0].login ?? now))} ago` : '–'}</b><span className="muted sm">{sessions?.logins[0] ? `${sessions.logins[0].user} from ${sessions.logins[0].ip}` : ''}</span></div>
@@ -63,22 +77,23 @@ export function SshPanel({ serverId, liveCount, canHistory, onCount }: { serverI
           <button className="btn sm" onClick={() => void load()} disabled={busy}><Icon name="refresh" size={14} />{busy ? 'Loading…' : 'Refresh'}</button></div>
         {sessionsError ? <div className="err" role="alert">{sessionsError}</div> : !sessions ? <p className="muted"><span className="spinner" /> Asking the agent…</p>
           : sessions.sessions.length === 0 ? <p className="muted">Nobody is connected over SSH.</p> : (
-            <div className="tbl-wrap"><table className="tbl"><thead><tr><th>User</th><th>From</th><th className="hide-sm">Terminal</th><th className="hide-sm">Since</th><th>Connected for</th></tr></thead><tbody>
-              {sessions.sessions.map((s, i) => <tr key={i}><td><b>{s.user}</b></td><td className="mono">{s.ip}</td><td className="hide-sm mono muted">{s.tty}</td><td className="hide-sm sm">{when(s.since)}</td><td><span className="ssh-live"><i />{s.since ? span(now - s.since) : '–'}</span></td></tr>)}
+            <div className="tbl-wrap"><table className="tbl"><thead><tr><th>User</th><th>From</th><th>Signed in with</th><th className="hide-sm">Terminal</th><th className="hide-sm">Since</th><th>Connected for</th></tr></thead><tbody>
+              {sessions.sessions.map((s, i) => <tr key={i}><td><b>{s.user}</b></td><td className="mono">{s.ip}</td><td><SignedInWith h={s} /></td><td className="hide-sm mono muted">{s.tty}</td><td className="hide-sm sm">{when(s.since)}</td><td><span className="ssh-live"><i />{s.since ? span(now - s.since) : '–'}</span></td></tr>)}
             </tbody></table></div>)}
         {sessions?.notes.map((n, i) => <p key={i} className="sm warn" style={{ marginTop: 8 }}><Icon name="alert" size={13} /> {n}</p>)}
       </section>
 
       <section className="card">
         <div className="card-head"><h2>SSH login history</h2><span className="grow" />
-          <label className="lg-field" style={{ maxWidth: 260 }}><Icon name="logs" size={14} /><input value={loginFilter} onChange={e => setLoginFilter(e.target.value)} placeholder="Filter user, IP, terminal" aria-label="Filter logins" /></label></div>
+          <label className="lg-field" style={{ maxWidth: 260 }}><Icon name="logs" size={14} /><input value={loginFilter} onChange={e => setLoginFilter(e.target.value)} placeholder="Filter user, IP, key, device" aria-label="Filter logins" /></label></div>
         {!sessions ? <p className="muted">{sessionsError ? 'Not available.' : 'Loading…'}</p> : logins.length === 0 ? <p className="muted">{sessions.logins.length ? 'No login matches the filter.' : 'No SSH logins on record.'}</p> : (
           <>
-            <div className="tbl-wrap"><table className="tbl"><thead><tr><th>User</th><th>Source IP</th><th className="hide-sm">Terminal</th><th>Login</th><th>Logout</th><th className="hide-sm">Duration</th><th>Status</th></tr></thead><tbody>
+            <div className="tbl-wrap"><table className="tbl"><thead><tr><th>User</th><th>Source IP</th><th>Signed in with</th><th className="hide-sm">Terminal</th><th>Login</th><th>Logout</th><th className="hide-sm">Duration</th><th>Status</th></tr></thead><tbody>
               {(allLogins ? logins : logins.slice(0, LOGINS_SHOWN)).map((l, i) => {
                 const [label, cls] = END_LABEL[l.end];
                 const end = l.logout ?? (l.end === 'active' ? now : null);
-                return <tr key={i}><td><b>{l.user}</b></td><td className="mono">{l.ip}</td><td className="hide-sm mono muted">{l.tty}</td><td className="sm">{when(l.login)}</td>
+                return <tr key={i}><td><b>{l.user}</b></td><td className="mono">{l.ip}{l.port ? <small className="muted"> :{l.port}</small> : null}</td>
+                  <td><SignedInWith h={l} />{l.transfers ? <span className="tag" title="SFTP / scp file-transfer sessions during this login" style={{ marginLeft: 6 }}>{l.transfers} file transfer{l.transfers > 1 ? 's' : ''}</span> : null}</td><td className="hide-sm mono muted">{l.tty}</td><td className="sm">{when(l.login)}</td>
                   <td className="sm">{l.logout ? when(l.logout) : l.end === 'active' ? <span className="good">still logged in</span> : '–'}</td>
                   <td className="hide-sm sm">{l.login && end ? span(end - l.login) : '–'}</td><td><span className={`ssh-end ${cls}`}>{label}</span></td></tr>;
               })}

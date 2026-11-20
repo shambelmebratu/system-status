@@ -1490,12 +1490,68 @@ def ssh_answer(target: str, lines: int) -> str:
     if target == "sessions":
         sessions, note = ssh_sessions()
         logins, login_note = ssh_logins()
+        try:
+            enrich_logins(logins, sessions)
+        except Exception as error:   # noqa: BLE001  (extra detail must never break the history)
+            log.debug("login details unavailable: %s", error)
         return json.dumps({"sessions": sessions, "logins": logins, "notes": [n for n in (note, login_note) if n], "now": int(time.time()), "history_available": AGENT_SSH == "on" and ssh.get("history", True)})
     if target == "history":
         if AGENT_SSH != "on" or not ssh.get("history", True):
             raise ValueError("Command history is turned off for this server")
         return json.dumps(shell_history(lines))
     raise ValueError("Unknown SSH request")
+
+
+def ssh_auth_events(max_lines: int = 20000) -> list[dict]:
+    """Successful logins and SFTP sessions from the auth log (or the journal), with their times: used to explain the login history."""
+    path = _auth_log()
+    if path:
+        lines = _tail_text(path, 4_000_000).splitlines()[-max_lines:]
+    else:
+        base = _journalctl() if not IS_MAC else None
+        if not base:
+            return []
+        try:
+            lines = subprocess.run(base + ["--no-pager", "-o", "short-iso", "-n", str(max_lines), "-u", "ssh.service", "-u", "sshd.service"],
+                                   capture_output=True, text=True, timeout=15, errors="replace").stdout.splitlines()
+        except (OSError, subprocess.SubprocessError):
+            return []
+    events, pids, now = [], {}, time.time()
+    for line in lines:
+        ok = SSH_ACCEPTED.search(line)
+        if ok:
+            pid = SSH_PID.search(line)
+            event = {"kind": "login", "ts": line_time(line, now), "user": ok.group("user"), "ip": ok.group("ip"), **login_details(ok), "transfers": 0}
+            events.append(event)
+            if pid:
+                pids[pid.group("pid")] = event
+            continue
+        sftp = SSH_SFTP.search(line)
+        if sftp:
+            pid = SSH_PID.search(line)
+            if pid and pid.group("pid") in pids:
+                pids[pid.group("pid")]["transfers"] += 1
+    return events
+
+
+def enrich_logins(logins: list[dict], sessions: list[dict]) -> None:
+    """Adds how each login happened (password or key: which key, and its name / device) by matching the auth log by user, address and time."""
+    events = ssh_auth_events()
+    if not events:
+        return
+    def best(user: str, ip: str, ts) -> dict | None:
+        if not ts:
+            return None
+        found = [e for e in events if e["user"] == user and e["ip"] == ip and e["ts"] and abs(e["ts"] - ts) <= 180]
+        return min(found, key=lambda e: abs(e["ts"] - ts)) if found else None
+    for row in logins:
+        e = best(row.get("user", ""), row.get("ip", ""), row.get("login"))
+        if e:
+            row.update({k: e[k] for k in ("method", "key_type", "fingerprint", "key_name", "port", "transfers")})
+    for row in sessions:
+        e = best(row.get("user", ""), row.get("ip", ""), row.get("since"))
+        if e:
+            row.update({k: e[k] for k in ("method", "key_type", "fingerprint", "key_name", "port")})
 
 
 # ------------------------------------------------------------------------------------------------ security signals
@@ -1510,7 +1566,31 @@ SSH_FAIL_PATTERNS = [
     re.compile(r"maximum authentication attempts exceeded for (?:invalid user )?(?P<user>\S*) from (?P<ip>[0-9a-fA-F:.]+)"),
     re.compile(r"Did not receive identification string from (?P<ip>[0-9a-fA-F:.]+)"),
 ]
-SSH_ACCEPTED = re.compile(r"Accepted (?P<method>password|publickey|keyboard-interactive/pam|gssapi-with-mic|hostbased) for (?P<user>\S+) from (?P<ip>[0-9a-fA-F:.]+) port \d+")
+SSH_ACCEPTED = re.compile(r"Accepted (?P<method>password|publickey|keyboard-interactive/pam|gssapi-with-mic|hostbased) for (?P<user>\S+) from (?P<ip>[0-9a-fA-F:.]+) port (?P<port>\d+)"
+                          r"(?: ssh2)?(?:: (?P<ktype>[A-Z0-9-]+) (?P<fp>SHA256:[A-Za-z0-9+/]+)(?: ID (?P<certid>\S+))?)?")
+SSH_PID = re.compile(r"sshd(?:-session)?\[(?P<pid>\d+)\]")
+SSH_SFTP = re.compile(r"subsystem request for sftp(?: by user (?P<user>\S+))?")
+_ssh_pids: dict[str, tuple[str, str]] = {}              # sshd process -> (address, user) of its login, to tie later lines (SFTP) to it
+_key_cache: dict = {"at": 0.0, "by_fp": {}}
+
+
+def key_names() -> dict[str, dict]:
+    """SHA256 fingerprint -> {user, comment, type} for every authorized key (comments usually name the device, e.g. sam@laptop)."""
+    if time.time() - _key_cache["at"] > 300:
+        try:
+            _key_cache["by_fp"] = {k["fingerprint"]: k for k in authorized_keys()}
+        except Exception:   # noqa: BLE001
+            _key_cache["by_fp"] = {}
+        _key_cache["at"] = time.time()
+    return _key_cache["by_fp"]
+
+
+def login_details(match: re.Match) -> dict:
+    """How someone logged in: the method, and for a key its type, fingerprint and name (the key's comment in authorized_keys)."""
+    fp = match.group("fp") or ""
+    known = key_names().get(fp) if fp else None
+    return {"method": match.group("method").split("/")[0], "key_type": (match.group("ktype") or "")[:30], "fingerprint": fp[:80],
+            "key_name": ((known or {}).get("comment") or match.group("certid") or "")[:80], "port": int(match.group("port"))}
 _journal_since: dict = {"t": None}
 
 
@@ -1526,6 +1606,7 @@ def parse_ssh_failures(lines: list[str]) -> dict:
     ips: dict[str, int] = {}
     users: dict[str, int] = {}
     accepted: list[dict] = []
+    transfers: list[dict] = []
     total = 0
     now = time.time()
     for line in lines:
@@ -1538,8 +1619,21 @@ def parse_ssh_failures(lines: list[str]) -> dict:
             except ValueError:
                 continue
             when = line_time(line, now)
-            accepted.append({"ip": ip, "user": "".join(ch for ch in ok.group("user") if ch.isprintable())[:40], "method": ok.group("method").split("/")[0],
-                             "ts": datetime.fromtimestamp(when if when and abs(when - now) < 7 * 86400 else now, timezone.utc).isoformat()})
+            user = "".join(ch for ch in ok.group("user") if ch.isprintable())[:40]
+            pid = SSH_PID.search(line)
+            if pid:
+                _ssh_pids[pid.group("pid")] = (ip, user)
+                while len(_ssh_pids) > 500:
+                    _ssh_pids.pop(next(iter(_ssh_pids)))
+            accepted.append({"ip": ip, "user": user, **login_details(ok), "ts": datetime.fromtimestamp(when if when and abs(when - now) < 7 * 86400 else now, timezone.utc).isoformat()})
+            continue
+        sftp = SSH_SFTP.search(line)
+        if sftp:   # a file transfer session (sftp, and scp on OpenSSH 9+, which uses sftp underneath)
+            pid = SSH_PID.search(line)
+            ip, user = _ssh_pids.get(pid.group("pid"), ("", "")) if pid else ("", "")
+            when = line_time(line, now)
+            transfers.append({"ip": ip, "user": (sftp.group("user") or user)[:40], "kind": "sftp",
+                              "ts": datetime.fromtimestamp(when if when and abs(when - now) < 7 * 86400 else now, timezone.utc).isoformat()})
             continue
         for pattern in SSH_FAIL_PATTERNS:
             match = pattern.search(line)
@@ -1556,7 +1650,7 @@ def parse_ssh_failures(lines: list[str]) -> dict:
                     users[user] = users.get(user, 0) + 1
                 break
     top = lambda d, n: dict(sorted(d.items(), key=lambda kv: -kv[1])[:n])   # noqa: E731
-    return {"total": total, "ips": top(ips, 25), "users": top(users, 15), "distinct_ips": len(ips), "accepted": accepted[-50:]}
+    return {"total": total, "ips": top(ips, 25), "users": top(users, 15), "distinct_ips": len(ips), "accepted": accepted[-50:], "transfers": transfers[-50:]}
 
 
 def ssh_failures() -> dict | None:
@@ -1572,7 +1666,7 @@ def ssh_failures() -> dict | None:
     now = time.time()
     since, _journal_since["t"] = _journal_since["t"], now
     if since is None:
-        return {"total": 0, "ips": {}, "users": {}, "distinct_ips": 0, "accepted": []}
+        return {"total": 0, "ips": {}, "users": {}, "distinct_ips": 0, "accepted": [], "transfers": []}
     try:
         out = subprocess.run(base + ["--no-pager", "-o", "short-iso", "-u", "ssh.service", "-u", "sshd.service", "--since", f"@{int(since)}", "--until", f"@{int(now)}"],
                              capture_output=True, text=True, timeout=15, errors="replace").stdout
@@ -1768,6 +1862,12 @@ def process_flags(pid: int, name: str, exe: str, cmdline: str) -> list[tuple[str
         flags.append(("critical", "reverse_shell", "has a command line that looks like a reverse shell (remote control of this server)"))
     if cmdline.startswith("[") and cmdline.rstrip().endswith("]") and exe:
         flags.append(("critical", "fake_kthread", "pretends to be a kernel thread (its name is in brackets) but runs a program"))
+    tunnel = tunnel_kind(base, cmdline)
+    if tunnel:
+        flags.append((tunnel[0], "tunnel", f"opens a tunnel ({tunnel[1]}): it can expose this server to the internet or carry traffic past your firewall"))
+    transfer = transfer_kind(base, cmdline)
+    if transfer:
+        flags.append(("medium" if transfer[1] else "low", "transfer", f"is transferring files ({transfer[0]})"))
     flags.sort(key=lambda f: ("critical", "high", "medium", "low").index(f[0]))
     return flags
 
@@ -1790,6 +1890,69 @@ def _connections() -> list:
     return found
 
 
+TUNNEL_HIGH = {"chisel", "ligolo", "ligolo-ng", "ligolo-agent", "frpc", "frps", "gost", "rathole", "revsocks", "iox", "pinggy"}
+TUNNEL_MEDIUM = {"ngrok", "cloudflared", "bore", "inlets", "zrok", "autossh", "localtunnel", "tor", "sish"}
+SSH_FORWARD = re.compile(r"(?:^|\s)-[A-Za-z]*[RLD]\s*\S+|serveo\.net|localhost\.run|pinggy\.io|\bssh\b.*-w\s*\d")
+SOCAT_FORWARD = re.compile(r"(?i)(tcp\d?-listen|udp\d?-listen)[^ ]*\s+(tcp|udp|openssl|exec|system)")
+
+
+def tunnel_kind(base: str, cmdline: str) -> tuple[str, str] | None:
+    """(severity, description) when a process opens a tunnel or forwards ports, else None."""
+    name = base.lower()
+    if name in TUNNEL_HIGH:
+        return "high", name
+    if name in TUNNEL_MEDIUM:
+        return "medium", name
+    if name in ("ssh", "autossh") and SSH_FORWARD.search(cmdline):
+        return "medium", "SSH port forwarding: " + " ".join(cmdline.split()[:8])[:120]
+    if name == "socat" and SOCAT_FORWARD.search(cmdline):
+        return "medium", "socat forwarding"
+    return None
+
+
+UPLOAD_ARGS = re.compile(r"(?:^|\s)(?:-T|--upload-file|--data-binary\s+@|-d\s*@|-F\s+\S+=@|--form\s+\S+=@|--post-file)")
+
+
+def transfer_kind(base: str, cmdline: str) -> tuple[str, bool] | None:
+    """(description, is_outgoing) when a process is copying files to or from another machine, else None."""
+    name, args = base.lower(), cmdline.split()
+    if name == "scp":
+        return ("scp " + ("receiving files" if " -t" in cmdline else "sending files" if " -f" in cmdline else " ".join(args[1:4])[:80]), " -f" in cmdline)
+    if name == "rsync" and (re.search(r"\S+:\S*", " ".join(args[1:])) or "--server" in cmdline):
+        return ("rsync to or from another host", "--sender" in cmdline)
+    if name == "rclone" and len(args) > 1 and args[1] in ("copy", "sync", "move", "copyto", "moveto"):
+        return (f"rclone {args[1]}", True)
+    if name in ("curl", "wget") and UPLOAD_ARGS.search(cmdline):
+        return (f"{name} uploading a file", True)
+    if name in ("aws", "gsutil", "azcopy") and re.search(r"\b(s3 (cp|sync|mv)|cp|sync|copy)\b", cmdline):
+        return (" ".join(args[:4])[:80], True)
+    if name in ("ftp", "lftp", "smbclient", "sftp"):
+        return (name, False)
+    return None
+
+
+SHELLS = {"sh", "bash", "dash", "zsh", "ksh", "nc", "ncat", "netcat", "telnet", "busybox"}
+
+
+def _shell_connections(findings: list[dict]) -> None:
+    """A shell holding a network connection to another machine: the classic reverse shell (an interactive SSH shell holds none)."""
+    for c in _connections():
+        if c.status != "ESTABLISHED" or not c.raddr or not c.pid:
+            continue
+        try:
+            ip = ipaddress.ip_address(c.raddr.ip)
+            if ip.is_loopback:
+                continue
+            p = psutil.Process(c.pid)
+            name = p.name()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError):
+            continue
+        if name.lower() in SHELLS:
+            findings.append({"key": f"net:shell:{name}:{c.raddr.ip}"[:200], "kind": "shell_connection", "severity": "high", "title": f"Shell connected to {c.raddr.ip}",
+                             "detail": f"{name} (PID {c.pid}) has a network connection to {c.raddr.ip}:{c.raddr.port}. A shell talking to another machine is how reverse shells work.",
+                             "pid": c.pid, "process": name, "remote": f"{c.raddr.ip}:{c.raddr.port}", "command": redact_command(" ".join(_try(p.cmdline) or []))[:300]})
+
+
 def _scan_processes(findings: list[dict]) -> None:
     for process in psutil.process_iter():
         try:
@@ -1804,7 +1967,8 @@ def _scan_processes(findings: list[dict]) -> None:
                 continue
             severity, kind, _ = flags[0]                          # one finding per program, with every reason, at the worst severity
             where = exe.replace(" (deleted)", "") or name
-            title = f"{name or where} needs a restart after an update" if kind == "deleted_exe_update" else f"Suspicious process: {name or where}"
+            title = (f"{name or where} needs a restart after an update" if kind == "deleted_exe_update" else f"Tunnel: {name or where}" if kind == "tunnel"
+                     else f"File transfer: {name or where}" if kind == "transfer" else f"Suspicious process: {name or where}")
             findings.append({"key": f"proc:{where}"[:200], "kind": f"process_{kind}", "severity": severity, "title": title,
                              "detail": f"{name} (PID {pid}, user {info['username'] or '?'}) " + "; it ".join(r for _, _, r in flags) + ".", "pid": pid, "process": name[:100],
                              "user": (info["username"] or "")[:60], "path": where[:300], "command": redact_command(cmd)[:300]})
@@ -1888,6 +2052,108 @@ def _persistence(findings: list[dict]) -> None:
         if len(f) >= 7 and f[2] == "0" and f[0] != "root":
             findings.append({"key": f"user:uid0:{f[0]}", "kind": "extra_root", "severity": "critical", "title": f"Extra administrator account: {f[0]}",
                              "detail": f"The account {f[0]} has user id 0, which gives it full root powers. Attackers add such accounts as a back door.", "user": f[0][:60]})
+
+
+AGENT_NEW_FILES_HOURS = max(1.0, float(os.getenv("AGENT_NEW_FILES_HOURS", "24")))   # how far back "new" files and scripts are looked for
+AGENT_NEW_FILES_BURST = max(5, int(os.getenv("AGENT_NEW_FILES_BURST", "50")))       # this many new files in one folder is a burst
+NEW_SERVICE_DAYS = 7
+WATCH_DIRS = [("/tmp", 3), ("/var/tmp", 3), ("/dev/shm", 3), ("/root", 4), ("/home", 5), ("/etc", 3), ("/usr/local/bin", 1), ("/usr/local/sbin", 1),
+              ("/opt", 4), ("/srv", 4), ("/var/www", 5), ("/var/spool/cron", 3)]
+SKIP_DIRS = {".git", "node_modules", ".cache", "__pycache__", "site-packages", "dist-packages", ".npm", ".venv", "venv", "snap", ".local", ".cargo", ".rustup", ".nvm",
+             ".vscode-server", ".cursor-server", ".m2", ".gradle", "go", ".docker", ".pnpm-store", ".yarn", ".bun"}
+RISKY_SCRIPT_PLACES = ("/tmp/", "/var/tmp/", "/dev/shm/", "/etc/cron", "/etc/init.d/", "/etc/profile.d/", "/etc/rc", "/var/spool/cron/")
+SHEBANG_SHELL = re.compile(rb"^#!\s*\S*/(?:env\s+)?(?:ba|da|z|k|c|tc)?sh\b")
+
+
+def _host_view(real: str) -> str:
+    return ("/" + os.path.relpath(real, AGENT_HOST_ROOT)) if AGENT_HOST_ROOT not in ("", "/") else real
+
+
+def _new_services(findings: list[dict]) -> None:
+    """Services, timers and scheduled tasks created or changed in the last NEW_SERVICE_DAYS days: a common way to stay on a server."""
+    cutoff = time.time() - NEW_SERVICE_DAYS * 86400
+    places = [("/etc/systemd/system", "service"), ("/etc/cron.d", "cron"), ("/var/spool/cron/crontabs", "cron"), ("/var/spool/cron", "cron"), ("/etc/init.d", "service")]
+    places += [(os.path.join(home, ".config/systemd/user"), "user service") for _, home in _home_dirs()]
+    seen = set()
+    for directory, label in places:
+        for path in _list_host(directory)[:400]:
+            if path in seen or (label != "cron" and not path.endswith((".service", ".timer", ".socket")) and directory != "/etc/init.d"):
+                continue
+            seen.add(path)
+            try:
+                st = os.stat(_host_path(path))
+            except OSError:
+                continue
+            changed = max(st.st_mtime, st.st_ctime)
+            if changed < cutoff:
+                continue
+            text = _read(path, 50_000)
+            run = next((line.split("=", 1)[1].strip() for line in text.splitlines() if line.startswith("ExecStart=")), "")
+            if label == "cron":
+                run = next((line.strip() for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#") and "=" not in line.split()[0]), "")
+            age = max(0, int((time.time() - changed) // 3600))
+            findings.append({"key": f"new:{label}:{path}"[:200], "kind": "new_cron" if label == "cron" else "new_service", "severity": "medium",
+                             "title": f"New {'scheduled task' if label == 'cron' else label}: {os.path.basename(path)}",
+                             "detail": f"{path} was created or changed {age} h ago" + (f"; it runs: {redact_command(run)[:200]}" if run else "") + ". Check you know who added it.",
+                             "path": path, "command": redact_command(run)[:300]})
+    rc = _host_path("/etc/rc.local")
+    try:
+        if os.path.getmtime(rc) >= cutoff:
+            findings.append({"key": "new:rc.local", "kind": "new_service", "severity": "medium", "title": "/etc/rc.local was changed recently",
+                             "detail": "Commands in /etc/rc.local run at every boot. It changed in the last week.", "path": "/etc/rc.local"})
+    except OSError:
+        pass
+
+
+def _new_files(findings: list[dict]) -> None:
+    """Files created in the last AGENT_NEW_FILES_HOURS hours in the places attackers use: new shell scripts, and bursts of new files."""
+    since = time.time() - AGENT_NEW_FILES_HOURS * 3600
+    scripts: dict[str, list[str]] = {}
+    per_dir: dict[str, int] = {}
+    budget = 60_000
+    for top, depth in WATCH_DIRS:
+        root = _host_path(top)
+        if not os.path.isdir(root):
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            budget -= len(filenames) + 1
+            if budget <= 0:
+                break
+            level = dirpath[len(root):].count(os.sep)
+            dirnames[:] = [] if level >= depth else [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(("systemd-private-", "snap-private-tmp"))]
+            for name in filenames:
+                path = os.path.join(dirpath, name)
+                try:
+                    st = os.lstat(path)
+                except OSError:
+                    continue
+                if st.st_ctime < since or not (st.st_mode & 0o170000 == 0o100000):        # regular files created/changed in the window
+                    continue
+                per_dir[dirpath] = per_dir.get(dirpath, 0) + 1
+                is_script = name.endswith((".sh", ".bash", ".zsh", ".ksh"))
+                if not is_script and st.st_size < 2_000_000:
+                    try:
+                        with open(path, "rb") as handle:
+                            is_script = bool(SHEBANG_SHELL.match(handle.read(64)))
+                    except OSError:
+                        pass
+                if is_script:
+                    view = _host_view(path)
+                    area = next((p for p in RISKY_SCRIPT_PLACES if view.startswith(p)), "") or ("hidden folder" if _hidden_dir(view) else os.path.dirname(view))
+                    scripts.setdefault(area, []).append(view)
+    for area, paths in sorted(scripts.items(), key=lambda kv: -len(kv[1]))[:10]:
+        risky = area in RISKY_SCRIPT_PLACES or area == "hidden folder"
+        findings.append({"key": f"files:scripts:{area}"[:200], "kind": "new_scripts", "severity": "high" if risky else "medium",
+                         "title": f"{len(paths)} new shell script{'s' if len(paths) != 1 else ''} in {area}",
+                         "detail": f"Created or changed in the last {AGENT_NEW_FILES_HOURS:g} h: " + ", ".join(paths[:12]) + (f" and {len(paths) - 12} more" if len(paths) > 12 else "")
+                                   + (". Scripts in this place are often dropped by attackers." if risky else ". Check they are expected."),
+                         "path": paths[0][:300], "packages": [p[:200] for p in paths[:30]]})
+    for directory, count in sorted(per_dir.items(), key=lambda kv: -kv[1])[:5]:
+        if count >= AGENT_NEW_FILES_BURST:
+            view = _host_view(directory)
+            findings.append({"key": f"files:burst:{view}"[:200], "kind": "new_files_burst", "severity": "medium", "title": f"{count} new files in {view}",
+                             "detail": f"{count} files were created or changed in {view} in the last {AGENT_NEW_FILES_HOURS:g} h. Unusual bursts can mean data being unpacked, collected or encrypted.",
+                             "path": view[:300]})
 
 
 def _list_host(directory: str) -> list[str]:
@@ -2060,7 +2326,7 @@ def foreign_packages() -> dict:
 def threat_scan() -> dict:
     findings: list[dict] = []
     started = time.monotonic()
-    for step in (_scan_processes, _executables_in_temp, _persistence):
+    for step in (_scan_processes, _shell_connections, _executables_in_temp, _persistence, _new_services, _new_files):
         try:
             step(findings)
         except Exception as error:   # noqa: BLE001  (one failing check must not hide the others)

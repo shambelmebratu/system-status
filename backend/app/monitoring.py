@@ -130,7 +130,7 @@ def redact(text: str, channel: Channel) -> str:
 _STATE = {"anomaly": ("📈", "UNUSUAL BEHAVIOUR"), "ai_note": ("🤖", "AI ANALYSIS"),
           "ssh_attack": ("🛡", "SSH BRUTE-FORCE ATTACK"), "security_finding": ("🛡", "SECURITY FINDING"),
           "ssh_login_breach": ("🚨", "POSSIBLE BREAK-IN: SSH LOGIN AFTER FAILED ATTEMPTS"), "ssh_login_new": ("🔑", "SSH LOGIN FROM A NEW ADDRESS"),
-          "threat": ("🚨", "POSSIBLE COMPROMISE"), "ssh_key_added": ("🔑", "NEW SSH KEY AUTHORIZED"),
+          "threat": ("🚨", "POSSIBLE COMPROMISE"), "ssh_login_many": ("🔁", "MANY SSH LOGINS TODAY"), "ssh_key_added": ("🔑", "NEW SSH KEY AUTHORIZED"),
           "slo_fast": ("🔥", "ERROR BUDGET BURNING FAST"), "slo_slow": ("🟠", "ERROR BUDGET BURNING"), "slo_exhausted": ("⛔", "ERROR BUDGET EXHAUSTED"),
           "dns_changed": ("🧭", "DNS CHANGED"), "domain": ("🌐", "DOMAIN EXPIRES SOON"), "domain_expired": ("⛔", "DOMAIN EXPIRED"), "domain_renewed": ("✅", "DOMAIN RENEWED"),
           "cert": ("🔐", "CERTIFICATE EXPIRES SOON"), "cert_expired": ("⛔", "CERTIFICATE EXPIRED"), "cert_renewed": ("✅", "CERTIFICATE RENEWED"),
@@ -906,7 +906,7 @@ def _security_loop() -> None:
     from . import ai, anomaly
     from .secscan import scans_due
     while True:
-        for name, job in (("security scan", scans_due), ("anomaly detection", lambda s: anomaly.run(s, ai.load(s)["anomaly_alerts"])), ("AI explanation", ai.auto_explain)):
+        for name, job in (("security scan", scans_due), ("anomaly detection", lambda s: anomaly.run(s, ai.load(s)["anomaly_alerts"])), ("AI explanation", lambda s: get_settings().ai_enabled and ai.auto_explain(s))):
             session = SessionLocal()
             try:
                 job(session)

@@ -60,6 +60,7 @@ export default function Home() {
   return <AppProvider me={session} reloadMe={async () => { await loadMe(); }} onUnauthorized={onUnauthorized}><Shell company={company} me={session} onSignOut={signOut} /></AppProvider>;
 }
 
+const AI_PAGES = ['assistant', 'ai-settings'];
 type NavItem = { id: string; label: string; icon: string; min: Role; fleet?: boolean; group: string };
 const GROUPS = ['Monitor', 'Quality', 'DevOps', 'Security', 'AI', 'Admin'];
 const NAV: NavItem[] = [
@@ -95,7 +96,9 @@ function Shell({ company, me, onSignOut }: { company: string; me: Me; onSignOut:
   useEffect(() => { setTheme(document.documentElement.dataset.theme === 'light' || (!document.documentElement.dataset.theme && matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark'); }, []);
   useEffect(() => setOpen(false), [route.join('/')]);
 
-  const allowed = NAV.filter(n => RANK[me.role] >= RANK[n.min] && !(n.fleet && me.access));   // fleet-wide pages are hidden from people limited to selected monitors
+  const aiOn = me.features?.ai !== false;   // AI_ENABLED=false: no AI pages at all; Anomalies (plain statistics) moves to Monitor
+  const allowed = NAV.filter(n => RANK[me.role] >= RANK[n.min] && !(n.fleet && me.access) && (aiOn || !AI_PAGES.includes(n.id)))   // fleet-wide pages are hidden from people limited to selected monitors
+    .map(n => (!aiOn && n.id === 'anomalies' ? { ...n, group: 'Monitor' } : n));
   const requested = route[0] || 'overview';
   const page = allowed.some(n => n.id === requested) ? requested : 'overview';   // a page your role cannot use falls back to Overview
   const toggleTheme = () => {

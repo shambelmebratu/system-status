@@ -48,6 +48,11 @@ const GROUPS: { id: string; label: string; hint: string; kinds: string[] }[] = [
   { id: 'breakin', label: 'Successful logins', hint: 'SSH logins after failed attempts, or from new addresses', kinds: ['ssh_login_after_failures', 'ssh_login_new_source'] },
   { id: 'backdoor', label: 'Back doors', hint: 'new SSH keys, extra root accounts, cron jobs that download code, library preloading', kinds: ['ssh_key_added', 'extra_root', 'cron_download', 'ld_preload', 'systemd_suspicious'] },
   { id: 'unknown', label: 'Unknown software', hint: 'programs in temporary folders, packages from outside your repositories', kinds: ['temp_executable', 'foreign_packages'] },
+  { id: 'tunnel', label: 'Tunnels & remote access', hint: 'ngrok, cloudflared, chisel, frp, SSH port forwarding, shells connected to other machines', kinds: ['process_tunnel', 'shell_connection'] },
+  { id: 'transfer', label: 'File transfers', hint: 'SFTP / scp sessions, uploads with curl, rsync, rclone, cloud copies', kinds: ['file_transfer', 'process_transfer'] },
+  { id: 'newfiles', label: 'New files & scripts', hint: 'shell scripts created in the last 24 h, bursts of new files in one folder', kinds: ['new_scripts', 'new_files_burst'] },
+  { id: 'services', label: 'New services & tasks', hint: 'systemd services, timers, cron jobs and rc.local changed in the last 7 days', kinds: ['new_service', 'new_cron'] },
+  { id: 'logins', label: 'Many logins', hint: 'more SSH logins on a server in one day than your limit, even legitimate ones', kinds: ['ssh_many_logins'] },
   { id: 'restart', label: 'Needs a restart', hint: 'services still running a version replaced by an update', kinds: ['process_deleted_exe_update'] },
 ];
 const groupOf = (kind: string) => GROUPS.find(g => g.kinds.includes(kind))?.id ?? 'other';
@@ -108,7 +113,7 @@ export function Security() {
   );
 }
 
-type Schedule = { scan_hours: number; threat_minutes: number; updates_hours: number; updated_by?: string | null; updated_at?: string | null; last_scan_at: string | null;
+type Schedule = { scan_hours: number; threat_minutes: number; updates_hours: number; daily_login_alert?: number; updated_by?: string | null; updated_at?: string | null; last_scan_at: string | null;
   job: { running: boolean; total: number; done: number; failed: number; started_at: string | null; finished_at: string | null; started_by: string | null; current: string | null } };
 const every = (n: number, unit: 'min' | 'h') => (unit === 'h' ? (n === 0 ? 'only on demand' : n % 24 === 0 ? `every ${n / 24 === 1 ? 'day' : `${n / 24} days`}` : `every ${n} h`) : n % 60 === 0 ? `every ${n / 60 === 1 ? 'hour' : `${n / 60} h`}` : `every ${n} min`);
 
@@ -145,7 +150,7 @@ function ScanControls({ server, onDone }: { server: string; onDone: () => Promis
 
 function ScheduleForm({ s, canEdit, onClose, onSaved }: { s: Schedule; canEdit: boolean; onClose: () => void; onSaved: () => Promise<void> }) {
   const { toast } = useApp();
-  const [f, setF] = useState({ scan_hours: s.scan_hours, threat_minutes: s.threat_minutes, updates_hours: s.updates_hours });
+  const [f, setF] = useState({ scan_hours: s.scan_hours, threat_minutes: s.threat_minutes, updates_hours: s.updates_hours, daily_login_alert: s.daily_login_alert ?? 4 });
   const [busy, setBusy] = useState(false);
   async function save(e: FormEvent) {
     e.preventDefault(); setBusy(true);
@@ -163,6 +168,8 @@ function ScheduleForm({ s, canEdit, onClose, onSaved }: { s: Schedule; canEdit: 
           [[5, 'Every 5 minutes'], [10, 'Every 10 minutes'], [15, 'Every 15 minutes'], [30, 'Every 30 minutes'], [60, 'Every hour'], [360, 'Every 6 hours'], [1440, 'Every day']])}
         {row('updates_hours', 'Pending updates and unknown packages (on each server)', 'A package-manager dry run: nothing is installed. Also re-checks packages from outside your repositories.',
           [[1, 'Every hour'], [3, 'Every 3 hours'], [6, 'Every 6 hours'], [12, 'Every 12 hours'], [24, 'Every day']])}
+        {row('daily_login_alert', 'Alert on many SSH logins (per server, per day)', 'Even legitimate logins: an alert once a day when one server has more logins than this (UTC day).',
+          [[0, 'Never'], [2, 'More than 2'], [3, 'More than 3'], [4, 'More than 4'], [5, 'More than 5'], [10, 'More than 10'], [20, 'More than 20']])}
         <p className="muted sm">SSH logins and failed attempts are reported continuously with every agent report. A server whose agent sets <code>AGENT_THREAT_MINUTES</code> or <code>AGENT_UPDATES_HOURS</code> itself keeps its own value.
           {s.updated_by ? ` Last changed by ${s.updated_by}${s.updated_at ? ` ${timeAgo(s.updated_at)}` : ''}.` : ' Defaults come from .env.'}</p>
         {!canEdit && <p className="sm warn">Only admins can change the schedule.</p>}
@@ -271,7 +278,7 @@ function Threats({ server, pick, reload }: { server: string; pick: (id: number) 
               {f.evidence.process && <span className="chip mono">process {f.evidence.process}{f.evidence.pid ? ` · PID ${f.evidence.pid}` : ''}</span>}
               {f.evidence.user && <span className="chip mono">user {f.evidence.user}</span>}
               {f.evidence.ip && <span className="chip mono">from {f.evidence.ip}</span>}
-              {f.evidence.path && <span className="chip mono" title={f.evidence.path}>{f.evidence.path}</span>}
+              {f.evidence.path && !(f.evidence.packages ?? []).includes(f.evidence.path) && <span className="chip mono" title={f.evidence.path}>{f.evidence.path}</span>}
               {f.evidence.remote && <span className="chip mono">→ {f.evidence.remote}</span>}
               {f.evidence.fingerprint && <span className="chip mono">{f.evidence.fingerprint}</span>}
             </div>
@@ -357,27 +364,33 @@ function KubernetesSecurity({ reload }: { reload: () => Promise<void> }) {
 
 /* ---------------------------------------------------------------- SSH access */
 type SshData = { total: number; per_server: (Who & { total: number; distinct_ips: number; top_ips: [string, number][] })[]; top_ips: { ip: string; attempts: number; servers: number; targets?: { id: number; name: string; attempts: number }[] }[];
-  top_users: [string, number][]; hourly: { t: string; attempts: number }[]; logins: Login[]; logins_supported: boolean };
+  top_users: [string, number][]; hourly: { t: string; attempts: number }[]; logins: Login[]; logins_supported: boolean; daily_limit?: number; today?: { id: number; name: string; logins: number }[] };
 function SshAccess({ server, pick }: { server: string; pick: (id: number) => void }) {
   const [hours, setHours] = useState(24);
   const [only, setOnly] = useState<'all' | 'flagged'>('all');
   const d = usePoll(() => api<SshData>(withQ(`/security/ssh?hours=${hours}`, server)), [hours, server], 60000, true);
   const v = d.value;
   const peak = Math.max(1, ...(v?.hourly ?? []).map(h => h.attempts));
-  const logins = (v?.logins ?? []).filter(l => only === 'all' || l.verdict !== 'ok');
-  const flagged = (v?.logins ?? []).filter(l => l.verdict !== 'ok').length;
+  const logins = (v?.logins ?? []).filter(l => only === 'all' || (l.verdict !== 'ok' && l.verdict !== 'transfer'));
+  const flagged = (v?.logins ?? []).filter(l => l.verdict === 'breach' || l.verdict === 'new').length;
+  const transfers = (v?.logins ?? []).filter(l => l.kind === 'sftp').length;
   return (
     <div className="grid">
       <div className="filterbar"><div className="seg">{[24, 72, 168].map(h => <button key={h} className={hours === h ? 'on' : ''} onClick={() => setHours(h)}>{h === 24 ? '24 hours' : h === 72 ? '3 days' : '7 days'}</button>)}</div>
-        <span className="muted sm">{v ? `${v.total.toLocaleString()} failed attempts · ${(v.logins ?? []).length} successful logins` : ''}</span></div>
+        <span className="muted sm">{v ? `${v.total.toLocaleString()} failed attempts · ${(v.logins ?? []).length - transfers} successful logins${transfers ? ` · ${transfers} file-transfer sessions` : ''}` : ''}</span></div>
+      {v?.today && v.today.length > 0 && <div className="sec-today">{v.today.map(t => <button key={t.id} className={`card sec-today-card ${v.daily_limit && t.logins > v.daily_limit ? 'warn' : ''}`} onClick={() => pick(t.id)}>
+        <small>{t.name}</small><b>{t.logins}</b><span className="muted sm">logins today{v.daily_limit ? ` · limit ${v.daily_limit}` : ''}</span></button>)}</div>}
       {v && <section className="card"><div className="card-head"><h2>Successful logins</h2>{flagged > 0 && <span className="sev critical">{flagged} suspicious</span>}<span className="grow" />
         <div className="seg">{([['all', 'All'], ['flagged', 'Suspicious only']] as const).map(([id, l]) => <button key={id} className={only === id ? 'on' : ''} onClick={() => setOnly(id)}>{l}</button>)}</div></div>
         {!v.logins_supported && v.logins.length === 0 ? <p className="muted sm">Agents 2.15+ report successful logins. Re-run the install command on your servers to update them.</p>
           : logins.length === 0 ? <p className="muted sm">{only === 'flagged' ? 'No suspicious logins.' : 'No SSH logins in this period.'}</p>
-          : <div className="tbl-wrap"><table className="tbl"><thead><tr><th>When</th><th>Server</th><th>User</th><th>From</th><th>Method</th><th>Assessment</th></tr></thead><tbody>
+          : <div className="tbl-wrap"><table className="tbl"><thead><tr><th>When</th><th>Server</th><th>User</th><th>From</th><th>Signed in with</th><th>Assessment</th></tr></thead><tbody>
             {logins.map(l => <tr key={l.id} className={l.verdict === 'breach' ? 'row-bad' : l.verdict === 'new' ? 'row-warn' : ''}><td className="sm" title={new Date(l.ts).toLocaleString()}>{timeAgo(l.ts)}</td><td><ServerTag who={l.server} onPick={pick} /></td>
-              <td className="mono">{l.user || '?'}</td><td className="mono">{l.ip}</td><td className="sm">{l.method}</td>
-              <td className="sm">{l.verdict === 'breach' ? <span className="sev critical">after {l.failures_before} failed attempts: possible break-in</span> : l.verdict === 'new' ? <span className="sev medium">first login from this address</span> : <span className="muted">known address</span>}</td></tr>)}
+              <td className="mono">{l.user || '?'}</td><td className="mono">{l.ip}</td>
+              <td className="sm">{l.kind === 'sftp' ? <span className="tag">file transfer (SFTP)</span> : l.method === 'publickey'
+                ? <span title={`${l.key_type ?? ''} ${l.fingerprint ?? ''}`}><b>{l.key_name || `${(l.key_type || '').replace('ssh-', '') || 'key'}`}</b>{l.fingerprint && <div className="muted mono" style={{ fontSize: 11 }}>{l.key_name ? `${(l.key_type ?? '').replace('ssh-', '')} ` : ''}{l.fingerprint.slice(0, 19)}…</div>}</span>
+                : <span className="warn">{l.method || '–'}</span>}</td>
+              <td className="sm">{l.verdict === 'transfer' ? <span className="muted">files sent or received</span> : l.verdict === 'breach' ? <span className="sev critical">after {l.failures_before} failed attempts: possible break-in</span> : l.verdict === 'new' ? <span className="sev medium">first login from this address</span> : <span className="muted">known address</span>}</td></tr>)}
           </tbody></table></div>}
       </section>}
       {v && v.total === 0 ? <div className="card"><Empty title="No failed SSH logins seen">Agents 2.14+ report failed SSH logins from the auth log or journal. A server whose agent cannot read them shows nothing here.</Empty></div> : v && <>
@@ -521,7 +534,7 @@ function Exposure({ o, reload, pick }: { o: Overview; reload: () => Promise<void
 /* ---------------------------------------------------------------- reports */
 type ReportData = { generated_at: string; days: number; since: string; filter: string | null; ssh: { total: number; top_ips: { ip: string; attempts: number; servers: number }[]; top_users: [string, number][] };
   servers: { server: Who; status: string; agent_version: string | null; updates: Updates | null; ssh_failures: { total: number; distinct_ips: number; top_ips: [string, number][] };
-    logins: { total: number; suspicious: number; new_sources: number; users: string[]; sources: string[] }; findings: Finding[]; hardening: Check[]; listening: Listen[]; authorized_keys: number;
+    logins: { total: number; suspicious: number; new_sources: number; users: string[]; sources: string[]; transfers?: number; keys?: string[] }; findings: Finding[]; hardening: Check[]; listening: Listen[]; authorized_keys: number;
     foreign_packages: Foreign; exposure: Scan | null; threat_scan_at: string | null }[] };
 const TEMPLATES = [
   { id: 'executive', label: 'Executive summary', desc: 'One page: the risk level of each server and what to fix first.' },
@@ -609,7 +622,7 @@ function SecurityReport({ data, template, onClose }: { data: ReportData; templat
               <h2>{s.server.name} <span className="muted">{addr(s.server)}{s.server.os ? ` · ${s.server.os}` : ''}</span></h2>
               <div className="db-r-facts"><span>Agent <b>{s.agent_version ?? '–'}</b></span><span>Status <b>{s.status}</b></span><span>Last threat scan <b>{s.threat_scan_at ? timeAgo(s.threat_scan_at) : 'never'}</b></span></div>
               {show.threats && <><h3>Threats ({open.length} open)</h3>{open.length === 0 ? <p className="sm good">No signs of compromise.</p> : <ul className="sec-r-list">{open.map(f => <li key={f.id}><span className={`sev ${f.severity}`}>{SEV_LABEL[f.severity]}</span> {f.title}{f.acknowledged_at ? <span className="muted"> (acknowledged by {f.acknowledged_by})</span> : ''}<div className="muted sm">{f.detail}</div></li>)}</ul>}</>}
-              {show.logins && <><h3>Logins</h3><p className="sm">{s.logins.total} successful SSH login{s.logins.total === 1 ? '' : 's'}{s.logins.total ? ` by ${s.logins.users.join(', ')} from ${s.logins.sources.length} address${s.logins.sources.length === 1 ? '' : 'es'}` : ''}.{s.logins.suspicious ? <b className="bad"> {s.logins.suspicious} after failed attempts.</b> : ''}{s.logins.new_sources ? ` ${s.logins.new_sources} from new addresses.` : ''}</p>
+              {show.logins && <><h3>Logins</h3><p className="sm">{s.logins.total} successful SSH login{s.logins.total === 1 ? '' : 's'}{s.logins.total ? ` by ${s.logins.users.join(', ')} from ${s.logins.sources.length} address${s.logins.sources.length === 1 ? '' : 'es'}` : ''}.{s.logins.suspicious ? <b className="bad"> {s.logins.suspicious} after failed attempts.</b> : ''}{s.logins.new_sources ? ` ${s.logins.new_sources} from new addresses.` : ''}{s.logins.transfers ? ` ${s.logins.transfers} file-transfer (SFTP/scp) session${s.logins.transfers > 1 ? 's' : ''}.` : ''}{s.logins.keys?.length ? ` Keys used: ${s.logins.keys.join(', ')}.` : ''}</p>
                 {s.logins.sources.length > 0 && <div className="chips">{s.logins.sources.map(ip => <span key={ip} className="chip mono">{ip}</span>)}</div>}</>}
               {show.attacks && <><h3>Attacks</h3><p className="sm">{s.ssh_failures.total.toLocaleString()} failed SSH logins from {s.ssh_failures.distinct_ips} addresses{s.ssh_failures.top_ips.length ? `; most from ${s.ssh_failures.top_ips.slice(0, 3).map(([ip, n]) => `${ip} (${n})`).join(', ')}` : ''}.</p></>}
               {show.updates && <><h3>Updates</h3><p className="sm">{!s.updates ? 'Not reported.' : `${s.updates.security} security and ${s.updates.total - s.updates.security} other updates pending${s.updates.reboot_required ? '; a reboot is needed' : ''}.`}</p>

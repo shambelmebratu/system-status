@@ -313,12 +313,12 @@ def schedule(db: Session) -> dict:
     """How often each check runs: what an admin saved in the dashboard, else the .env defaults."""
     from .models import AppSetting
     s = get_settings()
-    out = {"scan_hours": s.security_scan_hours, "threat_minutes": s.agent_threat_minutes, "updates_hours": s.agent_updates_hours, "rescan": {}}
+    out = {"scan_hours": s.security_scan_hours, "threat_minutes": s.agent_threat_minutes, "updates_hours": s.agent_updates_hours, "daily_login_alert": s.ssh_daily_login_alert, "rescan": {}}
     row = db.get(AppSetting, SCHEDULE_KEY)
     if row:
         try:
             saved = json.loads(row.value)
-            out.update({k: saved[k] for k in ("scan_hours", "threat_minutes", "updates_hours", "rescan", "updated_by", "updated_at") if k in saved})
+            out.update({k: saved[k] for k in ("scan_hours", "threat_minutes", "updates_hours", "daily_login_alert", "rescan", "updated_by", "updated_at") if k in saved})
         except ValueError:
             pass
     return out

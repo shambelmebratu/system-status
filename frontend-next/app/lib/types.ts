@@ -69,7 +69,7 @@ export type ScheduledMessage = {
 export type Role = 'admin' | 'operator' | 'viewer';
 export type Access = { servers: number[]; services: number[]; clusters: number[] };
 /** access: the only monitors this person may see; null = everything (always null for admins). */
-export type Me = { access: Access | null; totp_enabled?: boolean; mfa_setup_required?: boolean; id: number; email: string; name: string; role: Role; active: boolean; must_change_password: boolean; last_login_at: string | null; created_at: string | null };
+export type Me = { access: Access | null; features?: { ai?: boolean }; totp_enabled?: boolean; mfa_setup_required?: boolean; id: number; email: string; name: string; role: Role; active: boolean; must_change_password: boolean; last_login_at: string | null; created_at: string | null };
 export const ROLE_INFO: Record<Role, { label: string; blurb: string }> = {
   admin: { label: 'Admin', blurb: 'Everything, including managing users and their roles.' },
   operator: { label: 'Operator', blurb: 'Manage servers, services, alerts, schedules, logs and agent install links. Cannot manage users.' },
