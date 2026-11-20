@@ -94,3 +94,11 @@ def test_quick_queries(insp):
     assert inj["rows"] == [] or inj["rows"][0][0] == 0                       # a value is a plain value, never an operator
     with pytest.raises(dbinspect.DbError, match="sensitive"):
         dbquery.run(insp, customers, {"measures": [{"fn": "min", "column": "password_hash"}]})
+
+
+def test_slow_queries_never_fail(insp):
+    """Without the profiler (mongomock has none) the page still answers, and says how to turn profiling on."""
+    from app import dbslow
+    r = dbslow.slow_queries(insp)
+    assert r["engine"] == "mongodb" and r["statements"] == [] and "setProfilingLevel" in r["note"]
+    assert dbslow._shape({"email": "a@b.c", "total": {"$gt": 5}, "tags": ["x", "y"]}) == {"email": "?", "total": {"$gt": "?"}, "tags": ["?", "?"]}   # values never shown

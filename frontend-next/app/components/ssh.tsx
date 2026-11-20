@@ -38,6 +38,9 @@ export function SshPanel({ serverId, liveCount, canHistory, onCount }: { serverI
   const [sessionsError, setSessionsError] = useState('');
   const [busy, setBusy] = useState(false);
   const [loginFilter, setLoginFilter] = useState('');
+  // date range for the login history: a preset (days back) or from/to (local dates)
+  const [period, setPeriod] = useState<'all' | 'today' | '7' | '30' | 'custom'>('all');
+  const [from, setFrom] = useState(''); const [to, setTo] = useState('');
   const [allLogins, setAllLogins] = useState(false);
   const run = useRef(0);
 
@@ -54,8 +57,13 @@ export function SshPanel({ serverId, liveCount, canHistory, onCount }: { serverI
 
   const logins = useMemo(() => {
     const n = loginFilter.trim().toLowerCase();
-    return (sessions?.logins ?? []).filter(l => !n || `${l.user} ${l.ip} ${l.tty} ${l.key_name ?? ''} ${l.fingerprint ?? ''} ${l.method ?? ''}`.toLowerCase().includes(n));
-  }, [sessions, loginFilter]);
+    const day = (iso: string, end = false) => { const d = new Date(`${iso}T00:00:00`); if (end) d.setDate(d.getDate() + 1); return d.getTime() / 1000; };
+    const midnight = new Date(); midnight.setHours(0, 0, 0, 0);
+    const [lo, hi] = period === 'today' ? [midnight.getTime() / 1000, Infinity] : period === '7' || period === '30' ? [Date.now() / 1000 - Number(period) * 86400, Infinity]
+      : period === 'custom' ? [from ? day(from) : -Infinity, to ? day(to, true) : Infinity] : [-Infinity, Infinity];
+    return (sessions?.logins ?? []).filter(l => (!n || `${l.user} ${l.ip} ${l.tty} ${l.key_name ?? ''} ${l.fingerprint ?? ''} ${l.method ?? ''}`.toLowerCase().includes(n))
+      && (lo === -Infinity && hi === Infinity || (l.login != null && l.login >= lo && l.login < hi)));
+  }, [sessions, loginFilter, period, from, to]);
   const ips = useMemo(() => new Set((sessions?.logins ?? []).map(l => l.ip)).size, [sessions]);
   const limit = usePoll(() => api<{ daily_login_alert?: number }>('/security/schedule').catch(() => ({ daily_login_alert: 0 })), [], 0).value?.daily_login_alert ?? 0;
   const today = useMemo(() => { const start = new Date(); start.setUTCHours(0, 0, 0, 0); return (sessions?.logins ?? []).filter(l => l.login && l.login * 1000 >= start.getTime()).length; }, [sessions]);
@@ -84,9 +92,12 @@ export function SshPanel({ serverId, liveCount, canHistory, onCount }: { serverI
       </section>
 
       <section className="card">
-        <div className="card-head"><h2>SSH login history</h2><span className="grow" />
+        <div className="card-head ssh-hist-head"><h2>SSH login history</h2>
+          <div className="seg">{([['all', 'All'], ['today', 'Today'], ['7', '7 days'], ['30', '30 days'], ['custom', 'Dates…']] as const).map(([id, l]) => <button key={id} className={period === id ? 'on' : ''} onClick={() => setPeriod(id)}>{l}</button>)}</div>
+          {period === 'custom' && <span className="ssh-range"><label>From <input type="date" value={from} onChange={e => setFrom(e.target.value)} /></label><label>to <input type="date" value={to} onChange={e => setTo(e.target.value)} /></label></span>}
+          <span className="grow" />
           <label className="lg-field" style={{ maxWidth: 260 }}><Icon name="logs" size={14} /><input value={loginFilter} onChange={e => setLoginFilter(e.target.value)} placeholder="Filter user, IP, key, device" aria-label="Filter logins" /></label></div>
-        {!sessions ? <p className="muted">{sessionsError ? 'Not available.' : 'Loading…'}</p> : logins.length === 0 ? <p className="muted">{sessions.logins.length ? 'No login matches the filter.' : 'No SSH logins on record.'}</p> : (
+        {!sessions ? <p className="muted">{sessionsError ? 'Not available.' : 'Loading…'}</p> : logins.length === 0 ? <p className="muted">{sessions.logins.length ? 'No login matches the filter or dates.' : 'No SSH logins on record.'}</p> : (
           <>
             <div className="tbl-wrap"><table className="tbl"><thead><tr><th>User</th><th>Source IP</th><th>Signed in with</th><th className="hide-sm">Terminal</th><th>Login</th><th>Logout</th><th className="hide-sm">Duration</th><th>Status</th></tr></thead><tbody>
               {(allLogins ? logins : logins.slice(0, LOGINS_SHOWN)).map((l, i) => {
@@ -126,7 +137,8 @@ function CommandHistory({ serverId }: { serverId: number }) {
     try {
       const r = await runQuery(serverId, { source: 'ssh', target: 'history', lines }, () => run.current !== mine);
       if (run.current !== mine) return;
-      const answer = JSON.parse(r.output) as HistoryAnswer;
+      const raw = JSON.parse(r.output) as Partial<HistoryAnswer>;
+      const answer: HistoryAnswer = { users: Array.isArray(raw.users) ? raw.users : [], notes: Array.isArray(raw.notes) ? raw.notes : [] };   // an odd answer must not break the page
       setData(answer);
       setUser(u => (answer.users.some(x => `${x.user}|${x.shell}` === u) ? u : answer.users[0] ? `${answer.users[0].user}|${answer.users[0].shell}` : ''));
     } catch (e) { if ((e as Error).message !== 'cancelled' && run.current === mine) setError((e as Error).message); }

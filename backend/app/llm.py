@@ -423,6 +423,10 @@ class OpenAICompatProvider(Provider):
     def __init__(self, s: Spec, model: str, key: str, url: str):
         self.spec, self.model, self.key, self.url = s, model, key, url
         self.extra_body: dict = {}
+        # How long an answer may be. Without it every provider applies its own default, some very small (old Ollama: 128 tokens),
+        # and answers stop mid-sentence. OpenAI's newer models only accept the newer name of the setting.
+        self.limit_key: str | None = "max_completion_tokens" if s.id == "openai" else "max_tokens"
+        self.max_output = max(256, int(os.getenv("AI_MAX_OUTPUT_TOKENS", "4096") or 4096))
 
     # --------------------------------------------------------------------- HTTP
     def _post(self, body: dict) -> dict:
@@ -432,8 +436,10 @@ class OpenAICompatProvider(Provider):
         if self.spec.id == "openrouter":
             headers["X-Title"] = "SM-Watch"
         body = {"model": self.model, **self.extra_body, **body}
+        if self.limit_key and self.limit_key not in body and "max_tokens" not in body and "max_completion_tokens" not in body:
+            body[self.limit_key] = self.max_output
         waited = 0.0
-        for attempt in range(3):
+        for attempt in range(4):
             try:
                 with httpx.Client(timeout=self.TIMEOUT, transport=self.transport) as client:
                     r = client.post(self.url, json=body, headers=headers)
@@ -448,6 +454,10 @@ class OpenAICompatProvider(Provider):
                     time.sleep(wait)
                     waited += wait
                     continue
+            if r.status_code == 400 and self.limit_key and self.limit_key in body and self.limit_key in r.text:
+                body.pop(self.limit_key)                  # this server does not accept the output limit: use its own default
+                self.limit_key = None
+                continue
             if r.status_code >= 400:
                 raise self._error(r)
             try:
@@ -531,8 +541,13 @@ class OpenAICompatProvider(Provider):
         usage = self._usage(data)
         if message.get("refusal"):
             raise RefusedError("The model declined to answer this request.", usage)
+        if finish == "length" and self.limit_key:      # cut off: once more with room for twice as much
+            body[self.limit_key] = min(16384, self.max_output * 2)
+            data = self._post(body)
+            message, finish = self._message(data)
+            usage.add(self._usage(data))
         if finish == "length":
-            raise AiError("The answer was cut off. Try again with less input, or choose a model with a larger output limit.")
+            raise AiError("The answer was cut off by the model's output limit. Try again, raise AI_MAX_OUTPUT_TOKENS, or choose a model with a larger output limit.")
         try:
             parsed = schema.model_validate(extract_json(message.get("content") or ""))
         except ValidationError as error:
@@ -557,7 +572,19 @@ class OpenAICompatProvider(Provider):
                 return Reply("", model, usage, refused=True)
             calls = message.get("tool_calls") or []
             if not calls or step == max_iterations:
-                return Reply(_strip_reasoning(message.get("content") or ""), model, usage)
+                text = message.get("content") or ""
+                finish = (data.get("choices") or [{}])[0].get("finish_reason")
+                for _ in range(2):                                 # the answer hit the output limit: ask the model to go on
+                    if finish != "length":
+                        break
+                    more = self._post({"messages": [*convo, {"role": "assistant", "content": text},
+                                                    {"role": "user", "content": "Continue exactly where you stopped. Do not repeat anything."}]})
+                    usage.add(self._usage(more))
+                    piece, finish = self._message(more)
+                    text += piece.get("content") or ""
+                if finish == "length":
+                    text += "\n\n*(The answer was cut off by the model's output limit.)*"
+                return Reply(_strip_reasoning(text), model, usage)
             convo.append({"role": "assistant", "content": message.get("content") or "", "tool_calls": calls})
             for call in calls:
                 fn = (call.get("function") or {})

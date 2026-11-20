@@ -124,21 +124,38 @@ def servers_list(user: dict = Depends(require_operator), db: Session = Depends(g
 
 
 @router.get("/ssh")
-def ssh(hours: int = Query(24, ge=1, le=168), server: str | None = Query(None, max_length=200), user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+def ssh(hours: int = Query(24, ge=1, le=168), server: str | None = Query(None, max_length=200),
+        start: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"), end: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+        user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+    """Failed and successful SSH logins: the last `hours`, or the days from `start` to `end` (inclusive, UTC dates, at most 90 days)."""
+    until = datetime.now(timezone.utc)
+    if start or end:
+        try:
+            first = datetime.fromisoformat(start or end).replace(tzinfo=timezone.utc)
+            last = datetime.fromisoformat(end or start).replace(tzinfo=timezone.utc)
+        except ValueError as error:
+            raise HTTPException(422, "Dates must look like 2026-11-20") from error
+        if last < first:
+            first, last = last, first
+        until = min(last + timedelta(days=1), datetime.now(timezone.utc) + timedelta(minutes=1))
+        hours = max(1, int((until - first).total_seconds() // 3600) + (1 if (until - first).total_seconds() % 3600 else 0))
+        if hours > 90 * 24:
+            raise HTTPException(422, "Choose at most 90 days")
     servers = visible_servers(db, user, server)
     infos = {s.id: server_info(s) for s in servers}
-    data = secscan.ssh_summary(db, hours, list(infos))
+    data = secscan.ssh_summary(db, hours, list(infos), until)
     data["per_server"] = [{**infos.get(sid, {"id": sid, "name": f"server {sid}"}), **v} for sid, v in sorted(data["per_server"].items(), key=lambda kv: -kv[1]["total"])]
     # which servers each attacking address went after (by name, not just a count)
-    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    since = until - timedelta(hours=hours)
+    data["since"], data["until"] = since.isoformat(), until.isoformat()
     from .models import SshFailureSample
     targets: dict[str, dict[int, int]] = {}
-    for sid, raw in db.execute(select(SshFailureSample.server_id, SshFailureSample.ips).where(SshFailureSample.ts >= since, SshFailureSample.server_id.in_(list(infos) or [0]))).all():
+    for sid, raw in db.execute(select(SshFailureSample.server_id, SshFailureSample.ips).where(SshFailureSample.ts >= since, SshFailureSample.ts < until, SshFailureSample.server_id.in_(list(infos) or [0]))).all():
         for ip, n in json.loads(raw or "{}").items():
             targets.setdefault(ip, {})[sid] = targets.setdefault(ip, {}).get(sid, 0) + n
     for row in data["top_ips"]:
         row["targets"] = [{"id": sid, "name": infos[sid]["name"], "attempts": n} for sid, n in sorted(targets.get(row["ip"], {}).items(), key=lambda kv: -kv[1]) if sid in infos]
-    logins = db.scalars(select(SshLoginEvent).where(SshLoginEvent.ts >= since, SshLoginEvent.server_id.in_(list(infos) or [0])).order_by(desc(SshLoginEvent.ts)).limit(300)).all()
+    logins = db.scalars(select(SshLoginEvent).where(SshLoginEvent.ts >= since, SshLoginEvent.ts < until, SshLoginEvent.server_id.in_(list(infos) or [0])).order_by(desc(SshLoginEvent.ts)).limit(1000)).all()
     data["logins"] = [{"id": e.id, "server": {k: infos[e.server_id][k] for k in ("id", "name", "hostname", "public_ip")}, "ts": aware(e.ts).isoformat(), "ip": e.ip, "user": e.user,
                        "method": e.method, "failures_before": e.failures_before, "new_source": e.new_source, "kind": e.kind or "login",
                        "key_type": e.key_type or None, "fingerprint": e.fingerprint or None, "key_name": e.key_name or None,

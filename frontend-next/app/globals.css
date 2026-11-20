@@ -1049,3 +1049,25 @@ kbd{font:600 11px var(--mono);border:1px solid var(--line);background:var(--surf
 .sec-today-card{display:flex;flex-direction:column;gap:2px;text-align:left;cursor:pointer;color:var(--ink);padding:10px 14px;border-left:3px solid var(--line)}
 .sec-today-card b{font-size:22px}.sec-today-card small{font-weight:600;color:var(--ink-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .sec-today-card.warn{border-left-color:var(--warn)}.sec-today-card.warn b{color:var(--warn)}
+.join-addr{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.join-addr select{max-width:100%;min-width:0;flex:1 1 280px}.join-addr input{flex:1 1 240px}
+/* AI explanations: never cut the text */
+.ai-head{border-color:var(--line)!important;background:var(--surface-2)!important;align-items:flex-start!important;text-align:left}
+.ai-head .ai-badge{margin-top:1px}
+.ai-summary{flex:1;min-width:0;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.45}
+.ai-summary.open{display:block;font-weight:600}
+.ai-body{border-color:var(--line)!important;line-height:1.55}
+.ai-body p,.ai-body li{overflow-wrap:anywhere}
+.ai-lead{font-size:14px;margin:0 0 8px}
+.chat-msg.assistant{border-color:var(--line)!important}
+.sec-filter{flex-wrap:wrap}.sec-filter-label{display:inline-flex;align-items:center;gap:6px;font-weight:600;font-size:13px;color:var(--ink-2)}
+.sec-filter .pick-box{flex:0 1 420px}
+.ssh-range{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.ssh-range label{display:inline-flex;align-items:center;gap:6px;font-size:13px;color:var(--ink-2)}
+.ssh-range input[type=date]{min-height:32px;padding:3px 8px}
+.ssh-hist-head{flex-wrap:wrap;gap:8px 10px}
+/* Databases: slow queries */
+.dbs-filters{flex-wrap:wrap;gap:8px}
+.dbs-q{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word;max-width:760px}
+.dbs-q.open{display:block;white-space:pre-wrap}
+.dbs-more{margin-top:6px}
+.dbs-table td{vertical-align:top}
+.dbs-table .num{white-space:nowrap}

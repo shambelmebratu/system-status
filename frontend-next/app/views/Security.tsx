@@ -3,6 +3,7 @@
 import { FormEvent, Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import { Empty, Field, Icon, Modal, StatusPill } from '../components/ui';
 import { ProcessDrawer } from '../components/process';
+import { TargetPicker, type PickerOption } from '../components/logviewer';
 import { api, post, put } from '../lib/api';
 import { useApp, usePoll } from '../lib/app';
 import { timeAgo } from '../lib/format';
@@ -180,27 +181,22 @@ function ScheduleForm({ s, canEdit, onClose, onSaved }: { s: Schedule; canEdit: 
   );
 }
 
-/** Narrow every tab to one server: pick from the list, or type a name, host name, IP address or number. */
+/** Narrow every tab to one server: a searchable dropdown (name, host name, IP or #id) that can be reopened any time. */
 function ServerFilter({ servers, value, onChange }: { servers: Who[]; value: string; onChange: (v: string) => void }) {
-  const [text, setText] = useState('');
-  const [open, setOpen] = useState(false);
-  const chosen = servers.find(s => String(s.id) === value);
-  const needle = text.trim().toLowerCase().replace(/^#/, '');
-  const matches = servers.filter(s => !needle || String(s.id) === needle || [s.name, s.hostname, s.public_ip, s.host, ...s.private_ips].some(h => h && h.toLowerCase().includes(needle))).slice(0, 30);
-  const apply = (v: string) => { onChange(v); setText(''); setOpen(false); };
+  const { data } = useApp();
+  const status = new Map((data?.servers ?? []).map(s => [s.id, s.last_status]));
+  const dot = (id: number) => { const st = status.get(id); return st === 'down' ? 'exited' : st === 'alert' ? 'paused' : st === 'up' ? 'running' : 'unknown'; };
+  const options: PickerOption[] = [
+    { value: '', label: `All servers (${servers.length})`, hint: 'show everything' },
+    ...servers.map(s => ({ value: String(s.id), label: s.name, dot: dot(s.id), hint: [s.hostname && s.hostname !== s.name ? s.hostname : null, s.public_ip, ...s.private_ips, `#${s.id}`].filter(Boolean).join(' · ') })),
+  ];
+  const known = !value || servers.some(s => String(s.id) === value);
+  if (!known) options.push({ value, label: `Matching “${value}”`, hint: 'from an earlier search' });
   return (
     <div className="sec-filter">
-      <Icon name="server" size={15} />
-      {value ? <span className="sec-filter-chip">{chosen ? <><b>{chosen.name}</b><span className="muted mono">{addr(chosen) || `#${chosen.id}`}</span></> : <>matching <b>“{value}”</b></>}
-        <button className="lg-link" onClick={() => apply('')} aria-label="Show all servers"><Icon name="x" size={13} /></button></span>
-        : <span className="muted sm">All servers ({servers.length})</span>}
-      <div className="sec-filter-box">
-        <input value={text} onChange={e => { setText(e.target.value); setOpen(true); }} onFocus={() => setOpen(true)} onBlur={() => setTimeout(() => setOpen(false), 150)}
-          onKeyDown={e => { if (e.key === 'Enter' && text.trim()) apply(matches.length === 1 ? String(matches[0].id) : text.trim()); if (e.key === 'Escape') setOpen(false); }}
-          placeholder="Filter by server: name, host name, IP or #id" aria-label="Filter by server" />
-        {open && matches.length > 0 && <div className="sec-filter-list" role="listbox">{matches.map(s => <button key={s.id} role="option" aria-selected={String(s.id) === value} onMouseDown={e => e.preventDefault()} onClick={() => apply(String(s.id))}>
-          <b>{s.name}</b><span className="muted mono sm">{[s.hostname, s.public_ip, ...s.private_ips].filter(Boolean).join(' · ')}</span><span className="muted sm">#{s.id}</span></button>)}</div>}
-      </div>
+      <span className="sec-filter-label"><Icon name="server" size={15} />Server</span>
+      <TargetPicker value={value} options={options} onChange={onChange} placeholder="All servers" width={420} />
+      {value && <button type="button" className="btn ghost sm" onClick={() => onChange('')}>Show all servers</button>}
     </div>
   );
 }
@@ -368,16 +364,35 @@ type SshData = { total: number; per_server: (Who & { total: number; distinct_ips
   top_users: [string, number][]; hourly: { t: string; attempts: number }[]; logins: Login[]; logins_supported: boolean; daily_limit?: number; today?: { id: number; name: string; logins: number }[] };
 function SshAccess({ server, pick }: { server: string; pick: (id: number) => void }) {
   const [hours, setHours] = useState(24);
+  const today = new Date().toISOString().slice(0, 10);
+  const [range, setRange] = useState<{ start: string; end: string } | null>(null);   // a custom date range (UTC days), or null for the last N hours
+  const [draft, setDraft] = useState({ start: new Date(Date.now() - 6 * 86400000).toISOString().slice(0, 10), end: today });
+  const [picking, setPicking] = useState(false);
   const [only, setOnly] = useState<'all' | 'flagged'>('all');
-  const d = usePoll(() => api<SshData>(withQ(`/security/ssh?hours=${hours}`, server)), [hours, server], 60000, true);
+  const query = range ? `/security/ssh?start=${range.start}&end=${range.end}` : `/security/ssh?hours=${hours}`;
+  const d = usePoll(() => api<SshData>(withQ(query, server)), [query, server], 60000, true);
   const v = d.value;
-  const peak = Math.max(1, ...(v?.hourly ?? []).map(h => h.attempts));
+  // long ranges: one bar per day instead of per hour
+  const bars = useMemo(() => {
+    const h = v?.hourly ?? [];
+    if (h.length <= 168) return h.map(x => ({ t: x.t, attempts: x.attempts, label: new Date(x.t).toLocaleString() }));
+    const days = new Map<string, number>();
+    for (const x of h) { const k = x.t.slice(0, 10); days.set(k, (days.get(k) ?? 0) + x.attempts); }
+    return [...days.entries()].map(([k, n]) => ({ t: k, attempts: n, label: k }));
+  }, [v]);
+  const peak = Math.max(1, ...bars.map(h => h.attempts));
+  const rangeLabel = range ? (range.start === range.end ? range.start : `${range.start} → ${range.end}`) : '';
   const logins = (v?.logins ?? []).filter(l => only === 'all' || (l.verdict !== 'ok' && l.verdict !== 'transfer'));
   const flagged = (v?.logins ?? []).filter(l => l.verdict === 'breach' || l.verdict === 'new').length;
   const transfers = (v?.logins ?? []).filter(l => l.kind === 'sftp').length;
   return (
     <div className="grid">
-      <div className="filterbar"><div className="seg">{[24, 72, 168].map(h => <button key={h} className={hours === h ? 'on' : ''} onClick={() => setHours(h)}>{h === 24 ? '24 hours' : h === 72 ? '3 days' : '7 days'}</button>)}</div>
+      <div className="filterbar"><div className="seg">{[24, 72, 168].map(h => <button key={h} className={!range && hours === h ? 'on' : ''} onClick={() => { setRange(null); setHours(h); setPicking(false); }}>{h === 24 ? '24 hours' : h === 72 ? '3 days' : '7 days'}</button>)}
+          <button className={range || picking ? 'on' : ''} onClick={() => setPicking(!picking)}><Icon name="clock" size={13} /> {range ? rangeLabel : 'Custom range'}</button></div>
+        {picking && <form className="ssh-range" onSubmit={e => { e.preventDefault(); setRange({ start: draft.start <= draft.end ? draft.start : draft.end, end: draft.start <= draft.end ? draft.end : draft.start }); setPicking(false); }}>
+          <label>From <input type="date" value={draft.start} max={today} min={new Date(Date.now() - 89 * 86400000).toISOString().slice(0, 10)} onChange={e => setDraft({ ...draft, start: e.target.value })} required /></label>
+          <label>to <input type="date" value={draft.end} max={today} onChange={e => setDraft({ ...draft, end: e.target.value })} required /></label>
+          <button className="btn sm primary">Apply</button><span className="muted sm">UTC days · up to 90 days back</span></form>}
         <span className="muted sm">{v ? `${v.total.toLocaleString()} failed attempts · ${(v.logins ?? []).length - transfers} successful logins${transfers ? ` · ${transfers} file-transfer sessions` : ''}` : ''}</span></div>
       {v?.today && v.today.length > 0 && <div className="sec-today">{v.today.map(t => <button key={t.id} className={`card sec-today-card ${v.daily_limit && t.logins > v.daily_limit ? 'warn' : ''}`} onClick={() => pick(t.id)}>
         <small>{t.name}</small><b>{t.logins}</b><span className="muted sm">logins today{v.daily_limit ? ` · limit ${v.daily_limit}` : ''}</span></button>)}</div>}
@@ -395,8 +410,8 @@ function SshAccess({ server, pick }: { server: string; pick: (id: number) => voi
           </tbody></table></div>}
       </section>}
       {v && v.total === 0 ? <div className="card"><Empty title="No failed SSH logins seen">Agents 2.14+ report failed SSH logins from the auth log or journal. A server whose agent cannot read them shows nothing here.</Empty></div> : v && <>
-        <section className="card"><div className="card-head"><h2>Failed attempts per hour</h2></div>
-          <div className="sec-hist">{v.hourly.map(h => <span key={h.t} style={{ height: `${(h.attempts / peak) * 100}%` }} title={`${new Date(h.t).toLocaleString()}: ${h.attempts}`} className={h.attempts ? '' : 'zero'} />)}</div></section>
+        <section className="card"><div className="card-head"><h2>Failed attempts per {bars.length && (v.hourly ?? []).length > 168 ? 'day' : 'hour'}</h2></div>
+          <div className="sec-hist">{bars.map(h => <span key={h.t} style={{ height: `${(h.attempts / peak) * 100}%` }} title={`${h.label}: ${h.attempts}`} className={h.attempts ? '' : 'zero'} />)}</div></section>
         <div className="grid g-side" style={{ gridTemplateColumns: 'minmax(0,1.4fr) minmax(0,1fr)' }}>
           <section className="card"><div className="card-head"><h2>Top attacking addresses</h2></div>
             <div className="tbl-wrap"><table className="tbl"><thead><tr><th>Address</th><th className="num">Attempts</th><th>Servers targeted</th></tr></thead><tbody>

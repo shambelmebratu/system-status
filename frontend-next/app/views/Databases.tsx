@@ -118,7 +118,7 @@ function ConnectionForm({ existing, onClose, onSaved }: { existing?: Conn; onClo
 /* ---------------------------------------------------------------- one database */
 function DatabaseDetail({ conn, onEdit, reload, editing, closeEdit }: { conn: Conn; onEdit: () => void; reload: () => Promise<void>; editing: Conn | 'new' | null; closeEdit: () => void }) {
   const { go } = useApp();
-  const [tab, setTab] = useState<'graph' | 'tree' | 'query' | 'report' | 'saved'>('graph');
+  const [tab, setTab] = useState<'graph' | 'tree' | 'query' | 'slow' | 'report' | 'saved'>('graph');
   const [schema, setSchema] = useState<Schema | null>(null);
   const [error, setError] = useState(''); const [busy, setBusy] = useState(false);
   const [picks, setPicks] = useState<Record<string, string[] | null>>({});      // table -> chosen columns (null = all)
@@ -146,13 +146,14 @@ function DatabaseDetail({ conn, onEdit, reload, editing, closeEdit }: { conn: Co
         <div className="card ssh-stat"><small>{w.rows[0].toUpperCase() + w.rows.slice(1)} (estimate)</small><b className="sm-b">{num(tables.reduce((a, t) => a + (t.rows_estimate ?? 0), 0))}</b><span className="muted sm">from the database&apos;s statistics</span></div>
         <div className="card ssh-stat"><small>Size</small><b className="sm-b">{tables.some(t => t.size_bytes != null) ? bytes(tables.reduce((a, t) => a + (t.size_bytes ?? 0), 0)) : '–'}</b><span className="muted sm">{w.table}s and indexes</span></div>
       </div>}
-      <div className="ktabs" role="tablist">{([['graph', 'Relationships', 'overview'], ['tree', w.tables, 'logs'], ['query', 'Quick query', 'terminal'], ['report', `Report builder${Object.keys(picks).length ? ` (${Object.keys(picks).length})` : ''}`, 'zap'], ['saved', 'Saved reports', 'star']] as const).map(([id, label, icon]) =>
+      <div className="ktabs" role="tablist">{([['graph', 'Relationships', 'overview'], ['tree', w.tables, 'logs'], ['query', 'Quick query', 'terminal'], ['slow', 'Slow queries', 'clock'], ['report', `Report builder${Object.keys(picks).length ? ` (${Object.keys(picks).length})` : ''}`, 'zap'], ['saved', 'Saved reports', 'star']] as const).map(([id, label, icon]) =>
         <button key={id} role="tab" aria-selected={tab === id} className={tab === id ? 'on' : ''} onClick={() => setTab(id)}><Icon name={icon} size={15} />{label}</button>)}</div>
       {error && <div className="err" style={{ marginBottom: 12 }}>{error}</div>}
       {!schema ? (!error && <div className="card"><p className="muted"><span className="spinner" /> Reading the schema…</p></div>) : <>
         {tab === 'graph' && <SchemaGraph schema={schema} onAdd={addToReport} engine={conn.engine} />}
         {tab === 'tree' && <SchemaTree schema={schema} onAdd={addToReport} engine={conn.engine} />}
         {tab === 'query' && <QueryBuilder conn={conn} schema={schema} />}
+        {tab === 'slow' && <SlowQueries conn={conn} />}
         {tab === 'report' && <ReportBuilder conn={conn} schema={schema} picks={picks} setPicks={setPicks} onReport={setReport} />}
         {tab === 'saved' && <SavedReports conn={conn} onOpen={(s) => { setPicks(Object.fromEntries(s.selection.map(p => [p.table, p.columns.length ? p.columns : null]))); setTab('report'); }} onReport={setReport} />}
       </>}
@@ -593,6 +594,52 @@ function ReportView({ report, onClose }: { report: Report; onClose: () => void }
         })}
         {report.tables.some(s => !s.profile.rows_exact) && <p className="muted sm">* estimated by the database</p>}
       </article>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------- slowest queries (from the database's own statistics) */
+type SlowStatement = { query: string; calls: number; total_ms: number; mean_ms: number; max_ms: number; rows: number; rows_examined?: number; database: string; user?: string; share_pct: number };
+type Running = { id: string; database: string; user: string; state: string; running_ms: number; waiting: string; query: string };
+type Slow = { engine: string; source: string; available: boolean; note: string; statements: SlowStatement[]; running: Running[] };
+const ms = (v: number) => (v >= 60000 ? `${(v / 60000).toFixed(1)} min` : v >= 1000 ? `${(v / 1000).toFixed(2)} s` : `${v < 10 ? v.toFixed(2) : Math.round(v)} ms`);
+
+function SlowQueries({ conn }: { conn: Conn }) {
+  const [search, setSearch] = useState(''); const [applied, setApplied] = useState('');
+  const [minMs, setMinMs] = useState(0);
+  const [sort, setSort] = useState<'mean' | 'total' | 'max' | 'calls'>('mean');
+  const [limit, setLimit] = useState(50);
+  const [open, setOpen] = useState<number | null>(null);
+  const d = usePoll(() => api<Slow>(`/databases/${conn.id}/slow-queries?search=${encodeURIComponent(applied)}&min_ms=${minMs}&sort=${sort}&limit=${limit}`), [conn.id, applied, minMs, sort, limit], 30000, true);
+  const v = d.value;
+  const copy = (t: string) => void navigator.clipboard?.writeText(t);
+  return (
+    <div className="grid">
+      <form className="filterbar dbs-filters" onSubmit={e => { e.preventDefault(); setApplied(search); }}>
+        <label className="lg-field" style={{ flex: '1 1 260px' }}><Icon name="logs" size={14} /><input value={search} onChange={e => setSearch(e.target.value)} placeholder="Filter: table, keyword, database…" aria-label="Filter queries" /></label>
+        <select value={minMs} onChange={e => setMinMs(Number(e.target.value))} aria-label="Minimum average time">
+          {[[0, 'Any duration'], [10, 'Average ≥ 10 ms'], [100, 'Average ≥ 100 ms'], [500, 'Average ≥ 500 ms'], [1000, 'Average ≥ 1 s'], [5000, 'Average ≥ 5 s']].map(([v2, l]) => <option key={v2} value={v2}>{l}</option>)}</select>
+        <div className="seg">{([['mean', 'Slowest on average'], ['total', 'Most total time'], ['max', 'Slowest single run'], ['calls', 'Most frequent']] as const).map(([id, l]) => <button type="button" key={id} className={sort === id ? 'on' : ''} onClick={() => setSort(id)}>{l}</button>)}</div>
+        <select value={limit} onChange={e => setLimit(Number(e.target.value))} aria-label="How many">{[20, 50, 100, 200].map(n => <option key={n} value={n}>top {n}</option>)}</select>
+        <button className="btn sm" type="button" onClick={() => void d.reload()}><Icon name="refresh" size={14} />Refresh</button>
+      </form>
+      {d.error && <div className="err">{d.error}</div>}
+      {!v ? <div className="card"><p className="muted"><span className="spinner" /> Reading the database&apos;s statistics…</p></div> : <>
+        <section className="card"><div className="card-head"><h2>Running now</h2><span className="grow" /><span className="muted sm">{v.running.length ? `${v.running.length} active` : ''} · values hidden</span></div>
+          {v.running.length === 0 ? <p className="muted sm">No query is running right now.</p> : <div className="tbl-wrap"><table className="tbl"><thead><tr><th>For</th><th>Query</th><th className="hide-sm">Database / user</th><th className="hide-sm">State</th></tr></thead><tbody>
+            {v.running.map(r => <tr key={r.id}><td><b className={r.running_ms > 10000 ? 'bad' : r.running_ms > 1000 ? 'warn' : ''}>{ms(r.running_ms)}</b></td><td className="mono sm dbs-q">{r.query}</td>
+              <td className="hide-sm sm">{r.database}{r.user ? <span className="muted"> · {r.user}</span> : null}</td><td className="hide-sm sm">{r.state}{r.waiting ? <span className="warn"> · waiting ({r.waiting})</span> : null}</td></tr>)}</tbody></table></div>}
+        </section>
+        <section className="card"><div className="card-head"><h2>Slowest statements</h2><span className="grow" /><span className="muted sm">from {v.source}{v.available ? ' · since its statistics were last reset' : ''}</span></div>
+          {v.note && <div className="banner" style={{ marginBottom: 10 }}>{v.note}</div>}
+          {v.statements.length === 0 ? (v.available && <p className="muted sm">No statement matches the filter.</p>) : <div className="tbl-wrap"><table className="tbl dbs-table"><thead><tr><th>Query</th><th className="num">Avg</th><th className="num hide-sm">Max</th><th className="num">Calls</th><th className="num hide-sm">Total</th><th className="hide-sm">Share of time</th></tr></thead><tbody>
+            {v.statements.map((r, i) => <tr key={i} className="link" onClick={() => setOpen(open === i ? null : i)}>
+              <td><div className={`mono sm dbs-q ${open === i ? 'open' : ''}`}>{r.query}</div>
+                {open === i && <div className="sm muted dbs-more">{r.database && <>database <b>{r.database}</b> · </>}{r.user && <>user <b>{r.user}</b> · </>}{r.rows.toLocaleString()} rows returned{r.rows_examined ? ` · ${r.rows_examined.toLocaleString()} examined` : ''} · <button type="button" className="lg-link" onClick={e => { e.stopPropagation(); copy(r.query); }}>copy query</button></div>}</td>
+              <td className="num"><b className={r.mean_ms >= 1000 ? 'bad' : r.mean_ms >= 100 ? 'warn' : ''}>{ms(r.mean_ms)}</b></td><td className="num hide-sm">{ms(r.max_ms)}</td>
+              <td className="num">{r.calls.toLocaleString()}</td><td className="num hide-sm">{ms(r.total_ms)}</td>
+              <td className="hide-sm"><span className="dq-bar"><i style={{ width: `${Math.max(2, r.share_pct)}%` }} />{r.share_pct}%</span></td></tr>)}</tbody></table></div>}
+        </section></>}
     </div>
   );
 }

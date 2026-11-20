@@ -98,10 +98,12 @@ def record_ssh_failures(db: Session, server, data: dict, now: datetime) -> None:
     queue_event(db, "server", server, "warning", format_alert("Security", "ssh_attack", server.name, lines, at=now, where=server_where(server)), deliver=False, state="ssh_attack")
 
 
-def ssh_summary(db: Session, hours: int = 24, server_ids: list[int] | None = None) -> dict:
+def ssh_summary(db: Session, hours: int = 24, server_ids: list[int] | None = None, until: datetime | None = None) -> dict:
+    """Failed SSH logins in the `hours` before `until` (default: now)."""
     from .models import SshFailureSample
-    since = datetime.now(timezone.utc) - timedelta(hours=hours)
-    query = select(SshFailureSample.server_id, SshFailureSample.ts, SshFailureSample.total, SshFailureSample.ips, SshFailureSample.users).where(SshFailureSample.ts >= since)
+    until = until or datetime.now(timezone.utc)
+    since = until - timedelta(hours=hours)
+    query = select(SshFailureSample.server_id, SshFailureSample.ts, SshFailureSample.total, SshFailureSample.ips, SshFailureSample.users).where(SshFailureSample.ts >= since, SshFailureSample.ts < until)
     if server_ids is not None:
         query = query.where(SshFailureSample.server_id.in_(server_ids or [0]))
     per_server: dict[int, dict] = {}

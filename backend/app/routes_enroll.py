@@ -150,6 +150,37 @@ def control_plane_url(request: Request) -> str:
     return f"{scheme}://{host}"
 
 
+def chosen_url(request: Request) -> str | None:
+    """The control-plane address picked in the dashboard (`?url=`), e.g. its LAN address for servers that cannot reach PUBLIC_URL.
+    Accepted only for a LAN / VPN address (or PUBLIC_URL itself), so a doctored link cannot send an agent to an outside server."""
+    import ipaddress
+    import socket
+    import urllib.parse
+    raw = (request.query_params.get("url") or "").strip().rstrip("/")
+    if not raw:
+        return None
+    parts = urllib.parse.urlsplit(raw)
+    if parts.scheme not in ("http", "https") or not parts.hostname or parts.username or parts.password or parts.path not in ("", "/") or parts.query or parts.fragment:
+        return None
+    public = urllib.parse.urlsplit(get_settings().public_url or "").hostname
+    host = parts.hostname.lower()
+    if public and host == public.lower():
+        return f"{parts.scheme}://{parts.netloc}"
+    nets = [ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "fc00::/7", "fe80::/10")]
+    private = lambda ip: (lambda a: any(a.version == n.version and a in n for n in nets))(ipaddress.ip_address(ip.split("%")[0]))   # noqa: E731
+    try:
+        ok = private(host)
+    except ValueError:
+        try:
+            found = {info[4][0] for info in socket.getaddrinfo(host, None)}
+            ok = bool(found) and all(private(ip) for ip in found)
+        except (OSError, ValueError):
+            ok = False
+    if not ok or host in ("localhost",) or host.startswith("127."):
+        return None
+    return f"{parts.scheme}://{parts.netloc}"
+
+
 def shell_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
 
@@ -161,7 +192,7 @@ def render(request: Request, token: str, db: Session, template: str) -> str:
         return "#!/usr/bin/env bash\necho 'This join link is invalid, expired or revoked. Ask a dashboard admin for a new command.' >&2\nexit 1\n"
     body = (ROOT / template).read_text()
     body = "\n".join(line for i, line in enumerate(body.splitlines()) if not (i == 0 and line.startswith("#!")))
-    exports = f"SMWATCH_URL={shell_quote(control_plane_url(request))} SMWATCH_JOIN={shell_quote(token)}"
+    exports = f"SMWATCH_URL={shell_quote(chosen_url(request) or control_plane_url(request))} SMWATCH_JOIN={shell_quote(token)}"
     if template == "agent_install.sh":
         # The installer verifies the agent file it downloads against this hash.
         exports += f" SMWATCH_AGENT_SHA256={hashlib.sha256((ROOT / 'agent.py').read_bytes()).hexdigest()}"

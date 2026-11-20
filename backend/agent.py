@@ -39,7 +39,7 @@ from typing import Any
 
 import psutil
 
-AGENT_VERSION = "2.16.0"
+AGENT_VERSION = "2.16.1"
 _ENV_TOKEN = os.getenv("AGENT_TOKEN", "")                      # the token supplied by configuration; a rotation may supersede it (see _load_state)
 AGENT_TOKEN = ""                                                # the token in use: resolved by ensure_token() (saved state first, then configuration)
 AGENT_ALLOW_INSECURE = os.getenv("AGENT_ALLOW_INSECURE", "") == "1"   # permit http:// to a public address (not recommended)
@@ -2629,7 +2629,7 @@ def task_loop() -> None:
 # Networks where unencrypted HTTP is acceptable. An explicit list (not ipaddress.is_private, which also counts documentation
 # ranges such as 203.0.113.0/24) so the agent applies exactly the same policy as the installer scripts.
 _PRIVATE_NETWORKS = [ipaddress.ip_network(n) for n in (
-    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16", "::1/128", "fc00::/7", "fe80::/10")]
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "::1/128", "fc00::/7", "fe80::/10")]
 
 
 def _is_internal_host(host: str) -> bool:
@@ -2639,7 +2639,13 @@ def _is_internal_host(host: str) -> bool:
         address = ipaddress.ip_address(host)
         return any(address in network for network in _PRIVATE_NETWORKS if network.version == address.version)
     except ValueError:
-        return "." not in host or host.endswith((".local", ".lan", ".internal", ".home.arpa", ".localdomain", ".docker"))
+        if "." not in host or host.endswith((".local", ".lan", ".internal", ".home.arpa", ".localdomain", ".docker", ".corp", ".intranet", ".private")):
+            return True
+        try:   # a company name such as monitor.office.example: internal when every address it resolves to is private (LAN, VPN)
+            found = {info[4][0] for info in socket.getaddrinfo(host, None)}
+            return bool(found) and all(any(ipaddress.ip_address(ip.split("%")[0]) in n for n in _PRIVATE_NETWORKS if n.version == ipaddress.ip_address(ip.split("%")[0]).version) for ip in found)
+        except (OSError, ValueError):
+            return False
 
 
 def insecure_url_problem() -> str | None:
@@ -2702,6 +2708,18 @@ def check() -> int:
     return 0
 
 
+def note_report(ok: bool, detail: str = "") -> None:
+    """Records the outcome of the latest report in the state folder: the installer waits for the first success, `status` shows it."""
+    directory = os.path.dirname(_state_file() or "") or AGENT_STATE_DIR
+    try:
+        path = os.path.join(directory, "last_report.json")
+        with open(path + ".tmp", "w") as handle:
+            json.dump({"ok": ok, "at": datetime.now(timezone.utc).isoformat(), "detail": detail[:300], "url": SMWATCH_URL, "version": AGENT_VERSION}, handle)
+        os.replace(path + ".tmp", path)
+    except OSError:
+        pass
+
+
 def push_loop() -> None:
     interval = AGENT_PUSH_INTERVAL
     failures = 0
@@ -2724,9 +2742,11 @@ def push_loop() -> None:
             if failures:
                 log.info("connection to control plane restored")
             failures = 0
+            note_report(True, f"reporting every {interval} s")
         except urllib.error.HTTPError as error:
             failures += 1
             log.error("control plane rejected report: HTTP %s (%s)", error.code, "token no longer valid" if error.code in (401, 403) else error.reason)
+            note_report(False, f"the control plane rejected the report: HTTP {error.code} " + ("(this server was removed in the dashboard or its token was revoked)" if error.code in (401, 403) else str(error.reason)))
             if error.code == 401 and AGENT_TOKEN_FILE:
                 try:
                     forget_token(); ensure_token()   # the control plane may have issued a new token file
@@ -2742,6 +2762,7 @@ def push_loop() -> None:
         except Exception as error:  # network down, DNS, TLS... keep retrying
             failures += 1
             log.warning("report failed (%s); retrying", error)
+            note_report(False, f"cannot reach {SMWATCH_URL}: {error}")
         delay = interval if not failures else min(interval, 5 * 2 ** min(failures - 1, 4))
         time.sleep(max(1.0, delay - (time.monotonic() - started)))
 

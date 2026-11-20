@@ -113,9 +113,32 @@ def same_machine_groups(servers: list) -> dict[int, list[dict]]:
     return result
 
 
-def cookie_secure() -> bool:
-    """Session cookies are HTTPS-only whenever the dashboard is served over HTTPS (COOKIE_SECURE=true, or an https:// PUBLIC_URL)."""
-    return settings.cookie_secure or settings.public_url.lower().startswith("https://")
+def _lan_host(host: str) -> bool:
+    """A LAN / VPN address or name, as typed in the browser (192.168.1.10, 100.64.x Tailscale, smwatch, monitor.lan...)."""
+    import ipaddress
+    host = (host or "").strip().lower()
+    host = host[1:host.index("]")] if host.startswith("[") and "]" in host else host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+    try:
+        ip = ipaddress.ip_address(host)
+        nets = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "::1/128", "fc00::/7", "fe80::/10")
+        return any(ip.version == n.version and ip in n for n in map(ipaddress.ip_network, nets))
+    except ValueError:
+        return bool(host) and ("." not in host or host.endswith((".lan", ".local", ".internal", ".home.arpa", ".localdomain", ".corp", ".intranet", ".private")))
+
+
+def cookie_secure(request: Request | None = None) -> bool:
+    """Session cookies are HTTPS-only when the dashboard is served over HTTPS: COOKIE_SECURE=true, a request that arrived over HTTPS,
+    or an https:// PUBLIC_URL. Exception: the same dashboard opened over plain HTTP by its LAN / VPN address (http://192.168.1.10:8000),
+    where an HTTPS-only cookie would never be stored and sign-in could not work."""
+    if settings.cookie_secure:
+        return True
+    if request is not None and (request.headers.get("x-forwarded-proto", "").split(",")[0].strip() == "https" or request.url.scheme == "https"):
+        return True
+    if not settings.public_url.lower().startswith("https://"):
+        return False
+    if request is not None and _lan_host(request.headers.get("x-forwarded-host") or request.headers.get("host") or ""):
+        return False
+    return True
 
 
 _dev = settings.environment.lower() in ("development", "dev", "test")
@@ -289,7 +312,7 @@ def _start_session(user: User, request: Request, response: Response, db: Session
     user.last_login_at = datetime.now(timezone.utc)
     audit(db, request, "auth.login", actor=user.email, user={"email": user.email, "role": user.role}, target=f"user:{user.id}", detail=how or None)
     db.commit()
-    response.set_cookie(COOKIE_NAME, create_token(user.id, user.email, user.token_version), max_age=settings.session_hours * 3600, httponly=True, secure=cookie_secure(), samesite="strict", path="/api")
+    response.set_cookie(COOKIE_NAME, create_token(user.id, user.email, user.token_version), max_age=settings.session_hours * 3600, httponly=True, secure=cookie_secure(request), samesite="strict", path="/api")
     return {"email": user.email}
 
 
@@ -352,7 +375,7 @@ def mfa_enable(payload: MfaCode, request: Request, claims: dict = Depends(requir
     audit(db, request, "auth.2fa_enable", user=claims, target=f"user:{account.id}")
     db.commit()
     response = JSONResponse({"recovery_codes": codes})
-    response.set_cookie(COOKIE_NAME, create_token(account.id, account.email, account.token_version), max_age=settings.session_hours * 3600, httponly=True, secure=cookie_secure(), samesite="strict", path="/api")
+    response.set_cookie(COOKIE_NAME, create_token(account.id, account.email, account.token_version), max_age=settings.session_hours * 3600, httponly=True, secure=cookie_secure(request), samesite="strict", path="/api")
     return response
 
 
@@ -420,7 +443,7 @@ def change_password(payload: PasswordChange, request: Request, response: Respons
     account.token_version += 1  # signs out every other session
     audit(db, request, "auth.password_change", user=claims, target=f"user:{account.id}")
     db.commit()
-    response.set_cookie(COOKIE_NAME, create_token(account.id, account.email, account.token_version), max_age=settings.session_hours * 3600, httponly=True, secure=cookie_secure(), samesite="strict", path="/api")
+    response.set_cookie(COOKIE_NAME, create_token(account.id, account.email, account.token_version), max_age=settings.session_hours * 3600, httponly=True, secure=cookie_secure(request), samesite="strict", path="/api")
     return {"ok": True}
 
 

@@ -373,3 +373,25 @@ def test_explain_one_log_line_masks_secrets_and_uses_context(client, reset, serv
     assert client.post("/api/ai/log-line", headers=CSRF, json={"line": ""}).status_code == 422
     put(client, {"allow_logs": False})
     assert "not allowed" in client.post("/api/ai/log-line", headers=CSRF, json={"line": "x"}).json()["detail"]
+
+
+def _cut(content, model="m-1"):
+    return 200, {"model": model, "choices": [{"message": {"role": "assistant", "content": content}, "finish_reason": "length"}], "usage": {"prompt_tokens": 10, "completion_tokens": 10}}
+
+
+def test_answers_are_not_cut_off(server, monkeypatch):
+    """The output limit is always sent; a chat answer that hits it is continued; a server that rejects the limit still works."""
+    monkeypatch.setenv("AI_MAX_OUTPUT_TOKENS", "3000")
+    groq = llm.OpenAICompatProvider(llm.PROVIDERS["groq"], "m-1", "k", "https://api.example/v1/chat/completions")
+    srv = server(_cut("The disk is full because "), _cut("the log rotation stopped "), ok("on Monday. Run logrotate -f."))
+    reply = groq.chat("sys", [{"role": "user", "content": "why?"}], [])
+    assert reply.text == "The disk is full because the log rotation stopped on Monday. Run logrotate -f."
+    assert srv.requests[0]["body"]["max_tokens"] == 3000 and srv.requests[1]["body"]["messages"][-1]["content"].startswith("Continue exactly")
+    openai = llm.OpenAICompatProvider(llm.PROVIDERS["openai"], "gpt-x", "k", "https://api.example/v1/chat/completions")
+    srv = server(ok("hi"))
+    openai.chat("sys", [{"role": "user", "content": "x"}], [])
+    assert "max_completion_tokens" in srv.requests[0]["body"] and "max_tokens" not in srv.requests[0]["body"]   # OpenAI's newer name
+    srv = server((400, {"error": {"message": "Unsupported parameter: 'max_tokens'"}}), ok("fine"))
+    assert groq.chat("sys", [{"role": "user", "content": "x"}], []).text == "fine" and "max_tokens" not in srv.requests[1]["body"]
+    srv = server(_cut("a"), _cut("b"), _cut("c"))
+    assert groq.chat("sys", [{"role": "user", "content": "x"}], []).text.endswith("cut off by the model's output limit.)*")   # said, never silent

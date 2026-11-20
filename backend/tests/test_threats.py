@@ -323,3 +323,34 @@ def test_ssh_key_details_daily_limit_and_transfers(client, monkeypatch):
     assert (first["key_type"], first["fingerprint"], first["key_name"]) == ("ED25519", "SHA256:Abc123", "sam@laptop")
     assert any(e["verdict"] == "transfer" for e in ssh["logins"]) and ssh["today"] == [{"id": sid, "name": "keys-1", "logins": 5}] and ssh["daily_limit"] == 3
     client.put("/api/security/schedule", headers=CSRF, json={"scan_hours": 24, "threat_minutes": 10, "updates_hours": 6, "daily_login_alert": 4})
+
+
+def test_join_link_address_choice(client, monkeypatch):
+    """A LAN address chosen in the dashboard is used by the installer; an outside address is ignored (PUBLIC_URL is used)."""
+    from app.config import get_settings
+    sign_in(client)
+    monkeypatch.setattr(get_settings(), "public_url", "https://monitor.example.com")
+    token = client.post("/api/enrollments", headers=CSRF, json={}).json()["token"]
+    anon = TestClient(main.app)
+    def url_in(script: str) -> str:
+        return next(line for line in script.splitlines() if line.startswith("export ")).split("SMWATCH_URL=")[1].split(" ")[0].strip("'")
+    assert url_in(anon.get(f"/api/agent/join/{token}").text) == "https://monitor.example.com"
+    assert url_in(anon.get(f"/api/agent/join/{token}", params={"url": "http://192.168.1.10:8000"}).text) == "http://192.168.1.10:8000"
+    assert url_in(anon.get(f"/api/agent/join/{token}", params={"url": "http://100.101.5.6:8000/"}).text) == "http://100.101.5.6:8000"      # Tailscale
+    for bad in ("https://evil.example.org", "http://8.8.8.8", "http://203.0.113.5:8000", "http://127.0.0.1:8000", "http://192.168.1.10:8000/x", "javascript:alert(1)", "http://u:p@10.0.0.1"):
+        assert url_in(anon.get(f"/api/agent/join/{token}", params={"url": bad}).text) == "https://monitor.example.com", bad
+
+
+def test_sign_in_works_on_the_lan_when_public_url_is_https(monkeypatch):
+    """PUBLIC_URL=https://... must not make the session cookie HTTPS-only for someone opening the dashboard as http://192.168.x.x."""
+    from types import SimpleNamespace
+    monkeypatch.setattr(main.settings, "public_url", "https://monitor.example.com")
+    monkeypatch.setattr(main.settings, "cookie_secure", False)
+    req = lambda host, proto="", scheme="http": SimpleNamespace(headers={"x-forwarded-host": host, **({"x-forwarded-proto": proto} if proto else {})}, url=SimpleNamespace(scheme=scheme))   # noqa: E731
+    assert main.cookie_secure(req("monitor.example.com")) is True                                   # the public name: HTTPS-only
+    assert main.cookie_secure(req("203.0.113.5:8000")) is True and main.cookie_secure(req("8.8.8.8")) is True   # a public address over http: still HTTPS-only
+    for lan in ("192.168.1.10:8000", "10.0.0.5", "100.101.1.2:8000", "smwatch:8000", "monitor.lan", "[fd00::5]:8000"):
+        assert main.cookie_secure(req(lan)) is False, lan                                            # LAN / VPN over http: sign-in works
+    assert main.cookie_secure(req("192.168.1.10", proto="https")) is True                           # any HTTPS request: HTTPS-only
+    monkeypatch.setattr(main.settings, "cookie_secure", True)
+    assert main.cookie_secure(req("192.168.1.10")) is True                                          # COOKIE_SECURE=true always wins

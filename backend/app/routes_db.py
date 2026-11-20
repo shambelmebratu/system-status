@@ -230,6 +230,18 @@ class QueryIn(BaseModel):
     limit: int = Field(default=50, ge=1, le=500)
 
 
+@router.get("/databases/{cid}/slow-queries")
+def slow_queries(cid: int, request: Request, search: str = Query("", max_length=200), min_ms: float = Query(0, ge=0, le=3_600_000),
+                 sort: str = Query("mean", pattern="^(mean|total|max|calls)$"), limit: int = Query(50, ge=1, le=500),
+                 user: dict = Depends(require_admin), db: Session = Depends(get_db)) -> dict:
+    """The slowest statements (from the database's own statistics) and the queries running now. Read-only."""
+    from . import dbslow
+    c = get_conn(db, cid)
+    _, result = with_session(c, lambda i: dbslow.slow_queries(i, search, min_ms, sort, limit))
+    audit(db, request, "db.slow_queries", user=user, target=f"database:{c.id}", detail=f"{c.name}" + (f"; filter {search!r}" if search else ""), commit=True)
+    return result
+
+
 @router.post("/databases/{cid}/query")
 def quick_query(cid: int, payload: QueryIn, request: Request, user: dict = Depends(require_admin), db: Session = Depends(get_db)) -> dict:
     """COUNT / SUM / AVG / MIN / MAX ... built from a form (no typed SQL), read-only, with a time limit."""

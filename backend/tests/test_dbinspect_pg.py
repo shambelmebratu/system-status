@@ -99,3 +99,43 @@ def test_quick_query_by_month(pg, monkeypatch):
         events = next(t for t in tables if t.key == "public.events")
         r = dbquery.run(insp, events, {"measures": [{"fn": "count"}, {"fn": "sum", "column": "amount"}], "group_by": [{"column": "at", "bucket": "month"}], "order": "group_asc"})
         assert [row[0] for row in r["rows"]] == ["2026-01", "2026-02", "2026-03"] and sum(row[1] for row in r["rows"]) == 60
+
+
+def test_slow_queries(pg, monkeypatch):
+    """Running queries are always listed (with literals masked); statement statistics need pg_stat_statements, which is explained."""
+    from app import dbslow
+    monkeypatch.setattr(dbinspect, "resolve_checked", lambda host: None)
+    with dbinspect.PostgresInspector(pg, 5432, "postgres", "postgres", "", "disable") as insp:
+        r = dbslow.slow_queries(insp, sort="total")
+    assert r["engine"] == "postgresql" and isinstance(r["running"], list)
+    if not r["available"]:
+        assert "pg_stat_statements" in r["note"]
+    assert dbslow.mask_literals("SELECT * FROM users WHERE email = 'a@b.c' AND id = 42 AND t3 > 1.5") == "SELECT * FROM users WHERE email = '?' AND id = ? AND t3 > ?"
+    rows = [{"query": "select a", "calls": 10, "total_ms": 100.0, "mean_ms": 10.0, "max_ms": 50.0, "database": "shop"},
+            {"query": "select b from orders", "calls": 2, "total_ms": 300.0, "mean_ms": 150.0, "max_ms": 200.0, "database": "shop"}]
+    assert [x["query"] for x in dbslow._filter([dict(x) for x in rows], "", 0, "mean", 10)] == ["select b from orders", "select a"]
+    assert [x["query"] for x in dbslow._filter([dict(x) for x in rows], "orders", 0, "calls", 10)] == ["select b from orders"]
+    assert dbslow._filter([dict(x) for x in rows], "", 100, "mean", 10)[0]["share_pct"] == 100.0
+
+
+def test_slow_queries_statement_statistics(pg, monkeypatch):
+    """The pg_stat_statements query itself, against a stand-in table with the real column names (PostgreSQL 13+)."""
+    from app import dbslow
+    with psycopg.connect(host=pg, dbname="postgres", user="postgres", autocommit=True) as c:
+        c.execute("""DROP TABLE IF EXISTS public.pg_stat_statements;
+                     CREATE TABLE public.pg_stat_statements (userid oid, dbid oid, query text, calls bigint, total_exec_time float8, mean_exec_time float8, max_exec_time float8, rows bigint);
+                     INSERT INTO public.pg_stat_statements SELECT 10, (SELECT oid FROM pg_database WHERE datname = 'postgres'), q, c, t, t / c, m, r FROM (VALUES
+                       ('SELECT * FROM orders WHERE customer_id = $1', 5000, 25000.0, 40.0, 900),
+                       ('UPDATE stock SET qty = qty - $1 WHERE sku = $2', 20, 9000.0, 2000.0, 20),
+                       ('<insufficient privilege>', 3, 30.0, 10.0, 0)) v(q, c, t, m, r);""")
+    monkeypatch.setattr(dbinspect, "resolve_checked", lambda host: None)
+    with dbinspect.PostgresInspector(pg, 5432, "postgres", "postgres", "", "disable") as insp:
+        real_rows = insp.rows
+        monkeypatch.setattr(insp, "rows", lambda sql, params=(): [(1,)] if "pg_extension" in sql else real_rows(sql, params))
+        by_mean = dbslow.slow_queries(insp, sort="mean")
+        by_total = dbslow.slow_queries(insp, sort="total", search="orders")
+    assert by_mean["available"] and [s["query"][:6] for s in by_mean["statements"]] == ["UPDATE", "SELECT"] and by_mean["statements"][0]["mean_ms"] == 450.0
+    assert by_mean["statements"][0]["database"] == "postgres" and "hidden" in by_mean["note"]                  # other users' statements: explained
+    assert [s["calls"] for s in by_total["statements"]] == [5000]
+    with psycopg.connect(host=pg, dbname="postgres", user="postgres", autocommit=True) as c:
+        c.execute("DROP TABLE public.pg_stat_statements")

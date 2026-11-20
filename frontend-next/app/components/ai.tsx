@@ -104,8 +104,9 @@ export function IncidentAi({ incidentId, analysis, model, generatedAt, onDone }:
   }
   if (analysis && !analysis.error) return (
     <div className="ai-box" onClick={e => e.stopPropagation()}>
-      <button type="button" className="ai-head" onClick={() => setOpen(!open)} aria-expanded={open}><span className="ai-badge"><Icon name="zap" size={12} />AI</span><span className="trunc">{analysis.summary}</span><span className="grow" /><span className="muted">{open ? '▾' : '▸'}</span></button>
+      <button type="button" className="ai-head" onClick={() => setOpen(!open)} aria-expanded={open}><span className="ai-badge"><Icon name="zap" size={12} />AI</span><span className={`ai-summary ${open ? 'open' : ''}`}>{open ? 'AI explanation' : analysis.summary}</span><span className="muted">{open ? '▾ hide' : '▸ read'}</span></button>
       {open && <div className="ai-body">
+        <p className="ai-lead">{analysis.summary}</p>
         <p><b>Impact:</b> {analysis.impact}</p>
         <h4>Likely causes</h4>
         <ul className="ai-causes">{analysis.likely_causes.map((c, i) => <li key={i}><span className={`ai-conf ${c.confidence}`}>{c.confidence}</span><div><b>{c.cause}</b><div className="sm muted">{c.evidence}</div></div></li>)}</ul>
