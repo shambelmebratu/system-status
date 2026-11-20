@@ -32,7 +32,8 @@ type Listen = { port: number; address: string; all_interfaces: boolean; process:
 type Key = { user: string; type: string; fingerprint: string; comment: string; options: boolean; file: string };
 type Foreign = { manager: string | null; packages: string[]; total?: number; error: string | null } | null;
 type Hardening = { server: Who; agent_version: string | null; push: boolean; checked_at: string | null; checks: Check[]; listening: Listen[]; authorized_keys: Key[]; foreign_packages: Foreign; supported: boolean };
-type Login = { id: number; server: Pick<Who, 'id' | 'name' | 'hostname' | 'public_ip'>; ts: string; ip: string; user: string; method: string; failures_before: number; new_source: boolean; verdict: 'breach' | 'new' | 'ok' };
+type Login = { id: number; server: Pick<Who, 'id' | 'name' | 'hostname' | 'public_ip'>; ts: string; ip: string; user: string; method: string; failures_before: number; new_source: boolean;
+  verdict: 'breach' | 'new' | 'ok' | 'transfer'; kind?: 'login' | 'sftp'; key_type?: string | null; fingerprint?: string | null; key_name?: string | null };
 type Tab = 'overview' | 'threats' | 'kubernetes' | 'ssh' | 'updates' | 'hardening' | 'exposure' | 'reports' | 'signin';
 type K8sFinding = { id: number; cluster_id: number; cluster: { id: number; name: string } | null; key: string; kind: string; severity: Severity; namespace: string; object: string; title: string; detail: string;
   evidence: { container?: string; image?: string; command?: string; path?: string; capabilities?: string; subject?: string; role?: string; pods?: number; created?: string };

@@ -1040,3 +1040,12 @@ kbd{font:600 11px var(--mono);border:1px solid var(--line);background:var(--surf
 @media (prefers-color-scheme: dark){.ai-tier-tag.confidential{color:#4ade80}.ai-tier-tag.dev,.ai-shared{color:#fbbf24}.ai-warn svg{color:#fbbf24}}
 :root[data-theme="dark"] .ai-tier-tag.confidential{color:#4ade80}:root[data-theme="dark"] .ai-tier-tag.dev,:root[data-theme="dark"] .ai-shared{color:#fbbf24}
 :root[data-theme="light"] .ai-tier-tag.confidential{color:#15803d}:root[data-theme="light"] .ai-tier-tag.dev,:root[data-theme="light"] .ai-shared{color:#b45309}
+/* SSH: how each login was made, and logins today per server */
+.ssh-how{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;min-width:0}.ssh-how svg{flex:none;color:var(--muted)}
+.ssh-how span{display:flex;flex-direction:column;line-height:1.25;min-width:0}.ssh-how small{color:var(--muted);font-size:11px}
+.ssh-how.key svg{color:var(--good)}.ssh-how.pw{color:var(--warn)}.ssh-how.pw svg{color:var(--warn)}
+.ssh-stat.warn{border-color:color-mix(in srgb,var(--warn) 50%,var(--line))}
+.sec-today{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px}
+.sec-today-card{display:flex;flex-direction:column;gap:2px;text-align:left;cursor:pointer;color:var(--ink);padding:10px 14px;border-left:3px solid var(--line)}
+.sec-today-card b{font-size:22px}.sec-today-card small{font-weight:600;color:var(--ink-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sec-today-card.warn{border-left-color:var(--warn)}.sec-today-card.warn b{color:var(--warn)}

@@ -185,7 +185,7 @@ def put_settings_ai(payload: AiSettingsIn, request: Request, user: dict = Depend
     return ai.public_settings(db)
 
 
-@router.get("/ai/models")
+@router.get("/ai/models", dependencies=[Depends(require_ai)])
 async def ai_models(tier: str = Query("confidential", pattern="^(dev|confidential)$"), user: dict = Depends(require_admin)) -> dict:
     """The models a tier's saved provider offers to the saved key."""
     def run():
@@ -197,7 +197,7 @@ async def ai_models(tier: str = Query("confidential", pattern="^(dev|confidentia
         raise HTTPException(422, str(error)) from error
 
 
-@router.post("/ai/test")
+@router.post("/ai/test", dependencies=[Depends(require_ai)])
 async def test_ai(request: Request, tier: str = Query("confidential", pattern="^(dev|confidential)$"), user: dict = Depends(require_admin)) -> dict:
     """A tiny request that proves a tier's provider, key and model work (costs a few tokens)."""
     def run():
@@ -258,7 +258,7 @@ class LogLineIn(BaseModel):
     source: str = Field(default="", max_length=200)
 
 
-@router.post("/ai/log-line")
+@router.post("/ai/log-line", dependencies=[Depends(require_ai)])
 async def explain_log_line(payload: LogLineIn, request: Request, user: dict = Depends(require_operator)) -> dict:
     """Explains one log line (with a few surrounding lines as context). Secrets are masked before anything is sent."""
     _rate(user, "log-line", 120)

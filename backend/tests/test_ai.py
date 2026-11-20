@@ -195,7 +195,7 @@ def test_ai_switched_off_everywhere(client, monkeypatch):
     monkeypatch.setattr(get_settings(), "ai_enabled", False)
     assert client.get("/api/auth/me").json()["features"] == {"ai": False}
     for method, path, body in (("get", "/api/ai/settings", None), ("put", "/api/ai/settings", {"enabled": True}), ("post", "/api/ai/test", None), ("get", "/api/ai/models", None),
-                               ("post", "/api/ai/logs", {"text": "x"}), ("post", "/api/ai/ask", {"messages": [{"role": "user", "content": "hi"}]}), ("post", "/api/incidents/1/explain", None)):
+                               ("post", "/api/ai/logs", {"text": "x"}), ("post", "/api/ai/log-line", {"line": "x", "before": [], "after": [], "source": "x"}), ("post", "/api/ai/ask", {"messages": [{"role": "user", "content": "hi"}]}), ("post", "/api/incidents/1/explain", None)):
         r = getattr(client, method)(path, headers=CSRF, **({"json": body} if body is not None else {}))
         assert r.status_code == 404 and "AI_ENABLED=false" in r.json()["detail"], (path, r.status_code)
     assert client.get("/api/anomalies").status_code == 200                     # statistics, not AI: still available
