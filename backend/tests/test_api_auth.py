@@ -29,10 +29,14 @@ CSRF = {"X-Requested-With": "smwatch"}
 @pytest.fixture(autouse=True)
 def fresh_stats_cache():
     """Tests write history with past timestamps; production only ever writes "now" (cached past days never change there)."""
-    from app.stats import clear_cache
-    clear_cache()
+    from app.stats import clear_cache, forget_days
+    def reset():
+        with database.SessionLocal() as db:      # stored daily uptime too: tests write checks into days earlier tests already counted
+            forget_days(db); db.commit()
+        clear_cache()
+    reset()
     yield
-    clear_cache()
+    reset()
 
 
 @pytest.fixture()
@@ -104,7 +108,9 @@ def test_push_agent_lifecycle(client):
     ok = anon.post("/api/agent/report", json=report(), headers=auth)
     assert ok.status_code == 200 and ok.json()["interval_seconds"] == 30 and ok.json()["status"] == "up"
 
-    # threshold breach -> alert status + open incident; queued (not delivered inline)
+    # threshold breach: confirmed first (ALERT_AFTER_FAILURES=2 by default), then alert status + open incident; queued (not delivered inline)
+    assert anon.post("/api/agent/report", json=report(cpu=99), headers=auth).json()["status"] == "up"
+    assert client.get("/api/incidents?state=open").json() == []
     assert anon.post("/api/agent/report", json=report(cpu=99), headers=auth).json()["status"] == "alert"
     incidents = client.get("/api/incidents?state=open").json()
     assert [i["target_name"] for i in incidents] == ["edge-1"] and incidents[0]["severity"] == "warning"
@@ -114,7 +120,7 @@ def test_push_agent_lifecycle(client):
     assert client.get("/api/incidents?state=resolved").json()[0]["resolved_at"]
 
     history = client.get(f"/api/servers/{sid}/history?range=1h").json()
-    assert history["samples"] == 3 and history["points"] and history["uptime_pct"] == 100.0
+    assert history["samples"] == 4 and history["points"] and history["uptime_pct"] == 100.0   # the held report's metrics are kept too
     dash = client.get("/api/dashboard").json()
     srv = next(s for s in dash["servers"] if s["id"] == sid)
     assert srv["last_status"] == "up" and srv["last_metrics"]["hostname"] == "box" and srv["uptime_24h"] == 100.0
@@ -1827,12 +1833,13 @@ def test_real_traffic_target_marks_the_server_over_a_limit(client):
     r = client.put(f"/api/performance/targets/server/{sid}", headers=CSRF, json={"percentile": "p95", "threshold_ms": 100, "window_minutes": 30})
     assert r.status_code == 200
     slow = _traffic(100, [0, 0, 0, 0, 100], bounds=(10, 50, 100, 500), max_ms=900, sum_ms=100 * 700)
+    assert anon.post("/api/agent/report", json=report(traffic=slow), headers=auth).json()["status"] == "up"      # confirmed first (2 reports in a row)
     out = anon.post("/api/agent/report", json=report(traffic=slow), headers=auth).json()
     assert out["status"] == "alert"
     srv = next(s for s in client.get("/api/dashboard").json()["servers"] if s["id"] == sid)
     assert srv["last_status"] == "alert" and "Slow responses: p95" in json.dumps(client.get("/api/incidents?state=open").json())
     data = next(x for x in client.get("/api/performance/traffic?range=1h").json()["servers"] if x["server_id"] == sid)
-    assert data["target"]["breaching"] is True and data["target"]["value"] > 100 and data["target"]["samples"] == 100 and data["last_data_at"]
+    assert data["target"]["breaching"] is True and data["target"]["value"] > 100 and data["target"]["samples"] == 200 and data["last_data_at"]
     fast = _traffic(200, [190, 10, 0, 0, 0], bounds=(10, 50, 100, 500), max_ms=40, sum_ms=200 * 12)
     for _ in range(3):
         anon.post("/api/agent/report", json=report(traffic=fast), headers=auth)

@@ -4,7 +4,7 @@ import { FormEvent, useState } from 'react';
 import { MonitorAlertSettings, alertsOf, type MonitorAlerts } from '../components/alertpick';
 import { AvailabilityPanel } from '../components/availability';
 import { AreaChart } from '../components/charts';
-import { Empty, Field, Icon, Modal, StatusPill } from '../components/ui';
+import { ConfirmChecksField, ConfirmingBadge, Empty, Field, Icon, Modal, StatusPill } from '../components/ui';
 import { api, del, post, put } from '../lib/api';
 import { pollFor, useApp, useLimits, usePoll } from '../lib/app';
 import { clock, ms, pct, timeAgo, uptimeClass } from '../lib/format';
@@ -83,7 +83,7 @@ function ServiceDetail({ service }: { service: Service }) {
         {canOperate && <button className="btn sm" onClick={() => setEditing(true)}>Edit</button>}
         {canManage && <button className="btn sm danger" onClick={remove}>Remove</button>}
       </div>
-      <p className="muted" style={{ marginTop: -12, marginBottom: 18 }}><a href={service.url} target="_blank" rel="noreferrer noopener">{service.url}</a> · expects HTTP {service.expected_status}{service.keyword ? ` and a page that ${service.keyword_mode === 'absent' ? 'does not contain' : 'contains'} “${service.keyword}”` : ''} · every {service.interval_seconds}s · times out after {service.timeout_seconds_effective ?? 10}s</p>
+      <p className="muted" style={{ marginTop: -12, marginBottom: 18 }}><a href={service.url} target="_blank" rel="noreferrer noopener">{service.url}</a> · expects HTTP {service.expected_status}{service.keyword ? ` and a page that ${service.keyword_mode === 'absent' ? 'does not contain' : 'contains'} “${service.keyword}”` : ''} · every {service.interval_seconds}s · alerts after {service.confirm_checks_effective ?? 2} failed check{service.confirm_checks_effective === 1 ? '' : 's'} in a row · times out after {service.timeout_seconds_effective ?? 10}s <ConfirmingBadge failCount={service.fail_count} needed={service.confirm_checks_effective} status={service.last_status} /></p>
       {service.last_status === 'down' && service.last_error && <div className="err" style={{ marginBottom: 16 }}>{service.last_error}</div>}
 
       <div className="grid g4">
@@ -147,6 +147,7 @@ function ServiceForm({ existing, onClose }: { existing?: Service; onClose: () =>
   const [url, setUrl] = useState(existing?.url ?? 'https://');
   const [expected, setExpected] = useState(String(existing?.expected_status ?? 200));
   const [interval, setIntervalValue] = useState(String(existing?.interval_seconds ?? 60));
+  const [confirmChecks, setConfirmChecks] = useState(existing?.confirm_checks ? String(existing.confirm_checks) : '');
   const [isPublic, setPublic] = useState(existing?.public ?? false);
   const [alerts, setAlerts] = useState<MonitorAlerts>(alertsOf(existing));
   const [error, setError] = useState('');
@@ -157,7 +158,7 @@ function ServiceForm({ existing, onClose }: { existing?: Service; onClose: () =>
     setBusy(true); setError('');
     const days = certDaysText.split(/[\s,]+/).filter(Boolean).map(Number);
     if (days.some(x => !Number.isInteger(x) || x < 1 || x > 365)) { setBusy(false); setError('Certificate alert days must be whole numbers between 1 and 365, e.g. 30, 14, 7'); return; }
-    const body = { name, url, expected_status: Number(expected), interval_seconds: Number(interval), public: isPublic, ...alerts, timeout_seconds: timeout ? Number(timeout) : null, cert_check: certCheck, cert_alert_days: days, keyword: keyword.trim() || null, keyword_mode: keywordMode };
+    const body = { name, url, expected_status: Number(expected), interval_seconds: Number(interval), confirm_checks: confirmChecks ? Number(confirmChecks) : null, public: isPublic, ...alerts, timeout_seconds: timeout ? Number(timeout) : null, cert_check: certCheck, cert_alert_days: days, keyword: keyword.trim() || null, keyword_mode: keywordMode };
     try {
       if (existing) await put(`/services/${existing.id}`, body); else await post('/services', body);
       toast(existing ? 'Service updated' : 'Service added'); await refresh(); onClose();
@@ -172,6 +173,7 @@ function ServiceForm({ existing, onClose }: { existing?: Service; onClose: () =>
           <Field label="URL"><input type="url" value={url} onChange={e => setUrl(e.target.value)} required /></Field>
           <Field label="Expected HTTP status"><input type="number" min={100} max={599} value={expected} onChange={e => setExpected(e.target.value)} required /></Field>
           <Field label="Interval (seconds)"><input type="number" min={15} max={86400} value={interval} onChange={e => setIntervalValue(e.target.value)} required /></Field>
+          <ConfirmChecksField value={confirmChecks} onChange={setConfirmChecks} interval={Number(interval) || 60} fallback={lim.alertAfter} />
           <Field label="Timeout (seconds)" hint={`Slower answers count as a failed check. Empty = ${lim.serviceTimeout} s (default).`}><input type="number" min={1} max={120} value={timeout} onChange={e => setTimeoutValue(e.target.value)} placeholder={String(lim.serviceTimeout)} /></Field>
         </div>
         <fieldset className="cert-fs">

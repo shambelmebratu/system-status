@@ -34,6 +34,7 @@ class ServerCreate(AlertPrefs):
     host: str = Field(default="", max_length=255)
     monitor_mode: str = Field(default="agent", pattern="^(ping|agent|push)$")
     check_interval_seconds: int = Field(default_factory=lambda: get_settings().check_interval_seconds, ge=5, le=86400)
+    confirm_checks: int | None = Field(default=None, ge=1, le=50)       # failed checks in a row before alerting; null = ALERT_AFTER_FAILURES
     endpoint: str = Field(default="", max_length=500)
     agent_token: str = ""
     enabled: bool = True
@@ -60,6 +61,7 @@ class ServiceCreate(AlertPrefs):
     url: str = Field(min_length=8, max_length=500)
     expected_status: int = Field(200, ge=100, le=599)
     interval_seconds: int = Field(60, ge=15, le=86400)
+    confirm_checks: int | None = Field(default=None, ge=1, le=50)       # failed checks in a row before alerting; null = ALERT_AFTER_FAILURES
     enabled: bool = True
     public: bool = False
     server_id: int | None = None

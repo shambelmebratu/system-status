@@ -546,8 +546,8 @@ def delete_cluster(cluster_id: int, request: Request, user: dict = Depends(requi
     if cluster:
         audit(db, request, "k8s.cluster_delete", user=user, target=f"cluster:{cluster.id}", detail=cluster.name)
         db.execute(delete(CheckResult).where(CheckResult.target_type == "cluster", CheckResult.target_id == cluster.id))
-        from .stats import clear_cache
-        clear_cache()
+        from .stats import forget_days
+        forget_days(db, "cluster", cluster.id)
         db.execute(delete(Incident).where(Incident.target_type == "cluster", Incident.target_id == cluster.id))
         db.execute(delete(ClusterSample).where(ClusterSample.cluster_id == cluster.id))
         db.execute(delete(K8sRequest).where(K8sRequest.cluster_id == cluster.id))

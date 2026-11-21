@@ -6,7 +6,7 @@ from datetime import date, datetime, timedelta, timezone
 from sqlalchemy import Integer, case, func, select
 from sqlalchemy.orm import Session
 
-from .models import CheckResult, MetricSample, TrafficSample
+from .models import CheckDaily, CheckResult, MetricSample, TrafficSample
 
 METRIC_KEYS = ("cpu", "memory", "disk", "load", "swap", "net_rx_bps", "net_tx_bps")
 
@@ -55,15 +55,30 @@ def bucketize(rows: list[tuple[datetime, dict]], since: datetime, until: datetim
 # first day of a rolling window) is counted live. Results are exact; they are just not recomputed from millions of rows each time.
 CHART_POINTS = 120
 _lock = threading.Lock()
+_compute_lock = threading.Lock()   # one request counts missing days at a time; the others wait for its result instead of repeating it
 _day_cache: dict[date, dict[tuple[str, int], tuple[int, int]]] = {}     # finished UTC day -> {(kind, id): (checks, available)}
 _ttl_cache: dict[tuple, tuple[float, object]] = {}
+DONE = "_"                          # check_daily marker: this day has been counted
 
 
-def clear_cache() -> None:
-    """Forget cached uptime (after history is deleted or purged)."""
+def clear_cache(days: bool = True) -> None:
+    """Forget cached figures. days=False keeps the per-day uptime (it only changes when history is deleted or purged)."""
     with _lock:
-        _day_cache.clear()
+        if days:
+            _day_cache.clear()
         _ttl_cache.clear()
+
+
+def forget_days(db: Session, kind: str | None = None, target_id: int | None = None, before: date | None = None) -> None:
+    """Deletes stored daily totals when the history behind them is deleted: one monitor's, or every day before `before`, or all."""
+    from sqlalchemy import delete
+    q = delete(CheckDaily)
+    if kind is not None:
+        q = q.where(CheckDaily.target_type == kind, CheckDaily.target_id == target_id)
+    if before is not None:
+        q = q.where(CheckDaily.day < before)
+    db.execute(q)
+    clear_cache()
 
 
 def ttl_cached(key: tuple, seconds: float, compute):
@@ -116,29 +131,95 @@ def live_totals(db: Session, start: datetime, end: datetime, kind: str | None = 
     return {(k, i): (int(total), int(ok or 0)) for k, i, total, ok in db.execute(query.group_by(CheckResult.target_type, CheckResult.target_id)).all()}
 
 
-def ensure_days(db: Session, first: date, last: date) -> None:
-    """Counts every finished day in [first, last] that is not cached yet, in ONE grouped query."""
-    today = datetime.now(timezone.utc).date()
-    last = min(last, today - timedelta(days=1))
+def _missing(first: date, last: date) -> list[date]:
     with _lock:
-        missing = [first + timedelta(days=n) for n in range((last - first).days + 1) if first + timedelta(days=n) not in _day_cache]
-    if not missing:
-        return
-    lo, hi = min(missing), max(missing)
-    day = day_of(db, CheckResult.checked_at)
-    rows = db.execute(select(day, CheckResult.target_type, CheckResult.target_id, func.count(), func.sum(available(CheckResult.status)))
-                      .where(CheckResult.checked_at >= midnight(lo), CheckResult.checked_at < midnight(hi + timedelta(days=1)))
-                      .group_by(day, CheckResult.target_type, CheckResult.target_id)).all()
-    filled: dict[date, dict] = {d: {} for d in missing}
-    for when, kind, target_id, total, ok in rows:
-        d = _as_date(when)
-        if d in filled:
-            filled[d][(kind, target_id)] = (int(total), int(ok or 0))
+        return [first + timedelta(days=n) for n in range((last - first).days + 1) if first + timedelta(days=n) not in _day_cache]
+
+
+def _remember(filled: dict[date, dict]) -> None:
     with _lock:
         _day_cache.update(filled)
         if len(_day_cache) > 800:
             for old in sorted(_day_cache)[: len(_day_cache) - 800]:
                 del _day_cache[old]
+
+
+def _load_stored(db: Session, days: list[date]) -> None:
+    """Fills the memory cache from check_daily for the days that are stored there (counted earlier, by any process)."""
+    lo, hi = min(days), max(days)
+    filled: dict[date, dict] = {}
+    for day, kind, target_id, total, ok in db.execute(select(CheckDaily.day, CheckDaily.target_type, CheckDaily.target_id, CheckDaily.total, CheckDaily.ok)
+                                                      .where(CheckDaily.day >= lo, CheckDaily.day <= hi)).all():
+        slot = filled.setdefault(_as_date(day), {})
+        if kind != DONE:
+            slot[(kind, target_id)] = (int(total), int(ok))
+    _remember({d: v for d, v in filled.items() if d in set(days)})
+
+
+def _count_and_store(db: Session, days: list[date]) -> None:
+    """Counts the given finished days from the check results (one grouped query) and stores them, marker included."""
+    lo, hi = min(days), max(days)
+    day = day_of(db, CheckResult.checked_at)
+    rows = db.execute(select(day, CheckResult.target_type, CheckResult.target_id, func.count(), func.sum(available(CheckResult.status)))
+                      .where(CheckResult.checked_at >= midnight(lo), CheckResult.checked_at < midnight(hi + timedelta(days=1)))
+                      .group_by(day, CheckResult.target_type, CheckResult.target_id)).all()
+    wanted = set(days)
+    filled: dict[date, dict] = {d: {} for d in days}
+    for when, kind, target_id, total, ok in rows:
+        d = _as_date(when)
+        if d in wanted:
+            filled[d][(kind, target_id)] = (int(total), int(ok or 0))
+    records = [{"day": d, "target_type": k, "target_id": i, "total": t, "ok": o} for d, v in filled.items() for (k, i), (t, o) in v.items()]
+    records += [{"day": d, "target_type": DONE, "target_id": 0, "total": 0, "ok": 0} for d in days]
+    try:
+        if is_pg(db):
+            from sqlalchemy.dialects.postgresql import insert
+        else:
+            from sqlalchemy.dialects.sqlite import insert
+        for n in range(0, len(records), 2000):
+            db.execute(insert(CheckDaily).values(records[n:n + 2000]).on_conflict_do_nothing())
+        db.commit()
+    except Exception:   # noqa: BLE001  (storing is an optimisation: the figures are still right for this request)
+        db.rollback()
+    _remember(filled)
+
+
+def ensure_days(db: Session, first: date, last: date) -> None:
+    """Makes the per-day uptime of every finished day in [first, last] available: from memory, else from the check_daily table, else
+    counted once from the check results (and stored, so no process ever counts that day again)."""
+    today = datetime.now(timezone.utc).date()
+    last = min(last, today - timedelta(days=1))
+    if last < first or not _missing(first, last):
+        return
+    _load_stored(db, _missing(first, last))
+    if not _missing(first, last):
+        return
+    oldest = ttl_cached(("oldest-check",), 300, lambda: db.scalar(select(func.min(CheckResult.checked_at))))
+    empty = [d for d in _missing(first, last) if oldest is None or d < aware(oldest).date()]
+    if empty:                                       # before the oldest check there is nothing to count
+        _remember({d: {} for d in empty})
+    if not _missing(first, last):
+        return
+    with _compute_lock:
+        missing = _missing(first, last)            # another request may have counted them while this one waited
+        if missing:
+            _count_and_store(db, missing)
+
+
+def backfill_days(db: Session, max_days: int = 14) -> int:
+    """Worker hook: counts up to `max_days` finished days not stored yet, newest first, back to the oldest check result.
+    Pages then never have to count history themselves (also right after an upgrade). Returns how many days were counted."""
+    today = datetime.now(timezone.utc).date()
+    oldest = db.scalar(select(func.min(CheckResult.checked_at)))
+    if oldest is None:
+        return 0
+    first = max(aware(oldest).date(), today - timedelta(days=400))
+    stored = set(_as_date(d) for d in db.scalars(select(CheckDaily.day).where(CheckDaily.target_type == DONE, CheckDaily.day >= first)).all())
+    todo = [today - timedelta(days=n) for n in range(1, (today - first).days + 1) if today - timedelta(days=n) not in stored][:max_days]
+    for d in todo:                                   # one day per query: each stays small and quick
+        with _compute_lock:
+            _count_and_store(db, [d])
+    return len(todo)
 
 
 def day_totals(day: date) -> dict[tuple[str, int], tuple[int, int]]:

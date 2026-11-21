@@ -279,7 +279,7 @@ class ScheduleIn(BaseModel):
 def schedule_view(db: Session) -> dict:
     cfg = secscan.schedule(db)
     last = db.scalar(select(func.max(SecurityScan.started_at)))
-    return {k: cfg.get(k) for k in ("scan_hours", "threat_minutes", "updates_hours", "daily_login_alert", "updated_by", "updated_at")} | {"last_scan_at": aware(last).isoformat() if last else None, "job": dict(secscan.JOB)}
+    return {k: cfg.get(k) for k in ("scan_hours", "threat_minutes", "updates_hours", "daily_login_alert", "updated_by", "updated_at")} | {"last_scan_at": aware(last).isoformat() if last else None, "job": secscan.job_state(db)}
 
 
 @router.get("/schedule")
@@ -309,9 +309,10 @@ def scan_all(payload: ScanAllIn, request: Request, user: dict = Depends(require_
     update check at its next report. Covers the servers this person can see (narrowed by the page's server filter)."""
     import threading
     import time
-    if secscan.JOB["running"]:
+    job = secscan.job_state(db)
+    if job["running"]:
         raise HTTPException(409, "A scan of everything is already running")
-    finished = secscan.JOB.get("finished_at")
+    finished = job.get("finished_at")
     if finished and time.time() - datetime.fromisoformat(finished).timestamp() < 120:
         raise HTTPException(429, "Everything was scanned less than 2 minutes ago")
     servers = visible_servers(db, user, payload.server)
@@ -325,9 +326,9 @@ def scan_all(payload: ScanAllIn, request: Request, user: dict = Depends(require_
     secscan.request_agent_rescan(db, agents, user["email"])
     audit(db, request, "security.scan_all", user=user, detail=f"{len(targets)} exposure/TLS scans; {len(agents)} agents asked to re-check" + (f"; filter {payload.server}" if payload.server else ""))
     db.commit()
-    secscan.JOB.update(running=True, total=len(targets), done=0, failed=0)       # visible at once, before the thread starts
+    job = secscan.job_save(running=True, total=len(targets), done=0, failed=0, finished_at=None, started_by=user["email"])   # visible at once
     threading.Thread(target=secscan.scan_all, args=(targets, user["email"]), daemon=True, name="security-scan-all").start()
-    return {"scans": len(targets), "agents": len(agents), "job": dict(secscan.JOB)}
+    return {"scans": len(targets), "agents": len(agents), "job": job}
 
 
 _last_recheck: dict[int, float] = {}

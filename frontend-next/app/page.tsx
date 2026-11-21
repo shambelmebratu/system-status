@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { Logo } from './components/logo';
 import { Icon } from './components/ui';
 import { api, post } from './lib/api';
-import { AppProvider, useApp } from './lib/app';
+import { AppProvider, useApp, clearPollCache } from './lib/app';
 import { Audit } from './views/Audit';
 import { Channels } from './views/Channels';
 import { Kubernetes } from './views/Kubernetes';
@@ -46,10 +46,10 @@ export default function Home() {
   }, []);
 
   const loadMe = useCallback(() => api<Me>('/auth/me').then(me => setSession(me)).catch(() => setSession(null)), []);
-  const onUnauthorized = useCallback(() => setSession(null), []);
+  const onUnauthorized = useCallback(() => { clearPollCache(); setSession(null); }, []);
   if (session === 'loading') return null;
   if (!session) return <Login company={company} onSignedIn={() => void loadMe()} />;
-  const signOut = () => { void post('/auth/logout').catch(() => undefined); setSession(null); };
+  const signOut = () => { void post('/auth/logout').catch(() => undefined); clearPollCache(); setSession(null); };
   // A temporary password (new account or admin reset) must be replaced before anything else is reachable.
   if (session.must_change_password) return <ForcePasswordChange company={company} me={session} onDone={() => void loadMe()} onSignOut={signOut} />;
   if (session.mfa_setup_required) return (

@@ -1,6 +1,6 @@
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, func
+from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .crypto import EncryptedText
@@ -49,6 +49,7 @@ class Server(Base):
     last_error: Mapped[str | None] = mapped_column(Text)
     last_metrics: Mapped[str | None] = mapped_column(Text)
     fail_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    confirm_checks: Mapped[int | None] = mapped_column(Integer)          # failed checks in a row before an alert (NULL = ALERT_AFTER_FAILURES)
     public: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     # Per-monitor alert settings (NULL = inherit): which alert types are sent, to which channels, and how often to repeat.
     alert_events: Mapped[str | None] = mapped_column(String(100))      # down,alert,recovered,reminder
@@ -103,6 +104,7 @@ class Service(Base):
     cert_error: Mapped[str | None] = mapped_column(Text)
     cert_alerted: Mapped[int | None] = mapped_column(Integer)          # the smallest threshold already alerted for this certificate (-1 = expired)
     fail_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    confirm_checks: Mapped[int | None] = mapped_column(Integer)          # failed checks in a row before an alert (NULL = ALERT_AFTER_FAILURES)
     last_status: Mapped[str] = mapped_column(String(20), default="unknown")
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_latency_ms: Mapped[float | None] = mapped_column(Float)
@@ -636,3 +638,14 @@ class ClusterFinding(Base):
     acknowledged_by: Mapped[str | None] = mapped_column(String(320))
     acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     note: Mapped[str] = mapped_column(Text, default="")
+
+
+class CheckDaily(Base):
+    """Checks and available checks per monitor per finished UTC day: uptime over weeks or a year reads these few rows instead of
+    millions of check results. A row with target_type "_" marks a day as counted (also when nothing was checked that day)."""
+    __tablename__ = "check_daily"
+    day: Mapped[date] = mapped_column(Date, primary_key=True)
+    target_type: Mapped[str] = mapped_column(String(20), primary_key=True)
+    target_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    total: Mapped[int] = mapped_column(Integer, default=0)
+    ok: Mapped[int] = mapped_column(Integer, default=0)

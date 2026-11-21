@@ -128,7 +128,7 @@ def report(payload: AgentReport, request: Request, authorization: str | None = H
     from .secscan import agent_config
     reply["security"] = agent_config(db, server.id)   # how often to run the threat scan / update check, and "scan now" requests   # the agent uses these histogram boundaries from its next report on
     reply["log_policy"] = policy_lib.compile_for_agent(policy_lib.parse(server.log_policy))   # the agent enforces this too
-    return {**reply, "status": status, "interval_seconds": server.check_interval_seconds}
+    return {**reply, "status": server.last_status, "interval_seconds": server.check_interval_seconds}   # the published status (a problem being confirmed is not one yet)
 
 
 @router.get("/install.sh", response_class=PlainTextResponse)

@@ -34,7 +34,7 @@ def in_maintenance(db: Session, target_type: str, target_id: int) -> str | None:
 
 
 def changed() -> None:
-    clear_cache()
+    clear_cache(days=False)     # maintenance windows do not change past uptime
 
 
 # ------------------------------------------------------------------------------------------------ heartbeats

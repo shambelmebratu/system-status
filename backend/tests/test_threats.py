@@ -232,7 +232,7 @@ def test_scan_schedule_and_scan_all(client, monkeypatch):
     reply = anon.post("/api/agent/report", headers=auth, json={**BASE, "hostname": "sched-1"}).json()
     assert reply["security"]["threat_minutes"] == 30 and reply["security"]["rescan"]
     assert {"security.schedule", "security.scan_all"} <= {e["action"] for e in client.get("/api/audit?category=security").json()}
-    secscan.JOB["finished_at"] = None
+    secscan.job_save(finished_at=None)
 
 
 def test_agent_adopts_schedule_and_rescans(agent, monkeypatch):
@@ -354,3 +354,60 @@ def test_sign_in_works_on_the_lan_when_public_url_is_https(monkeypatch):
     assert main.cookie_secure(req("192.168.1.10", proto="https")) is True                           # any HTTPS request: HTTPS-only
     monkeypatch.setattr(main.settings, "cookie_secure", True)
     assert main.cookie_secure(req("192.168.1.10")) is True                                          # COOKIE_SECURE=true always wins
+
+
+def test_alert_after_n_failed_checks(client, monkeypatch):
+    """Per server / service: how many failed checks in a row before an alert (1 = at once); metrics are kept while confirming."""
+    from app import monitoring as m
+    from app.models import Service
+    sign_in(client)
+    monkeypatch.setattr(m, "deliver_event", _real_deliver_event)
+    anon = TestClient(main.app)
+    sid, auth = _enroll(client, anon, "confirm-1")
+    _report(anon, auth, hostname="confirm-1")
+    srv = next(s for s in client.get("/api/dashboard").json()["servers"] if s["id"] == sid)
+    assert srv["confirm_checks"] is None and srv["confirm_checks_effective"] == 2
+    client.put(f"/api/servers/{sid}", headers=CSRF, json={**{k: srv[k] for k in ("name", "host", "monitor_mode", "check_interval_seconds")}, "confirm_checks": 3})
+    states = []
+    for _ in range(3):
+        states.append(anon.post("/api/agent/report", headers=auth, json={**BASE, "hostname": "confirm-1", "cpu": 99}).json()["status"]); time.sleep(2.05)
+    assert states == ["unknown", "unknown", "alert"]          # saving the settings re-checks the server; only the third breach in a row alerts
+    with database.SessionLocal() as db:
+        assert db.query(AlertEvent).filter_by(target_type="server", target_id=sid, state="alert").count() == 1
+    assert client.get(f"/api/servers/{sid}/history?range=1h").json()["samples"] == 4                 # every report's metrics kept
+    svc = client.post("/api/services", headers=CSRF, json={"name": "confirm-svc", "url": "https://example.com", "confirm_checks": 1}).json()
+    assert svc["confirm_checks_effective"] == 1
+    with database.SessionLocal() as db:
+        out = m.apply_service_result(db, db.get(Service, svc["id"]), {"status": "up", "latency_ms": 20.0, "http_status": 200, "error": None})
+        out = m.apply_service_result(db, db.get(Service, svc["id"]), {"status": "down", "latency_ms": None, "http_status": None, "error": "refused"})
+        assert out["status"] == "down" and not out["held"]                                           # 1 = alert at the first failure
+    assert client.post("/api/services", headers=CSRF, json={"name": "bad", "url": "https://example.com", "confirm_checks": 0}).status_code == 422
+
+
+def test_daily_uptime_is_stored_once(client):
+    """Past days' uptime is counted once, stored in check_daily, and read back after a restart (memory cleared) without recounting."""
+    from datetime import datetime, timedelta, timezone
+    from app import stats
+    from app.models import CheckDaily, CheckResult
+    sign_in(client)
+    svc = client.post("/api/services", headers=CSRF, json={"name": "daily-1", "url": "https://example.org"}).json()["id"]
+    now = datetime.now(timezone.utc)
+    with database.SessionLocal() as db:
+        for d in range(1, 6):
+            for k, st in enumerate(["up", "up", "up", "down"]):
+                db.add(CheckResult(target_type="service", target_id=svc, status=st, checked_at=now - timedelta(days=d, minutes=k)))
+        db.commit()
+        assert stats.backfill_days(db, 30) >= 5                                                      # the worker fills past days
+        rows = db.query(CheckDaily).filter_by(target_type="service", target_id=svc).all()
+        assert len(rows) >= 4 and all(r.total >= 3 for r in rows)
+    stats.clear_cache()                                                                              # like an API restart
+    real = stats._count_and_store
+    stats._count_and_store = lambda *a, **k: (_ for _ in ()).throw(AssertionError("recounted"))
+    try:
+        week = client.get(f"/api/services/{svc}/availability?range=1mo").json()
+    finally:
+        stats._count_and_store = real
+    assert week["checks"] == 20 and week["uptime_pct"] == 75.0                                       # from the stored days, nothing recounted
+    client.delete(f"/api/services/{svc}", headers=CSRF)
+    with database.SessionLocal() as db:
+        assert db.query(CheckDaily).filter_by(target_type="service", target_id=svc).count() == 0      # deleting the monitor removes them

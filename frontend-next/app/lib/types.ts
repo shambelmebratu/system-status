@@ -12,7 +12,7 @@ export type Metrics = {
 export type CpuBreakdown = { user?: number; nice?: number; system?: number; idle?: number; iowait?: number; irq?: number; softirq?: number; steal?: number };
 
 export type Server = {
-  id: number; name: string; host: string; monitor_mode: Mode; check_interval_seconds: number; endpoint: string;
+  id: number; name: string; host: string; monitor_mode: Mode; check_interval_seconds: number; endpoint: string; confirm_checks?: number | null; confirm_checks_effective?: number; fail_count?: number;
   agent_token: string; enabled: boolean; cpu_threshold: number; memory_threshold: number; disk_threshold: number;
   load_threshold: number; swap_threshold: number; process_names: string; process_threshold: number;
   last_status: Status; last_checked_at: string | null; last_seen_at: string | null; last_error: string | null;
@@ -20,7 +20,7 @@ export type Server = {
   token_issued_at?: string | null; token_rotation_pending?: boolean; last_agent_ip?: string | null; public_ip?: string | null; private_ips?: string[]; alert_events?: string[]; alert_channels?: number[]; alert_reminder_minutes?: number | null; same_machine_as?: { id: number; name: string }[];
 };
 export type Service = {
-  id: number; name: string; url: string; expected_status: number; interval_seconds: number; enabled: boolean; public: boolean;
+  id: number; name: string; url: string; expected_status: number; interval_seconds: number; enabled: boolean; public: boolean; confirm_checks?: number | null; confirm_checks_effective?: number; fail_count?: number;
   server_id: number | null; last_status: Status; last_checked_at: string | null; last_latency_ms: number | null;
   last_http_status: number | null; last_error: string | null; uptime_24h: number | null;
   alert_events?: string[]; alert_channels?: number[]; alert_reminder_minutes?: number | null;
@@ -40,7 +40,7 @@ export type Dashboard = {
   servers: Server[]; services: Service[]; events: AlertEvent[];
   threshold_defaults: { cpu: number; memory: number; disk: number; load: number; swap: number; process: number; server_interval_seconds: number };
   agents?: { latest: string; latest_k8s: string };
-  limits?: { reminder_minutes: number; usage_warn_percent: number; usage_bad_percent: number; k8s_offline_seconds: number; enrollment_default_minutes: number; enrollment_max_minutes: number; log_result_ttl_minutes: number; service_timeout_seconds?: number; cert_alert_days?: string; cert_check_hours?: number };
+  limits?: { reminder_minutes: number; alert_after_failures?: number; usage_warn_percent: number; usage_bad_percent: number; k8s_offline_seconds: number; enrollment_default_minutes: number; enrollment_max_minutes: number; log_result_ttl_minutes: number; service_timeout_seconds?: number; cert_alert_days?: string; cert_check_hours?: number };
   summary: { servers: number; services: number; up: number; alerts: number; open_incidents: number };
 };
 export type Point = { t: string; [key: string]: number | string | undefined };

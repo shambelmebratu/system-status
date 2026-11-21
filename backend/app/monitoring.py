@@ -624,15 +624,27 @@ def queue_event(session, target_type: str, target, severity: str, message: str, 
         deliver_event(event, session)
 
 
-def settle_status(target, raw_status: str) -> str:
-    """Debounce: a healthy target must fail `alert_after_failures` checks in a row before it is published as down."""
-    if raw_status != "down":
+def confirm_checks(target) -> int:
+    """Failed checks in a row needed before an alert: the monitor's own setting, else ALERT_AFTER_FAILURES (1 = alert at once)."""
+    own = getattr(target, "confirm_checks", None)
+    return max(1, int(own if own else get_settings().alert_after_failures))
+
+
+def settle_status(target, raw_status: str, confirm_alerts: bool = False, from_unknown: bool = False) -> str:
+    """Debounce: a healthy target must fail `confirm_checks` checks in a row before it is published as down, or (servers, with
+    confirm_alerts) as over a threshold. from_unknown: also when its state is not known yet (new, or just edited), so saving a
+    monitor's settings never turns the next single failure into an alert. History keeps every check; recovery is published at once."""
+    bad = ("down", "alert") if confirm_alerts else ("down",)
+    if raw_status not in bad:
         target.fail_count = 0
         return raw_status
     target.fail_count = (target.fail_count or 0) + 1
-    if target.fail_count < get_settings().alert_after_failures and target.last_status in ("up", "alert"):
+    holdable = (("up",) if confirm_alerts else ("up", "alert")) + (("unknown",) if from_unknown else ())
+    if target.last_status in holdable and target.fail_count < confirm_checks(target):
         return target.last_status
-    return "down"
+    if raw_status == "down" and target.last_status == "alert" and target.fail_count < confirm_checks(target):
+        return "alert"
+    return raw_status
 
 
 def should_notify_again(session, target_type: str, target_id: int, minutes: int | None = None) -> bool:
@@ -659,7 +671,7 @@ def apply_service_result(session, service: Service, result: dict) -> dict:
         apply_certificate(session, service, result)
     except Exception:   # a certificate problem must never stop the uptime result from being recorded
         logger.exception("certificate check failed for service id=%s", service.id)
-    status = settle_status(service, raw_status)
+    status = settle_status(service, raw_status, from_unknown=True)
     if status == previous_status and raw_status == "down" and previous_status != "down":
         # Failure absorbed by the debounce: history keeps it, but no state change, incident or alert yet.
         session.commit()
@@ -708,17 +720,17 @@ def apply_server_result(session, server: Server, status: str, failures: list[str
     detail = error or "; ".join(failures) or None
     record_result(session, "server", server.id, raw_status, (metrics or {}).get("latency_ms"), None, detail)
     server.last_checked_at = now
-    status = settle_status(server, raw_status) if debounce else raw_status
-    if debounce is False and raw_status == "down":
+    status = settle_status(server, raw_status, confirm_alerts=True, from_unknown=True) if debounce else raw_status
+    if debounce is False and raw_status in ("down", "alert"):
         server.fail_count = (server.fail_count or 0) + 1
-    if status == previous and raw_status == "down" and previous != "down":
-        return  # failure absorbed by the debounce; recorded in history only
-    server.last_status = status
-    server.last_error = error
-    if metrics is not None:
+    if metrics is not None:   # graphs and the server page always get the latest numbers, also while a problem is being confirmed
         server.last_metrics = json.dumps(metrics)
         if all(key in metrics for key in ("cpu", "memory", "disk", "load", "swap")):  # ping-only checks carry no resource metrics
             session.add(MetricSample(server_id=server.id, ts=now, cpu=metrics["cpu"], cpu_peak=metrics.get("cpu_peak"), memory=metrics["memory"], disk=metrics["disk"], load=metrics["load"], swap=metrics["swap"], net_rx_bps=metrics.get("net_rx_bps"), net_tx_bps=metrics.get("net_tx_bps")))
+    if status == previous and raw_status in ("down", "alert") and previous not in ("down", "alert"):
+        return  # a problem not confirmed yet (fewer failed checks in a row than the monitor needs): history only, no alert
+    server.last_status = status
+    server.last_error = error
     resolved = sync_incident(session, "server", server, status, detail)
     if status == "down":
         if previous != "down" or should_notify_again(session, "server", server.id, reminder_minutes(server)):
@@ -901,12 +913,13 @@ def retry_pending_alerts(session) -> None:
 
 
 def _security_loop() -> None:
-    """Slow background work on its own thread, so it never delays the regular checks: scheduled exposure scans and TLS audits,
-    anomaly detection, and (when enabled) AI explanations of new incidents."""
+    """Slow background work on its own thread, so it never delays the regular checks: storing yesterday's (and older) uptime per
+    day, scheduled exposure scans and TLS audits, anomaly detection, and (when enabled) AI explanations of new incidents."""
     from . import ai, anomaly
     from .secscan import scans_due
     while True:
-        for name, job in (("security scan", scans_due), ("anomaly detection", lambda s: anomaly.run(s, ai.load(s)["anomaly_alerts"])), ("AI explanation", lambda s: get_settings().ai_enabled and ai.auto_explain(s))):
+        from .stats import backfill_days
+        for name, job in (("uptime per day", lambda s: backfill_days(s, 60)), ("security scan", scans_due), ("anomaly detection", lambda s: anomaly.run(s, ai.load(s)["anomaly_alerts"])), ("AI explanation", lambda s: get_settings().ai_enabled and ai.auto_explain(s))):
             session = SessionLocal()
             try:
                 job(session)

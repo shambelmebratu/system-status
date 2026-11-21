@@ -167,8 +167,8 @@ app.include_router(stats_router)
 def purge_history(db: Session, kind: str, target_id: int) -> None:
     db.execute(delete(CheckResult).where(CheckResult.target_type == kind, CheckResult.target_id == target_id))
     db.execute(delete(Incident).where(Incident.target_type == kind, Incident.target_id == target_id))
-    from .stats import clear_cache
-    clear_cache()
+    from .stats import forget_days
+    forget_days(db, kind, target_id)
 
 
 def ensure_unique_token(db: Session, token: str | None, exclude_server: int | None = None) -> None:
@@ -205,6 +205,9 @@ def serialize(item):
         result["timeout_seconds_effective"] = service_timeout(item)
         result.pop("cert_alerted", None)
     result.pop("token_hash", None)
+    if "confirm_checks" in result:   # servers and services: how many failed checks in a row before an alert, and how many so far
+        from .monitoring import confirm_checks
+        result["confirm_checks_effective"] = confirm_checks(item)
     if "last_agent_ip" in result and "monitor_mode" in result:   # servers: public and private addresses, resolved on the server
         result.update(server_addresses(item))
     if "pending_token_hash" in result:   # never expose a staged token; just whether a rotation is waiting for the agent
@@ -525,7 +528,7 @@ def dashboard(user: dict = Depends(require_user), db: Session = Depends(get_db))
         },
         "agents": {"latest": latest_server_agent(), "latest_k8s": latest_k8s_agent()},
         "limits": {
-            "reminder_minutes": settings.reminder_minutes, "usage_warn_percent": settings.usage_warn_percent, "usage_bad_percent": settings.usage_bad_percent, "k8s_offline_seconds": settings.k8s_offline_seconds,
+            "reminder_minutes": settings.reminder_minutes, "alert_after_failures": settings.alert_after_failures, "usage_warn_percent": settings.usage_warn_percent, "usage_bad_percent": settings.usage_bad_percent, "k8s_offline_seconds": settings.k8s_offline_seconds,
             "service_timeout_seconds": settings.service_timeout_seconds, "cert_alert_days": settings.cert_alert_days, "cert_check_hours": settings.cert_check_hours,
             "enrollment_default_minutes": settings.enrollment_default_minutes, "enrollment_max_minutes": settings.enrollment_max_minutes, "log_result_ttl_minutes": settings.log_result_ttl_minutes,
         },

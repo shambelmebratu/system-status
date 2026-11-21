@@ -10,7 +10,7 @@ import { SshPanel } from '../components/ssh';
 import { AgentUpdate } from '../components/agentupdate';
 import { MonitorAlertSettings, alertSummary, alertsOf, type MonitorAlerts } from '../components/alertpick';
 import { LogPolicyCard } from '../components/logpolicy';
-import { CodeBox, Empty, Field, Icon, Meter, Modal, StatusPill } from '../components/ui';
+import { CodeBox, ConfirmChecksField, ConfirmingBadge, Empty, Field, Icon, Meter, Modal, StatusPill } from '../components/ui';
 import { api, del, post, put } from '../lib/api';
 import { pollFor, useApp, useLimits, useNow, usePoll } from '../lib/app';
 import { bytesPerSecond, duration, isOlder, ms, pct, timeAgo } from '../lib/format';
@@ -259,7 +259,7 @@ function ServerDetail({ server }: { server: Server }) {
               </>}
               <tr><td className="muted">Alerts</td><td className="sm">{alertSummary(server, new Map(channels.map(c => [c.id, c.name])), lim.reminder)}</td></tr>
               <tr><td className="muted">Status page</td><td>{server.public ? 'Public' : 'Private'}</td></tr>
-              <tr><td className="muted">Interval</td><td>{server.check_interval_seconds}s</td></tr>
+              <tr><td className="muted">Interval</td><td>{server.check_interval_seconds}s · alerts after {server.confirm_checks_effective ?? lim.alertAfter} failed check{(server.confirm_checks_effective ?? lim.alertAfter) === 1 ? '' : 's'} in a row <ConfirmingBadge failCount={server.fail_count} needed={server.confirm_checks_effective} status={server.last_status} /></td></tr>
               <tr><td className="muted">Availability 24h</td><td>{pct(server.uptime_24h, 2)}</td></tr>
             </tbody></table>
           </section>
@@ -319,11 +319,13 @@ type Thresholds = { cpu: string; memory: string; disk: string; load: string; swa
 
 function ServerWizard({ existing, onClose }: { existing?: Server; onClose: () => void }) {
   const { data, toast, refresh, go } = useApp();
+  const lim = useLimits();
   const defaults = data!.threshold_defaults;
   const [mode, setMode] = useState<Mode | null>(existing ? existing.monitor_mode : null);
   const [name, setName] = useState(existing?.name ?? '');
   const [host, setHost] = useState(existing?.host ?? '');
   const [interval, setIntervalValue] = useState(String(existing?.check_interval_seconds ?? defaults.server_interval_seconds));
+  const [confirmChecks, setConfirmChecks] = useState(existing?.confirm_checks ? String(existing.confirm_checks) : '');
   const [endpoint, setEndpoint] = useState(existing?.endpoint ?? '');
   const [token, setToken] = useState('');
   const [processNames, setProcessNames] = useState(existing?.process_names ?? '');
@@ -342,7 +344,7 @@ function ServerWizard({ existing, onClose }: { existing?: Server; onClose: () =>
     event.preventDefault();
     setBusy(true); setError('');
     const body = {
-      name, host, monitor_mode: mode, check_interval_seconds: Number(interval), endpoint: mode === 'agent' ? endpoint : '', agent_token: mode === 'agent' ? token : '',
+      name, host, monitor_mode: mode, check_interval_seconds: Number(interval), confirm_checks: confirmChecks ? Number(confirmChecks) : null, endpoint: mode === 'agent' ? endpoint : '', agent_token: mode === 'agent' ? token : '',
       public: isPublic, ...alerts, process_names: processNames, cpu_threshold: Number(th.cpu), memory_threshold: Number(th.memory), disk_threshold: Number(th.disk),
       load_threshold: Number(th.load), swap_threshold: Number(th.swap), process_threshold: Number(th.process),
     };
@@ -381,6 +383,7 @@ function ServerWizard({ existing, onClose }: { existing?: Server; onClose: () =>
           <Field label="Name"><input value={name} onChange={e => setName(e.target.value)} placeholder="web-01" required autoFocus /></Field>
           {mode !== 'push' && <Field label="Host / IP"><input value={host} onChange={e => setHost(e.target.value)} placeholder="10.0.0.12" required /></Field>}
           <Field label="Interval (seconds)" hint={mode === 'push' ? 'How often the agent reports.' : undefined}><input type="number" min={5} max={86400} value={interval} onChange={e => setIntervalValue(e.target.value)} required /></Field>
+          <ConfirmChecksField value={confirmChecks} onChange={setConfirmChecks} interval={Number(interval) || 60} fallback={lim.alertAfter} />
           {mode === 'agent' && <>
             <Field label="Agent URL"><input value={endpoint} onChange={e => setEndpoint(e.target.value)} placeholder="http://10.0.0.12:9100" required /></Field>
             <Field label="Agent token" hint={existing ? 'Leave blank to keep the saved token.' : '32+ characters (openssl rand -hex 32)'}><input type="password" value={token} onChange={e => setToken(e.target.value)} required={!existing} minLength={token ? 32 : undefined} /></Field>

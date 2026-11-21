@@ -78,7 +78,7 @@ export function useLimits() {
   const l = data?.limits;
   return {
     warn: l?.usage_warn_percent ?? 70, bad: l?.usage_bad_percent ?? 90, offlineMs: (l?.k8s_offline_seconds ?? 120) * 1000,
-    reminder: l?.reminder_minutes ?? 30, enrollDefault: l?.enrollment_default_minutes ?? 15, enrollMax: l?.enrollment_max_minutes ?? 1440, logTtl: l?.log_result_ttl_minutes ?? 15,
+    reminder: l?.reminder_minutes ?? 30, alertAfter: l?.alert_after_failures ?? 2, enrollDefault: l?.enrollment_default_minutes ?? 15, enrollMax: l?.enrollment_max_minutes ?? 1440, logTtl: l?.log_result_ttl_minutes ?? 15,
     serviceTimeout: l?.service_timeout_seconds ?? 10, certDays: (l?.cert_alert_days ?? '30,14,7').split(',').map(Number).filter(Boolean), certHours: l?.cert_check_hours ?? 6,
   };
 }
@@ -94,12 +94,24 @@ export function useNow(ms = 1000) {
  *  - A tick is skipped while the previous request is still running, so a slow connection never piles requests up.
  *  - An answer that arrives after the deps changed is ignored (it belongs to the previous page or range).
  *  - keepWhileLoading: show the previous data until the new answer arrives (e.g. switching a graph's range) instead of a blank. */
+// What each poll showed last (per loader and its inputs), so going back to a page is instant: the last data shows at once while
+// fresh data loads. Memory only, bounded, and wiped at sign-out (clearPollCache) so one person never sees another's data.
+const lastValues = new Map<string, unknown>();
+export const clearPollCache = () => lastValues.clear();
+function remember(key: string, value: unknown) {
+  lastValues.delete(key); lastValues.set(key, value);
+  if (lastValues.size > 150) lastValues.delete(lastValues.keys().next().value as string);
+}
+
 export function usePoll<T>(load: () => Promise<T>, deps: unknown[], intervalMs = 15000, keepWhileLoading = false) {
-  const [value, setValue] = useState<T | null>(null);
+  const key = (() => { try { return `${load.toString()}|${JSON.stringify(deps)}`; } catch { return ''; } })();
+  const [value, setValue] = useState<T | null>(() => (key && lastValues.has(key) ? (lastValues.get(key) as T) : null));
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
   const fn = useRef(load);
   fn.current = load;
+  const keyRef = useRef(key);
+  keyRef.current = key;
   const generation = useRef(0);
   const inFlight = useRef(false);
   const run = useCallback(async (mine: number) => {
@@ -107,7 +119,7 @@ export function usePoll<T>(load: () => Promise<T>, deps: unknown[], intervalMs =
     inFlight.current = true;
     try {
       const result = await fn.current();
-      if (mine === generation.current) { setValue(result); setError(''); }
+      if (mine === generation.current) { setValue(result); setError(''); if (keyRef.current) remember(keyRef.current, result); }
     } catch (e) {
       if (mine === generation.current) setError((e as Error).message);
     } finally {
@@ -119,7 +131,7 @@ export function usePoll<T>(load: () => Promise<T>, deps: unknown[], intervalMs =
     generation.current++;
     inFlight.current = false;
     const mine = generation.current;
-    if (!keepWhileLoading) setValue(null);
+    if (!keepWhileLoading) setValue(key && lastValues.has(key) ? (lastValues.get(key) as T) : null);   // last time's data, or a clean "Loading…"
     setLoading(true);
     void run(mine);
     if (intervalMs <= 0) return;   // 0 = load once (reload() refreshes on demand)

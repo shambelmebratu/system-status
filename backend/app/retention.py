@@ -79,6 +79,8 @@ def _delete_older(db: Session, category: str, cutoff: datetime | None) -> int:
         return [] if cutoff is None else [column < cutoff]
 
     if category == "checks":
+        from .stats import forget_days
+        forget_days(db, before=cutoff.date() if cutoff else None)      # purged history: its daily uptime goes too
         stmt = delete(CheckResult).where(*older(CheckResult.checked_at))
     elif category == "metrics":
         n = db.execute(delete(MetricSample).where(*older(MetricSample.ts))).rowcount or 0
@@ -159,7 +161,7 @@ def run_scheduled(db: Session) -> dict | None:
 
 
 def stats(db: Session) -> dict:
-    """Row counts, oldest entry and (on PostgreSQL) disk size for each kind."""
+    """Row counts (large PostgreSQL tables: the planner's estimate), oldest entry and (on PostgreSQL) disk size for each kind."""
     spec = {
         "checks": [(CheckResult, CheckResult.checked_at)],
         "metrics": [(MetricSample, MetricSample.ts), (TrafficSample, TrafficSample.ts), (ClusterSample, ClusterSample.ts), (SshFailureSample, SshFailureSample.ts)],
@@ -174,7 +176,13 @@ def stats(db: Session) -> dict:
     for key, parts in spec.items():
         rows, oldest, size = 0, None, 0
         for model, column in parts:
-            rows += db.scalar(select(func.count()).select_from(model)) or 0
+            estimate = None
+            if pg:   # counting millions of rows takes seconds; PostgreSQL's own statistics are close enough for a size overview
+                try:
+                    estimate = db.scalar(text("select reltuples::bigint from pg_class where relname = :t"), {"t": model.__tablename__})
+                except Exception:
+                    db.rollback()
+            rows += int(estimate) if estimate is not None and estimate > 100_000 else (db.scalar(select(func.count()).select_from(model)) or 0)
             first = db.scalar(select(func.min(column)))
             if first is not None and (oldest is None or first < oldest):
                 oldest = first

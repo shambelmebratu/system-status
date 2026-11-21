@@ -85,3 +85,21 @@ export function Meter({ value, warnAt, badAt }: { value: number; warnAt: number;
   const cls = value >= badAt ? 'bad' : value >= warnAt ? 'warn' : '';
   return <div className={`bar ${cls}`}><i style={{ width: `${Math.min(100, Math.max(0, value))}%` }} /></div>;
 }
+
+
+/** "Alert after N failed checks in a row" for a server or service: empty = the default; shows how long that is at this interval. */
+export function ConfirmChecksField({ value, onChange, interval, fallback }: { value: string; onChange: (v: string) => void; interval: number; fallback: number }) {
+  const n = Number(value) || fallback;
+  const wait = n <= 1 ? 'alerts at the first failed check' : `about ${(() => { const s = (n - 1) * Math.max(1, interval); return s < 90 ? `${s} s` : s < 5400 ? `${Math.round(s / 60)} min` : `${(s / 3600).toFixed(1)} h`; })()} after the first failure (${n} × ${interval} s checks)`;
+  return (
+    <Field label="Alert after failed checks in a row" hint={`${value ? '' : `Empty = default (${fallback}). `}1 = alert immediately. With ${n}: ${wait}. Recovery is reported at once.`}>
+      <input type="number" min={1} max={50} value={value} onChange={e => onChange(e.target.value)} placeholder={String(fallback)} />
+    </Field>
+  );
+}
+
+/** "confirming 1 of 3": a problem seen but not alerted yet. */
+export function ConfirmingBadge({ failCount, needed, status }: { failCount?: number | null; needed?: number | null; status?: string }) {
+  if (!failCount || !needed || needed <= 1 || status === 'down' || status === 'alert' || failCount >= needed) return null;
+  return <span className="tag warn-tag" title="A failed check was seen; the alert is sent only if it fails again">confirming {failCount} of {needed}</span>;
+}

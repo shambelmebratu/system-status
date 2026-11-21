@@ -349,7 +349,42 @@ def agent_config(db: Session, server_id: int) -> dict:
 
 
 # ------------------------------------------------------------------------------------------------ scan everything now
-JOB: dict = {"running": False, "total": 0, "done": 0, "failed": 0, "started_at": None, "finished_at": None, "started_by": None, "current": None}
+JOB_KEY = "security_scan_job"
+IDLE = {"running": False, "total": 0, "done": 0, "failed": 0, "started_at": None, "finished_at": None, "started_by": None, "current": None}
+_job_lock = __import__("threading").Lock()
+
+
+def job_state(db: Session | None = None) -> dict:
+    """The "Scan all now" progress, kept in the database so every API process (API_WORKERS > 1) sees the same job. A job that has
+    not moved for 30 minutes (its process was restarted) counts as finished."""
+    from .database import SessionLocal
+    from .models import AppSetting
+    own = db is None
+    db = db or SessionLocal()
+    try:
+        row = db.get(AppSetting, JOB_KEY)
+        job = {**IDLE, **(json.loads(row.value) if row and row.value else {})}
+    except ValueError:
+        job = dict(IDLE)
+    finally:
+        if own:
+            db.close()
+    if job["running"] and job.get("updated_at"):
+        if datetime.now(timezone.utc) - datetime.fromisoformat(job["updated_at"]) > timedelta(minutes=30):
+            job.update(running=False, current=None)
+    return job
+
+
+def job_save(**changes) -> dict:
+    from .database import SessionLocal
+    from .models import AppSetting
+    with _job_lock, SessionLocal() as db:
+        job = {**job_state(db), **changes, "updated_at": datetime.now(timezone.utc).isoformat()}
+        row = db.get(AppSetting, JOB_KEY) or AppSetting(key=JOB_KEY)
+        row.value = json.dumps(job)
+        db.add(row)
+        db.commit()
+        return job
 
 
 def scan_all(targets: list[tuple[str, int]], user: str) -> None:
@@ -363,33 +398,38 @@ def scan_all(targets: list[tuple[str, int]], user: str) -> None:
             obj = db.get(Server if kind == "server" else Service, tid)
             if obj is None:
                 return
-            JOB["current"] = obj.name
+            job_save(current=obj.name)
             started = datetime.now(timezone.utc)
             try:
                 result = run_server_scan(obj) if kind == "server" else run_service_scan(obj)
             except Exception as error:   # noqa: BLE001  (one bad target must not stop the others)
                 result = {"error": str(error)[:200]}
+            failed = False
             if kind == "server" and result.get("error") and not server_address(obj)[0]:
-                JOB["failed"] += 1                               # no address known: nothing to store
+                failed = True                                    # no address known: nothing to store
             else:
                 store(db, "ports" if kind == "server" else "tls", obj, kind, result, started)
                 db.commit()
-                if result.get("error"):
-                    JOB["failed"] += 1
-        JOB["done"] += 1
+                failed = bool(result.get("error"))
+        with counter_lock:
+            counts["done"] += 1; counts["failed"] += int(failed)
+            done, bad = counts["done"], counts["failed"]
+        job_save(done=done, failed=bad)
 
-    JOB.update(running=True, total=len(targets), done=0, failed=0, started_at=datetime.now(timezone.utc).isoformat(), finished_at=None, started_by=user, current=None)
+    import threading
+    counter_lock, counts = threading.Lock(), {"done": 0, "failed": 0}
+    job_save(running=True, total=len(targets), done=0, failed=0, started_at=datetime.now(timezone.utc).isoformat(), finished_at=None, started_by=user, current=None)
     try:
         with ThreadPoolExecutor(max_workers=4) as pool:
             list(pool.map(one, targets))
     finally:
-        JOB.update(running=False, finished_at=datetime.now(timezone.utc).isoformat(), current=None)
+        job_save(running=False, finished_at=datetime.now(timezone.utc).isoformat(), current=None)
 
 
 def scans_due(db: Session) -> None:
     """Worker hook: re-scan every server and https service every `scan_hours` (one target per tick, to spread the load)."""
     from .models import SecurityScan, Server, Service
-    if JOB["running"]:
+    if job_state(db)["running"]:
         return
     hours = schedule(db)["scan_hours"]
     if hours <= 0:
