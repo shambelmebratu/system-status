@@ -130,7 +130,7 @@ def redact(text: str, channel: Channel) -> str:
 _STATE = {"anomaly": ("📈", "UNUSUAL BEHAVIOUR"), "ai_note": ("🤖", "AI ANALYSIS"),
           "ssh_attack": ("🛡", "SSH BRUTE-FORCE ATTACK"), "security_finding": ("🛡", "SECURITY FINDING"),
           "ssh_login_breach": ("🚨", "POSSIBLE BREAK-IN: SSH LOGIN AFTER FAILED ATTEMPTS"), "ssh_login_new": ("🔑", "SSH LOGIN FROM A NEW ADDRESS"),
-          "threat": ("🚨", "POSSIBLE COMPROMISE"), "ssh_login_many": ("🔁", "MANY SSH LOGINS TODAY"), "ssh_key_added": ("🔑", "NEW SSH KEY AUTHORIZED"),
+          "threat": ("🚨", "POSSIBLE COMPROMISE"), "ssh_login_many": ("🔁", "MANY SSH LOGINS TODAY"), "ssh_key_added": ("🔑", "NEW SSH KEY AUTHORIZED"), "security_change": ("🛡", "SECURITY CHANGE"),
           "slo_fast": ("🔥", "ERROR BUDGET BURNING FAST"), "slo_slow": ("🟠", "ERROR BUDGET BURNING"), "slo_exhausted": ("⛔", "ERROR BUDGET EXHAUSTED"),
           "dns_changed": ("🧭", "DNS CHANGED"), "domain": ("🌐", "DOMAIN EXPIRES SOON"), "domain_expired": ("⛔", "DOMAIN EXPIRED"), "domain_renewed": ("✅", "DOMAIN RENEWED"),
           "cert": ("🔐", "CERTIFICATE EXPIRES SOON"), "cert_expired": ("⛔", "CERTIFICATE EXPIRED"), "cert_renewed": ("✅", "CERTIFICATE RENEWED"),

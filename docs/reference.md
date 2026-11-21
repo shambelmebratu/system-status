@@ -437,8 +437,31 @@ Review the manifest first by running the `curl` alone. It creates a `smwatch` na
   - *file transfers* (2.16): SFTP/scp sessions from the SSH log (one finding per user, address and day, counting sessions) and transfers running at scan time: scp, rsync to another host, rclone, `curl -T` / `-F @file`, `wget --post-file`, aws s3 / gsutil / azcopy copies, ftp, smbclient;
   - *new services and scheduled tasks* (2.16): systemd services, timers and sockets (also users' own), cron jobs, init scripts and `/etc/rc.local` created or changed in the last 7 days, with what they run;
   - *new files* (2.16): shell scripts (by `.sh` name or a shell `#!` line) created or changed in the last `AGENT_NEW_FILES_HOURS` (24) in `/tmp`, `/var/tmp`, `/dev/shm`, `/root`, `/home`, `/etc`, `/usr/local/bin`, `/opt`, `/srv`, `/var/www` and cron spools (high in temporary, cron, init and hidden folders, medium elsewhere), and bursts of `AGENT_NEW_FILES_BURST` (50) or more new files in one folder.
+  - *more compromise signs* (2.17):
+    - **web shells**: PHP, JSP, ASP and CGI files in web folders (`/var/www`, nginx and Tomcat roots, `/srv`) changed in the last `AGENT_WEB_SHELL_DAYS` (30) days that contain code running commands sent by a visitor (critical);
+    - **programs with extra rights in odd places**: set-user-id / set-group-id files in temporary, home or web folders (critical);
+    - **attacking other machines**: one program connected to `AGENT_OUTBOUND_SCAN_TARGETS` (20) or more public addresses on SSH, RDP or database ports (critical), or trying twice that many unanswered addresses at once, the pattern of a port scanner (high);
+    - **packet sniffing**: a real network card in promiscuous mode (high);
+    - **hidden commands**: a user's shell history pointed at `/dev/null` (high);
+    - **containers that can control the host**: privileged, sharing the host's processes, or with the Docker socket mounted (medium).
+  - *changes since the previous scan* (2.17): the agent also sends a baseline of fingerprints (sha256, never contents) of critical files and system programs, the accounts that can log in, members of the administrator groups, and the loaded kernel modules. SM-Watch compares each scan with the previous one. The first scan only records the baseline.
+    - **new account** (high; critical with user id 0);
+    - **added to an administrator group**: sudo, wheel, admin, or docker / lxd, which are equivalent to root (high);
+    - **security file changed**: sudoers and PAM files (high); `sshd_config`, `passwd`, `shadow` and `group` (medium); hosts, profiles and crontab (low). If packages were installed between the two scans, only sudoers and PAM changes stay high;
+    - **system program replaced**: `ps`, `ls`, `ss`, `netstat`, `sudo`, `sshd`, `su`, `login`, `passwd`, `bash`, `curl` and others changed with no package install or update in between. This is the rootkit pattern (critical);
+    - **protection turned off**: a hardening check that passed and now fails, e.g. SSH password logins switched back on (that check's severity);
+    - **new service open to every network**: also a port that moved from localhost to all interfaces (high for databases, Docker, Redis and the like, medium otherwise);
+    - **kernel module loaded** (medium).
+
+    These alert as *SECURITY CHANGE* and stay open until acknowledged.
   One problem stays one finding (first seen / last seen). Agent findings close themselves when they disappear; *It was us: acknowledge* (with a note) closes login and new-key findings and quiets the others. Findings at or above `THREAT_ALERT_SEVERITY` (high) are sent to your alert channels. These are heuristics, not an antivirus: each finding says why it was raised.
-- **Hardening** (agent ≥ 2.15): SSH password and root logins, firewall, fail2ban, automatic security updates, accounts with empty passwords or user id 0, services listening on every network, and the SSH keys that can log in (fingerprints only). *Check now* on a server's card (or *Re-check all*) makes its agent run these checks, the threat scan and the update check at its next report; the card updates by itself when the new results arrive.
+- **Hardening** (agent ≥ 2.15): SSH password and root logins, firewall, fail2ban, automatic security updates, accounts with empty passwords or user id 0, services listening on every network, and the SSH keys that can log in (fingerprints only). Agent 2.17 adds:
+  - SSH: empty passwords refused, at most 6 guesses per connection, tunnels restricted;
+  - file permissions: `/etc/shadow` readable by root only, `/etc/passwd` not writable by others, the Docker socket not open to everyone;
+  - kernel: ASLR, SYN-flood protection and hidden kernel addresses;
+  - sudo without a password;
+  - SELinux or AppArmor enforcing;
+  - time sync and system logging running. *Check now* on a server's card (or *Re-check all*) makes its agent run these checks, the threat scan and the update check at its next report; the card updates by itself when the new results arrive.
 - **Process details:** click a process on a server page (or *Inspect process* on a finding) to see its user and group, run time, CPU and memory, command line (secrets masked), program and working folder, parent and children, container, network connections and kernel status. Environment variable **names** are listed, but their values are never sent (they often hold passwords), except harmless ones such as `PATH`. Operators only; every look is audited.
 - **Reports:** *Executive summary*, *Full server report*, *SSH access report* and *Patch & hardening report* for the last 7, 30 or 90 days, for all servers or the filtered ones. Print them or save as PDF; findings download as CSV.
 

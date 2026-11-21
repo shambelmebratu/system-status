@@ -39,7 +39,7 @@ from typing import Any
 
 import psutil
 
-AGENT_VERSION = "2.16.1"
+AGENT_VERSION = "2.17.0"
 _ENV_TOKEN = os.getenv("AGENT_TOKEN", "")                      # the token supplied by configuration; a rotation may supersede it (see _load_state)
 AGENT_TOKEN = ""                                                # the token in use: resolved by ensure_token() (saved state first, then configuration)
 AGENT_ALLOW_INSECURE = os.getenv("AGENT_ALLOW_INSECURE", "") == "1"   # permit http:// to a public address (not recommended)
@@ -2323,10 +2323,305 @@ def foreign_packages() -> dict:
     return {"manager": None, "packages": [], "error": "not supported on this system"}
 
 
+# ------------------------------------------------------------------------------------------------ more threat checks (2.17)
+WEB_ROOTS = ("/var/www", "/usr/share/nginx/html", "/srv/www", "/srv/http", "/var/lib/tomcat9/webapps", "/var/lib/tomcat10/webapps", "/opt/tomcat/webapps")
+WEB_EXTS = (".php", ".phtml", ".php5", ".php7", ".phar", ".jsp", ".jspx", ".asp", ".aspx", ".cgi", ".pl")
+WEB_SHELL = re.compile(rb"eval\s*\(\s*(?:base64_decode|gzinflate|gzuncompress|str_rot13|\$_(?:POST|GET|REQUEST|COOKIE|SERVER))"
+                       rb"|assert\s*\(\s*\$_(?:POST|GET|REQUEST|COOKIE)"
+                       rb"|(?:system|shell_exec|passthru|exec|popen|proc_open|pcntl_exec)\s*\(\s*\$_(?:GET|POST|REQUEST|COOKIE)"
+                       rb"|preg_replace\s*\(\s*['\"][^'\"]*/e['\"]"
+                       rb"|Runtime\.getRuntime\(\)\.exec\(\s*request\.getParameter"
+                       rb"|\b(?:c99|r57|wso|b374k|weevely)\s*shell", re.I)
+WEB_SHELL_DAYS = float(os.getenv("AGENT_WEB_SHELL_DAYS", "30"))
+ATTACK_PORTS = {22, 23, 445, 1433, 2222, 3306, 3389, 5432, 5900, 6379, 27017}
+OUTBOUND_TARGETS = int(os.getenv("AGENT_OUTBOUND_SCAN_TARGETS", "20"))
+VIRTUAL_IFACES = ("veth", "docker", "br-", "cni", "flannel", "cali", "virbr", "vnet", "tap", "tun", "lo", "kube", "cilium", "weave", "vxlan", "genev", "wg", "zt", "tailscale")
+
+
+def _web_shells(findings: list[dict]) -> None:
+    """Scripts in web folders containing code that runs commands sent by a visitor (a web shell). Only the path is reported."""
+    cutoff, seen = time.time() - WEB_SHELL_DAYS * 86400, 0
+    for top in WEB_ROOTS:
+        root = _host_path(top)
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and d != "vendor"]
+            for f in filenames:
+                if not f.lower().endswith(WEB_EXTS):
+                    continue
+                seen += 1
+                if seen > 6000:
+                    return
+                path = os.path.join(dirpath, f)
+                try:
+                    st = os.stat(path)
+                    if st.st_mtime < cutoff or st.st_size > 1_000_000:
+                        continue
+                    with open(path, "rb") as handle:
+                        body = handle.read(1_000_000)
+                except OSError:
+                    continue
+                if WEB_SHELL.search(body):
+                    view = _host_view(path)
+                    findings.append({"key": f"web_shell:{view}"[:200], "kind": "web_shell", "severity": "critical", "title": f"Possible web shell: {os.path.basename(view)}",
+                                     "detail": f"{view} (changed {datetime.fromtimestamp(st.st_mtime, timezone.utc):%Y-%m-%d %H:%M} UTC) contains code that runs commands sent by a visitor. "
+                                               "Attackers upload these to control a server through its website. Check the file and how it got there.", "path": view[:300]})
+
+
+def _suid_unusual(findings: list[dict]) -> None:
+    """Programs that run as their owner (set-user-id / set-group-id) in places where none belong: temporary folders, home and web folders."""
+    import stat as st_mod
+    for top, depth in (("/tmp", 3), ("/var/tmp", 3), ("/dev/shm", 3), ("/home", 4), ("/root", 3), ("/var/www", 4), ("/srv", 3)):
+        root, count = _host_path(top), 0
+        for dirpath, dirnames, filenames in os.walk(root):
+            if dirpath[len(root):].count(os.sep) >= depth:
+                dirnames[:] = []
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+            for f in filenames:
+                count += 1
+                if count > 5000:
+                    break
+                path = os.path.join(dirpath, f)
+                try:
+                    mode = os.lstat(path).st_mode
+                except OSError:
+                    continue
+                if st_mod.S_ISREG(mode) and mode & (st_mod.S_ISUID | st_mod.S_ISGID) and mode & 0o111:
+                    view = _host_view(path)
+                    findings.append({"key": f"suid:{view}"[:200], "kind": "suid_unusual", "severity": "critical", "title": f"Program that runs with extra rights in {top}",
+                                     "detail": f"{view} is set-user-id / set-group-id: it runs with its owner's rights (often root) whoever starts it. Programs like this do not belong "
+                                               f"in {top}; attackers leave them as a way back to root.", "path": view[:300]})
+
+
+def _promiscuous(findings: list[dict]) -> None:
+    """A real network card in promiscuous mode receives everyone's traffic: a sign of a packet sniffer (unless you run one on purpose)."""
+    base = _host_path("/sys/class/net") if os.path.isdir(_host_path("/sys/class/net")) else "/sys/class/net"
+    for name in (os.listdir(base) if os.path.isdir(base) else []):
+        if name.startswith(VIRTUAL_IFACES) or os.path.exists(os.path.join(base, name, "brport")):
+            continue
+        try:
+            flags = int(open(os.path.join(base, name, "flags")).read().strip(), 16)
+        except (OSError, ValueError):
+            continue
+        if flags & 0x100:
+            findings.append({"key": f"promisc:{name}", "kind": "promisc_interface", "severity": "high", "title": f"Network card {name} is capturing all traffic",
+                             "detail": f"{name} is in promiscuous mode, so it receives traffic meant for other machines. That is how packet sniffers steal passwords. "
+                                       "Acknowledge it if you run tcpdump, Wireshark or an IDS on purpose."})
+
+
+def _outbound_attacks(findings: list[dict]) -> None:
+    """This server opening connections to many machines on login ports (SSH, RDP, databases ...): it is probably attacking or scanning others."""
+    try:
+        conns = _connections()
+    except (psutil.AccessDenied, OSError, RuntimeError):
+        return
+    listening = {c.laddr.port for c in conns if c.status == "LISTEN" and c.laddr}
+    by_proc: dict[int | None, set] = {}
+    pending: dict[int | None, set] = {}
+    for c in conns:
+        if not c.raddr or not c.laddr or c.laddr.port in listening:
+            continue
+        try:
+            if ipaddress.ip_address(c.raddr.ip).is_private or ipaddress.ip_address(c.raddr.ip).is_loopback:
+                continue
+        except ValueError:
+            continue
+        if c.raddr.port in ATTACK_PORTS and c.status in ("ESTABLISHED", "SYN_SENT"):
+            by_proc.setdefault(c.pid, set()).add(c.raddr.ip)
+        if c.status == "SYN_SENT":
+            pending.setdefault(c.pid, set()).add((c.raddr.ip, c.raddr.port))
+    for pid, ips in by_proc.items():
+        if len(ips) >= OUTBOUND_TARGETS:
+            name = _proc_name(pid)
+            findings.append({"key": f"outbound:login:{name}", "kind": "outbound_attack", "severity": "critical", "title": f"{name or 'A process'} is connecting to {len(ips)} machines on login ports",
+                             "detail": f"{name or 'A process'} (pid {pid}) has connections to {len(ips)} different addresses on SSH / RDP / database ports. A compromised server is often "
+                                       "used to break into others. Your provider may suspend it for this.", "pid": pid, "process": name})
+    for pid, targets in pending.items():
+        if len(targets) >= OUTBOUND_TARGETS * 2:
+            name = _proc_name(pid)
+            findings.append({"key": f"outbound:scan:{name}", "kind": "outbound_attack", "severity": "high", "title": f"{name or 'A process'} is scanning other machines",
+                             "detail": f"{name or 'A process'} (pid {pid}) is trying {len(targets)} addresses/ports at once that do not answer: the pattern of a port scanner.", "pid": pid, "process": name})
+
+
+def _proc_name(pid: int | None) -> str:
+    try:
+        return psutil.Process(pid).name()[:60] if pid else ""
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return ""
+
+
+def _history_disabled(findings: list[dict]) -> None:
+    """Shell history pointed at /dev/null: attackers do it to hide the commands they ran."""
+    for user, home in _home_dirs():
+        for name in (".bash_history", ".zsh_history", ".ash_history", ".sh_history"):
+            path = os.path.join(home, name)
+            try:
+                target = os.readlink(_host_path(path))
+            except OSError:
+                continue
+            if target == "/dev/null":
+                findings.append({"key": f"history:{path}"[:200], "kind": "history_disabled", "severity": "high", "title": f"Command history of {user} is switched off",
+                                 "detail": f"{path} points to /dev/null, so commands typed as {user} are not recorded. Attackers do this to hide what they ran.", "user": user, "path": path})
+
+
+def _privileged_containers(findings: list[dict]) -> None:
+    """Containers that can take over the host: privileged, host PID namespace, or the Docker socket mounted inside."""
+    if not docker_available():
+        return
+    me = socket.gethostname()
+    for c in (_docker("/containers/json") or [])[:80]:
+        cid = c.get("Id", "")
+        if cid.startswith(me) or me.startswith(cid[:12]):
+            continue                                               # the agent's own container
+        try:
+            info = _docker(f"/containers/{cid}/json")
+        except Exception:   # noqa: BLE001
+            continue
+        host = info.get("HostConfig") or {}
+        name = (info.get("Name") or "").lstrip("/")[:100]
+        image = ((info.get("Config") or {}).get("Image") or "")[:200]
+        if "smwatch" in image.lower() or "sm-watch" in image.lower():
+            continue
+        reasons = []
+        if host.get("Privileged"):
+            reasons.append("runs privileged (full access to the host's devices and kernel)")
+        if host.get("PidMode") == "host":
+            reasons.append("shares the host's processes")
+        if any((m.get("Source") or "").endswith("docker.sock") for m in info.get("Mounts") or []):
+            reasons.append("has the Docker socket mounted (it can start any container as root)")
+        if reasons:
+            findings.append({"key": f"container:priv:{name}"[:200], "kind": "privileged_container", "severity": "medium", "title": f"Container {name} can control the host",
+                             "detail": f"{name} ({image}) " + "; ".join(reasons) + ". If it is compromised, so is the server. Acknowledge it if it needs these rights.",
+                             "process": name, "command": image})
+
+
+# ------------------------------------------------------------------------------------------------ baseline (compared by SM-Watch with the previous scan)
+CRITICAL_FILES = ("/etc/passwd", "/etc/shadow", "/etc/group", "/etc/sudoers", "/etc/ssh/sshd_config", "/etc/pam.d/sshd", "/etc/pam.d/common-auth", "/etc/pam.d/system-auth",
+                  "/etc/pam.d/password-auth", "/etc/pam.d/su", "/etc/pam.d/sudo", "/etc/hosts", "/etc/crontab", "/etc/profile", "/etc/bash.bashrc", "/etc/environment",
+                  "/root/.bashrc", "/root/.profile", "/etc/ld.so.preload")
+CRITICAL_DIRS = ("/etc/sudoers.d", "/etc/ssh/sshd_config.d", "/etc/profile.d")
+SYSTEM_PROGRAMS = ("/usr/bin/sudo", "/usr/sbin/sshd", "/usr/bin/ssh", "/bin/login", "/usr/bin/login", "/usr/bin/passwd", "/bin/su", "/usr/bin/su", "/bin/ps", "/usr/bin/ps",
+                   "/bin/ls", "/usr/bin/ls", "/bin/netstat", "/usr/bin/netstat", "/usr/bin/ss", "/usr/bin/top", "/usr/bin/find", "/usr/bin/lsof", "/usr/sbin/cron", "/usr/sbin/crond",
+                   "/bin/bash", "/usr/bin/bash", "/usr/bin/curl", "/usr/bin/wget")
+ADMIN_GROUPS = ("sudo", "wheel", "admin", "root", "docker", "lxd")
+PACKAGE_LOGS = ("/var/log/dpkg.log", "/var/log/dnf.rpm.log", "/var/log/yum.log", "/var/log/apk.log", "/var/log/pacman.log", "/var/lib/rpm/rpmdb.sqlite", "/var/lib/rpm/Packages")
+
+
+def _file_fingerprint(path: str) -> str | None:
+    h = hashlib.sha256()
+    try:
+        with open(_host_path(path), "rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                h.update(chunk)
+    except OSError:
+        return None
+    return h.hexdigest()[:24]
+
+
+def baseline() -> dict:
+    """Facts SM-Watch compares between scans: fingerprints (sha256) of critical files and programs, accounts that can log in, members of
+    administrator groups, loaded kernel modules, and when packages were last installed. Never file contents."""
+    files = {p: fp for p in CRITICAL_FILES if (fp := _file_fingerprint(p))}
+    for d in CRITICAL_DIRS:
+        for p in _list_host(d)[:40]:
+            if (fp := _file_fingerprint(p)):
+                files[p] = fp
+    programs: dict[str, str] = {}
+    for p in SYSTEM_PROGRAMS:
+        real = os.path.realpath(_host_path(p))
+        if real in {os.path.realpath(_host_path(q)) for q in programs}:
+            continue                                                # /bin is often a link to /usr/bin
+        if (fp := _file_fingerprint(p)):
+            programs[p] = fp
+    accounts = []
+    for row in _read("/etc/passwd").splitlines():
+        f = row.split(":")
+        if len(f) >= 7 and not f[6].endswith(("nologin", "false", "sync", "halt", "shutdown")):
+            accounts.append({"user": f[0][:60], "uid": int(f[2]) if f[2].isdigit() else -1, "shell": f[6][:60]})
+    admins = {}
+    for row in _read("/etc/group").splitlines():
+        f = row.split(":")
+        if len(f) >= 4 and f[0] in ADMIN_GROUPS:
+            admins[f[0]] = sorted(u for u in f[3].split(",") if u)[:100]
+    try:
+        modules = sorted(line.split()[0] for line in open("/proc/modules").read().splitlines() if line.strip())   # the kernel is shared with a container
+    except OSError:
+        modules = []
+    pkg = max([os.path.getmtime(_host_path(p)) for p in PACKAGE_LOGS if os.path.exists(_host_path(p))] or [0])
+    return {"files": files, "programs": programs, "accounts": accounts[:300], "admins": admins, "modules": modules[:600],
+            "packages_changed_at": datetime.fromtimestamp(pkg, timezone.utc).isoformat() if pkg else None}
+
+
+def _mode(path: str) -> int | None:
+    try:
+        return os.stat(_host_path(path)).st_mode
+    except OSError:
+        return None
+
+
+def _sysctl(name: str) -> str | None:
+    try:
+        return open("/proc/sys/" + name.replace(".", "/")).read().strip()      # the kernel is shared with a container
+    except OSError:
+        return None
+
+
+def more_hardening() -> list[dict]:
+    checks: list[dict] = []
+    add = lambda cid, title, ok, detail, severity="medium": checks.append({"id": cid, "title": title, "ok": ok, "detail": detail, "severity": severity})   # noqa: E731
+    if _read("/etc/ssh/sshd_config"):
+        empty = _sshd_option("PermitEmptyPasswords")
+        add("ssh_empty_passwords", "SSH refuses accounts without a password", empty != "yes", f"PermitEmptyPasswords is {empty or 'not set (default: no)'}.", "critical")
+        tries = _sshd_option("MaxAuthTries")
+        add("ssh_max_tries", "SSH limits password guesses per connection", (int(tries) if (tries or "").isdigit() else 6) <= 6,
+            f"MaxAuthTries is {tries or 'not set (default: 6)'}. 3 to 6 slows down guessing.", "low")
+        fwd = _sshd_option("AllowTcpForwarding")
+        add("ssh_forwarding", "SSH tunnels are restricted", fwd in ("no", "local"), f"AllowTcpForwarding is {fwd or 'not set (default: yes)'}. "
+            "Tunnels let a logged-in user reach internal services through this server; turn it off unless you use it.", "low")
+    shadow = _mode("/etc/shadow")
+    if shadow is not None:
+        add("shadow_perms", "Password hashes are readable by root only", not shadow & 0o004, f"/etc/shadow permissions are {oct(shadow & 0o777)}.", "critical")
+    passwd = _mode("/etc/passwd")
+    if passwd is not None:
+        add("passwd_perms", "Only root can change the account list", not passwd & 0o022, f"/etc/passwd permissions are {oct(passwd & 0o777)}.", "critical")
+    sock = _mode("/var/run/docker.sock")
+    if sock is not None:
+        add("docker_socket", "The Docker socket is not open to everyone", not sock & 0o002, f"/var/run/docker.sock permissions are {oct(sock & 0o777)}: anyone who can write it is root.", "critical")
+    aslr = _sysctl("kernel.randomize_va_space")
+    if aslr is not None:
+        add("aslr", "Memory layout randomisation (ASLR) is on", aslr == "2", f"kernel.randomize_va_space is {aslr} (2 = full). It makes exploits much harder.", "medium")
+    syn = _sysctl("net.ipv4.tcp_syncookies")
+    if syn is not None:
+        add("syncookies", "Protection against SYN floods is on", syn == "1", f"net.ipv4.tcp_syncookies is {syn}.", "low")
+    kptr = _sysctl("kernel.kptr_restrict")
+    if kptr is not None:
+        add("kptr", "Kernel addresses are hidden from users", kptr in ("1", "2"), f"kernel.kptr_restrict is {kptr}.", "low")
+    nopass = []
+    for text in [_read("/etc/sudoers")] + [_read(p) for p in _list_host("/etc/sudoers.d")]:
+        for line in text.splitlines():
+            line = line.strip()
+            if line and not line.startswith(("#", "Defaults")) and re.search(r"NOPASSWD:\s*ALL\b", line):
+                nopass.append(line.split()[0])
+    if _read("/etc/sudoers") or _list_host("/etc/sudoers.d"):
+        add("sudo_nopasswd", "Administrators need their password for sudo", not nopass,
+            ("Run anything as root without a password: " + ", ".join(sorted(set(nopass))[:8])[:250] + ". A stolen key for these accounts is enough to become root.") if nopass
+            else "No account may run everything as root without a password.", "medium")
+    selinux = _read("/sys/fs/selinux/enforce").strip()
+    apparmor = _read("/sys/module/apparmor/parameters/enabled").strip()
+    enforcing = selinux == "1" or apparmor == "Y"
+    add("mac", "SELinux or AppArmor is enforcing", enforcing if (selinux or apparmor) else None,
+        "SELinux is enforcing." if selinux == "1" else "AppArmor is enabled." if apparmor == "Y" else "Neither SELinux nor AppArmor is enforcing: a compromised service can reach more of the system.", "low")
+    add("time_sync", "The clock is synchronised", _running("chronyd", "ntpd", "systemd-timesyncd", "timesyncd", "openntpd") or None,
+        "Accurate time keeps logs and certificates trustworthy." if _running("chronyd", "ntpd", "systemd-timesyncd", "timesyncd", "openntpd") else "No time service (chrony, ntpd, systemd-timesyncd) was found running.", "low")
+    logging_on = _running("rsyslogd", "syslog-ng", "systemd-journald", "syslogd")
+    add("logging", "System logging runs", logging_on or None, "Logins and errors are being recorded." if logging_on else "No logging service was found running: break-ins would leave no trace.", "medium")
+    return checks
+
+
 def threat_scan() -> dict:
     findings: list[dict] = []
     started = time.monotonic()
-    for step in (_scan_processes, _shell_connections, _executables_in_temp, _persistence, _new_services, _new_files):
+    for step in (_scan_processes, _shell_connections, _executables_in_temp, _persistence, _new_services, _new_files, _web_shells, _suid_unusual, _promiscuous,
+                 _outbound_attacks, _history_disabled, _privileged_containers):
         try:
             step(findings)
         except Exception as error:   # noqa: BLE001  (one failing check must not hide the others)
@@ -2347,7 +2642,7 @@ def threat_scan() -> dict:
         if f["key"] not in seen:
             seen.add(f["key"]); unique.append(f)
     unique.sort(key=lambda f: ("critical", "high", "medium", "low").index(f["severity"]))
-    return {"checked_at": datetime.now(timezone.utc).isoformat(), "findings": unique[:60], "hardening": _safe(hardening, []), "listening": _safe(listening, []),
+    return {"checked_at": datetime.now(timezone.utc).isoformat(), "findings": unique[:60], "hardening": _safe(hardening, []) + _safe(more_hardening, []), "listening": _safe(listening, []), "baseline": _safe(baseline, None),
             "authorized_keys": _safe(authorized_keys, []), "foreign_packages": pkg or None, "seconds": round(time.monotonic() - started, 2)}
 
 

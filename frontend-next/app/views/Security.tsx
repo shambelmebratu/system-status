@@ -26,7 +26,7 @@ type Overview = { servers: ServerRow[]; services: { id: number; name: string; ur
   kubernetes?: Counts & { clusters: number; scanned: number } };
 type Severity = 'critical' | 'high' | 'medium' | 'low';
 type Finding = { id: number; server_id: number; server: Who | null; source: 'agent' | 'smwatch'; kind: string; severity: Severity; title: string; detail: string;
-  evidence: { pid?: number; process?: string; user?: string; path?: string; command?: string; remote?: string; ip?: string; method?: string; fingerprint?: string; packages?: string[]; failed_attempts_24h?: number };
+  evidence: { pid?: number; process?: string; user?: string; path?: string; command?: string; remote?: string; ip?: string; method?: string; fingerprint?: string; packages?: string[]; failed_attempts_24h?: number; port?: number; group?: string; modules?: string[] };
   first_seen: string; last_seen: string; resolved_at: string | null; acknowledged_by: string | null; acknowledged_at: string | null; note: string };
 type Check = { id: string; title: string; ok: boolean | null; detail: string; severity: Severity };
 type Listen = { port: number; address: string; all_interfaces: boolean; process: string };
@@ -46,9 +46,11 @@ const RISK_LABEL = { critical: 'Critical', high: 'High', medium: 'Check', info: 
 const SEV_LABEL: Record<Severity, string> = { critical: 'Critical', high: 'High', medium: 'Medium', low: 'Low' };
 /** What kind of problem a finding is, in words people use. */
 const GROUPS: { id: string; label: string; hint: string; kinds: string[] }[] = [
-  { id: 'malware', label: 'Running malware', hint: 'miners, reverse shells, programs running from temporary folders or deleted from disk', kinds: ['process_miner', 'process_reverse_shell', 'process_fileless', 'process_deleted_exe', 'process_temp_exe', 'process_hidden_exe', 'process_fake_kthread', 'mining_connection'] },
+  { id: 'malware', label: 'Running malware', hint: 'miners, reverse shells, web shells, programs running from temporary folders, attacking or scanning other machines, packet sniffing', kinds: ['process_miner', 'process_reverse_shell', 'process_fileless', 'process_deleted_exe', 'process_temp_exe', 'process_hidden_exe', 'process_fake_kthread', 'mining_connection', 'web_shell', 'outbound_attack', 'promisc_interface'] },
   { id: 'breakin', label: 'Successful logins', hint: 'SSH logins after failed attempts, or from new addresses', kinds: ['ssh_login_after_failures', 'ssh_login_new_source'] },
   { id: 'backdoor', label: 'Back doors', hint: 'new SSH keys, extra root accounts, cron jobs that download code, library preloading', kinds: ['ssh_key_added', 'extra_root', 'cron_download', 'ld_preload', 'systemd_suspicious'] },
+  { id: 'changes', label: 'System changes', hint: 'new accounts and administrators, changed sudoers / PAM / SSH files, replaced system programs, kernel modules, protections turned off', kinds: ['user_added', 'admin_granted', 'critical_file_changed', 'system_program_changed', 'kernel_module_loaded', 'hardening_weakened', 'history_disabled'] },
+  { id: 'exposure', label: 'Exposure', hint: 'services newly open to every network, programs with root rights in odd places, containers that can control the host', kinds: ['port_opened', 'suid_unusual', 'privileged_container'] },
   { id: 'unknown', label: 'Unknown software', hint: 'programs in temporary folders, packages from outside your repositories', kinds: ['temp_executable', 'foreign_packages'] },
   { id: 'tunnel', label: 'Tunnels & remote access', hint: 'ngrok, cloudflared, chisel, frp, SSH port forwarding, shells connected to other machines', kinds: ['process_tunnel', 'shell_connection'] },
   { id: 'transfer', label: 'File transfers', hint: 'SFTP / scp sessions, uploads with curl, rsync, rclone, cloud copies', kinds: ['file_transfer', 'process_transfer'] },
@@ -278,6 +280,9 @@ function Threats({ server, pick, reload }: { server: string; pick: (id: number) 
               {f.evidence.path && !(f.evidence.packages ?? []).includes(f.evidence.path) && <span className="chip mono" title={f.evidence.path}>{f.evidence.path}</span>}
               {f.evidence.remote && <span className="chip mono">→ {f.evidence.remote}</span>}
               {f.evidence.fingerprint && <span className="chip mono">{f.evidence.fingerprint}</span>}
+              {f.evidence.port != null && <span className="chip mono">port {f.evidence.port}</span>}
+              {f.evidence.group && <span className="chip mono">group {f.evidence.group}</span>}
+              {(f.evidence.modules ?? []).length > 0 && <span className="chip mono" title={f.evidence.modules!.join(', ')}>modules {f.evidence.modules!.slice(0, 4).join(', ')}{f.evidence.modules!.length > 4 ? ' …' : ''}</span>}
             </div>
             {f.evidence.command && <code className="proc-cmd sm">{f.evidence.command}</code>}
             {f.evidence.packages && f.evidence.packages.length > 0 && <div className="chips">{f.evidence.packages.map(p => <span key={p} className="chip mono">{p}</span>)}</div>}

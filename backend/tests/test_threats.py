@@ -411,3 +411,80 @@ def test_daily_uptime_is_stored_once(client):
     client.delete(f"/api/services/{svc}", headers=CSRF)
     with database.SessionLocal() as db:
         assert db.query(CheckDaily).filter_by(target_type="service", target_id=svc).count() == 0      # deleting the monitor removes them
+
+
+def test_agent_more_threat_checks_and_baseline(agent, tmp_path, monkeypatch):
+    """Agent 2.17: web shells, programs with extra rights in odd places, disabled history, extra hardening checks, the baseline."""
+    root = tmp_path / "host"
+    monkeypatch.setattr(agent, "_host_path", lambda p: str(root / p.lstrip("/")))
+    (root / "var/www/html/uploads").mkdir(parents=True)
+    (root / "var/www/html/index.php").write_text("<?php echo 'hello'; include 'db.php';")
+    (root / "var/www/html/uploads/img.php").write_text("<?php @eval(base64_decode($_POST['x'])); ?>")
+    (root / "tmp").mkdir()
+    (root / "tmp/.rootme").write_bytes(b"\x7fELF" + b"\0" * 2000)
+    os.chmod(root / "tmp/.rootme", 0o4755)
+    (root / "etc/sudoers.d").mkdir(parents=True)
+    (root / "etc/passwd").write_text("root:x:0:0:root:/root:/bin/bash\ndeploy:x:1000:1000::/home/deploy:/bin/bash\nwww-data:x:33:33::/var/www:/usr/sbin/nologin\n")
+    (root / "etc/group").write_text("root:x:0:\nsudo:x:27:deploy\ndocker:x:999:\n")
+    (root / "etc/shadow").write_text("root:*:1::::::\n")
+    os.chmod(root / "etc/shadow", 0o644)
+    (root / "etc/sudoers").write_text("Defaults env_reset\nroot ALL=(ALL:ALL) ALL\n")
+    (root / "etc/sudoers.d/90-deploy").write_text("deploy ALL=(ALL) NOPASSWD: ALL\n")
+    (root / "etc/ssh").mkdir()
+    (root / "etc/ssh/sshd_config").write_text("PermitEmptyPasswords yes\nMaxAuthTries 10\n")
+    (root / "home/deploy").mkdir(parents=True)
+    os.symlink("/dev/null", root / "home/deploy/.bash_history")
+    findings: list[dict] = []
+    for step in (agent._web_shells, agent._suid_unusual, agent._history_disabled):
+        step(findings)
+    by_kind = {f["kind"]: f for f in findings}
+    assert set(by_kind) == {"web_shell", "suid_unusual", "history_disabled"}
+    assert by_kind["web_shell"]["path"].endswith("uploads/img.php") and by_kind["web_shell"]["severity"] == "critical"   # index.php is clean
+    assert "base64_decode" not in json.dumps(findings)                                     # the path only, never the file's content
+    assert by_kind["history_disabled"]["user"] == "deploy"
+    checks = {c["id"]: c for c in agent.more_hardening()}
+    assert checks["ssh_empty_passwords"]["ok"] is False and checks["ssh_max_tries"]["ok"] is False
+    assert checks["shadow_perms"]["ok"] is False and checks["passwd_perms"]["ok"] is True
+    assert checks["sudo_nopasswd"]["ok"] is False and "deploy" in checks["sudo_nopasswd"]["detail"]
+    assert all(len(c["detail"]) <= 500 for c in checks.values())
+    base = agent.baseline()
+    assert [a["user"] for a in base["accounts"]] == ["root", "deploy"] and base["admins"] == {"root": [], "sudo": ["deploy"], "docker": []}
+    assert "/etc/sudoers.d/90-deploy" in base["files"] and len(base["files"]["/etc/passwd"]) == 24
+    assert "NOPASSWD" not in json.dumps(base)                                              # fingerprints only
+
+
+def test_changes_since_previous_scan(client, monkeypatch):
+    """New account and administrator, edited sudoers, a replaced system program, a weakened protection, a newly exposed port."""
+    sign_in(client)
+    monkeypatch.setattr(monitoring, "deliver_event", _real_deliver_event)
+    anon = TestClient(main.app)
+    sid, auth = _enroll(client, anon, "web-changes")
+    base = {"files": {"/etc/passwd": "a" * 24, "/etc/sudoers": "b" * 24}, "programs": {"/usr/bin/ps": "c" * 24, "/usr/bin/sudo": "d" * 24},
+            "accounts": [{"user": "root", "uid": 0, "shell": "/bin/bash"}], "admins": {"sudo": []}, "modules": ["ext4", "overlay"], "packages_changed_at": "2026-11-01T00:00:00+00:00"}
+    scan = {"checked_at": "2026-11-20T10:00:00+00:00", "findings": [], "authorized_keys": [], "baseline": base,
+            "hardening": [{"id": "ssh_passwords", "title": "SSH password logins are off", "ok": True, "detail": "no", "severity": "high"}],
+            "listening": [{"port": 22, "address": "0.0.0.0", "all_interfaces": True, "process": "sshd"}, {"port": 6379, "address": "127.0.0.1", "all_interfaces": False, "process": "redis-server"}]}
+    _report(anon, auth, hostname="web-changes", ips=WEB_IPS, security=scan)                    # the first scan only records the baseline
+    with database.SessionLocal() as db:
+        assert db.query(SecurityFinding).filter_by(server_id=sid).count() == 0
+    changed = {**base, "files": {"/etc/passwd": "e" * 24, "/etc/sudoers": "f" * 24}, "programs": {**base["programs"], "/usr/bin/ps": "9" * 24},
+               "accounts": base["accounts"] + [{"user": "backup", "uid": 1001, "shell": "/bin/bash"}], "admins": {"sudo": ["backup"]}, "modules": ["ext4", "overlay", "diamorphine"]}
+    scan2 = {**scan, "checked_at": "2026-11-20T10:10:00+00:00", "baseline": changed,
+             "hardening": [{"id": "ssh_passwords", "title": "SSH password logins are off", "ok": False, "detail": "yes", "severity": "high"}],
+             "listening": [scan["listening"][0], {"port": 6379, "address": "0.0.0.0", "all_interfaces": True, "process": "redis-server"}]}
+    _report(anon, auth, hostname="web-changes", ips=WEB_IPS, security=scan2)
+    with database.SessionLocal() as db:
+        found = {f.kind: f for f in db.query(SecurityFinding).filter_by(server_id=sid).all()}
+        assert set(found) == {"user_added", "admin_granted", "critical_file_changed", "system_program_changed", "kernel_module_loaded", "hardening_weakened", "port_opened"}
+        assert found["system_program_changed"].severity == "critical" and "/usr/bin/ps" in found["system_program_changed"].title
+        assert found["port_opened"].severity == "high" and "Redis" in found["port_opened"].title      # moved from localhost to every network
+        files = db.query(SecurityFinding).filter_by(server_id=sid, kind="critical_file_changed").all()
+        assert {f.title.split(": ")[1]: f.severity for f in files} == {"/etc/passwd": "medium", "/etc/sudoers": "high"}
+        alerts = db.query(AlertEvent).filter_by(state="security_change", target_id=sid).all()
+        assert len(alerts) == 6 and all("web-changes" in a.message for a in alerts)          # high and critical only (THREAT_ALERT_SEVERITY=high)
+    # after a package update, a changed program is expected: no finding
+    scan3 = {**scan2, "checked_at": "2026-11-20T10:20:00+00:00", "baseline": {**changed, "programs": {**changed["programs"], "/usr/bin/sudo": "8" * 24},
+                                                                              "packages_changed_at": "2026-11-20T10:15:00+00:00"}}
+    _report(anon, auth, hostname="web-changes", ips=WEB_IPS, security=scan3)
+    with database.SessionLocal() as db:
+        assert db.query(SecurityFinding).filter_by(server_id=sid, kind="system_program_changed").count() == 1

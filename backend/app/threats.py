@@ -1,4 +1,6 @@
-"""Signs of compromise: suspicious successful SSH logins, the agent's threat findings (malware, persistence), and newly authorized SSH keys.
+"""Signs of compromise: suspicious successful SSH logins, the agent's threat findings (malware, persistence, web shells ...), newly authorized
+SSH keys, and changes since the previous scan (new accounts and administrators, changed security files and system programs, weakened
+protections, newly exposed ports, kernel modules).
 
 Findings are kept per server with a stable key, so the same problem seen in every report stays ONE finding (first seen / last seen).
 Agent findings resolve themselves when the agent stops seeing them. Findings SM-Watch derives itself (a login after failed attempts,
@@ -161,6 +163,12 @@ def sync_threats(db: Session, server, report: dict, previous: dict | None, now: 
     for row in db.scalars(select(SecurityFinding).where(SecurityFinding.server_id == server.id, SecurityFinding.source == "agent", SecurityFinding.resolved_at.is_(None))).all():
         if row.key not in present:
             row.resolved_at = now
+    if previous and previous.get("hardening") is not None:
+        hardening_weakened(db, server, report.get("hardening") or [], previous.get("hardening") or [], now, level)
+    if previous and previous.get("listening") is not None:
+        ports_opened(db, server, report.get("listening") or [], previous.get("listening") or [], now, level)
+    if previous and previous.get("baseline") and report.get("baseline"):
+        compare_baseline(db, server, report["baseline"], previous["baseline"], previous.get("checked_at"), now, level)
     # SSH keys: compare with the previous scan (the first scan only sets the baseline)
     if previous and previous.get("authorized_keys") is not None:
         before = {(k["user"], k["fingerprint"]) for k in previous.get("authorized_keys") or []}
@@ -180,3 +188,89 @@ def finding_view(f, server_info: dict | None = None) -> dict:
             "detail": f.detail, "evidence": json.loads(f.evidence or "{}"), "first_seen": aware(f.first_seen).isoformat(), "last_seen": aware(f.last_seen).isoformat(),
             "resolved_at": aware(f.resolved_at).isoformat() if f.resolved_at else None, "acknowledged_by": f.acknowledged_by,
             "acknowledged_at": aware(f.acknowledged_at).isoformat() if f.acknowledged_at else None, "note": f.note}
+
+
+# ------------------------------------------------------------------------------------------------ changes since the previous scan (agent 2.17+)
+# Like new SSH keys these are events: they stay open until acknowledged. The first scan of a server only records the baseline.
+def _change(db: Session, server, key: str, kind: str, severity: str, title: str, detail: str, evidence: dict, now: datetime, level: int) -> None:
+    _, is_new = open_finding(db, server, key, kind=kind, severity=severity, title=title, detail=detail, evidence=evidence, source="smwatch", now=now)
+    if is_new and SEVERITY_ORDER[severity] <= level:
+        _alert(db, server, "security_change", [title, detail], "critical" if severity == "critical" else "warning")
+
+
+def hardening_weakened(db: Session, server, current: list[dict], previous: list[dict], now: datetime, level: int) -> None:
+    """A protection that passed in the previous scan and fails now, e.g. someone turned SSH password logins back on."""
+    before = {c["id"]: c for c in previous}
+    for c in current:
+        old = before.get(c["id"])
+        if old and old.get("ok") is True and c.get("ok") is False:
+            _change(db, server, f"weakened:{c['id']}:{now.date().isoformat()}", "hardening_weakened", c.get("severity") or "medium",
+                    f"Protection turned off: {c['title']}", f"This passed in the previous check and fails now. {c.get('detail') or ''} If nobody on your team changed it, investigate.",
+                    {"check": c["id"]}, now, level)
+
+
+def ports_opened(db: Session, server, current: list[dict], previous: list[dict], now: datetime, level: int) -> None:
+    """A service that started accepting connections from every network since the previous scan."""
+    from .secscan import PORTS
+    before = {p["port"] for p in previous if p.get("all_interfaces")}       # also catches a port moved from localhost to every network
+    for p in current:
+        if not p.get("all_interfaces") or p["port"] in before:
+            continue
+        label, risk, advice = PORTS.get(p["port"], (None, "medium", ""))
+        severity = "high" if risk == "critical" else "medium"
+        what = f"{label} ({p['port']})" if label else f"port {p['port']}"
+        _change(db, server, f"port_opened:{p['port']}:{p.get('process') or ''}", "port_opened", severity, f"New service open to every network: {what}",
+                f"{p.get('process') or 'A program'} started accepting connections on {what} from any address. {advice} Acknowledge it if you opened it on purpose.",
+                {"port": p["port"], "process": p.get("process") or ""}, now, level)
+
+
+SENSITIVE_FILES = ("/etc/sudoers", "/etc/sudoers.d/", "/etc/pam.d/", "/etc/ld.so.preload")
+LOGIN_FILES = ("/etc/ssh/sshd_config", "/etc/passwd", "/etc/shadow", "/etc/group")
+
+
+def compare_baseline(db: Session, server, current: dict, previous: dict, previous_at: str | None, now: datetime, level: int) -> None:
+    """New accounts and administrators, changed critical files and system programs, newly loaded kernel modules."""
+    updated = False                                            # were packages installed between the two scans? (programs legitimately change then)
+    try:
+        if current.get("packages_changed_at") and previous_at:
+            updated = datetime.fromisoformat(current["packages_changed_at"]) >= datetime.fromisoformat(previous_at) - timedelta(minutes=1)
+    except ValueError:
+        updated = True
+    old_users = {a["user"] for a in previous.get("accounts") or []}
+    for a in current.get("accounts") or []:
+        if a["user"] not in old_users:
+            root = a.get("uid") == 0
+            _change(db, server, f"user_added:{a['user']}", "user_added", "critical" if root else "high", f"New account that can log in: {a['user']}" + (" (root rights)" if root else ""),
+                    f"The account {a['user']} (uid {a.get('uid')}, shell {a.get('shell') or '?'}) was created since the previous check. Attackers create accounts to come back. "
+                    "Acknowledge it if someone on your team added it.", {"user": a["user"], "uid": a.get("uid"), "shell": a.get("shell")}, now, level)
+    old_admins = previous.get("admins") or {}
+    for group, members in (current.get("admins") or {}).items():
+        for user in set(members) - set(old_admins.get(group) or []):
+            what = "can control Docker (equivalent to root)" if group in ("docker", "lxd") else "can now run commands as root"
+            _change(db, server, f"admin_granted:{group}:{user}", "admin_granted", "high", f"{user} was added to the {group} group",
+                    f"{user} {what}. If you did not grant this, someone with access may be preparing to keep root rights.", {"user": user, "group": group}, now, level)
+    old_files = previous.get("files") or {}
+    for path, fp in (current.get("files") or {}).items():
+        if path not in old_files and not path.startswith(("/etc/sudoers.d/", "/etc/ld.so.preload")):
+            continue                                           # a file that just was not readable before; new sudoers rules or a preload file always count
+        if old_files.get(path) == fp:
+            continue
+        severity = "high" if path.startswith(SENSITIVE_FILES) else "medium" if path.startswith(LOGIN_FILES) else "low"
+        if updated and severity != "high":
+            severity = "low"
+        _change(db, server, f"file_changed:{path}:{fp}", "critical_file_changed", severity, f"Security file changed: {path}",
+                f"{path} " + ("was created" if path not in old_files else "was changed") + " since the previous check"
+                + (" (packages were also updated, which can explain it)" if updated else "") + ". It controls who can log in or become root; check the change was yours.",
+                {"path": path}, now, level)
+    old_programs = previous.get("programs") or {}
+    if not updated:
+        for path, fp in (current.get("programs") or {}).items():
+            if old_programs.get(path) and old_programs[path] != fp:
+                _change(db, server, f"program_changed:{path}:{fp}", "system_program_changed", "critical", f"System program replaced: {path}",
+                        f"{path} changed but no package was installed or updated. Rootkits replace programs like ps, ls, ssh or sudo to hide themselves or steal passwords. "
+                        "Compare it with the package (debsums / rpm -V) before trusting this server.", {"path": path}, now, level)
+    new_modules = sorted(set(current.get("modules") or []) - set(previous.get("modules") or []))
+    if previous.get("modules") and new_modules:
+        _change(db, server, f"kmod:{','.join(new_modules[:10])}"[:200], "kernel_module_loaded", "medium", f"Kernel module loaded: {', '.join(new_modules[:5])}",
+                "New code was loaded into the kernel since the previous check (" + ", ".join(new_modules[:20]) + "). Usually a driver or Docker networking; rootkits load modules too.",
+                {"modules": new_modules[:40]}, now, level)

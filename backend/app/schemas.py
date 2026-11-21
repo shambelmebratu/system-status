@@ -1,6 +1,7 @@
 from datetime import datetime
+from typing import Annotated
 
-from pydantic import field_validator, BaseModel, ConfigDict, Field, model_validator
+from pydantic import field_validator, BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 from .config import get_settings
 
@@ -308,6 +309,26 @@ class ForeignPackages(BaseModel):
     error: str | None = Field(default=None, max_length=300)
 
 
+Short = Annotated[str, StringConstraints(max_length=300)]
+Fp = Annotated[str, StringConstraints(max_length=64)]
+
+
+class BaselineAccount(BaseModel):
+    user: str = Field(max_length=64)
+    uid: int = Field(default=-1, ge=-1, le=2**32)
+    shell: str = Field(default="", max_length=80)
+
+
+class SecurityBaseline(BaseModel):
+    """Facts compared with the previous scan (agent 2.17+): fingerprints, accounts, administrators, kernel modules. No file contents."""
+    files: dict[Short, Fp] = Field(default_factory=dict, max_length=150)
+    programs: dict[Short, Fp] = Field(default_factory=dict, max_length=40)
+    accounts: list[BaselineAccount] = Field(default_factory=list, max_length=300)
+    admins: dict[Annotated[str, StringConstraints(max_length=40)], list[Annotated[str, StringConstraints(max_length=64)]]] = Field(default_factory=dict, max_length=10)
+    modules: list[Annotated[str, StringConstraints(max_length=80)]] = Field(default_factory=list, max_length=600)
+    packages_changed_at: str | None = Field(default=None, max_length=40)
+
+
 class SecurityReport(BaseModel):
     checked_at: str = Field(max_length=40)
     findings: list[ThreatFinding] = Field(default_factory=list, max_length=60)
@@ -315,6 +336,7 @@ class SecurityReport(BaseModel):
     listening: list[ListeningPort] = Field(default_factory=list, max_length=80)
     authorized_keys: list[AuthorizedKey] = Field(default_factory=list, max_length=200)
     foreign_packages: ForeignPackages | None = None
+    baseline: SecurityBaseline | None = None
     seconds: float = Field(default=0, ge=0)
 
 
