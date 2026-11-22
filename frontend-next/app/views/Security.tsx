@@ -11,6 +11,12 @@ import { SEC_NAV, SEC_SECTIONS, TAB_LABEL, groupOfSection, setSecCounts, type Se
 
 const COUNT_KEY: Partial<Record<SecSection, string>> = { servers: 'atRisk', threats: 'threats', kubernetes: 'k8s', hardening: 'weak', updates: 'updates', exposure: 'exposed' };
 const COUNT_TONE: Partial<Record<SecSection, string>> = { threats: 'bad', kubernetes: 'bad', exposure: 'bad' };
+const COUNT_HINT: Partial<Record<SecSection, (n: number) => string>> = {
+  servers: n => `${n} server${n === 1 ? '' : 's'} scoring below 75`, threats: n => `${n} critical or high finding${n === 1 ? '' : 's'} needing attention`,
+  kubernetes: n => `${n} critical or high Kubernetes finding${n === 1 ? '' : 's'}`, hardening: n => `${n} failed hardening check${n === 1 ? '' : 's'} across all servers`,
+  updates: n => `${n} pending security update${n === 1 ? '' : 's'} across all servers`,
+  exposure: n => `${n}: risky ports reachable from SM-Watch plus https services with weak TLS, each counted once`,
+};
 
 /* ---------------------------------------------------------------- types */
 type Who = { id: number; name: string; hostname: string | null; public_ip: string | null; private_ips: string[]; host: string | null; os?: string | null };
@@ -112,8 +118,7 @@ export function Security() {
       atRisk: s.filter(x => { const sc = scoreOf(x).score; return sc != null && sc < 75; }).length,
       weak: s.reduce((a, x) => a + x.hardening.failed, 0),
       updates: s.reduce((a, x) => a + (x.updates?.security ?? 0), 0),
-      exposed: s.reduce((a, x) => a + (x.scan?.results.open ?? []).filter(p => p.risk === 'critical' || p.risk === 'high').length, 0)
-        + (o?.clusters ?? []).reduce((a, c) => a + (c.scan?.results.open ?? []).filter(p => p.risk === 'critical' || p.risk === 'high').length, 0),
+      exposed: o ? riskyPorts(o).length + weakTls(o).length : 0,
       ssh: o?.ssh.total ?? 0,
     };
   }, [o, k8s]);
@@ -139,7 +144,7 @@ export function Security() {
         <div className="sec-main">
           <div className="sec-main-head"><h2>{group.label}</h2><span className="grow" /><ServerFilter servers={servers} value={server} onChange={setServer} /></div>
           {tabs.length > 1 && <div className="ktabs sec-subtabs" role="tablist">{tabs.map(t => { const c = (n as Record<string, number>)[COUNT_KEY[t] ?? ''] ?? 0;
-            return <button key={t} role="tab" aria-selected={tab === t} className={tab === t ? 'on' : ''} onClick={() => setTab(t)}>{label(t)}{c > 0 && <span className={`sub-count ${COUNT_TONE[t] ?? 'warn'}`}>{c}</span>}</button>; })}</div>}
+            return <button key={t} role="tab" aria-selected={tab === t} className={tab === t ? 'on' : ''} onClick={() => setTab(t)}>{label(t)}{c > 0 && <span className={`sub-count ${COUNT_TONE[t] ?? 'warn'}`} title={COUNT_HINT[t]?.(c)}>{c}</span>}</button>; })}</div>}
           {data.error && <div className="err">{data.error}</div>}
           {!o || !sec ? <div className="card"><p className="muted"><span className="spinner" /> Loading…</p></div> : o.servers.length === 0 && server ? <div className="card"><Empty title="No server matches">Nothing matches “{server}”. Search by name, host name, IP address or server number. <button className="lg-link" onClick={() => setServer('')}>Show all servers</button></Empty></div> :
             <SecCtx.Provider value={sec}>
@@ -251,6 +256,24 @@ function ServerFilter({ servers, value, onChange }: { servers: Who[]; value: str
   );
 }
 
+/* ---------------------------------------------------------------- exposure, counted once */
+type ExposedPort = OpenPort & { where: string; serverId?: number };
+/** Critical / high ports reachable from SM-Watch, each counted once: a Kubernetes NodePort appears in its node's server scan AND in
+ * the cluster scan (same port on every node), and the same address can be both a server and a cluster node. */
+function riskyPorts(o: Overview): ExposedPort[] {
+  const seen = new Set<string>(), out: ExposedPort[] = [];
+  const key = (address: string | undefined, p: OpenPort) => (p.source === 'kubernetes' && /NodePort/.test(p.service) ? `nodeport:${p.port}` : `${address ?? ''}:${p.port}`);
+  const add = (address: string | undefined, p: OpenPort, where: string, serverId?: number) => {
+    if (p.risk !== 'critical' && p.risk !== 'high') return;
+    const k = key(address, p);
+    if (!seen.has(k)) { seen.add(k); out.push({ ...p, where, serverId }); }
+  };
+  for (const s of o.servers) for (const p of s.scan?.results.open ?? []) add(s.scan?.address, p, s.name, s.id);
+  for (const c of o.clusters ?? []) for (const p of c.scan?.results.open ?? []) add(p.address, p, `cluster ${c.name}`);
+  return out;
+}
+const weakTls = (o: Overview) => o.services.filter(s => s.tls && ['C', 'D', 'F'].includes(s.tls.grade ?? ''));
+
 /* ---------------------------------------------------------------- score */
 type Reason = { text: string; points: number; tab: Tab };
 type Score = { score: number | null; grade: string; tone: string; reasons: Reason[] };
@@ -281,7 +304,7 @@ function scoreOf(s: ServerRow): Score {
 function overallScore(o: Overview): Score & { worst: { row: ServerRow; score: Score } | null } {
   const rows = o.servers.map(row => ({ row, score: scoreOf(row) })).filter(x => x.score.score != null);
   const reasons: Reason[] = [];
-  const badTls = o.services.filter(s => s.tls && ['C', 'D', 'F'].includes(s.tls.grade ?? '')).length;
+  const badTls = weakTls(o).length;
   if (badTls) reasons.push({ text: `${plural(badTls, 'https service')} with weak TLS`, points: Math.min(15, badTls * 5), tab: 'exposure' });
   const k = o.kubernetes;
   if (k && k.critical + k.high) reasons.push({ text: `${plural(k.critical + k.high, 'serious Kubernetes risk')}`, points: Math.min(25, k.critical * 10 + k.high * 4), tab: 'kubernetes' });
@@ -334,7 +357,7 @@ function SecurityHome({ server }: { server: string }) {
   const rows = o.servers.map(row => ({ row, score: scoreOf(row) }));
   const act = usePoll(() => api<ActivityItem[]>(withQ('/security/activity?days=7&limit=8', server)), [server], 60000, true);
   const secUpdates = o.servers.reduce((a, s) => a + (s.updates?.security ?? 0), 0);
-  const exposed = o.servers.flatMap(s => (s.scan?.results.open ?? []).filter(p => p.risk === 'critical' || p.risk === 'high').map(p => ({ server: s, ...p })));
+  const exposed = riskyPorts(o);
   const crit = o.servers.reduce((a, s) => a + s.threats.critical, 0), high = o.servers.reduce((a, s) => a + s.threats.high, 0);
   const weak = o.servers.reduce((a, s) => a + s.hardening.failed, 0);
   const tf = o.two_factor;
@@ -344,13 +367,12 @@ function SecurityHome({ server }: { server: string }) {
     if (row.threats.critical) actions.push({ sev: 'critical', title: `${plural(row.threats.critical, 'critical threat')} on ${row.name}`, sub: 'Possible compromise: look now', open: () => openServer(row.id) });
     else if (row.threats.high) actions.push({ sev: 'high', title: `${plural(row.threats.high, 'high-risk finding')} on ${row.name}`, sub: 'Review and acknowledge or fix', open: () => openServer(row.id) });
   }
-  for (const e of exposed) actions.push({ sev: e.risk === 'critical' ? 'critical' : 'high', title: `${e.service.split(' · ')[0]} reachable on ${e.server.name}`, sub: `port ${e.port}${e.source ? ` · ${SOURCE_LABEL[e.source] ?? e.source}` : ''}`, open: () => openServer(e.server.id) });
-  for (const c of o.clusters ?? []) for (const p of (c.scan?.results.open ?? []).filter(p => p.risk === 'critical' || p.risk === 'high'))
-    actions.push({ sev: p.risk === 'critical' ? 'critical' : 'high', title: `${p.service.split(' · ')[0]} reachable in cluster ${c.name}`, sub: `${p.address ?? ''}:${p.port}`, open: () => go('exposure') });
+  for (const e of exposed) actions.push({ sev: e.risk === 'critical' ? 'critical' : 'high', title: `${e.service.split(' · ')[0]} reachable on ${e.where}`, sub: `port ${e.port}${e.source ? ` · ${SOURCE_LABEL[e.source] ?? e.source}` : ''}`,
+    open: () => (e.serverId ? openServer(e.serverId) : go('exposure')) });
   if (o.kubernetes && o.kubernetes.critical + o.kubernetes.high) actions.push({ sev: o.kubernetes.critical ? 'critical' : 'high', title: `${plural(o.kubernetes.critical + o.kubernetes.high, 'serious Kubernetes risk')}`, sub: 'Privileged or malicious workloads, too much access', open: () => go('kubernetes') });
   for (const { row } of rows) if (row.updates?.security) actions.push({ sev: row.updates.security > 10 ? 'high' : 'medium', title: `${plural(row.updates.security, 'security update')} on ${row.name}`, sub: row.updates.reboot_required ? 'and a reboot is needed' : 'install them soon', open: () => openServer(row.id) });
   for (const { row } of rows) if (row.hardening.failed) actions.push({ sev: 'medium', title: `${plural(row.hardening.failed, 'weak setting')} on ${row.name}`, sub: 'see Hardening', open: () => openServer(row.id) });
-  for (const s of o.services.filter(s => s.tls && ['C', 'D', 'F'].includes(s.tls.grade ?? ''))) actions.push({ sev: s.tls!.grade === 'F' ? 'high' : 'medium', title: `Weak TLS on ${s.name}`, sub: `grade ${s.tls!.grade}`, open: () => go('exposure') });
+  for (const s of weakTls(o)) actions.push({ sev: s.tls!.grade === 'F' ? 'high' : 'medium', title: `Weak TLS on ${s.name}`, sub: `grade ${s.tls!.grade}`, open: () => go('exposure') });
   if (tf && tf.enabled < tf.total) actions.push({ sev: tf.without.some(u => u.role === 'admin') ? 'high' : 'low', title: `${plural(tf.total - tf.enabled, 'person')} without two-factor sign-in`, sub: tf.without.some(u => u.role === 'admin') ? 'including admins' : 'turn it on in Settings', open: () => go('signin') });
   const order: Record<Severity, number> = { critical: 0, high: 1, medium: 2, low: 3 };
   actions.sort((a, b) => order[a.sev] - order[b.sev]);

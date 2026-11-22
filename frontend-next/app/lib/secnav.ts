@@ -26,7 +26,7 @@ export type SecGroup = { id: string; label: string; icon: string; tabs: SecSecti
 export const SEC_GROUPS: SecGroup[] = [
   { id: 'overview', label: 'Overview', icon: 'overview', tabs: ['overview', 'servers'] },
   { id: 'threats', label: 'Threats', icon: 'alert', tabs: ['threats', 'kubernetes'] },
-  { id: 'posture', label: 'Posture', icon: 'check', tabs: ['hardening', 'updates', 'exposure'] },
+  { id: 'posture', label: 'Posture', icon: 'check', tabs: ['exposure', 'hardening', 'updates'] },
   { id: 'access', label: 'Access', icon: 'terminal', tabs: ['ssh', 'signin'] },
   { id: 'activity', label: 'Activity', icon: 'clock', tabs: ['activity', 'reports'] },
   { id: 'alerts', label: 'Alerts', icon: 'bell', tabs: ['alerts'] },

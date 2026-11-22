@@ -90,6 +90,9 @@ const NAV: NavItem[] = [
 ];
 const RANK: Record<Role, number> = { viewer: 1, operator: 2, admin: 3 };
 
+const COUNT_WORDS: Partial<Record<SecSection, string>> = { servers: 'servers at risk', threats: 'serious threats', kubernetes: 'Kubernetes risks', exposure: 'exposure / TLS problems',
+  hardening: 'failed hardening checks', updates: 'security updates' };
+
 /** The Security menu: six entries nested under "Security" while that page is open (related sections are tabs on the page). */
 function SecuritySubNav({ section, isAdmin, go }: { section?: string; isAdmin: boolean; go: (path: string) => void }) {
   const { k8s, counts } = useSecCounts();
@@ -99,11 +102,12 @@ function SecuritySubNav({ section, isAdmin, go }: { section?: string; isAdmin: b
   return <div className="nav-sub" ref={ref} role="group" aria-label="Security sections">{SEC_GROUPS.map(g => {
     const tabs = visibleTabs(g, k8s, isAdmin);
     if (!tabs.length) return null;
-    const parts = tabs.map(t => counts[t]).filter((c): c is { n: number; tone: 'bad' | 'warn' } => !!c && c.n > 0);
-    const n = parts.reduce((a, c) => a + c.n, 0), tone = parts.some(c => c.tone === 'bad') ? 'bad' : 'warn';
+    const parts = tabs.map(t => ({ t, c: counts[t] })).filter((x): x is { t: SecSection; c: { n: number; tone: 'bad' | 'warn' } } => !!x.c && x.c.n > 0);
+    const n = parts.reduce((a, x) => a + x.c.n, 0), tone = parts.some(x => x.c.tone === 'bad') ? 'bad' : 'warn';
+    const why = parts.map(x => `${x.c.n} ${COUNT_WORDS[x.t] ?? x.t}`).join(' · ');
     return <button key={g.id} className={`nav nav-sub-item ${current.id === g.id ? 'active' : ''}`} aria-current={current.id === g.id ? 'page' : undefined}
       onClick={() => go(g.id === 'overview' ? 'security' : `security/${tabs[0]}`)}>
-      <Icon name={g.icon} size={15} />{g.label}{n > 0 && <span className={`sub-count ${tone}`}>{n > 999 ? '999+' : n}</span>}</button>;
+      <Icon name={g.icon} size={15} />{g.label}{n > 0 && <span className={`sub-count ${tone}`} title={why}>{n > 999 ? '999+' : n}</span>}</button>;
   })}</div>;
 }
 
