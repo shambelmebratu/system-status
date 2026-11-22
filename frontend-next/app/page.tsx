@@ -1,10 +1,11 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
 import { Logo } from './components/logo';
 import { Icon } from './components/ui';
 import { api, post } from './lib/api';
 import { AppProvider, useApp, clearPollCache } from './lib/app';
+import { SEC_NAV, SEC_SECTIONS, type SecSection, useSecCounts } from './lib/secnav';
 import { Audit } from './views/Audit';
 import { Channels } from './views/Channels';
 import { Kubernetes } from './views/Kubernetes';
@@ -89,8 +90,27 @@ const NAV: NavItem[] = [
 ];
 const RANK: Record<Role, number> = { viewer: 1, operator: 2, admin: 3 };
 
+/** The Security sections, nested under "Security" in the main menu while that page is open. */
+function SecuritySubNav({ section, isAdmin, go }: { section?: string; isAdmin: boolean; go: (path: string) => void }) {
+  const { k8s, counts } = useSecCounts();
+  const current = SEC_SECTIONS.includes(section as SecSection) ? section : 'overview';
+  const items = SEC_NAV.filter(i => (!i.admin || isAdmin) && (!i.k8s || k8s));
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => { ref.current?.querySelector('.active')?.scrollIntoView({ block: 'nearest' }); }, [current]);
+  let group = '';
+  return <div className="nav-sub" ref={ref} role="group" aria-label="Security sections">{items.map(i => {
+    const head = i.group && i.group !== group ? (group = i.group) : null;
+    const c = counts[i.id];
+    return <Fragment key={i.id}>{head && <div className="nav-sub-label">{head}</div>}
+      <button className={`nav nav-sub-item ${current === i.id ? 'active' : ''}`} aria-current={current === i.id ? 'page' : undefined} onClick={() => go(i.id === 'overview' ? 'security' : `security/${i.id}`)}>
+        <Icon name={i.icon} size={15} />{i.label}{c && c.n > 0 && <span className={`sub-count ${c.tone}`}>{c.n > 999 ? '999+' : c.n}</span>}</button></Fragment>;
+  })}</div>;
+}
+
 function Shell({ company, me, onSignOut }: { company: string; me: Me; onSignOut: () => void }) {
   const { route, go, data } = useApp();
+  const secCounts = useSecCounts();
+  const secAttention = secCounts.counts.threats?.n ?? 0;
   const [open, setOpen] = useState(false);
   const [theme, setTheme] = useState<'dark' | 'light'>('dark');
   useEffect(() => { setTheme(document.documentElement.dataset.theme === 'light' || (!document.documentElement.dataset.theme && matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark'); }, []);
@@ -121,7 +141,9 @@ function Shell({ company, me, onSignOut }: { company: string; me: Me; onSignOut:
                 <button key={item.id} className={`nav ${page === item.id ? 'active' : ''}`} onClick={() => go(item.id)}>
                   <Icon name={item.icon} />{item.label}
                   {item.id === 'incidents' && !!data?.summary.open_incidents && <span className="count">{data.summary.open_incidents}</span>}
+                  {item.id === 'security' && page !== 'security' && secAttention > 0 && <span className="count">{secAttention}</span>}
                 </button>))}
+              {g === 'Security' && page === 'security' && <SecuritySubNav section={route[1]} isAdmin={me.role === 'admin'} go={go} />}
             </div>) : null; })}
         </nav>
         <div className="side-foot">

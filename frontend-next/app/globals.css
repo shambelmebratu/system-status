@@ -1189,3 +1189,11 @@ kbd{font:600 11px var(--mono);border:1px solid var(--line);background:var(--surf
 .sec-ports-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.sec-ports-head .mono{font-weight:700;min-width:44px}
 @media (max-width:600px){.sec-kpis{width:100%;grid-template-columns:repeat(2,minmax(0,1fr))}.sec-main-head .sec-filter{flex:1 1 100%}.sec-main-head .sec-filter .pick-box{flex:1 1 auto}}
 .sec-layout .grow,.sec-drawer .grow{flex:1 1 auto;min-width:0}
+/* Security sections nested in the main menu (replaces the in-page panel) */
+.sec-layout{display:block}
+.nav-sub{margin:2px 0 6px 18px;padding-left:10px;border-left:1px solid var(--line);display:flex;flex-direction:column;gap:1px}
+.nav-sub-label{font-size:9.5px;font-weight:700;letter-spacing:.7px;text-transform:uppercase;color:var(--muted);padding:8px 10px 2px}
+.nav.nav-sub-item{padding:6px 10px;font-size:13px;gap:9px}
+.nav.nav-sub-item.active{background:color-mix(in srgb,var(--accent) 14%,var(--surface-2));box-shadow:inset 2px 0 0 var(--accent)}
+.sub-count{margin-left:auto;font-size:10.5px;font-weight:700;min-width:18px;text-align:center;padding:0 6px;border-radius:99px;font-variant-numeric:tabular-nums}
+.sub-count.bad{background:color-mix(in srgb,var(--bad) 22%,transparent);color:var(--bad)}.sub-count.warn{background:color-mix(in srgb,var(--warn) 22%,transparent);color:var(--warn)}

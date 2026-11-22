@@ -7,6 +7,7 @@ import { TargetPicker, type PickerOption } from '../components/logviewer';
 import { api, post, put } from '../lib/api';
 import { useApp, usePoll } from '../lib/app';
 import { timeAgo } from '../lib/format';
+import { SEC_NAV, SEC_SECTIONS, setSecCounts, type SecSection } from '../lib/secnav';
 
 /* ---------------------------------------------------------------- types */
 type Who = { id: number; name: string; hostname: string | null; public_ip: string | null; private_ips: string[]; host: string | null; os?: string | null };
@@ -38,7 +39,7 @@ type Foreign = { manager: string | null; packages: string[]; total?: number; err
 type Hardening = { server: Who; agent_version: string | null; push: boolean; checked_at: string | null; checks: Check[]; listening: Listen[]; authorized_keys: Key[]; foreign_packages: Foreign; supported: boolean };
 type Login = { id: number; server: Pick<Who, 'id' | 'name' | 'hostname' | 'public_ip'>; ts: string; ip: string; user: string; method: string; failures_before: number; new_source: boolean;
   verdict: 'breach' | 'new' | 'ok' | 'transfer'; kind?: 'login' | 'sftp'; key_type?: string | null; fingerprint?: string | null; key_name?: string | null };
-type Tab = 'overview' | 'activity' | 'servers' | 'threats' | 'kubernetes' | 'ssh' | 'updates' | 'hardening' | 'exposure' | 'alerts' | 'reports' | 'signin';
+type Tab = SecSection;
 type K8sFinding = { id: number; cluster_id: number; cluster: { id: number; name: string } | null; key: string; kind: string; severity: Severity; namespace: string; object: string; title: string; detail: string;
   evidence: { container?: string; image?: string; command?: string; path?: string; capabilities?: string; subject?: string; role?: string; pods?: number; created?: string };
   first_seen: string; last_seen: string; resolved_at: string | null; acknowledged_by: string | null; acknowledged_at: string | null; note: string };
@@ -86,10 +87,10 @@ type SecApi = { o: Overview; openServer: (id: number) => void; openFinding: (f: 
   reload: () => Promise<void>; version: number; changed: () => void };
 const SecCtx = createContext<SecApi | null>(null);
 const useSec = () => useContext(SecCtx)!;
-const SECTIONS: Tab[] = ['overview', 'activity', 'servers', 'threats', 'kubernetes', 'ssh', 'hardening', 'updates', 'exposure', 'alerts', 'signin', 'reports'];
+const SECTIONS: Tab[] = SEC_SECTIONS;
 
 export function Security() {
-  const { isAdmin, route, go: navigate } = useApp();
+  const { route, go: navigate } = useApp();
   const [server, setServer] = useState<string>(() => { try { return localStorage.getItem(FILTER_KEY) ?? ''; } catch { return ''; } });
   useEffect(() => { try { if (server) localStorage.setItem(FILTER_KEY, server); else localStorage.removeItem(FILTER_KEY); } catch { /* storage unavailable */ } }, [server]);
   const servers = usePoll(() => api<Who[]>('/security/servers'), [], 120000).value ?? [];
@@ -113,16 +114,12 @@ export function Security() {
       ssh: o?.ssh.total ?? 0,
     };
   }, [o, k8s]);
-  const nav: { group: string; items: { id: Tab; label: string; icon: string; count?: number; tone?: 'bad' | 'warn' }[] }[] = [
-    { group: '', items: [{ id: 'overview', label: 'Overview', icon: 'shield' }, { id: 'activity', label: 'Activity', icon: 'clock' }, { id: 'servers', label: 'Servers', icon: 'server', count: n.atRisk, tone: 'warn' }] },
-    { group: 'Detect', items: [{ id: 'threats', label: 'Threats', icon: 'alert', count: n.threats, tone: 'bad' },
-      ...(k8s?.clusters ? [{ id: 'kubernetes' as Tab, label: 'Kubernetes', icon: 'k8s', count: n.k8s, tone: 'bad' as const }] : []),
-      { id: 'ssh', label: 'SSH access', icon: 'terminal' }] },
-    { group: 'Posture', items: [{ id: 'hardening', label: 'Hardening', icon: 'check', count: n.weak, tone: 'warn' }, { id: 'updates', label: 'Updates', icon: 'refresh', count: n.updates, tone: 'warn' },
-      { id: 'exposure', label: 'Exposure & TLS', icon: 'globe', count: n.exposed, tone: 'bad' }] },
-    { group: 'Configure', items: [{ id: 'alerts', label: 'Alerts', icon: 'bell' }, ...(isAdmin ? [{ id: 'signin' as Tab, label: 'Sign-in', icon: 'users' }] : []), { id: 'reports', label: 'Reports', icon: 'logs' }] },
-  ];
-  const current = nav.flatMap(g => g.items).find(i => i.id === tab);
+  useEffect(() => {   // the main menu shows these sections nested under "Security", with these counts
+    if (!o) return;
+    setSecCounts({ k8s: !!k8s?.clusters, counts: { servers: { n: n.atRisk, tone: 'warn' }, threats: { n: n.threats, tone: 'bad' }, kubernetes: { n: n.k8s, tone: 'bad' },
+      hardening: { n: n.weak, tone: 'warn' }, updates: { n: n.updates, tone: 'warn' }, exposure: { n: n.exposed, tone: 'bad' } } });
+  }, [o, k8s, n]);
+  const current = SEC_NAV.find(i => i.id === tab);
   const sec: SecApi | null = o ? {
     o, go: setTab, reload: data.reload, version, changed: () => { setVersion(v => v + 1); void data.reload(); },
     openServer: id => setDrawer({ kind: 'server', id }), openFinding: (f, from) => setDrawer({ kind: 'finding', finding: f, from }),
@@ -134,11 +131,6 @@ export function Security() {
       <div className="topbar"><div><h1>Security</h1><p className="muted sm">Attacks and break-ins, signs of malware, missing patches, weak settings, what is exposed to the internet, and how people sign in.</p></div>
         <span className="grow" /><ScanControls server={server} onDone={data.reload} /></div>
       <div className="sec-layout">
-        <nav className="sec-nav" aria-label="Security sections">
-          {nav.map(g => <div key={g.group || 'main'} className="sec-nav-group">{g.group && <div className="sec-nav-title">{g.group}</div>}
-            {g.items.map(i => <button key={i.id} className={tab === i.id ? 'on' : ''} aria-current={tab === i.id ? 'page' : undefined} onClick={() => setTab(i.id)}>
-              <Icon name={i.icon} size={15} /><span className="grow">{i.label}</span>{i.count ? <span className={`sec-nav-count ${i.tone ?? ''}`}>{i.count > 999 ? '999+' : i.count}</span> : null}</button>)}</div>)}
-        </nav>
         <div className="sec-main">
           <div className="sec-main-head"><h2>{current?.label ?? 'Overview'}</h2><span className="grow" /><ServerFilter servers={servers} value={server} onChange={setServer} /></div>
           {data.error && <div className="err">{data.error}</div>}
