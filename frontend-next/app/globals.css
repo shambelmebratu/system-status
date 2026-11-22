@@ -1197,3 +1197,4 @@ kbd{font:600 11px var(--mono);border:1px solid var(--line);background:var(--surf
 .nav.nav-sub-item.active{background:color-mix(in srgb,var(--accent) 14%,var(--surface-2));box-shadow:inset 2px 0 0 var(--accent)}
 .sub-count{margin-left:auto;font-size:10.5px;font-weight:700;min-width:18px;text-align:center;padding:0 6px;border-radius:99px;font-variant-numeric:tabular-nums}
 .sub-count.bad{background:color-mix(in srgb,var(--bad) 22%,transparent);color:var(--bad)}.sub-count.warn{background:color-mix(in srgb,var(--warn) 22%,transparent);color:var(--warn)}
+.sec-subtabs{margin-bottom:16px;align-self:flex-start}.sec-subtabs .sub-count{margin-left:4px}

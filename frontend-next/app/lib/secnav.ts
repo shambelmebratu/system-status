@@ -21,6 +21,23 @@ export const SEC_NAV: SecNavItem[] = [
 ];
 export const SEC_SECTIONS = SEC_NAV.map(i => i.id);
 
+/** The six menu entries; each holds one or more of the sections above, shown as tabs on the page. */
+export type SecGroup = { id: string; label: string; icon: string; tabs: SecSection[] };
+export const SEC_GROUPS: SecGroup[] = [
+  { id: 'overview', label: 'Overview', icon: 'overview', tabs: ['overview', 'servers'] },
+  { id: 'threats', label: 'Threats', icon: 'alert', tabs: ['threats', 'kubernetes'] },
+  { id: 'posture', label: 'Posture', icon: 'check', tabs: ['hardening', 'updates', 'exposure'] },
+  { id: 'access', label: 'Access', icon: 'terminal', tabs: ['ssh', 'signin'] },
+  { id: 'activity', label: 'Activity', icon: 'clock', tabs: ['activity', 'reports'] },
+  { id: 'alerts', label: 'Alerts', icon: 'bell', tabs: ['alerts'] },
+];
+/** Tab names inside a group (shorter than the section names where the group already says it). */
+export const TAB_LABEL: Partial<Record<SecSection, string>> = { threats: 'Servers', overview: 'Summary', activity: 'Timeline', ssh: 'SSH logins', signin: 'Two-factor sign-in' };
+export const groupOfSection = (s: SecSection) => SEC_GROUPS.find(g => g.tabs.includes(s)) ?? SEC_GROUPS[0];
+/** The tabs of a group this person can see (Kubernetes only with clusters, sign-in only for admins). */
+export const visibleTabs = (g: SecGroup, k8s: boolean, isAdmin: boolean) =>
+  g.tabs.filter(t => { const i = SEC_NAV.find(n => n.id === t)!; return (!i.admin || isAdmin) && (!i.k8s || k8s); });
+
 export type SecCounts = { k8s: boolean; counts: Partial<Record<SecSection, { n: number; tone: 'bad' | 'warn' }>> };
 let state: SecCounts = { k8s: false, counts: {} };
 const listeners = new Set<() => void>();

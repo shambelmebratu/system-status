@@ -7,7 +7,10 @@ import { TargetPicker, type PickerOption } from '../components/logviewer';
 import { api, post, put } from '../lib/api';
 import { useApp, usePoll } from '../lib/app';
 import { timeAgo } from '../lib/format';
-import { SEC_NAV, SEC_SECTIONS, setSecCounts, type SecSection } from '../lib/secnav';
+import { SEC_NAV, SEC_SECTIONS, TAB_LABEL, groupOfSection, setSecCounts, type SecSection, visibleTabs } from '../lib/secnav';
+
+const COUNT_KEY: Partial<Record<SecSection, string>> = { servers: 'atRisk', threats: 'threats', kubernetes: 'k8s', hardening: 'weak', updates: 'updates', exposure: 'exposed' };
+const COUNT_TONE: Partial<Record<SecSection, string>> = { threats: 'bad', kubernetes: 'bad', exposure: 'bad' };
 
 /* ---------------------------------------------------------------- types */
 type Who = { id: number; name: string; hostname: string | null; public_ip: string | null; private_ips: string[]; host: string | null; os?: string | null };
@@ -90,7 +93,7 @@ const useSec = () => useContext(SecCtx)!;
 const SECTIONS: Tab[] = SEC_SECTIONS;
 
 export function Security() {
-  const { route, go: navigate } = useApp();
+  const { isAdmin, route, go: navigate } = useApp();
   const [server, setServer] = useState<string>(() => { try { return localStorage.getItem(FILTER_KEY) ?? ''; } catch { return ''; } });
   useEffect(() => { try { if (server) localStorage.setItem(FILTER_KEY, server); else localStorage.removeItem(FILTER_KEY); } catch { /* storage unavailable */ } }, [server]);
   const servers = usePoll(() => api<Who[]>('/security/servers'), [], 120000).value ?? [];
@@ -119,7 +122,9 @@ export function Security() {
     setSecCounts({ k8s: !!k8s?.clusters, counts: { servers: { n: n.atRisk, tone: 'warn' }, threats: { n: n.threats, tone: 'bad' }, kubernetes: { n: n.k8s, tone: 'bad' },
       hardening: { n: n.weak, tone: 'warn' }, updates: { n: n.updates, tone: 'warn' }, exposure: { n: n.exposed, tone: 'bad' } } });
   }, [o, k8s, n]);
-  const current = SEC_NAV.find(i => i.id === tab);
+  const group = groupOfSection(tab);
+  const tabs = visibleTabs(group, !!k8s?.clusters, isAdmin);
+  const label = (t: Tab) => TAB_LABEL[t] ?? SEC_NAV.find(i => i.id === t)?.label ?? t;
   const sec: SecApi | null = o ? {
     o, go: setTab, reload: data.reload, version, changed: () => { setVersion(v => v + 1); void data.reload(); },
     openServer: id => setDrawer({ kind: 'server', id }), openFinding: (f, from) => setDrawer({ kind: 'finding', finding: f, from }),
@@ -132,7 +137,9 @@ export function Security() {
         <span className="grow" /><ScanControls server={server} onDone={data.reload} /></div>
       <div className="sec-layout">
         <div className="sec-main">
-          <div className="sec-main-head"><h2>{current?.label ?? 'Overview'}</h2><span className="grow" /><ServerFilter servers={servers} value={server} onChange={setServer} /></div>
+          <div className="sec-main-head"><h2>{group.label}</h2><span className="grow" /><ServerFilter servers={servers} value={server} onChange={setServer} /></div>
+          {tabs.length > 1 && <div className="ktabs sec-subtabs" role="tablist">{tabs.map(t => { const c = (n as Record<string, number>)[COUNT_KEY[t] ?? ''] ?? 0;
+            return <button key={t} role="tab" aria-selected={tab === t} className={tab === t ? 'on' : ''} onClick={() => setTab(t)}>{label(t)}{c > 0 && <span className={`sub-count ${COUNT_TONE[t] ?? 'warn'}`}>{c}</span>}</button>; })}</div>}
           {data.error && <div className="err">{data.error}</div>}
           {!o || !sec ? <div className="card"><p className="muted"><span className="spinner" /> Loading…</p></div> : o.servers.length === 0 && server ? <div className="card"><Empty title="No server matches">Nothing matches “{server}”. Search by name, host name, IP address or server number. <button className="lg-link" onClick={() => setServer('')}>Show all servers</button></Empty></div> :
             <SecCtx.Provider value={sec}>

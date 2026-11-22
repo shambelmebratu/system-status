@@ -1,11 +1,11 @@
 'use client';
 
-import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Logo } from './components/logo';
 import { Icon } from './components/ui';
 import { api, post } from './lib/api';
 import { AppProvider, useApp, clearPollCache } from './lib/app';
-import { SEC_NAV, SEC_SECTIONS, type SecSection, useSecCounts } from './lib/secnav';
+import { SEC_GROUPS, SEC_SECTIONS, groupOfSection, type SecSection, useSecCounts, visibleTabs } from './lib/secnav';
 import { Audit } from './views/Audit';
 import { Channels } from './views/Channels';
 import { Kubernetes } from './views/Kubernetes';
@@ -63,7 +63,7 @@ export default function Home() {
 
 const AI_PAGES = ['assistant', 'ai-settings'];
 type NavItem = { id: string; label: string; icon: string; min: Role; fleet?: boolean; group: string };
-const GROUPS = ['Monitor', 'Quality', 'DevOps', 'Security', 'AI', 'Admin'];
+const GROUPS = ['Monitor', 'Security', 'Quality', 'DevOps', 'AI', 'Admin'];
 const NAV: NavItem[] = [
   { id: 'overview', label: 'Overview', icon: 'overview', min: 'viewer', group: 'Monitor' },
   { id: 'servers', label: 'Servers', icon: 'server', min: 'viewer', group: 'Monitor' },
@@ -90,20 +90,20 @@ const NAV: NavItem[] = [
 ];
 const RANK: Record<Role, number> = { viewer: 1, operator: 2, admin: 3 };
 
-/** The Security sections, nested under "Security" in the main menu while that page is open. */
+/** The Security menu: six entries nested under "Security" while that page is open (related sections are tabs on the page). */
 function SecuritySubNav({ section, isAdmin, go }: { section?: string; isAdmin: boolean; go: (path: string) => void }) {
   const { k8s, counts } = useSecCounts();
-  const current = SEC_SECTIONS.includes(section as SecSection) ? section : 'overview';
-  const items = SEC_NAV.filter(i => (!i.admin || isAdmin) && (!i.k8s || k8s));
+  const current = groupOfSection(SEC_SECTIONS.includes(section as SecSection) ? section as SecSection : 'overview');
   const ref = useRef<HTMLDivElement>(null);
-  useEffect(() => { ref.current?.querySelector('.active')?.scrollIntoView({ block: 'nearest' }); }, [current]);
-  let group = '';
-  return <div className="nav-sub" ref={ref} role="group" aria-label="Security sections">{items.map(i => {
-    const head = i.group && i.group !== group ? (group = i.group) : null;
-    const c = counts[i.id];
-    return <Fragment key={i.id}>{head && <div className="nav-sub-label">{head}</div>}
-      <button className={`nav nav-sub-item ${current === i.id ? 'active' : ''}`} aria-current={current === i.id ? 'page' : undefined} onClick={() => go(i.id === 'overview' ? 'security' : `security/${i.id}`)}>
-        <Icon name={i.icon} size={15} />{i.label}{c && c.n > 0 && <span className={`sub-count ${c.tone}`}>{c.n > 999 ? '999+' : c.n}</span>}</button></Fragment>;
+  useEffect(() => { ref.current?.querySelector('.active')?.scrollIntoView({ block: 'nearest' }); }, [current.id]);
+  return <div className="nav-sub" ref={ref} role="group" aria-label="Security sections">{SEC_GROUPS.map(g => {
+    const tabs = visibleTabs(g, k8s, isAdmin);
+    if (!tabs.length) return null;
+    const parts = tabs.map(t => counts[t]).filter((c): c is { n: number; tone: 'bad' | 'warn' } => !!c && c.n > 0);
+    const n = parts.reduce((a, c) => a + c.n, 0), tone = parts.some(c => c.tone === 'bad') ? 'bad' : 'warn';
+    return <button key={g.id} className={`nav nav-sub-item ${current.id === g.id ? 'active' : ''}`} aria-current={current.id === g.id ? 'page' : undefined}
+      onClick={() => go(g.id === 'overview' ? 'security' : `security/${tabs[0]}`)}>
+      <Icon name={g.icon} size={15} />{g.label}{n > 0 && <span className={`sub-count ${tone}`}>{n > 999 ? '999+' : n}</span>}</button>;
   })}</div>;
 }
 
