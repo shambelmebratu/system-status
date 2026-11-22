@@ -419,6 +419,17 @@ Review the manifest first by running the `curl` alone. It creates a `smwatch` na
 
 ## Security
 
+**The Security page:**
+- A sidebar groups the sections into Overview, Activity and Servers; *Detect* (Threats, Kubernetes, SSH access); *Posture* (Hardening, Updates, Exposure & TLS); and *Configure* (Alerts, Sign-in, Reports). Each section shows a live count and has its own link, e.g. `#security/threats`. The server filter sits at the top of every section.
+- **Overview** shows a **security score** from 0 to 100 with a grade:
+  - Each server starts at 100 and loses points for critical (−30) and high-risk (−12) findings, findings to review, reachable critical (−20) and risky ports, pending security updates, a needed reboot, failed hardening checks, and heavy SSH attacks. Each kind is capped, so one problem cannot hide the rest.
+  - The page score averages the servers, pulls the score down when one server is much worse than the rest, and subtracts points for weak TLS and serious Kubernetes risks.
+  - Below it: a *Fix first* list in order of severity, recent activity, failed SSH logins over 24 h, and the riskiest servers.
+- **Activity:** one timeline over 24 hours, 7, 30 or 90 days. It shows findings found, acknowledged and resolved; port and TLS scans; security alerts with their delivery result; and security settings changes, with who made them.
+- **Servers:** a card per server with its grade, threats, updates, hardening, exposure, SSH failures and the main reason for its score, riskiest first.
+- Clicking a server anywhere opens its **server drawer**. It shows why the score is what it is (each reason links to its section), the threats needing attention, weak settings, security updates, what SM-Watch can reach, the top SSH attackers and the SSH keys. Buttons: *Run checks now*, *Scan ports now*, *Only this server* and *Server page*.
+- Clicking a finding opens the **finding drawer**: what was found, a *What to do* guide for that kind of problem, the evidence, the command, a timeline (first seen, still seen, acknowledged with the note, resolved), and *Inspect process* / *Acknowledge*.
+
 - **Two-factor sign-in:** each person turns it on in *Settings* (any authenticator app) and gets 10 one-time recovery codes. Admins can require it for admins or for everyone (*Security → Sign-in*); people without it are then sent to the setup screen after signing in. Admins can reset someone's 2FA from *Users*.
 - **SSH brute-force detection:** agents ≥ 2.14.0 report failed SSH logins (IP and user name only, never log lines). `SSH_ATTACK_THRESHOLD` (30) failures in 10 minutes on one server raise an alert (at most hourly). *Security → SSH attacks* lists top source IPs.
 - **Pending security updates:** the agent checks apt / dnf / yum / apk every `AGENT_UPDATES_HOURS` (6) using a dry run (nothing is installed) and reports counts, the packages and whether a reboot is needed. `AGENT_SECURITY=off` on a server turns both agent features off.

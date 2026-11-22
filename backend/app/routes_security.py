@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, or_, select
 from sqlalchemy.orm import Session
 
 from . import secalerts, secscan
@@ -128,6 +128,64 @@ def overview(server: str | None = Query(None, max_length=200), user: dict = Depe
     return out
 
 
+ACTION_TITLES = {"security.alerts": "Security alert settings changed", "security.alerts_test": "Test security alert sent", "security.scan_all": "Scan of everything started",
+                 "security.scan": "Scan run by hand", "security.recheck": "Agents asked to re-check", "security.schedule": "Scan schedule changed",
+                 "security.acknowledge": "Finding acknowledged", "security.report": "Security report created", "security.policy": "Two-factor policy changed"}
+
+
+@router.get("/activity")
+def activity(days: int = Query(7, ge=1, le=90), server: str | None = Query(None, max_length=200), limit: int = Query(300, ge=1, le=1000),
+             user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> list[dict]:
+    """One timeline of security events, newest first: findings opened, acknowledged and resolved, port / TLS scans, security alerts
+    (and whether they were delivered), and security settings changes. Only the servers this person can see."""
+    from .models import AlertEvent, AuditEvent
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    servers = visible_servers(db, user, server)
+    who = {s.id: {"id": s.id, "name": s.name} for s in servers}
+    ids = list(who) or [0]
+    out: list[dict] = []
+    for f in db.scalars(select(SecurityFinding).where(SecurityFinding.server_id.in_(ids), or_(SecurityFinding.first_seen >= since, SecurityFinding.resolved_at >= since,
+                                                                                               SecurityFinding.acknowledged_at >= since))).all():
+        base = {"server": who.get(f.server_id), "finding_id": f.id, "kind": f.kind, "severity": f.severity, "title": f.title}
+        if aware(f.first_seen) >= since:
+            out.append({**base, "at": aware(f.first_seen).isoformat(), "type": "found", "detail": f.detail[:300]})
+        if f.acknowledged_at and aware(f.acknowledged_at) >= since:
+            out.append({**base, "at": aware(f.acknowledged_at).isoformat(), "type": "acknowledged", "actor": f.acknowledged_by, "detail": f.note or ""})
+        if f.resolved_at and aware(f.resolved_at) >= since:
+            out.append({**base, "at": aware(f.resolved_at).isoformat(), "type": "resolved", "detail": ""})
+    scan_q = select(SecurityScan).where(SecurityScan.started_at >= since)
+    if server:
+        scan_q = scan_q.where(SecurityScan.target_type == "server", SecurityScan.target_id.in_(ids))
+    from .models import Cluster
+    names = {("service", s.id): s.name for s in db.scalars(select(Service)).all()} | {("cluster", c.id): f"cluster {c.name}" for c in db.scalars(select(Cluster)).all()}
+    for sc in db.scalars(scan_q.order_by(desc(SecurityScan.id)).limit(200)).all():
+        if sc.target_type == "server" and sc.target_id not in who:
+            continue
+        if sc.target_type in ("service", "cluster") and not can_see(user, sc.target_type, sc.target_id):
+            continue
+        target = who.get(sc.target_id) if sc.target_type == "server" else None
+        label = target["name"] if target else names.get((sc.target_type, sc.target_id)) or f"{sc.target_type} #{sc.target_id}"
+        out.append({"at": aware(sc.started_at).isoformat(), "type": "scan", "server": target, "severity": "high" if (sc.findings or 0) else "low",
+                    "title": f"{'Port scan' if sc.kind == 'ports' else 'TLS audit'} of {label}: " + (f"failed ({sc.error[:120]})" if sc.error else f"grade {sc.grade or '–'}, {sc.findings or 0} risky"),
+                    "detail": sc.address or "", "kind": sc.kind})
+    alert_q = select(AlertEvent).where(AlertEvent.state.in_(secalerts.SECURITY_STATES), AlertEvent.created_at >= since)
+    for e in db.scalars(alert_q.order_by(desc(AlertEvent.id)).limit(300)).all():
+        if e.target_type == "server" and e.target_id not in who:
+            continue
+        if server and e.target_type != "server":
+            continue
+        lines = [ln for ln in (e.message or "").replace("<b>", "").replace("</b>", "").splitlines() if ln.strip()]
+        out.append({"at": aware(e.created_at).isoformat(), "type": "alert", "server": who.get(e.target_id) if e.target_type == "server" else None,
+                    "severity": "critical" if e.severity == "critical" else "medium", "title": lines[1][:200] if len(lines) > 1 else (lines[0][:200] if lines else "Security alert"),
+                    "detail": "sent" if e.sent else (e.delivery_error or "not sent yet"), "sent": bool(e.sent), "kind": secalerts.category_of(e.state, e.target_type)})
+    if not server:
+        for a in db.scalars(select(AuditEvent).where(AuditEvent.action.like("security.%"), AuditEvent.ts >= since).order_by(desc(AuditEvent.id)).limit(200)).all():
+            out.append({"at": aware(a.ts).isoformat(), "type": "action", "server": None, "severity": "low", "title": ACTION_TITLES.get(a.action, a.action.replace("security.", "").replace("_", " ").capitalize()),
+                        "detail": (a.detail or "")[:300], "actor": a.actor, "kind": a.action})
+    out.sort(key=lambda r: r["at"], reverse=True)
+    return out[:limit]
+
+
 @router.get("/servers")
 def servers_list(user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> list[dict]:
     """The server picker: every visible server with what people search by."""
@@ -218,6 +276,15 @@ def findings(server: str | None = Query(None, max_length=200), status: str = Que
     out = [finding_view(f, infos[f.server_id]) for f in rows]
     out.sort(key=lambda f: (f["resolved_at"] is not None, f["acknowledged_at"] is not None, SEVERITY_ORDER.get(f["severity"], 9), f["last_seen"]))
     return out
+
+
+@router.get("/findings/{finding_id}")
+def finding_detail(finding_id: int, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+    f = db.get(SecurityFinding, finding_id)
+    if f is None or not can_see(user, "server", f.server_id):
+        raise HTTPException(404, "Finding not found")
+    server = db.get(Server, f.server_id)
+    return finding_view(f, server_info(server) if server else None)
 
 
 class AckIn(BaseModel):
