@@ -54,7 +54,7 @@ class K8sSecurity(BaseModel):
 def sync_cluster_findings(db: Session, cluster, report: K8sSecurity, now: datetime) -> list:
     """Opens, refreshes and resolves findings. Returns the new ones that should alert."""
     from .models import ClusterFinding
-    level = _alert_level()
+    level = _alert_level(db)
     open_rows = {r.key: r for r in db.scalars(select(ClusterFinding).where(ClusterFinding.cluster_id == cluster.id, ClusterFinding.resolved_at.is_(None))).all()}
     seen, new_serious = set(), []
     for f in report.findings:

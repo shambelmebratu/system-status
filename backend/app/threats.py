@@ -70,7 +70,8 @@ def record_logins(db: Session, server, accepted: list[dict], now: datetime) -> N
         db.add(SshLoginEvent(server_id=server.id, ts=ts, ip=ip, user=user, method=method, failures_before=tried, new_source=new_source, kind="login", **key))
         db.flush()
         evidence = {"ip": ip, "user": user, "method": method, "failed_attempts_24h": tried, "at": ts.isoformat(), **{k: v for k, v in key.items() if v}}
-        if tried >= settings.ssh_success_after_failures:
+        from .secalerts import config as alert_config
+        if tried >= alert_config(db)["ssh_success_after_failures"]:
             finding, is_new = open_finding(db, server, f"login_breach:{ip}:{user}", kind="ssh_login_after_failures", severity="critical", source="smwatch", now=now,
                                            title=f"SSH login by {user or '?'} from {ip} after {tried} failed attempts",
                                            detail=(f"{user or 'Someone'} logged in over SSH ({method or 'unknown method'}) from {ip}, an address that failed to log in {tried} times "
@@ -137,8 +138,14 @@ def record_transfers(db: Session, server, transfers: list[dict], now: datetime) 
 
 
 # ------------------------------------------------------------------------------------------------ agent threat scan
-def _alert_level() -> int:
-    level = get_settings().threat_alert_severity.lower()
+def _alert_level(db: Session | None = None) -> int:
+    from .database import SessionLocal
+    from .secalerts import config
+    if db is None:
+        with SessionLocal() as own:
+            level = config(own)["threat_severity"]
+    else:
+        level = config(db)["threat_severity"]
     return -1 if level == "off" else SEVERITY_ORDER.get(level, 1)
 
 
@@ -148,7 +155,7 @@ def sync_threats(db: Session, server, report: dict, previous: dict | None, now: 
     from .models import SecurityFinding
     if previous and previous.get("checked_at") == report.get("checked_at"):
         return                                                  # the same cached scan, re-sent with the next report: nothing new
-    level = _alert_level()
+    level = _alert_level(db)
     present = set()
     for f in report.get("findings") or []:
         key = f"agent:{f['key']}"

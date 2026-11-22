@@ -24,7 +24,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-AGENT_VERSION = "1.3.0"
+AGENT_VERSION = "1.4.0"
 SMWATCH_URL = os.getenv("SMWATCH_URL", "").rstrip("/")
 _TOKEN = os.getenv("SMWATCH_TOKEN", "")                       # this cluster's agent token (from the Secret the manifest created)
 AGENT_ALLOW_INSECURE = os.getenv("AGENT_ALLOW_INSECURE", "") == "1"
@@ -784,6 +784,28 @@ def summary() -> dict:
             if len(problems) < 25:
                 problems.append(f"{key[:-1]} {meta(i).get('namespace')}/{meta(i).get('name')}: not fully available")
     hpas, _ = klist("/apis/autoscaling/v2/horizontalpodautoscalers", cap=5000)
+    exposed = []
+    try:
+        services, _ = klist("/api/v1/services", cap=5000)
+    except Exception:   # noqa: BLE001  (no permission to list services: the rest of the report still counts)
+        services = []
+    for svc in services:
+        spec = svc.get("spec") or {}
+        kind = spec.get("type") or "ClusterIP"
+        if kind not in ("NodePort", "LoadBalancer"):
+            continue
+        ingress = ((svc.get("status") or {}).get("loadBalancer") or {}).get("ingress") or []
+        exposed.append({"namespace": meta(svc).get("namespace", "")[:80], "name": meta(svc).get("name", "")[:120], "type": kind,
+                        "ports": [{"port": int(p.get("port") or 0), "node_port": int(p.get("nodePort") or 0), "target": str(p.get("targetPort") or "")[:40]}
+                                  for p in spec.get("ports") or [] if (p.get("protocol") or "TCP") == "TCP"][:20],
+                        "external": [(i.get("ip") or i.get("hostname") or "")[:200] for i in ingress if i.get("ip") or i.get("hostname")][:5]})
+        if len(exposed) >= 200:
+            break
+    node_addresses = []
+    for n in nodes[:200]:
+        addrs = {a.get("type"): a.get("address", "") for a in (n.get("status") or {}).get("addresses") or []}
+        ready = any(c.get("type") == "Ready" and c.get("status") == "True" for c in (n.get("status") or {}).get("conditions") or [])
+        node_addresses.append({"name": meta(n)["name"][:200], "internal": addrs.get("InternalIP", "")[:60], "external": addrs.get("ExternalIP", "")[:60], "ready": ready})
     for name in not_ready:
         problems.insert(0, f"node {name}: NotReady")
     return {
@@ -794,6 +816,7 @@ def summary() -> dict:
         "statefulsets_total": workloads["statefulsets"][0], "statefulsets_unavailable": workloads["statefulsets"][1],
         "daemonsets_total": workloads["daemonsets"][0], "daemonsets_unavailable": workloads["daemonsets"][1], "hpa_total": len(hpas),
         "problems": [p[:200] for p in problems[:30]], **usage_totals(nodes), "security": security_scan(pods),
+        "exposed": exposed, "node_addresses": node_addresses,
     }
 
 

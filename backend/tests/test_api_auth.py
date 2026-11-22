@@ -30,10 +30,15 @@ CSRF = {"X-Requested-With": "smwatch"}
 def fresh_stats_cache():
     """Tests write history with past timestamps; production only ever writes "now" (cached past days never change there)."""
     from app.stats import clear_cache, forget_days
+    from app import secalerts
     def reset():
         with database.SessionLocal() as db:      # stored daily uptime too: tests write checks into days earlier tests already counted
-            forget_days(db); db.commit()
+            forget_days(db)
+            from app.models import AppSetting
+            db.query(AppSetting).filter(AppSetting.key == secalerts.KEY).delete()   # security alert settings saved by a test
+            db.commit()
         clear_cache()
+        secalerts.forget()
     reset()
     yield
     reset()
@@ -2097,9 +2102,13 @@ def test_service_timeout_marks_slow_answers_failed(client, monkeypatch):
         slow = m.Service(name="slow", url=base + "/slow", expected_status=200, timeout_seconds=1, cert_check=True)
         assert m.probe_service(fast)["status"] == "up" and "cert" not in m.probe_service(fast)          # http: no certificate to read
         r = m.probe_service(slow)
-        assert r["status"] == "down" and "Timed out" in r["error"] and "1 s" in r["error"]
+        assert r["status"] == "down" and "Timed out" in r["error"] and "1000 ms" in r["error"]          # legacy whole seconds still work
         slow.timeout_seconds = 5
         assert m.probe_service(slow)["status"] == "up"
+        fast.timeout_ms, slow.timeout_ms = 300, 300                                                    # milliseconds win over seconds
+        assert m.probe_service(fast)["status"] == "up"
+        r = m.probe_service(slow)
+        assert r["status"] == "down" and "300 ms" in r["error"] and r["latency_ms"] < 1200
     finally:
         server.shutdown()
 

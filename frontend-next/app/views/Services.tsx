@@ -1,10 +1,11 @@
 'use client';
 
-import { FormEvent, useState } from 'react';
+import { FormEvent, ReactNode, useState } from 'react';
 import { MonitorAlertSettings, alertsOf, type MonitorAlerts } from '../components/alertpick';
 import { AvailabilityPanel } from '../components/availability';
 import { AreaChart } from '../components/charts';
-import { ConfirmChecksField, ConfirmingBadge, Empty, Field, Icon, Modal, StatusPill } from '../components/ui';
+import { ConfirmChecksField, ConfirmingBadge, Empty, Field, Icon, Modal } from '../components/ui';
+import { MonitorStatus, PauseControl } from '../components/pause';
 import { api, del, post, put } from '../lib/api';
 import { pollFor, useApp, useLimits, usePoll } from '../lib/app';
 import { clock, ms, pct, timeAgo, uptimeClass } from '../lib/format';
@@ -43,7 +44,7 @@ function ServiceList() {
             <tbody>{services.map(s => (
               <tr key={s.id} className="link" onClick={() => go(`services/${s.id}`)}>
                 <td><div className="name">{s.name}{s.public && <> <span className="tag">public</span></>} <CertBadge service={s} /><small>{s.url}</small></div></td>
-                <td><StatusPill status={s.last_status} /></td><td className="num hide-sm">{s.last_http_status ?? '–'}</td>
+                <td><MonitorStatus item={s} /></td><td className="num hide-sm">{s.last_http_status ?? '–'}</td>
                 <td className="num hide-sm">{ms(s.last_latency_ms)}</td><td className={`num ${uptimeClass(s.uptime_24h)}`}>{pct(s.uptime_24h, 2)}</td><td className="hide-sm muted">{timeAgo(s.last_checked_at)}</td>
               </tr>))}</tbody></table>
         )}
@@ -78,12 +79,13 @@ function ServiceDetail({ service }: { service: Service }) {
     <>
       <div className="topbar">
         <button className="btn ghost sm" onClick={() => go('services')}><Icon name="back" size={15} />Services</button>
-        <h1>{service.name}</h1><StatusPill status={service.last_status} /><span className="grow" />
+        <h1>{service.name}</h1><MonitorStatus item={service} /><span className="grow" />
+        <PauseControl kind="services" item={service} />
         {canOperate && <button className="btn sm" onClick={checkNow} disabled={busy}><Icon name="refresh" size={14} />{busy ? 'Checking…' : 'Check now'}</button>}
         {canOperate && <button className="btn sm" onClick={() => setEditing(true)}>Edit</button>}
         {canManage && <button className="btn sm danger" onClick={remove}>Remove</button>}
       </div>
-      <p className="muted" style={{ marginTop: -12, marginBottom: 18 }}><a href={service.url} target="_blank" rel="noreferrer noopener">{service.url}</a> · expects HTTP {service.expected_status}{service.keyword ? ` and a page that ${service.keyword_mode === 'absent' ? 'does not contain' : 'contains'} “${service.keyword}”` : ''} · every {service.interval_seconds}s · alerts after {service.confirm_checks_effective ?? 2} failed check{service.confirm_checks_effective === 1 ? '' : 's'} in a row · times out after {service.timeout_seconds_effective ?? 10}s <ConfirmingBadge failCount={service.fail_count} needed={service.confirm_checks_effective} status={service.last_status} /></p>
+      <p className="muted" style={{ marginTop: -12, marginBottom: 18 }}><a href={service.url} target="_blank" rel="noreferrer noopener">{service.url}</a> · expects HTTP {service.expected_status}{service.keyword ? ` and a page that ${service.keyword_mode === 'absent' ? 'does not contain' : 'contains'} “${service.keyword}”` : ''} · every {service.interval_seconds}s · timeout {service.timeout_ms_effective ?? (service.timeout_seconds_effective ?? 10) * 1000} ms · alerts after {service.confirm_checks_effective ?? 2} failed check{service.confirm_checks_effective === 1 ? '' : 's'} in a row · times out after {service.timeout_seconds_effective ?? 10}s <ConfirmingBadge failCount={service.fail_count} needed={service.confirm_checks_effective} status={service.last_status} /></p>
       {service.last_status === 'down' && service.last_error && <div className="err" style={{ marginBottom: 16 }}>{service.last_error}</div>}
 
       <div className="grid g4">
@@ -137,7 +139,7 @@ function CertificateCard({ service }: { service: Service }) {
 
 function ServiceForm({ existing, onClose }: { existing?: Service; onClose: () => void }) {
   const lim = useLimits();
-  const [timeout, setTimeoutValue] = useState(existing?.timeout_seconds ? String(existing.timeout_seconds) : '');
+  const [timeout, setTimeoutValue] = useState(existing?.timeout_ms ? String(existing.timeout_ms) : existing?.timeout_seconds ? String(existing.timeout_seconds * 1000) : '');
   const [certCheck, setCertCheck] = useState(existing?.cert_check ?? true);
   const [certDaysText, setCertDaysText] = useState((existing?.cert_alert_days ?? []).join(', '));
   const [keyword, setKeyword] = useState(existing?.keyword ?? '');
@@ -158,7 +160,7 @@ function ServiceForm({ existing, onClose }: { existing?: Service; onClose: () =>
     setBusy(true); setError('');
     const days = certDaysText.split(/[\s,]+/).filter(Boolean).map(Number);
     if (days.some(x => !Number.isInteger(x) || x < 1 || x > 365)) { setBusy(false); setError('Certificate alert days must be whole numbers between 1 and 365, e.g. 30, 14, 7'); return; }
-    const body = { name, url, expected_status: Number(expected), interval_seconds: Number(interval), confirm_checks: confirmChecks ? Number(confirmChecks) : null, public: isPublic, ...alerts, timeout_seconds: timeout ? Number(timeout) : null, cert_check: certCheck, cert_alert_days: days, keyword: keyword.trim() || null, keyword_mode: keywordMode };
+    const body = { name, url, expected_status: Number(expected), interval_seconds: Number(interval), confirm_checks: confirmChecks ? Number(confirmChecks) : null, public: isPublic, ...alerts, timeout_ms: timeout ? Number(timeout) : null, timeout_seconds: null, cert_check: certCheck, cert_alert_days: days, keyword: keyword.trim() || null, keyword_mode: keywordMode };
     try {
       if (existing) await put(`/services/${existing.id}`, body); else await post('/services', body);
       toast(existing ? 'Service updated' : 'Service added'); await refresh(); onClose();
@@ -174,7 +176,9 @@ function ServiceForm({ existing, onClose }: { existing?: Service; onClose: () =>
           <Field label="Expected HTTP status"><input type="number" min={100} max={599} value={expected} onChange={e => setExpected(e.target.value)} required /></Field>
           <Field label="Interval (seconds)"><input type="number" min={15} max={86400} value={interval} onChange={e => setIntervalValue(e.target.value)} required /></Field>
           <ConfirmChecksField value={confirmChecks} onChange={setConfirmChecks} interval={Number(interval) || 60} fallback={lim.alertAfter} />
-          <Field label="Timeout (seconds)" hint={`Slower answers count as a failed check. Empty = ${lim.serviceTimeout} s (default).`}><input type="number" min={1} max={120} value={timeout} onChange={e => setTimeoutValue(e.target.value)} placeholder={String(lim.serviceTimeout)} /></Field>
+          <Field label="Timeout (milliseconds)" hint={<>Slower answers count as a failed check{Number(timeout) ? ` (${Number(timeout) >= 1000 ? `${(Number(timeout) / 1000).toFixed(Number(timeout) % 1000 ? 1 : 0)} s` : `${timeout} ms`})` : ''}. Empty = {lim.serviceTimeout * 1000} ms (default). 50 to 120000.{' '}
+            {[200, 500, 1000, 3000].map(v => <button key={v} type="button" className="lg-link" onClick={() => setTimeoutValue(String(v))}>{v} ms</button>).reduce((a: ReactNode[], b, i) => i ? [...a, ' · ', b] : [b], [])}</>}>
+            <input type="number" min={50} max={120000} step={50} value={timeout} onChange={e => setTimeoutValue(e.target.value)} placeholder={String(lim.serviceTimeout * 1000)} /></Field>
         </div>
         <fieldset className="cert-fs">
           <legend><b>Content check</b> <span className="muted sm">(optional)</span></legend>

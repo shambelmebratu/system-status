@@ -50,6 +50,10 @@ class Server(Base):
     last_metrics: Mapped[str | None] = mapped_column(Text)
     fail_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     confirm_checks: Mapped[int | None] = mapped_column(Integer)          # failed checks in a row before an alert (NULL = ALERT_AFTER_FAILURES)
+    pause_mode: Mapped[str | None] = mapped_column(String(10))                 # "monitor" = no checks and no alerts; "alerts" = checked, alerts muted
+    paused_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))   # NULL with a mode = until resumed
+    paused_by: Mapped[str | None] = mapped_column(String(320))
+    pause_reason: Mapped[str | None] = mapped_column(String(200))
     public: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     # Per-monitor alert settings (NULL = inherit): which alert types are sent, to which channels, and how often to repeat.
     alert_events: Mapped[str | None] = mapped_column(String(100))      # down,alert,recovered,reminder
@@ -91,7 +95,8 @@ class Service(Base):
     perf_percentile: Mapped[str | None] = mapped_column(String(4))     # p50 | p95 | p99
     perf_threshold_ms: Mapped[int | None] = mapped_column(Integer)
     perf_window_minutes: Mapped[int | None] = mapped_column(Integer)   # NULL = PERF_DEFAULT_WINDOW_MINUTES
-    timeout_seconds: Mapped[int | None] = mapped_column(Integer)       # a slower answer is a failed check; NULL = SERVICE_TIMEOUT_SECONDS
+    timeout_seconds: Mapped[int | None] = mapped_column(Integer)       # legacy (before timeout_ms); still read when timeout_ms is NULL
+    timeout_ms: Mapped[int | None] = mapped_column(Integer)            # a slower answer is a failed check; NULL = SERVICE_TIMEOUT_SECONDS
     keyword: Mapped[str | None] = mapped_column(String(200))           # content check: text the page must (or must not) contain
     keyword_mode: Mapped[str] = mapped_column(String(10), default="contains", server_default="contains")   # contains | absent
     # TLS certificate expiry (https only): checked every CERT_CHECK_HOURS, alerts at each of cert_alert_days (NULL = CERT_ALERT_DAYS)
@@ -105,6 +110,10 @@ class Service(Base):
     cert_alerted: Mapped[int | None] = mapped_column(Integer)          # the smallest threshold already alerted for this certificate (-1 = expired)
     fail_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     confirm_checks: Mapped[int | None] = mapped_column(Integer)          # failed checks in a row before an alert (NULL = ALERT_AFTER_FAILURES)
+    pause_mode: Mapped[str | None] = mapped_column(String(10))                 # "monitor" = no checks and no alerts; "alerts" = checked, alerts muted
+    paused_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))   # NULL with a mode = until resumed
+    paused_by: Mapped[str | None] = mapped_column(String(320))
+    pause_reason: Mapped[str | None] = mapped_column(String(200))
     last_status: Mapped[str] = mapped_column(String(20), default="unknown")
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_latency_ms: Mapped[float | None] = mapped_column(Float)

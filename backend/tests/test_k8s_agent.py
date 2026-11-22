@@ -127,3 +127,26 @@ def test_related_for_a_workload_pod_and_service(k8s, monkeypatch):
     assert '"pods"' in text
     with pytest.raises(ValueError):
         k8s.run_query({"kind": "related", "resource": "deployment", "name": "api"})          # namespace required
+
+
+def test_summary_lists_services_reachable_from_outside(k8s, monkeypatch):
+    """Agent 1.4: NodePort and LoadBalancer services, and node addresses, so SM-Watch can scan them (ClusterIP services are internal)."""
+    node = {"metadata": {"name": "node-1"}, "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0.5"}, {"type": "ExternalIP", "address": "203.0.113.20"}],
+                                                       "conditions": [{"type": "Ready", "status": "True"}], "allocatable": {"cpu": "2", "memory": "4Gi"}}}
+    services = [{"metadata": {"namespace": "shop", "name": "api"}, "spec": {"type": "NodePort", "ports": [{"port": 5432, "nodePort": 31432, "targetPort": 5432, "protocol": "TCP"}]}},
+                {"metadata": {"namespace": "shop", "name": "front"}, "spec": {"type": "LoadBalancer", "ports": [{"port": 443, "nodePort": 30443, "targetPort": "https"}]},
+                 "status": {"loadBalancer": {"ingress": [{"ip": "198.51.100.9"}]}}},
+                {"metadata": {"namespace": "shop", "name": "internal"}, "spec": {"type": "ClusterIP", "ports": [{"port": 80}]}},
+                {"metadata": {"namespace": "dns", "name": "udp"}, "spec": {"type": "NodePort", "ports": [{"port": 53, "nodePort": 30053, "protocol": "UDP"}]}}]
+    lists = {"/api/v1/nodes": [node], "/api/v1/services": services}
+    monkeypatch.setattr(k8s, "klist", lambda path, params=None, cap=0: (lists.get(path, []), False))
+    monkeypatch.setattr(k8s, "kapi", lambda path, *a, **kw: {"gitVersion": "v1.30.0"} if path == "/version" else {"items": []})
+    monkeypatch.setattr(k8s, "usage_totals", lambda nodes: {})
+    monkeypatch.setattr(k8s, "security_scan", lambda pods: None)
+    s = k8s.summary()
+    assert [(e["name"], e["type"]) for e in s["exposed"]] == [("api", "NodePort"), ("front", "LoadBalancer"), ("udp", "NodePort")]
+    assert s["exposed"][0]["ports"] == [{"port": 5432, "node_port": 31432, "target": "5432"}] and s["exposed"][1]["external"] == ["198.51.100.9"]
+    assert s["exposed"][2]["ports"] == []                                                       # UDP is not port-scanned
+    assert s["node_addresses"] == [{"name": "node-1", "internal": "10.0.0.5", "external": "203.0.113.20", "ready": True}]
+    from app.routes_k8s import K8sReport
+    K8sReport(**{k: v for k, v in s.items() if k != "security"})                                 # the control plane accepts it

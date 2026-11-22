@@ -422,7 +422,19 @@ Review the manifest first by running the `curl` alone. It creates a `smwatch` na
 - **Two-factor sign-in:** each person turns it on in *Settings* (any authenticator app) and gets 10 one-time recovery codes. Admins can require it for admins or for everyone (*Security → Sign-in*); people without it are then sent to the setup screen after signing in. Admins can reset someone's 2FA from *Users*.
 - **SSH brute-force detection:** agents ≥ 2.14.0 report failed SSH logins (IP and user name only, never log lines). `SSH_ATTACK_THRESHOLD` (30) failures in 10 minutes on one server raise an alert (at most hourly). *Security → SSH attacks* lists top source IPs.
 - **Pending security updates:** the agent checks apt / dnf / yum / apk every `AGENT_UPDATES_HOURS` (6) using a dry run (nothing is installed) and reports counts, the packages and whether a reboot is needed. `AGENT_SECURITY=off` on a server turns both agent features off.
-- **Exposure & TLS audit:** every `SECURITY_SCAN_HOURS` (24), and on demand, SM-Watch scans common ports of each server's public address and grades HTTPS services (protocol versions, certificate, key, HSTS: A+ to F). New critical or high findings alert once. Only scan servers you own. The address is the one the server page shows, learned automatically: a public address on the server's own network interface, else the address its agent connects from, else (for the bundled agent) this machine's own. `AGENT_PUBLIC_IP` is only needed to override it.
+- **Security alerts** (*Security → Alerts*): every user sees what is sent; admins change it (audited).
+  - The whole switch, and one switch per kind: signs of compromise, system changes, possible break-in, SSH brute-force attacks, new SSH key, login from a new address, many logins in a day, exposed ports and TLS problems, Kubernetes threats.
+  - The limits behind them: the severity that alerts (`THREAT_ALERT_SEVERITY`), failed logins in 10 minutes that count as an attack (`SSH_ATTACK_THRESHOLD`; 0 = never), failed attempts before a login counts as a break-in (`SSH_SUCCESS_AFTER_FAILURES`), and logins per day (`SSH_DAILY_LOGIN_ALERT`). The `.env` values are only the defaults.
+  - Where security alerts go: the usual channels, or only the channels you pick (for example a security team chat).
+  - *Send a test alert*, how many alerts of each kind were raised in the last 7 days, and the 25 most recent security alerts with their delivery result.
+
+  A kind that is off is still recorded and marked "not sent", never retried.
+- **Exposure & TLS audit:** every `SECURITY_SCAN_HOURS` (24), and on demand, SM-Watch scans common ports of each server's public address and grades HTTPS services (protocol versions, certificate, key, HSTS: A+ to F). It also scans the ports common lists miss:
+  - **Docker-published ports** (agent ≥ 2.18): Docker writes its own firewall rules, so `-p 16379:6379` is reachable even when ufw looks closed. Such a port is rated by what runs inside, so this example counts as Redis: critical.
+  - **Programs the agent sees listening on every network.**
+  - **Kubernetes NodePorts** of any cluster this server is a node of (Kubernetes agent ≥ 1.4).
+
+  Clusters also get their own row: NodePort services on one node's address (public preferred), and each LoadBalancer's external address with the service's ports. Each open port says where it came from (Docker, Kubernetes, agent). New critical or high findings alert once. Only scan servers you own. The address is the one the server page shows, learned automatically: a public address on the server's own network interface, else the address its agent connects from, else (for the bundled agent) this machine's own. `AGENT_PUBLIC_IP` is only needed to override it.
 - **Scan schedule and Scan all now:** *Security → Schedule* shows and (for admins) sets how often each check runs: open ports & TLS from SM-Watch (default every 24 h, or only on demand), the agents' threat scan (default every 10 min) and their update check (default every 6 h). Agents receive the schedule with their next report, so nothing is reconfigured on the servers; a server whose agent sets `AGENT_THREAT_MINUTES` / `AGENT_UPDATES_HOURS` itself keeps its own value. *Scan all now* (operators) runs the port and TLS scans immediately in the background with a progress bar, and asks every agent to run its threat scan and update check at its next report (within a minute); with the server filter set it scans only those servers. Both are audited. SSH logins and failures are always reported continuously.
 - **Server filter:** a dropdown at the top of the Security page narrows every tab to one server; search it by name, host name, IP address or number (`#3`), switch to another server or back to *All servers* at any time. Every finding, login and report line names its server with host name and address, and so do alerts.
 - **SSH access dates:** *Security → SSH access* shows the last 24 hours, 3 or 7 days, or a custom date range (UTC days, up to 90 days back); long ranges chart failed attempts per day.
@@ -503,7 +515,7 @@ Model names change over time; the defaults are starting points that can be edite
 
 ## Service timeout and certificate expiry
 
-Each service has a **timeout** (seconds; default `SERVICE_TIMEOUT_SECONDS=10`). A check fails when the answer does not arrive in time, even if it would have come eventually; the reason reads "Timed out…".
+Each service has a **timeout in milliseconds** (50 to 120000; default `SERVICE_TIMEOUT_SECONDS=10`, i.e. 10000 ms). A check fails when the complete answer does not arrive in time, even if it would have come eventually. The reason reads, for example, "Timed out: the response took 412 ms, longer than the 300 ms limit". The form offers quick picks (200, 500, 1000, 3000 ms), and the service page shows the limit next to the interval. Timeouts saved in whole seconds before migration 0039 are converted automatically, and older API clients that still send `timeout_seconds` keep working. The certificate check always allows at least 5 s.
 
 For https services SM-Watch also reads the **TLS certificate** every `CERT_CHECK_HOURS` (6) and on *Check now*: expiry date, issuer and whether it covers the host name. The service page shows the days left on a bar with the alert points; the list shows a badge (green, amber, red). Alerts are sent once at each threshold (default `CERT_ALERT_DAYS=30,14,7`; set per service in *Edit*), once more if it expires, and a "renewed" message when a new certificate replaces one that was alerted about. Certificate alerts follow the channels' *alert* setting (renewals follow *recovered*). Untick *Watch the TLS certificate* to switch it off for a service.
 
@@ -566,6 +578,16 @@ Alert limits are set **per server** (Edit the server) and per cluster log policy
 ## Choosing which alerts a channel receives
 
 Alerts → add or edit a channel → **Send to this channel**. Tick the alert types (*Down*, *Over a limit*, *Recovered*, *Reminders* while something is still failing) and the sources (*Servers*, *Services*, *Kubernetes clusters*). A channel with everything ticked receives everything, which is the default. Example: an on-call channel that only gets *Down* and *Recovered* for servers, next to a team channel that gets everything. An alert that no channel is set to receive is recorded in the delivery log as "not sent" and is not retried.
+
+### Pausing a server or service
+
+*Pause* on a server's or service's page stops it for a while, without editing or deleting it (operators; audited):
+
+- **Pause monitoring:** no checks and no alerts. Nothing is recorded, so the time does not count against uptime. A paused agent stays connected, but its reports are not evaluated or stored.
+- **Mute alerts only:** checks and history continue, and problems show on the dashboard, but no alert is sent. These alerts are recorded in the delivery log as "not sent: the monitor is paused".
+- **For:** 15 minutes, 1, 4, 8 or 24 hours, 7 days, until a date and time, or until someone presses *Resume*. A reason is optional.
+
+The monitor shows *Paused · until 14:30* (or *Muted*) in lists and on its page. It resumes by itself when the time runs out; the worker writes that to the audit log. A resumed monitor starts as *Pending*, so its first check cannot send a stale alert. For planned work that should appear on the public status page, use a maintenance window instead. API: `POST /api/servers/{id}/pause` (or `/api/services/{id}/pause`) with `{"mode": "monitor"|"alerts", "minutes": 60}` or `{"until": "…"}`, and `POST …/resume`.
 
 ### Alert settings per server, service and cluster
 

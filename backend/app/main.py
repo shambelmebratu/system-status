@@ -4,7 +4,7 @@ import os
 import re
 import secrets
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from pydantic import ValidationError
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, Response
@@ -33,7 +33,7 @@ from .performance import router as performance_router
 from .routes_retention import router as retention_router
 from .routes_schedule import router as schedule_router
 from .routes_stats import router as stats_router
-from .schemas import ChannelCreate, ChannelUpdate, LoginRequest, PasswordChange, ProfileUpdate, TokenBody, ServerCreate, ServiceCreate
+from .schemas import ChannelCreate, ChannelUpdate, LoginRequest, PasswordChange, PauseRequest, ProfileUpdate, TokenBody, ServerCreate, ServiceCreate
 from .stats import uptime_by_target
 from .netguard import BlockedTargetError, insecure_pull_problem, validate_host, validate_url
 from .routes_users import router as users_router, serialize_user
@@ -202,9 +202,15 @@ def serialize(item):
         from .monitoring import cert_thresholds, service_timeout
         result["cert_alert_days"] = [int(d) for d in (result["cert_alert_days"] or "").split(",") if d.strip().isdigit()]
         result["cert_alert_days_effective"] = cert_thresholds(item)
+        result["timeout_ms_effective"] = round(service_timeout(item) * 1000)
         result["timeout_seconds_effective"] = service_timeout(item)
         result.pop("cert_alerted", None)
     result.pop("token_hash", None)
+    if "pause_mode" in result:       # servers and services: is a pause active right now (an expired one counts as not paused)
+        from .monitoring import pause_state
+        result["paused"] = pause_state(item)
+        if result.get("paused_until"):
+            result["paused_until"] = (result["paused_until"] if result["paused_until"].tzinfo else result["paused_until"].replace(tzinfo=timezone.utc)).isoformat()
     if "confirm_checks" in result:   # servers and services: how many failed checks in a row before an alert, and how many so far
         from .monitoring import confirm_checks
         result["confirm_checks_effective"] = confirm_checks(item)
@@ -729,6 +735,9 @@ def service_values(payload: ServiceCreate) -> dict:
     values = payload.model_dump()
     values["cert_alert_days"] = ",".join(str(d) for d in values["cert_alert_days"]) or None
     values["keyword"] = (values.get("keyword") or "").strip() or None
+    if values.get("timeout_ms") is None and values.get("timeout_seconds"):
+        values["timeout_ms"] = values["timeout_seconds"] * 1000          # an older client sent whole seconds
+    values["timeout_seconds"] = None
     return values
 
 
@@ -788,6 +797,47 @@ def check_service_now(item_id: int, user: dict = Depends(require_operator), db: 
     except Exception as error:
         db.rollback()
         raise HTTPException(502, f"Service check failed: {error}") from error
+
+
+@app.post("/api/{kind}/{item_id}/pause")
+def pause_monitor(kind: str, item_id: int, payload: PauseRequest, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+    """Pause a server or service: no checks and no alerts ("monitor"), or checks without alerts ("alerts"); for a while or until resumed."""
+    model, target_type = {"servers": (Server, "server"), "services": (Service, "service")}.get(kind, (None, None))
+    if model is None:
+        raise HTTPException(404, "Not found")
+    ensure_access(user, target_type, item_id)
+    item = db.get(model, item_id)
+    if not item:
+        raise HTTPException(404, f"{target_type.capitalize()} not found")
+    now = datetime.now(timezone.utc)
+    until = now + timedelta(minutes=payload.minutes) if payload.minutes else payload.until
+    if until is not None:
+        until = until if until.tzinfo else until.replace(tzinfo=timezone.utc)
+        if until <= now + timedelta(seconds=30):
+            raise HTTPException(422, "Pick a time in the future")
+    item.pause_mode, item.paused_until, item.paused_by, item.pause_reason = payload.mode, until, user["email"], payload.reason.strip() or None
+    what = "monitoring and alerts" if payload.mode == "monitor" else "alerts"
+    audit(db, request, f"{target_type}.pause", user=user, target=f"{target_type}:{item.id}",
+          detail=f"{item.name}: {what} paused " + (f"until {until.isoformat(timespec='minutes')}" if until else "until resumed") + (f" ({payload.reason.strip()})" if payload.reason.strip() else ""))
+    db.commit(); db.refresh(item)
+    return serialize(item)
+
+
+@app.post("/api/{kind}/{item_id}/resume")
+def resume_monitor(kind: str, item_id: int, request: Request, user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+    model, target_type = {"servers": (Server, "server"), "services": (Service, "service")}.get(kind, (None, None))
+    if model is None:
+        raise HTTPException(404, "Not found")
+    ensure_access(user, target_type, item_id)
+    item = db.get(model, item_id)
+    if not item:
+        raise HTTPException(404, f"{target_type.capitalize()} not found")
+    from .monitoring import resume
+    if item.pause_mode:
+        resume(item)
+        audit(db, request, f"{target_type}.resume", user=user, target=f"{target_type}:{item.id}", detail=item.name)
+        db.commit(); db.refresh(item)
+    return serialize(item)
 
 
 @app.post("/api/monitor/run")

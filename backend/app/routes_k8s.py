@@ -61,6 +61,28 @@ class K8sResult(BaseModel):
     truncated: bool = False
 
 
+class K8sServicePort(BaseModel):
+    port: int = Field(default=0, ge=0, le=65535)
+    node_port: int = Field(default=0, ge=0, le=65535)
+    target: str = Field(default="", max_length=40)
+
+
+class K8sExposed(BaseModel):
+    """A Service reachable from outside the cluster: NodePort (every node, ports 30000-32767) or LoadBalancer (its external address)."""
+    namespace: str = Field(default="", max_length=80)
+    name: str = Field(default="", max_length=120)
+    type: str = Field(default="NodePort", pattern="^(NodePort|LoadBalancer)$")
+    ports: list[K8sServicePort] = Field(default_factory=list, max_length=20)
+    external: list[str] = Field(default_factory=list, max_length=5)
+
+
+class K8sNodeAddress(BaseModel):
+    name: str = Field(default="", max_length=200)
+    internal: str = Field(default="", max_length=60)
+    external: str = Field(default="", max_length=60)
+    ready: bool = True
+
+
 class K8sReport(BaseModel):
     agent_version: str = Field(default="", max_length=32)
     k8s_version: str = Field(default="", max_length=40)
@@ -91,6 +113,8 @@ class K8sReport(BaseModel):
     mem_alloc_mib: float | None = Field(default=None, ge=0)
     problems: list[str] = Field(default_factory=list, max_length=30)
     security: K8sSecurity | None = None    # security checks (agent 1.3+)
+    exposed: list[K8sExposed] = Field(default_factory=list, max_length=200)          # NodePort / LoadBalancer services (agent 1.4+)
+    node_addresses: list[K8sNodeAddress] = Field(default_factory=list, max_length=200)
 
     @field_validator("problems", "not_ready_nodes")
     @classmethod

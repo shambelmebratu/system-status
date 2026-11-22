@@ -12,6 +12,7 @@ export type Metrics = {
 export type CpuBreakdown = { user?: number; nice?: number; system?: number; idle?: number; iowait?: number; irq?: number; softirq?: number; steal?: number };
 
 export type Server = {
+  paused?: 'monitor' | 'alerts' | null; pause_mode?: string | null; paused_until?: string | null; paused_by?: string | null; pause_reason?: string | null;
   id: number; name: string; host: string; monitor_mode: Mode; check_interval_seconds: number; endpoint: string; confirm_checks?: number | null; confirm_checks_effective?: number; fail_count?: number;
   agent_token: string; enabled: boolean; cpu_threshold: number; memory_threshold: number; disk_threshold: number;
   load_threshold: number; swap_threshold: number; process_names: string; process_threshold: number;
@@ -20,11 +21,12 @@ export type Server = {
   token_issued_at?: string | null; token_rotation_pending?: boolean; last_agent_ip?: string | null; public_ip?: string | null; private_ips?: string[]; alert_events?: string[]; alert_channels?: number[]; alert_reminder_minutes?: number | null; same_machine_as?: { id: number; name: string }[];
 };
 export type Service = {
+  paused?: 'monitor' | 'alerts' | null; pause_mode?: string | null; paused_until?: string | null; paused_by?: string | null; pause_reason?: string | null;
   id: number; name: string; url: string; expected_status: number; interval_seconds: number; enabled: boolean; public: boolean; confirm_checks?: number | null; confirm_checks_effective?: number; fail_count?: number;
   server_id: number | null; last_status: Status; last_checked_at: string | null; last_latency_ms: number | null;
   last_http_status: number | null; last_error: string | null; uptime_24h: number | null;
   alert_events?: string[]; alert_channels?: number[]; alert_reminder_minutes?: number | null;
-  timeout_seconds?: number | null; timeout_seconds_effective?: number; cert_check?: boolean; cert_alert_days?: number[]; cert_alert_days_effective?: number[];
+  timeout_seconds?: number | null; timeout_seconds_effective?: number; timeout_ms?: number | null; timeout_ms_effective?: number; cert_check?: boolean; cert_alert_days?: number[]; cert_alert_days_effective?: number[];
   keyword?: string | null; keyword_mode?: 'contains' | 'absent';
   cert_expires_at?: string | null; cert_issuer?: string | null; cert_subject?: string | null; cert_checked_at?: string | null; cert_error?: string | null;
 };

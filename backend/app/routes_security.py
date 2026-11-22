@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
-from . import secscan
+from . import secalerts, secscan
 from .audit import audit
 from .database import SessionLocal, get_db
 from .models import SecurityFinding, SecurityScan, Server, Service, SshLoginEvent, User
@@ -109,6 +109,17 @@ def overview(server: str | None = Query(None, max_length=200), user: dict = Depe
            "ssh": {k: ssh[k] for k in ("total", "top_ips", "top_users", "hourly")}, "filter": server or None}
     if not server:
         out["kubernetes"] = kubernetes_counts(db, user)
+        cluster_ports = latest_scans(db, "ports", "cluster")
+        rows = []
+        for c in visible_clusters(db, user):
+            try:
+                summary = json.loads(c.summary or "{}") or {}
+            except ValueError:
+                summary = {}
+            targets, reason = secscan.cluster_targets(c)
+            rows.append({"id": c.id, "name": c.name, "agent_version": c.agent_version, "scan": scan_view(cluster_ports.get(c.id)), "scannable": bool(targets),
+                         "scan_unavailable": reason or None, "exposed": summary.get("exposed") or [], "nodes": len(summary.get("node_addresses") or [])})
+        out["clusters"] = rows
     if user["role"] == "admin" and not server:
         from .mfa import policy
         users = db.scalars(select(User).where(User.active.is_(True))).all()
@@ -159,7 +170,7 @@ def ssh(hours: int = Query(24, ge=1, le=168), server: str | None = Query(None, m
     data["logins"] = [{"id": e.id, "server": {k: infos[e.server_id][k] for k in ("id", "name", "hostname", "public_ip")}, "ts": aware(e.ts).isoformat(), "ip": e.ip, "user": e.user,
                        "method": e.method, "failures_before": e.failures_before, "new_source": e.new_source, "kind": e.kind or "login",
                        "key_type": e.key_type or None, "fingerprint": e.fingerprint or None, "key_name": e.key_name or None,
-                       "verdict": "transfer" if e.kind == "sftp" else "breach" if e.failures_before >= _breach_threshold() else "new" if e.new_source else "ok"} for e in logins]
+                       "verdict": "transfer" if e.kind == "sftp" else "breach" if e.failures_before >= _breach_threshold(db) else "new" if e.new_source else "ok"} for e in logins]
     # how many SSH logins each server had today, against the daily limit
     day = datetime.now(timezone.utc).date()
     start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
@@ -178,8 +189,11 @@ def version_at_least(version: str | None, wanted: tuple[int, int]) -> bool:
         return False
 
 
-def _breach_threshold() -> int:
+def _breach_threshold(db: Session | None = None) -> int:
     from .config import get_settings
+    if db is not None:
+        from .secalerts import config
+        return config(db)["ssh_success_after_failures"]
     return get_settings().ssh_success_after_failures
 
 
@@ -259,7 +273,7 @@ def report(request: Request, server: str | None = Query(None, max_length=200), d
         rows.append({"server": infos[s.id], "status": s.last_status, "agent_version": m.get("agent_version"), "updates": m.get("updates"),
                      "ssh_failures": ssh_data["per_server"].get(s.id, {"total": 0, "distinct_ips": 0, "top_ips": []}),
                      "logins": {"total": sum(1 for e in my_logins if e.kind != "sftp"), "transfers": sum(1 for e in my_logins if e.kind == "sftp"),
-                                "keys": sorted({e.key_name or e.fingerprint for e in my_logins if e.fingerprint})[:20], "suspicious": sum(1 for e in my_logins if e.failures_before >= _breach_threshold()), "new_sources": sum(1 for e in my_logins if e.new_source),
+                                "keys": sorted({e.key_name or e.fingerprint for e in my_logins if e.fingerprint})[:20], "suspicious": sum(1 for e in my_logins if e.failures_before >= _breach_threshold(db)), "new_sources": sum(1 for e in my_logins if e.new_source),
                                 "users": sorted({e.user for e in my_logins})[:20], "sources": sorted({e.ip for e in my_logins})[:30]},
                      "findings": [finding_view(f, None) for f in mine], "hardening": sec.get("hardening") or [], "listening": sec.get("listening") or [],
                      "authorized_keys": len(sec.get("authorized_keys") or []), "foreign_packages": sec.get("foreign_packages"), "exposure": scan_view(ports.get(s.id)),
@@ -296,7 +310,76 @@ def put_schedule(payload: ScheduleIn, request: Request, user: dict = Depends(req
     secscan.save_schedule(db, cfg)
     audit(db, request, "security.schedule", user=user, detail="; ".join(changes) or "no changes")
     db.commit()
+    secalerts.forget()
     return schedule_view(db)
+
+
+# ------------------------------------------------------------------------------------------------ alert settings (Security → Alerts)
+class SecurityAlertsIn(BaseModel):
+    enabled: bool = True
+    categories: dict[str, bool] = Field(default_factory=dict)
+    channels: list[int] = Field(default_factory=list, max_length=50)
+    threat_severity: str = Field(default="high", pattern="^(critical|high|medium|off)$")
+    ssh_attack_threshold: int = Field(default=30, ge=0, le=100000)          # 0 = no attack alerts
+    ssh_success_after_failures: int = Field(default=5, ge=1, le=10000)
+    daily_login_alert: int = Field(default=4, ge=0, le=10000)                # 0 = off
+
+
+def alerts_view(db: Session) -> dict:
+    from .models import AlertEvent, Channel
+    cfg = secalerts.config(db, fresh=True)
+    recent = db.scalars(select(AlertEvent).where(AlertEvent.state.in_(secalerts.SECURITY_STATES)).order_by(AlertEvent.id.desc()).limit(25)).all()
+    names = {"server": {s.id: s.name for s in db.scalars(select(Server)).all()}}
+    week = datetime.now(timezone.utc) - timedelta(days=7)
+    counts = {k: 0 for k in secalerts.CATEGORIES}
+    for state, target_type, n in db.execute(select(AlertEvent.state, AlertEvent.target_type, func.count()).where(AlertEvent.state.in_(secalerts.SECURITY_STATES), AlertEvent.created_at >= week)
+                                            .group_by(AlertEvent.state, AlertEvent.target_type)).all():
+        cat = secalerts.category_of(state, target_type)
+        if cat:
+            counts[cat] += n
+    return {**cfg, "kinds": [{"id": k, "label": l, "description": d, "last_7_days": counts[k]} for k, (l, d, _) in secalerts.CATEGORIES.items()],
+            "available_channels": [{"id": c.id, "name": c.name, "type": c.type, "enabled": c.enabled} for c in db.scalars(select(Channel).order_by(Channel.name)).all()],
+            "recent": [{"id": e.id, "at": aware(e.created_at).isoformat(), "kind": secalerts.category_of(e.state, e.target_type), "severity": e.severity,
+                        "target": names.get(e.target_type, {}).get(e.target_id) or f"{e.target_type} #{e.target_id}",
+                        "summary": next((line for line in (e.message or "").replace("<b>", "").replace("</b>", "").splitlines() if line.strip() and not line.startswith(("🚨", "🛡", "🔑", "🔁"))), "")[:200],
+                        "sent": bool(e.sent), "error": e.delivery_error} for e in recent]}
+
+
+@router.get("/alerts")
+def get_alerts(_: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+    return alerts_view(db)
+
+
+@router.put("/alerts")
+def put_alerts(payload: SecurityAlertsIn, request: Request, user: dict = Depends(require_admin), db: Session = Depends(get_db)) -> dict:
+    from .models import Channel
+    known = {c for c in db.scalars(select(Channel.id)).all()}
+    if any(c not in known for c in payload.channels):
+        raise HTTPException(422, "Unknown channel")
+    unknown = [k for k in payload.categories if k not in secalerts.CATEGORIES]
+    if unknown:
+        raise HTTPException(422, f"Unknown alert kind '{unknown[0]}'")
+    before = secalerts.config(db, fresh=True)
+    data = payload.model_dump()
+    data["categories"] = {**before["categories"], **payload.categories}
+    changes = [f"{k} {before.get(k)} -> {data[k]}" for k in ("enabled", "channels", "threat_severity", "ssh_attack_threshold", "ssh_success_after_failures", "daily_login_alert") if before.get(k) != data[k]]
+    changes += [f"{k} {'on' if v else 'off'}" for k, v in data["categories"].items() if before["categories"].get(k) != v]
+    secalerts.save(db, data, user["email"])
+    audit(db, request, "security.alerts", user=user, detail="; ".join(changes) or "no changes")
+    db.commit()
+    return alerts_view(db)
+
+
+@router.post("/alerts/test")
+def test_alerts(request: Request, user: dict = Depends(require_admin), db: Session = Depends(get_db)) -> dict:
+    """Sends a test message to the channels security alerts go to."""
+    from .monitoring import format_alert, send_alert
+    cfg = secalerts.config(db, fresh=True)
+    message = format_alert("Security", "security_finding", "SM-Watch", ["This is a test of your security alerts.", f"Sent by {user['email']} from Security → Alerts."])
+    sent, error = send_alert(message, db, None, None, set(cfg["channels"]) if cfg["channels"] else None)
+    audit(db, request, "security.alerts_test", user=user, detail="sent" if sent else (error or "not sent")[:200], success=bool(sent))
+    db.commit()
+    return {"sent": bool(sent), "error": error}
 
 
 class ScanAllIn(BaseModel):
@@ -322,6 +405,8 @@ def scan_all(payload: ScanAllIn, request: Request, user: dict = Depends(require_
         hosts = {h for s in servers for h in (server_info(s).get("hostname"), server_info(s).get("public_ip"), s.host) if h}
         services = [s for s in services if s.server_id in ids or any(h in s.url for h in hosts)]
     targets = [("server", s.id) for s in servers if s.enabled and secscan.server_address(s)[0]] + [("service", s.id) for s in services]
+    if not payload.server:
+        targets += [("cluster", c.id) for c in visible_clusters(db, user) if c.enabled and secscan.cluster_targets(c)[0]]
     agents = [s.id for s in servers if s.monitor_mode == "push"]
     secscan.request_agent_rescan(db, agents, user["email"])
     audit(db, request, "security.scan_all", user=user, detail=f"{len(targets)} exposure/TLS scans; {len(agents)} agents asked to re-check" + (f"; filter {payload.server}" if payload.server else ""))
@@ -357,8 +442,11 @@ def recheck(payload: RecheckIn, request: Request, user: dict = Depends(require_o
 
 @router.post("/scan/{target_type}/{target_id}")
 async def scan_now(target_type: str, target_id: int, request: Request, user: dict = Depends(require_operator)) -> dict:
-    if target_type not in ("server", "service"):
+    if target_type not in ("server", "service", "cluster"):
         raise HTTPException(404, "Unknown target")
+    from .models import Cluster
+    model = {"server": Server, "service": Service, "cluster": Cluster}[target_type]
+    runner = {"server": secscan.run_server_scan, "service": secscan.run_service_scan, "cluster": secscan.run_cluster_scan}[target_type]
     ensure_access(user, target_type, target_id)
     import time
     key = (target_type, target_id)
@@ -366,15 +454,15 @@ async def scan_now(target_type: str, target_id: int, request: Request, user: dic
         raise HTTPException(429, "This target was scanned less than 2 minutes ago")
     _last_manual[key] = time.monotonic()
     with SessionLocal() as db:
-        target = db.get(Server if target_type == "server" else Service, target_id)
+        target = db.get(model, target_id)
         if target is None:
             raise HTTPException(404, "Not found")
         db.expunge(target)
     started = datetime.now(timezone.utc)
-    result = await run_in_threadpool(secscan.run_server_scan if target_type == "server" else secscan.run_service_scan, target)
+    result = await run_in_threadpool(runner, target)
     with SessionLocal() as db:
-        target = db.get(Server if target_type == "server" else Service, target_id)
-        kind = "ports" if target_type == "server" else "tls"
+        target = db.get(model, target_id)
+        kind = "tls" if target_type == "service" else "ports"
         secscan.store(db, kind, target, target_type, result, started)
         audit(db, request, "security.scan", user=user, target=f"{target_type}:{target_id}", detail=f"{kind} scan of {target.name}: " + (result.get("error") or f"grade {result.get('grade')}, {result.get('findings', 0)} findings"))
         db.commit()

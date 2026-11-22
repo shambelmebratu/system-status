@@ -10,7 +10,8 @@ import { SshPanel } from '../components/ssh';
 import { AgentUpdate } from '../components/agentupdate';
 import { MonitorAlertSettings, alertSummary, alertsOf, type MonitorAlerts } from '../components/alertpick';
 import { LogPolicyCard } from '../components/logpolicy';
-import { CodeBox, ConfirmChecksField, ConfirmingBadge, Empty, Field, Icon, Meter, Modal, StatusPill } from '../components/ui';
+import { CodeBox, ConfirmChecksField, ConfirmingBadge, Empty, Field, Icon, Meter, Modal } from '../components/ui';
+import { MonitorStatus, PauseControl } from '../components/pause';
 import { api, del, post, put } from '../lib/api';
 import { pollFor, useApp, useLimits, useNow, usePoll } from '../lib/app';
 import { bytesPerSecond, duration, isOlder, ms, pct, timeAgo } from '../lib/format';
@@ -78,7 +79,7 @@ function ServerList() {
             const m = s.last_metrics;
             return (
               <div key={s.id} className="card tile" onClick={() => go(`servers/${s.id}`)}>
-                <div className="tile-top"><div className="grow"><div className="name">{s.name}</div><small className="muted">{m?.hostname || s.host || 'waiting for first report'}</small></div>{m?.ssh_sessions != null && <span className={`ssh-badge ${m.ssh_sessions ? 'on' : ''}`} title={`${m.ssh_sessions} active SSH session${m.ssh_sessions === 1 ? '' : 's'}`}><Icon name="terminal" size={12} />{m.ssh_sessions}</span>}<StatusPill status={s.last_status} /></div>
+                <div className="tile-top"><div className="grow"><div className="name">{s.name}</div><small className="muted">{m?.hostname || s.host || 'waiting for first report'}</small></div>{m?.ssh_sessions != null && <span className={`ssh-badge ${m.ssh_sessions ? 'on' : ''}`} title={`${m.ssh_sessions} active SSH session${m.ssh_sessions === 1 ? '' : 's'}`}><Icon name="terminal" size={12} />{m.ssh_sessions}</span>}<MonitorStatus item={s} /></div>
                 {m?.cpu != null ? (
                   <div className="minis">
                     {(['cpu', 'memory', 'disk'] as const).map(k => <div key={k} className="mini">{k === 'cpu' ? 'CPU' : k === 'memory' ? 'Memory' : 'Disk'}<b>{pct(m[k], 0)}</b><Meter value={m[k]!} warnAt={s[`${k}_threshold` as const] * (lim.warn / lim.bad)} badAt={s[`${k}_threshold` as const]} /></div>)}
@@ -157,10 +158,11 @@ function ServerDetail({ server }: { server: Server }) {
     <>
       <div className="topbar">
         <button className="btn ghost sm" onClick={() => go('servers')}><Icon name="back" size={15} />Servers</button>
-        <h1>{server.name}</h1><StatusPill status={server.last_status} /><span className="tag">{MODE_LABEL[server.monitor_mode]}</span>
+        <h1>{server.name}</h1><MonitorStatus item={server} /><span className="tag">{MODE_LABEL[server.monitor_mode]}</span>
         <span className="grow" />
         {canOperate && server.monitor_mode !== 'ping' && <button className="btn sm" onClick={rotate} disabled={!!server.token_rotation_pending} title="Delivered to the agent automatically; nothing to reinstall">{server.token_rotation_pending ? 'Rotation pending…' : 'Rotate token'}</button>}
         {canOperate && server.monitor_mode !== 'ping' && <button className="btn sm danger" onClick={revokeNow} title="Invalidate the current token immediately (if it may be stolen)">Revoke now</button>}
+        <PauseControl kind="servers" item={server} />
         {canOperate && <button className="btn sm" onClick={() => setEditing(true)}>Edit</button>}
         {canManage && <button className="btn sm danger" onClick={remove}>Remove</button>}
       </div>

@@ -1,6 +1,6 @@
 'use client';
 
-import { FormEvent, Fragment, useEffect, useMemo, useRef, useState } from 'react';
+import { FormEvent, Fragment, ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import { Empty, Field, Icon, Modal, StatusPill } from '../components/ui';
 import { ProcessDrawer } from '../components/process';
 import { TargetPicker, type PickerOption } from '../components/logviewer';
@@ -12,7 +12,10 @@ import { timeAgo } from '../lib/format';
 type Who = { id: number; name: string; hostname: string | null; public_ip: string | null; private_ips: string[]; host: string | null; os?: string | null };
 type Pkg = { name: string; version: string; security: boolean };
 type Updates = { manager: string | null; total: number; security: number; packages: Pkg[]; reboot_required: boolean; reboot_packages?: string[]; error: string | null; checked_at: string | null; lists_age_hours?: number };
-type OpenPort = { port: number; service: string; risk: 'critical' | 'high' | 'medium' | 'info'; advice: string };
+type OpenPort = { port: number; service: string; risk: 'critical' | 'high' | 'medium' | 'info'; advice: string; source?: 'docker' | 'kubernetes' | 'agent' | null; address?: string };
+type ClusterExposure = { id: number; name: string; agent_version: string | null; scan: Scan | null; scannable: boolean; scan_unavailable: string | null; nodes: number;
+  exposed: { namespace: string; name: string; type: 'NodePort' | 'LoadBalancer'; ports: { port: number; node_port: number; target: string }[]; external: string[] }[] };
+const SOURCE_LABEL: Record<string, string> = { docker: 'Docker', kubernetes: 'Kubernetes', agent: 'agent' };
 type Tls = { address: string; grade: string | null; findings: number; issues: { severity: string; text: string }[]; versions?: Record<string, boolean | null>; negotiated?: string; cipher?: string; key?: string;
   signature?: string; days_left?: number; issuer?: string; hsts?: string | null; error?: string };
 type Scan = { id: number; kind: 'ports' | 'tls'; address: string; started_at: string; grade: string | null; findings: number; error: string | null; results: { open?: OpenPort[]; private?: boolean; checked_ports?: number; tls?: Tls[] } & Tls };
@@ -20,7 +23,7 @@ type Counts = { critical: number; high: number; medium: number; low: number; ack
 type ServerRow = Who & { status: string; updates: Updates | null; agent_version: string | null; ssh_24h: { total: number; distinct_ips: number; top_ips: [string, number][] };
   scan: Scan | null; scan_address: string | null; scan_unavailable: string | null; push: boolean; threats: Counts; threat_scan_at: string | null; threat_scan: boolean;
   hardening: { passed: number; failed: number; total: number } };
-type Overview = { servers: ServerRow[]; services: { id: number; name: string; url: string; tls: Scan | null }[]; filter: string | null;
+type Overview = { clusters?: ClusterExposure[]; servers: ServerRow[]; services: { id: number; name: string; url: string; tls: Scan | null }[]; filter: string | null;
   ssh: { total: number; top_ips: { ip: string; attempts: number; servers: number }[]; top_users: [string, number][]; hourly: { t: string; attempts: number }[] };
   two_factor?: { policy: 'none' | 'admins' | 'everyone'; enabled: number; total: number; without: { id: number; email: string; role: string }[] };
   kubernetes?: Counts & { clusters: number; scanned: number } };
@@ -35,7 +38,7 @@ type Foreign = { manager: string | null; packages: string[]; total?: number; err
 type Hardening = { server: Who; agent_version: string | null; push: boolean; checked_at: string | null; checks: Check[]; listening: Listen[]; authorized_keys: Key[]; foreign_packages: Foreign; supported: boolean };
 type Login = { id: number; server: Pick<Who, 'id' | 'name' | 'hostname' | 'public_ip'>; ts: string; ip: string; user: string; method: string; failures_before: number; new_source: boolean;
   verdict: 'breach' | 'new' | 'ok' | 'transfer'; kind?: 'login' | 'sftp'; key_type?: string | null; fingerprint?: string | null; key_name?: string | null };
-type Tab = 'overview' | 'threats' | 'kubernetes' | 'ssh' | 'updates' | 'hardening' | 'exposure' | 'reports' | 'signin';
+type Tab = 'overview' | 'threats' | 'kubernetes' | 'ssh' | 'updates' | 'hardening' | 'exposure' | 'alerts' | 'reports' | 'signin';
 type K8sFinding = { id: number; cluster_id: number; cluster: { id: number; name: string } | null; key: string; kind: string; severity: Severity; namespace: string; object: string; title: string; detail: string;
   evidence: { container?: string; image?: string; command?: string; path?: string; capabilities?: string; subject?: string; role?: string; pods?: number; created?: string };
   first_seen: string; last_seen: string; resolved_at: string | null; acknowledged_by: string | null; acknowledged_at: string | null; note: string };
@@ -90,7 +93,7 @@ export function Security() {
   const k8s = o?.kubernetes;
   const k8sAttention = k8s ? k8s.critical + k8s.high : 0;
   const tabs: [Tab, string, string][] = [['overview', 'Overview', 'shield'], ['threats', `Threats${attention ? ` (${attention})` : ''}`, 'alert'], ['ssh', 'SSH access', 'terminal'], ['updates', 'Updates', 'refresh'],
-    ['hardening', 'Hardening', 'check'], ['exposure', 'Exposure & TLS', 'globe'], ['reports', 'Reports', 'logs']];
+    ['hardening', 'Hardening', 'check'], ['exposure', 'Exposure & TLS', 'globe'], ['alerts', 'Alerts', 'bell'], ['reports', 'Reports', 'logs']];
   if (k8s?.clusters) tabs.splice(2, 0, ['kubernetes', `Kubernetes${k8sAttention ? ` (${k8sAttention})` : ''}`, 'k8s']);
   if (isAdmin) tabs.push(['signin', 'Sign-in', 'users']);
   const pick = (id: number) => setServer(String(id));
@@ -109,6 +112,7 @@ export function Security() {
         {tab === 'updates' && <UpdatesView o={o} pick={pick} />}
         {tab === 'hardening' && <HardeningView server={server} pick={pick} />}
         {tab === 'exposure' && <Exposure o={o} reload={data.reload} pick={pick} />}
+        {tab === 'alerts' && <SecurityAlerts />}
         {tab === 'reports' && <Reports server={server} servers={servers} />}
         {tab === 'signin' && o.two_factor && <SignIn tf={o.two_factor} reload={data.reload} />}
         {tab === 'signin' && !o.two_factor && <div className="card"><p className="muted">Sign-in settings apply to everyone. <button className="lg-link" onClick={() => setServer('')}>Clear the server filter</button> to see them.</p></div>}
@@ -518,13 +522,13 @@ function HardeningView({ server, pick }: { server: string; pick: (id: number) =>
 function Exposure({ o, reload, pick }: { o: Overview; reload: () => Promise<void>; pick: (id: number) => void }) {
   const { toast, canOperate } = useApp();
   const [busy, setBusy] = useState('');
-  async function scan(kind: 'server' | 'service', id: number) {
+  async function scan(kind: 'server' | 'service' | 'cluster', id: number) {
     setBusy(`${kind}${id}`);
     try { const r = await post<Scan>(`/security/scan/${kind}/${id}`); toast(r.error ? r.error : `Scan finished: grade ${r.grade}`, !!r.error); await reload(); } catch (e) { toast((e as Error).message, true); } finally { setBusy(''); }
   }
   return (
     <div className="grid">
-      <section className="card"><div className="card-head"><h2>Open ports</h2><span className="grow" /><span className="muted sm">45 common ports checked from SM-Watch on each server&apos;s public address, once a day</span></div>
+      <section className="card"><div className="card-head"><h2>Open ports</h2><span className="grow" /><span className="muted sm">Checked from SM-Watch on each server&apos;s public address: common ports, plus ports Docker publishes, Kubernetes NodePorts and programs listening on every network</span></div>
         {o.servers.map(s => { const r = s.scan?.results; return (
           <div key={s.id} className="sec-row">
             <div className="sec-row-head"><span className={`grade big ${GRADE_TONE(s.scan?.grade)}`}>{s.scan?.grade ?? '–'}</span><div style={{ minWidth: 0 }}><ServerTag who={s} onPick={pick} /><div className="sm muted mono">{s.scan ? 'scanned' : 'will scan'} {s.scan?.address || s.scan_address || '–'}{r?.private ? ' · private (shows what your network can reach)' : ''}</div></div>
@@ -532,9 +536,23 @@ function Exposure({ o, reload, pick }: { o: Overview; reload: () => Promise<void
               {canOperate && s.scan_address && <button className="btn sm" onClick={() => scan('server', s.id)} disabled={busy === `server${s.id}`}><Icon name="refresh" size={13} />{busy === `server${s.id}` ? 'Scanning…' : 'Scan now'}</button>}</div>
             {s.scan?.error && <p className="sm warn">{s.scan.error}</p>}
             {!s.scan && s.scan_unavailable && <p className="sm muted">{s.scan_unavailable}</p>}
-            {r?.open && (r.open.length === 0 ? <p className="sm good">No common port is reachable.</p> : <table className="tbl"><tbody>{r.open.map(p => <tr key={p.port}><td className="mono" style={{ width: 70 }}>{p.port}</td><td style={{ width: 170 }}><b>{p.service}</b></td><td><span className={`risk ${p.risk}`}>{RISK_LABEL[p.risk]}</span></td><td className="sm">{p.advice}</td></tr>)}</tbody></table>)}
+            {r?.open && (r.open.length === 0 ? <p className="sm good">Nothing reachable{r.checked_ports ? ` (${r.checked_ports} ports checked)` : ''}.</p> : <OpenPorts open={r.open} />)}
           </div>); })}
       </section>
+      {(o.clusters ?? []).length > 0 && <section className="card"><div className="card-head"><h2>Kubernetes services reachable from outside</h2><span className="grow" /><span className="muted sm">NodePort services on a node&apos;s address and LoadBalancer addresses, checked from SM-Watch</span></div>
+        {o.clusters!.map(c => { const r = c.scan?.results; return (
+          <div key={c.id} className="sec-row">
+            <div className="sec-row-head"><span className={`grade big ${GRADE_TONE(c.scan?.grade)}`}>{c.scan?.grade ?? '–'}</span><div style={{ minWidth: 0 }}><b><Icon name="k8s" size={13} /> {c.name}</b>
+              <div className="sm muted">{c.exposed.length} exposed service{c.exposed.length === 1 ? '' : 's'} · {c.nodes} node{c.nodes === 1 ? '' : 's'}{c.scan?.address ? <> · <span className="mono">{c.scan.address}</span></> : ''}</div></div>
+              <span className="grow" /><span className="sm muted">{c.scan ? `scanned ${timeAgo(c.scan.started_at)}` : c.scan_unavailable ?? 'not scanned yet'}</span>
+              {canOperate && c.scannable && <button className="btn sm" onClick={() => scan('cluster', c.id)} disabled={busy === `cluster${c.id}`}><Icon name="refresh" size={13} />{busy === `cluster${c.id}` ? 'Scanning…' : 'Scan now'}</button>}</div>
+            {!c.scannable && c.scan_unavailable && <p className="sm muted">{c.scan_unavailable}</p>}
+            {c.scan?.error && <p className="sm warn">{c.scan.error}</p>}
+            {r?.open && (r.open.length === 0 ? <p className="sm good">None of the {c.exposed.length} exposed services answered from SM-Watch.</p> : <OpenPorts open={r.open} withAddress />)}
+            {c.exposed.length > 0 && <details className="sm"><summary className="muted">Exposed services ({c.exposed.length})</summary><ul className="sec-issues">{c.exposed.map(e => <li key={`${e.namespace}/${e.name}`}>
+              <b>{e.namespace}/{e.name}</b> <span className="tag">{e.type}</span> {e.ports.map(p => `${p.port}${p.node_port ? ` → node ${p.node_port}` : ''}`).join(', ')}{e.external.length ? ` · ${e.external.join(', ')}` : ''}</li>)}</ul></details>}
+          </div>); })}
+      </section>}
       <section className="card"><div className="card-head"><h2>TLS of https services</h2></div>
         {o.services.length === 0 ? <p className="muted">No https services{o.filter ? ' on this server' : ''}.</p> : o.services.map(s => { const t = s.tls?.results; return (
           <div key={s.id} className="sec-row">
@@ -551,6 +569,105 @@ function Exposure({ o, reload, pick }: { o: Overview; reload: () => Promise<void
     </div>
   );
 }
+
+function OpenPorts({ open, withAddress }: { open: OpenPort[]; withAddress?: boolean }) {
+  return <table className="tbl"><tbody>{open.map(p => <tr key={`${p.address ?? ''}:${p.port}`}>
+    {withAddress && <td className="mono sm" style={{ width: 130 }}>{p.address}</td>}
+    <td className="mono" style={{ width: 70 }}>{p.port}</td>
+    <td style={{ width: 260 }}><b>{p.service}</b>{p.source && <> <span className="tag">{SOURCE_LABEL[p.source] ?? p.source}</span></>}</td>
+    <td><span className={`risk ${p.risk}`}>{RISK_LABEL[p.risk]}</span></td><td className="sm">{p.advice}</td></tr>)}</tbody></table>;
+}
+
+
+/* ---------------------------------------------------------------- alert settings */
+type AlertKind = { id: string; label: string; description: string; last_7_days: number };
+type SecAlerts = { enabled: boolean; categories: Record<string, boolean>; channels: number[]; threat_severity: 'critical' | 'high' | 'medium' | 'off'; ssh_attack_threshold: number;
+  ssh_success_after_failures: number; daily_login_alert: number; updated_by: string | null; updated_at: string | null; kinds: AlertKind[];
+  available_channels: { id: number; name: string; type: string; enabled: boolean }[];
+  recent: { id: number; at: string; kind: string | null; severity: string; target: string; summary: string; sent: boolean; error: string | null }[] };
+const KIND_ICON: Record<string, string> = { threat: 'alert', changes: 'settings', ssh_breach: 'alert', ssh_attack: 'shield', ssh_key: 'shield', ssh_new: 'terminal', ssh_many: 'users', exposure: 'globe', kubernetes: 'k8s' };
+
+/** Security → Alerts: which security alerts are sent, where to, and the limits behind them. Everyone sees it; admins change it. */
+function SecurityAlerts() {
+  const { isAdmin, toast } = useApp();
+  const data = usePoll(() => api<SecAlerts>('/security/alerts'), [], 60000, true);
+  const [f, setF] = useState<SecAlerts | null>(null);
+  const [busy, setBusy] = useState('');
+  useEffect(() => { if (data.value && !f) setF(data.value); }, [data.value, f]);
+  if (!f) return <div className="card"><p className="muted"><span className="spinner" /> Loading…</p></div>;
+  const saved = data.value!;
+  const dirty = JSON.stringify([f.enabled, f.categories, f.channels, f.threat_severity, f.ssh_attack_threshold, f.ssh_success_after_failures, f.daily_login_alert])
+    !== JSON.stringify([saved.enabled, saved.categories, saved.channels, saved.threat_severity, saved.ssh_attack_threshold, saved.ssh_success_after_failures, saved.daily_login_alert]);
+  const set = (patch: Partial<SecAlerts>) => setF({ ...f, ...patch });
+  async function save() {
+    setBusy('save');
+    try {
+      const r = await put<SecAlerts>('/security/alerts', { enabled: f!.enabled, categories: f!.categories, channels: f!.channels, threat_severity: f!.threat_severity,
+        ssh_attack_threshold: f!.ssh_attack_threshold, ssh_success_after_failures: f!.ssh_success_after_failures, daily_login_alert: f!.daily_login_alert });
+      setF(r); await data.reload(); toast('Security alert settings saved');
+    } catch (e) { toast((e as Error).message, true); } finally { setBusy(''); }
+  }
+  async function test() {
+    setBusy('test');
+    try { const r = await post<{ sent: boolean; error: string | null }>('/security/alerts/test'); toast(r.sent ? 'Test alert sent' : (r.error ?? 'Not sent'), !r.sent); await data.reload(); }
+    catch (e) { toast((e as Error).message, true); } finally { setBusy(''); }
+  }
+  const num = (key: 'ssh_attack_threshold' | 'ssh_success_after_failures' | 'daily_login_alert', min: number) =>
+    <input type="number" min={min} value={f[key]} disabled={!isAdmin} onChange={e => set({ [key]: Math.max(min, Number(e.target.value) || 0) } as Partial<SecAlerts>)} style={{ width: 90 }} />;
+  const limits: Record<string, ReactNode> = {
+    threat: <label className="sec-alert-limit">Send from severity <select value={f.threat_severity} disabled={!isAdmin} onChange={e => set({ threat_severity: e.target.value as SecAlerts['threat_severity'] })}>
+      <option value="critical">Critical only</option><option value="high">High and critical</option><option value="medium">Medium and above</option><option value="off">None</option></select></label>,
+    changes: <span className="sec-alert-limit muted">uses the same severity as signs of compromise</span>,
+    ssh_attack: <label className="sec-alert-limit">{num('ssh_attack_threshold', 0)} failed logins in 10 min <span className="muted">(0 = never)</span></label>,
+    ssh_breach: <label className="sec-alert-limit">after {num('ssh_success_after_failures', 1)} failed attempts in 24 h</label>,
+    ssh_many: <label className="sec-alert-limit">more than {num('daily_login_alert', 0)} logins per server per day <span className="muted">(0 = never)</span></label>,
+  };
+  const off = !f.enabled;
+  return (
+    <div className="grid">
+      <section className="card">
+        <div className="card-head"><h2>Security alerts</h2><span className="grow" />
+          <label className="switch-row"><input type="checkbox" checked={f.enabled} disabled={!isAdmin} onChange={e => set({ enabled: e.target.checked })} /><b>{f.enabled ? 'On' : 'Off'}</b></label></div>
+        <p className="muted sm" style={{ marginTop: 0 }}>Which security events send a message to your channels. Everything is still recorded on the Security page and in the delivery log; a kind that is off is marked “not sent”.
+          {saved.updated_by ? ` Last changed by ${saved.updated_by}${saved.updated_at ? ` ${timeAgo(saved.updated_at)}` : ''}.` : ' Defaults come from .env.'}</p>
+        <div className={`sec-alert-kinds ${off ? 'dim' : ''}`}>
+          {f.kinds.map(k => (
+            <div key={k.id} className={`sec-alert-kind ${f.categories[k.id] ? 'on' : ''}`}>
+              <label className="sec-alert-toggle"><input type="checkbox" checked={!!f.categories[k.id]} disabled={!isAdmin || off} onChange={e => set({ categories: { ...f.categories, [k.id]: e.target.checked } })} />
+                <Icon name={KIND_ICON[k.id] ?? 'bell'} size={16} /><b>{k.label}</b></label>
+              <span className="muted sm">{k.description}</span>
+              <div className="sec-alert-foot">{limits[k.id] ?? <span />}<span className={`sm ${k.last_7_days ? '' : 'muted'}`}>{k.last_7_days} in the last 7 days</span></div>
+            </div>))}
+        </div>
+      </section>
+      <section className="card">
+        <div className="card-head"><h2>Where they go</h2></div>
+        {f.available_channels.length === 0 ? <p className="muted">No notification channels yet. Add one under Alerts.</p> : <>
+          <div className="chips">
+            <button type="button" className={`chip-btn ${f.channels.length === 0 ? 'on' : ''}`} disabled={!isAdmin} onClick={() => set({ channels: [] })}>Same channels as other alerts</button>
+            {f.available_channels.map(c => <button type="button" key={c.id} disabled={!isAdmin} className={`chip-btn ${f.channels.includes(c.id) ? 'on' : ''}`}
+              onClick={() => set({ channels: f.channels.includes(c.id) ? f.channels.filter(x => x !== c.id) : [...f.channels, c.id] })}>{c.name} <span className="muted">{c.type}</span>{!c.enabled && ' (disabled)'}</button>)}
+          </div>
+          <p className="muted sm">{f.channels.length ? 'Security alerts go only to the selected channels, for example a security team chat.' : 'Security alerts follow each server’s own alert settings and each channel’s filter.'}</p></>}
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          {isAdmin && <button className="btn primary" disabled={!dirty || busy === 'save'} onClick={() => void save()}>{busy === 'save' ? 'Saving…' : 'Save'}</button>}
+          {isAdmin && dirty && <button className="btn ghost" onClick={() => setF(saved)}>Undo changes</button>}
+          {isAdmin && <button className="btn" disabled={busy === 'test' || dirty} onClick={() => void test()} title={dirty ? 'Save first' : 'Send a test message to these channels'}><Icon name="bell" size={14} />{busy === 'test' ? 'Sending…' : 'Send a test alert'}</button>}
+          {!isAdmin && <p className="sm muted">Only admins can change these settings.</p>}
+        </div>
+      </section>
+      <section className="card">
+        <div className="card-head"><h2>Recent security alerts</h2></div>
+        {saved.recent.length === 0 ? <p className="muted">No security alerts yet.</p> : <div className="tbl-wrap"><table className="tbl"><thead><tr><th>When</th><th>Kind</th><th>Where</th><th>What</th><th>Delivery</th></tr></thead><tbody>
+          {saved.recent.map(r => <tr key={r.id}><td className="sm nowrap" title={new Date(r.at).toLocaleString()}>{timeAgo(r.at)}</td>
+            <td className="sm">{f.kinds.find(k => k.id === r.kind)?.label ?? r.kind ?? '–'}</td><td className="sm"><b>{r.target}</b></td><td className="sm">{r.summary}</td>
+            <td className="sm">{r.sent ? <span className="good">sent</span> : <span className={r.error?.startsWith('Not sent') ? 'muted' : 'bad'} title={r.error ?? ''}>{r.error?.startsWith('Not sent') ? r.error.replace('Not sent: ', 'not sent: ') : 'failed'}</span>}</td></tr>)}
+        </tbody></table></div>}
+      </section>
+    </div>
+  );
+}
+
 
 /* ---------------------------------------------------------------- reports */
 type ReportData = { generated_at: string; days: number; since: string; filter: string | null; ssh: { total: number; top_ips: { ip: string; attempts: number; servers: number }[]; top_users: [string, number][] };

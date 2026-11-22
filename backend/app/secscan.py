@@ -81,7 +81,8 @@ def record_ssh_failures(db: Session, server, data: dict, now: datetime) -> None:
     since = now - timedelta(minutes=10)
     rows = db.execute(select(SshFailureSample.total, SshFailureSample.ips).where(SshFailureSample.server_id == server.id, SshFailureSample.ts >= since)).all()
     total = sum(r[0] for r in rows)
-    threshold = get_settings().ssh_attack_threshold
+    from .secalerts import config as alert_config
+    threshold = alert_config(db)["ssh_attack_threshold"] or 10**9      # 0 = attack alerts off
     last = server.ssh_alert_at if server.ssh_alert_at is None or server.ssh_alert_at.tzinfo else server.ssh_alert_at.replace(tzinfo=timezone.utc)
     if total < threshold or (last and now - last < timedelta(hours=1)):
         return
@@ -168,20 +169,39 @@ def _probe(address: str, port: int, timeout: float) -> bool:
         return False
 
 
-def scan_ports(address: str, ports: list[int] | None = None, timeout: float = 1.5) -> dict:
-    ports = ports or sorted(PORTS)
+def describe_port(port: int, extra: dict | None = None) -> dict:
+    """What an open port is: the common-port table, plus where SM-Watch learned about it (Docker, Kubernetes, the agent)."""
+    known = PORTS.get(port)
+    if not extra:
+        return {"port": port, "service": known[0] if known else "unknown", "risk": known[1] if known else "medium", "advice": known[2] if known else "Check what listens here."}
+    inner = PORTS.get(extra.get("inner_port") or 0)            # e.g. Docker 16379 -> 6379 inside: as risky as Redis
+    base = known or inner
+    service = f"{base[0]} · {extra['label']}" if base and base[0] not in extra["label"] else extra["label"]
+    risk = known[1] if known else inner[1] if inner else extra.get("risk", "medium")
+    if not known and risk == "info":
+        risk = "medium"                                         # a normal service (web, mail) on an unusual public port: worth a look
+    return {"port": port, "service": service[:120], "risk": risk,
+            "advice": " ".join(a for a in ((base[2] if base else ""), extra.get("advice", "")) if a), "source": extra.get("source")}
+
+
+def scan_ports(address: str, ports: list[int] | None = None, timeout: float = 1.5, extra: dict[int, dict] | None = None) -> dict:
+    """Probes the common ports plus `extra` (port -> label, source, advice: Docker-published, Kubernetes NodePorts, programs the agent
+    sees listening on every network)."""
+    extra = extra or {}
+    ports = sorted(set(ports or PORTS) | set(extra))
     started = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=32) as pool:
+    with ThreadPoolExecutor(max_workers=48) as pool:
         open_ports = [p for p, ok in zip(ports, pool.map(lambda p: _probe(address, p, timeout), ports)) if ok]
     try:
         private = ipaddress.ip_address(socket.getaddrinfo(address, None)[0][4][0]).is_private
     except (OSError, ValueError):
         private = False
-    found = [{"port": p, "service": PORTS.get(p, ("unknown", "medium", ""))[0], "risk": PORTS.get(p, ("", "medium", ""))[1], "advice": PORTS.get(p, ("", "", "Check what listens here."))[2]} for p in open_ports]
+    found = [describe_port(p, extra.get(p)) for p in open_ports]
     found.sort(key=lambda f: (RISK_ORDER[f["risk"]], f["port"]))
     risky = [f for f in found if f["risk"] in ("critical", "high")]
     grade = "F" if any(f["risk"] == "critical" for f in found) else "C" if risky else "B" if any(f["risk"] == "medium" for f in found) else "A"
-    return {"address": address, "private": private, "checked_ports": len(ports), "open": found, "grade": grade, "findings": len(risky), "duration_ms": round((time.perf_counter() - started) * 1000)}
+    return {"address": address, "private": private, "checked_ports": len(ports), "extra_ports": len(extra), "open": found, "grade": grade, "findings": len(risky),
+            "duration_ms": round((time.perf_counter() - started) * 1000)}
 
 
 # ------------------------------------------------------------------------------------------------ TLS
@@ -267,13 +287,110 @@ def audit_tls(host: str, port: int = 443, sni: str | None = None, url: str | Non
 
 
 # ------------------------------------------------------------------------------------------------ running and storing scans
+DOCKER_ADVICE = "Published by Docker (-p). Docker writes its own firewall rules, so it is reachable even when ufw looks closed: bind it to 127.0.0.1 or remove the mapping if it should not be public."
+NODEPORT_ADVICE = "Kubernetes opens a NodePort on every node's addresses. Put it behind an Ingress / LoadBalancer or restrict it with a firewall if it should not be public."
+LISTEN_ADVICE = "A program on the server listens on every network on this port."
+
+
+def server_extra_ports(server) -> dict[int, dict]:
+    """Ports beyond the common list worth checking on this server: Docker-published ports and programs listening on every network
+    (from its agent), and NodePorts of Kubernetes clusters this server is a node of."""
+    from .database import SessionLocal
+    from .models import Cluster
+    from .monitoring import server_addresses
+    try:
+        metrics = json.loads(server.last_metrics or "{}") or {}
+    except ValueError:
+        metrics = {}
+    sec = metrics.get("security") or {}
+    extra: dict[int, dict] = {}
+    for l in sec.get("listening") or []:
+        if l.get("all_interfaces") and l.get("port"):
+            extra[int(l["port"])] = {"label": f"{l.get('process') or 'a program'} (listening on every network)", "source": "agent", "advice": LISTEN_ADVICE}
+    for p in sec.get("published") or []:
+        extra[int(p["port"])] = {"label": f"Docker container {p.get('container') or '?'}" + (f" (port {p['private_port']} inside)" if p.get("private_port") and p["private_port"] != p["port"] else ""),
+                                 "source": "docker", "inner_port": p.get("private_port") or 0, "advice": DOCKER_ADVICE}
+    addresses = server_addresses(server)
+    names = {a for a in [metrics.get("hostname"), addresses.get("public_ip"), server.host, *(addresses.get("private_ips") or [])] if a}
+    with SessionLocal() as db:
+        for cluster in db.scalars(select(Cluster).where(Cluster.enabled.is_(True))).all():
+            try:
+                summary = json.loads(cluster.summary or "{}") or {}
+            except ValueError:
+                continue
+            if not any({n.get("name"), n.get("internal"), n.get("external")} & names for n in summary.get("node_addresses") or []):
+                continue
+            for svc in summary.get("exposed") or []:
+                for port in svc.get("ports") or []:
+                    if port.get("node_port"):
+                        extra[int(port["node_port"])] = {"label": f"Kubernetes NodePort {svc['namespace']}/{svc['name']} ({cluster.name})", "source": "kubernetes",
+                                                         "inner_port": port.get("port") or 0, "advice": NODEPORT_ADVICE}
+    return dict(sorted(extra.items())[:300])
+
+
 def run_server_scan(server) -> dict:
     address, reason = server_address(server)
     if not address:
         return {"error": reason}
-    result = scan_ports(address)
+    result = scan_ports(address, extra=server_extra_ports(server))
     result["tls"] = [audit_tls(address, f["port"]) for f in result["open"] if f["port"] in TLS_PORTS][:3]
     return result
+
+
+def cluster_targets(cluster) -> tuple[list[tuple[str, dict[int, dict]]], str]:
+    """(address, ports) to probe for a cluster: its NodePorts on one node (they open on every node), and each LoadBalancer's
+    external address with the service's ports. Public node addresses are preferred. ("" reason when there is something to scan.)"""
+    try:
+        summary = json.loads(cluster.summary or "{}") or {}
+    except ValueError:
+        summary = {}
+    if "exposed" not in summary:
+        return [], "Needs the Kubernetes agent 1.4 or newer"
+    nodes = [n for n in summary.get("node_addresses") or [] if n.get("ready", True)] or summary.get("node_addresses") or []
+    node_address = None
+    for candidate in [n.get("external") for n in nodes] + [n.get("internal") for n in nodes]:
+        if not candidate:
+            continue
+        try:
+            validate_host(candidate)
+            node_address = candidate
+            break
+        except BlockedTargetError:
+            continue
+    targets: dict[str, dict[int, dict]] = {}
+    for svc in summary.get("exposed") or []:
+        where = f"{svc['namespace']}/{svc['name']}"
+        for port in svc.get("ports") or []:
+            if port.get("node_port") and node_address:
+                targets.setdefault(node_address, {})[int(port["node_port"])] = {"label": f"NodePort {where}", "source": "kubernetes", "inner_port": port.get("port") or 0, "advice": NODEPORT_ADVICE}
+            if svc.get("type") == "LoadBalancer" and port.get("port"):
+                for ext in svc.get("external") or []:
+                    targets.setdefault(ext, {})[int(port["port"])] = {"label": f"LoadBalancer {where}", "source": "kubernetes",
+                                                                      "advice": "Exposed through the cluster's load balancer. Check it should be public."}
+    if not targets:
+        return [], ("No NodePort or LoadBalancer services" if summary.get("exposed") == [] else "No node address SM-Watch is allowed to scan")
+    return list(targets.items())[:10], ""
+
+
+def run_cluster_scan(cluster) -> dict:
+    targets, reason = cluster_targets(cluster)
+    if not targets:
+        return {"error": reason}
+    started, found, checked, private = time.perf_counter(), [], 0, False
+    for address, extra in targets:
+        try:
+            validate_host(address)
+        except BlockedTargetError as error:
+            found.append({"port": 0, "address": address, "service": "not scanned", "risk": "info", "advice": str(error)[:200]})
+            continue
+        r = scan_ports(address, ports=sorted(extra), extra=extra)
+        checked += r["checked_ports"]; private = private or r["private"]
+        found += [{**f, "address": address} for f in r["open"]]
+    found.sort(key=lambda f: (RISK_ORDER[f["risk"]], f["port"]))
+    risky = [f for f in found if f["risk"] in ("critical", "high")]
+    grade = "F" if any(f["risk"] == "critical" for f in found) else "C" if risky else "B" if any(f["risk"] == "medium" for f in found) else "A"
+    return {"address": ", ".join(a for a, _ in targets)[:300], "private": private, "checked_ports": checked, "open": found, "grade": grade, "findings": len(risky),
+            "duration_ms": round((time.perf_counter() - started) * 1000)}
 
 
 def run_service_scan(service) -> dict:
@@ -295,14 +412,14 @@ def store(db: Session, kind: str, target, target_type: str, result: dict, starte
                         grade=result.get("grade"), findings=result.get("findings") or 0, results=json.dumps(result), error=result.get("error")))
     def bad(r: dict) -> set[str]:
         if kind == "ports":
-            return {f"port {f['port']} ({f['service']})" for f in r.get("open", []) if f["risk"] in ("critical", "high")}
+            return {f"{f.get('address') + ':' if f.get('address') else 'port '}{f['port']} ({f['service']})" for f in r.get("open", []) if f["risk"] in ("critical", "high")}
         return {i["text"] for i in r.get("issues", []) if i["severity"] in ("critical", "high")}
     new = bad(result) - (bad(json.loads(previous.results)) if previous else set())
     if new and not result.get("error"):
         what = "Exposed on the internet" if kind == "ports" and not result.get("private") else "Reachable" if kind == "ports" else "TLS problems"
         lines = [f"{what} at {result.get('address')}:"] + sorted(new)[:8]
         from .monitoring import server_where
-        where = server_where(target) if target_type == "server" else target.url
+        where = server_where(target) if target_type == "server" else target.url if target_type == "service" else None
         queue_event(db, target_type, target, "warning", format_alert("Security", "security_finding", target.name, lines, where=where), deliver=False, state="security_finding")
 
 
@@ -390,25 +507,27 @@ def job_save(**changes) -> dict:
 def scan_all(targets: list[tuple[str, int]], user: str) -> None:
     """Runs exposure scans (servers) and TLS audits (https services) for the given targets, 4 at a time. Run in a thread."""
     from .database import SessionLocal
-    from .models import Server, Service
+    from .models import Cluster, Server, Service
+    models = {"server": Server, "service": Service, "cluster": Cluster}
+    runners = {"server": run_server_scan, "service": run_service_scan, "cluster": run_cluster_scan}
 
     def one(target: tuple[str, int]) -> None:
         kind, tid = target
         with SessionLocal() as db:
-            obj = db.get(Server if kind == "server" else Service, tid)
+            obj = db.get(models[kind], tid)
             if obj is None:
                 return
             job_save(current=obj.name)
             started = datetime.now(timezone.utc)
             try:
-                result = run_server_scan(obj) if kind == "server" else run_service_scan(obj)
+                result = runners[kind](obj)
             except Exception as error:   # noqa: BLE001  (one bad target must not stop the others)
                 result = {"error": str(error)[:200]}
             failed = False
             if kind == "server" and result.get("error") and not server_address(obj)[0]:
                 failed = True                                    # no address known: nothing to store
             else:
-                store(db, "ports" if kind == "server" else "tls", obj, kind, result, started)
+                store(db, "tls" if kind == "service" else "ports", obj, kind, result, started)
                 db.commit()
                 failed = bool(result.get("error"))
         with counter_lock:
@@ -447,5 +566,12 @@ def scans_due(db: Session) -> None:
         if service.url.lower().startswith("https://") and due(("tls", "service", service.id)):
             started = datetime.now(timezone.utc)
             store(db, "tls", service, "service", run_service_scan(service), started)
+            db.commit()
+            return
+    from .models import Cluster
+    for cluster in db.scalars(select(Cluster).where(Cluster.enabled.is_(True))).all():
+        if due(("ports", "cluster", cluster.id)) and cluster_targets(cluster)[0]:
+            started = datetime.now(timezone.utc)
+            store(db, "ports", cluster, "cluster", run_cluster_scan(cluster), started)
             db.commit()
             return

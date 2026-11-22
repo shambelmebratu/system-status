@@ -86,6 +86,15 @@ def report(payload: AgentReport, request: Request, authorization: str | None = H
         audit(db, request, "agent.ip_changed", actor=f"agent:{server.name}", target=f"server:{server.id}", detail=f"{server.last_agent_ip} -> {ip}")
     server.last_agent_ip = ip
 
+    from .monitoring import pause_state
+    from .secscan import agent_config
+    if pause_state(server, now) == "monitor":   # paused: the agent stays connected, nothing is evaluated, stored or alerted
+        server.last_seen_at = now
+        db.commit()
+        reply["status"] = "paused"
+        reply["security"] = agent_config(db, server.id)
+        return reply
+
     metrics = payload.model_dump()
     traffic = metrics.pop("traffic", None)   # stored in its own table, not in the host metrics JSON
     failures_seen = metrics.pop("ssh_failures", None)

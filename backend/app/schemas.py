@@ -66,7 +66,8 @@ class ServiceCreate(AlertPrefs):
     enabled: bool = True
     public: bool = False
     server_id: int | None = None
-    timeout_seconds: int | None = Field(default=None, ge=1, le=120)           # null = SERVICE_TIMEOUT_SECONDS
+    timeout_ms: int | None = Field(default=None, ge=50, le=120000)            # null = SERVICE_TIMEOUT_SECONDS
+    timeout_seconds: int | None = Field(default=None, ge=1, le=120)           # older clients; used when timeout_ms is not given
     cert_check: bool = True                                                    # https only: watch the certificate's expiry date
     keyword: str | None = Field(default=None, max_length=200)                  # content check (case-insensitive); empty = off
     keyword_mode: str = Field(default="contains", pattern="^(contains|absent)$")
@@ -329,6 +330,14 @@ class SecurityBaseline(BaseModel):
     packages_changed_at: str | None = Field(default=None, max_length=40)
 
 
+class PublishedPort(BaseModel):
+    """A port Docker publishes on every network (agent 2.18+)."""
+    port: int = Field(ge=1, le=65535)
+    private_port: int = Field(default=0, ge=0, le=65535)
+    container: str = Field(default="", max_length=100)
+    image: str = Field(default="", max_length=150)
+
+
 class SecurityReport(BaseModel):
     checked_at: str = Field(max_length=40)
     findings: list[ThreatFinding] = Field(default_factory=list, max_length=60)
@@ -337,6 +346,7 @@ class SecurityReport(BaseModel):
     authorized_keys: list[AuthorizedKey] = Field(default_factory=list, max_length=200)
     foreign_packages: ForeignPackages | None = None
     baseline: SecurityBaseline | None = None
+    published: list[PublishedPort] = Field(default_factory=list, max_length=200)
     seconds: float = Field(default=0, ge=0)
 
 
@@ -537,3 +547,12 @@ class ChannelUpdate(BaseModel):
 
 class ORMModel(BaseModel):
     model_config = ConfigDict(from_attributes=True)
+
+
+class PauseRequest(BaseModel):
+    """Pause a monitor: "monitor" stops checks and alerts, "alerts" keeps checking but sends nothing. For `minutes`, until `until`,
+    or (neither) until someone resumes it."""
+    mode: str = Field(default="monitor", pattern="^(monitor|alerts)$")
+    minutes: int | None = Field(default=None, ge=1, le=525600)
+    until: datetime | None = None
+    reason: str = Field(default="", max_length=200)

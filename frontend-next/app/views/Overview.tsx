@@ -1,7 +1,8 @@
 'use client';
 
 import { Fragment } from 'react';
-import { Empty, Icon, Meter, StatusPill } from '../components/ui';
+import { Empty, Icon, Meter } from '../components/ui';
+import { MonitorStatus } from '../components/pause';
 import { post } from '../lib/api';
 import { useApp, usePoll } from '../lib/app';
 import { api } from '../lib/api';
@@ -64,7 +65,7 @@ export function Overview() {
                   const m = s.last_metrics;
                   return <tr key={s.id} className="link" onClick={() => go(`servers/${s.id}`)}>
                     <td><div className="name">{s.name}<small>{m?.hostname || s.host || 'awaiting first report'}</small></div></td>
-                    <td><StatusPill status={s.last_status} /></td>
+                    <td><MonitorStatus item={s} /></td>
                     {(['cpu', 'memory', 'disk'] as const).map(k => <td key={k} className="hide-sm" style={{ minWidth: 90 }}>{m?.[k] != null ? <Fragment><span className="sm">{pct(m[k], 0)}</span><Meter value={m[k]!} warnAt={(s[`${k}_threshold` as const] as number) * 0.85} badAt={s[`${k}_threshold` as const] as number} /></Fragment> : <span className="muted">–</span>}</td>)}
                     <td className="num">{pct(s.uptime_24h, 2)}</td></tr>;
                 })}</tbody></table>
@@ -75,7 +76,7 @@ export function Overview() {
             {services.length === 0 ? <Empty title="No services"><button className="btn primary" onClick={() => go('services/new')}>Add service</button></Empty> : (
               <table className="tbl"><thead><tr><th>Service</th><th>Status</th><th className="num hide-sm">Response</th><th className="num">24h</th></tr></thead>
                 <tbody>{services.map(s => <tr key={s.id} className="link" onClick={() => go(`services/${s.id}`)}>
-                  <td><div className="name">{s.name}<small>{s.url}</small></div></td><td><StatusPill status={s.last_status} /></td>
+                  <td><div className="name">{s.name}<small>{s.url}</small></div></td><td><MonitorStatus item={s} /></td>
                   <td className="num hide-sm">{ms(s.last_latency_ms)}</td><td className="num">{pct(s.uptime_24h, 2)}</td></tr>)}</tbody></table>
             )}
           </section>

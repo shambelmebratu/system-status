@@ -39,7 +39,7 @@ from typing import Any
 
 import psutil
 
-AGENT_VERSION = "2.17.0"
+AGENT_VERSION = "2.18.0"
 _ENV_TOKEN = os.getenv("AGENT_TOKEN", "")                      # the token supplied by configuration; a rotation may supersede it (see _load_state)
 AGENT_TOKEN = ""                                                # the token in use: resolved by ensure_token() (saved state first, then configuration)
 AGENT_ALLOW_INSECURE = os.getenv("AGENT_ALLOW_INSECURE", "") == "1"   # permit http:// to a public address (not recommended)
@@ -2551,6 +2551,22 @@ def baseline() -> dict:
             "packages_changed_at": datetime.fromtimestamp(pkg, timezone.utc).isoformat() if pkg else None}
 
 
+def published_ports() -> list[dict]:
+    """Ports Docker publishes on every network (-p 8080:80). Docker writes its own firewall rules, so these are reachable even when
+    ufw looks closed; SM-Watch adds them to the exposure scan. Ports bound to 127.0.0.1 are not exposed and are left out."""
+    if not docker_available():
+        return []
+    out: dict[int, dict] = {}
+    for c in (_docker("/containers/json") or [])[:200]:
+        name = ((c.get("Names") or ["/?"])[0]).lstrip("/")[:100]
+        for p in c.get("Ports") or []:
+            public, ip = p.get("PublicPort"), p.get("IP") or ""
+            if not public or p.get("Type", "tcp") != "tcp" or ip not in ("", "0.0.0.0", "::"):
+                continue
+            out.setdefault(int(public), {"port": int(public), "private_port": int(p.get("PrivatePort") or 0), "container": name, "image": (c.get("Image") or "")[:150]})
+    return sorted(out.values(), key=lambda r: r["port"])[:200]
+
+
 def _mode(path: str) -> int | None:
     try:
         return os.stat(_host_path(path)).st_mode
@@ -2642,7 +2658,7 @@ def threat_scan() -> dict:
         if f["key"] not in seen:
             seen.add(f["key"]); unique.append(f)
     unique.sort(key=lambda f: ("critical", "high", "medium", "low").index(f["severity"]))
-    return {"checked_at": datetime.now(timezone.utc).isoformat(), "findings": unique[:60], "hardening": _safe(hardening, []) + _safe(more_hardening, []), "listening": _safe(listening, []), "baseline": _safe(baseline, None),
+    return {"checked_at": datetime.now(timezone.utc).isoformat(), "findings": unique[:60], "hardening": _safe(hardening, []) + _safe(more_hardening, []), "listening": _safe(listening, []), "baseline": _safe(baseline, None), "published": _safe(published_ports, []),
             "authorized_keys": _safe(authorized_keys, []), "foreign_packages": pkg or None, "seconds": round(time.monotonic() - started, 2)}
 
 

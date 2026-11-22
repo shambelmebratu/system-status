@@ -455,12 +455,24 @@ def deliver_event(event: AlertEvent, session) -> None:
     if target is not None and not target_allows(target, event.state):
         event.sent, event.delivery_error, event.delivery_attempts = False, MONITOR_MUTED, 10   # a choice made on the monitor, never retried
         return
+    paused = pause_state(target) if target is not None else None
+    if paused:   # someone paused this monitor: recorded, never sent or retried
+        event.sent, event.delivery_error, event.delivery_attempts = False, "Not sent: the monitor is paused" + (f" by {target.paused_by}" if target.paused_by else ""), 10
+        return
+    from . import secalerts
+    off = secalerts.blocked(session, event.state, event.target_type)
+    if off:      # this kind of security alert is turned off in Security → Alerts
+        event.sent, event.delivery_error, event.delivery_attempts = False, off, 10
+        return
     from .devops import in_maintenance
     window = in_maintenance(session, event.target_type, event.target_id)
     if window is not None:   # planned work: the alert is recorded but not sent
         event.sent, event.delivery_error, event.delivery_attempts = False, f"Not sent: maintenance window \"{window}\"", 10
         return
-    event.sent, event.delivery_error = send_alert(event.message, session, event.target_type, event.state, target_channel_ids(target) if target is not None else None)
+    channels = secalerts.channels_for(session, event.state, event.target_type)
+    if channels is None:
+        channels = target_channel_ids(target) if target is not None else None
+    event.sent, event.delivery_error = send_alert(event.message, session, event.target_type, event.state, channels)
     if (event.delivery_error or "").startswith("Not sent:"):
         event.delivery_attempts = 10   # a deliberate choice, not a failure: never retried
         return
@@ -482,8 +494,49 @@ def send_channel_test(channel: Channel) -> tuple[bool, str]:
     return True, f"{labels.get(channel.type, channel.type)} test notification delivered"
 
 
-def service_timeout(service: Service) -> int:
-    return service.timeout_seconds or get_settings().service_timeout_seconds
+def service_timeout(service: Service) -> float:
+    """Seconds (fractions allowed): the service's own limit in milliseconds, else the older whole-second one, else SERVICE_TIMEOUT_SECONDS."""
+    if getattr(service, "timeout_ms", None):
+        return service.timeout_ms / 1000
+    return float(service.timeout_seconds or get_settings().service_timeout_seconds)
+
+
+def fmt_limit(seconds: float) -> str:
+    return f"{round(seconds * 1000)} ms" if seconds < 10 else f"{seconds:g} s"
+
+
+# ------------------------------------------------------------------------------------------------ pause
+def pause_state(target, now: datetime | None = None) -> str | None:
+    """"monitor" (no checks, no alerts) or "alerts" (checked, alerts muted) while a pause is active, else None."""
+    mode = getattr(target, "pause_mode", None)
+    if not mode:
+        return None
+    until = target.paused_until
+    if until is not None:
+        until = until if until.tzinfo else until.replace(tzinfo=timezone.utc)
+        if until <= (now or datetime.now(timezone.utc)):
+            return None
+    return mode
+
+
+def resume(target, now: datetime | None = None) -> None:
+    """Ends a pause. A monitor that was not checked starts again as "unknown", so its first check cannot raise a stale alert."""
+    was_monitor = target.pause_mode == "monitor"
+    target.pause_mode = target.paused_until = target.paused_by = target.pause_reason = None
+    if was_monitor:
+        target.last_status, target.fail_count, target.last_checked_at = "unknown", 0, None
+        if getattr(target, "monitor_mode", None) == "push":
+            target.last_seen_at = now or datetime.now(timezone.utc)      # a fresh grace period before "no heartbeat" counts
+
+
+def expire_pauses(session) -> None:
+    """Worker: resumes monitors whose pause has run out (and writes it to the audit log)."""
+    from .audit import audit
+    now = datetime.now(timezone.utc)
+    for model, kind in ((Server, "server"), (Service, "service")):
+        for item in session.scalars(select(model).where(model.pause_mode.is_not(None), model.paused_until.is_not(None), model.paused_until <= now)).all():
+            resume(item, now)
+            audit(session, None, f"{kind}.resume", actor="system", target=f"{kind}:{item.id}", detail=f"{item.name}: pause ended")
 
 
 def cert_thresholds(service: Service) -> list[int]:
@@ -534,14 +587,14 @@ def probe_service(service: Service, force_cert: bool = False) -> dict:
     except Exception as error:
         reason = getattr(error, "reason", error)
         timed_out = isinstance(reason, (TimeoutError, socket.timeout)) or "timed out" in str(error).lower()
-        error_message = f"Timed out: no response within {limit} s" if timed_out else str(error)[:500]
+        error_message = f"Timed out: no response within {fmt_limit(limit)}" if timed_out else str(error)[:500]
     elapsed = time.perf_counter() - started
     if status == "up" and elapsed > limit:     # a socket timeout applies per read; the whole answer must also be in time
-        status, error_message = "down", f"Timed out: the response took {elapsed:.1f} s, longer than the {limit} s limit"
+        status, error_message = "down", f"Timed out: the response took {fmt_limit(elapsed)}, longer than the {fmt_limit(limit)} limit"
     result = {"status": status, "http_status": http_status, "latency_ms": round(elapsed * 1000, 1), "error": error_message}
     if cert_due(service, force_cert):
         try:
-            result["cert"] = fetch_certificate(service.url, timeout=min(limit, 15))
+            result["cert"] = fetch_certificate(service.url, timeout=min(max(limit, 5), 15))
         except Exception as error:   # noqa: BLE001
             result["cert_error"] = str(error)[:300] or error.__class__.__name__
     return result
@@ -786,9 +839,11 @@ def run_once() -> None:
     """One scheduler tick: probe everything that is due concurrently, then apply results serially."""
     session = SessionLocal()
     try:
-        servers = session.scalars(select(Server).where(Server.enabled.is_(True))).all()
+        expire_pauses(session)
+        session.commit()
+        servers = [s for s in session.scalars(select(Server).where(Server.enabled.is_(True))).all() if pause_state(s) != "monitor"]
         pull_servers = [s for s in servers if s.monitor_mode != "push" and is_due(s.last_checked_at, s.check_interval_seconds)]
-        services = [s for s in session.scalars(select(Service).where(Service.enabled.is_(True))).all() if is_due(s.last_checked_at, s.interval_seconds)]
+        services = [s for s in session.scalars(select(Service).where(Service.enabled.is_(True))).all() if pause_state(s) != "monitor" and is_due(s.last_checked_at, s.interval_seconds)]
         from . import dnsmon, qa
         from .models import ApiTest, DnsMonitor
         tests = [t for t in session.scalars(select(ApiTest).where(ApiTest.enabled.is_(True))).all() if is_due(t.last_checked_at, t.interval_seconds)]
