@@ -111,6 +111,17 @@ def _ping_dgram(destination: str) -> float | None:
             return None
 
 
+def process_label(item: dict) -> str:
+    """"xmrig PID 592826", plus the program the command line runs when the kernel name differs (a process can rename itself):
+    "2.1.330 PID 3078 (claude)". That is what `ps aux | grep` finds on the server."""
+    label = f"{item['name']} PID {item['pid']}"
+    first = (item.get("cmd") or "").split(" ", 1)[0]
+    program = first.rsplit("/", 1)[-1]
+    if program and not program.startswith(item["name"][:15]) and not item["name"].startswith(program):
+        label += f" ({program[:60]})"
+    return label
+
+
 def evaluate_metrics(server: Server, metrics: dict) -> tuple[str, list[str]]:
     """Compares a metrics payload to the server's thresholds. Shared by pull checks and push reports."""
     required_metrics = ("cpu", "memory", "disk", "load", "swap")
@@ -121,7 +132,7 @@ def evaluate_metrics(server: Server, metrics: dict) -> tuple[str, list[str]]:
     failures = [f"{name} {value}{unit} >= {threshold}{unit}" for name, value, threshold, unit in checks if value >= threshold]
     configured_processes = {name.strip().lower() for name in server.process_names.split(",") if name.strip()}
     process_failures = [item for item in metrics.get("processes", []) if item["cpu"] >= server.process_threshold and (not configured_processes or item["name"].lower() in configured_processes)]
-    failures.extend(f"Process {item['name']} PID {item['pid']} CPU {item['cpu']}% >= {server.process_threshold}%" for item in process_failures)
+    failures.extend(f"Process {process_label(item)} CPU {item['cpu']}% >= {server.process_threshold}%" for item in process_failures)
     return ("alert" if failures else "up", failures)
 
 

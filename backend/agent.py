@@ -186,12 +186,21 @@ def process_rows() -> list[dict]:
     # the threat scan iterating at the same moment with other fields would replace .info mid-loop (KeyError -> a lost report).
     for process in psutil.process_iter():
         try:
-            info = process.as_dict(["pid", "name", "username", "memory_percent"])
-            rows.append({"pid": info["pid"], "name": (info["name"] or "unknown")[:100], "user": (info["username"] or "unknown")[:100], "cpu": round(process.cpu_percent(interval=None), 1), "memory": round(min(100.0, info["memory_percent"] or 0), 1)})
+            info = process.as_dict(["pid", "name", "username", "memory_percent", "cmdline", "status"])
+            if info.get("status") == psutil.STATUS_ZOMBIE:
+                continue      # killed, waiting for its parent to collect it: not running any more
+            rows.append({"pid": info["pid"], "name": (info["name"] or "unknown")[:100], "user": (info["username"] or "unknown")[:100], "cpu": round(process.cpu_percent(interval=None), 1),
+                         "memory": round(min(100.0, info["memory_percent"] or 0), 1), "cmd": _short_cmd(info.get("cmdline"))})
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
     rows.sort(key=lambda item: item["cpu"], reverse=True)
     return rows
+
+
+def _short_cmd(cmdline) -> str:
+    """The command line as `ps aux` shows it (secrets masked, shortened). On Linux a process's name is the kernel's 15-character
+    "comm", which a program can set to anything (miners often do): the command line is what you find it by on the server."""
+    return redact_command(" ".join(cmdline or []))[:160] if cmdline else ""
 
 
 def process_cpu_total(rows: list[dict]) -> float:
@@ -204,26 +213,35 @@ def live_snapshot(seconds: float = 1.0) -> dict[str, Any]:
     process objects, network rates and log offsets all stay as they are, so the next regular report is unaffected)."""
     seconds = max(0.2, min(3.0, seconds))
 
-    def proc_times() -> dict[int, tuple[float, str, str, float]]:
+    def proc_times() -> dict[int, tuple[float, str, str, float, float, str]]:
         out = {}
         for pid in psutil.pids():
             try:
                 p = psutil.Process(pid)        # a fresh object: psutil's cached ones keep the report's own CPU baseline
                 with p.oneshot():
+                    if p.status() == psutil.STATUS_ZOMBIE:
+                        continue
                     t = p.cpu_times()
-                    out[pid] = (t.user + t.system, p.name(), _try(p.username) or "unknown", p.memory_percent())
+                    out[pid] = (t.user + t.system, p.name(), _try(p.username) or "unknown", p.memory_percent(), p.create_time(), _short_cmd(_try(p.cmdline)))
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 continue
         return out
 
+    started = time.time()
     t1, s1, p1, m1 = psutil.cpu_times(), proc_stat(), proc_times(), time.monotonic()
     time.sleep(seconds)
     t2, s2, p2, m2 = psutil.cpu_times(), proc_stat(), proc_times(), time.monotonic()
     elapsed = max(0.001, m2 - m1)
     rows = []
-    for pid, (cpu2, name, user, mem) in p2.items():
-        used = cpu2 - p1[pid][0] if pid in p1 else cpu2      # a process that started during the sample used all its CPU inside it
-        rows.append({"pid": pid, "name": (name or "unknown")[:100], "user": str(user)[:100], "cpu": round(max(0.0, used) / elapsed * 100, 1), "memory": round(min(100.0, mem or 0), 1)})
+    for pid, (cpu2, name, user, mem, created, cmd) in p2.items():
+        before = p1.get(pid)
+        if before and abs(before[4] - created) < 0.5:
+            used = cpu2 - before[0]
+        elif created >= started - 1.0:
+            used = cpu2                      # started during the sample: all its CPU time was used inside it
+        else:
+            continue                         # missed in the first pass (or a reused PID): its CPU in this window is unknown, never its lifetime total
+        rows.append({"pid": pid, "name": (name or "unknown")[:100], "user": str(user)[:100], "cpu": round(max(0.0, used) / elapsed * 100, 1), "memory": round(min(100.0, mem or 0), 1), "cmd": cmd})
     rows.sort(key=lambda r: (r["cpu"], r["memory"]), reverse=True)
     breakdown = cpu_breakdown(t1, t2) or {}
     memory, swap = psutil.virtual_memory(), psutil.swap_memory()

@@ -130,8 +130,9 @@ class ProcessSample(BaseModel):
     user: str = Field(default="", max_length=100)
     cpu: float = Field(ge=0, le=100000)
     memory: float = Field(default=0, ge=0, le=100)
+    cmd: str = Field(default="", max_length=200)          # agent 2.18.1+: the command line, as `ps aux` shows it
 
-    @field_validator("name", "user")
+    @field_validator("name", "user", "cmd")
     @classmethod
     def printable_only(cls, v: str) -> str:
         return _printable(v)

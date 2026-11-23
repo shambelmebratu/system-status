@@ -318,8 +318,14 @@ def server_history(db: Session, server_id: int, hours: int) -> dict:
     target = (CheckResult.target_type == "server", CheckResult.target_id == server_id, CheckResult.checked_at >= since)
     latency_rows = db.execute(select(lb, func.avg(CheckResult.latency_ms), func.max(CheckResult.latency_ms)).where(*target, CheckResult.latency_ms.is_not(None)).group_by(lb).order_by(lb)).all()
     stats = latency_stats(db, since, "server", server_id).get(("server", server_id))
+    # Exact figures for the whole range (the chart's buckets hold different numbers of samples, so averaging them would be skewed)
+    whole = db.execute(select(*[f(getattr(MetricSample, k)) for k in METRIC_KEYS for f in (func.avg, func.max)], func.max(func.coalesce(MetricSample.cpu_peak, MetricSample.cpu)))
+                       .where(MetricSample.server_id == server_id, MetricSample.ts >= since)).one()
+    summary = {k: {"avg": round(float(whole[2 * n]), 2), "max": round(float(whole[2 * n + 1]), 2)} for n, k in enumerate(METRIC_KEYS) if whole[2 * n] is not None}
+    if "cpu" in summary and whole[-1] is not None:
+        summary["cpu"]["max"] = round(max(float(whole[-1]), summary["cpu"]["max"]), 2)
     return {
-        "hours": hours, "points": points, "samples": samples, "uptime_pct": uptime_for(db, "server", server_id, hours),
+        "hours": hours, "points": points, "samples": samples, "summary": summary, "uptime_pct": uptime_for(db, "server", server_id, hours),
         "latency_points": [{"t": _point_time(since, int(i), width), "latency": round(float(a), 2), "latency_max": round(float(m), 2)} for i, a, m in latency_rows],
         "latency_avg": stats["avg"] if stats else None, "latency_p95": stats["p95"] if stats else None, "latency_max": stats["max"] if stats else None,
     }

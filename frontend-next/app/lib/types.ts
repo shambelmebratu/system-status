@@ -1,7 +1,7 @@
 export type Status = 'up' | 'down' | 'alert' | 'unknown';
 export type Mode = 'ping' | 'agent' | 'push';
 
-export type ProcessSample = { pid: number; name: string; user?: string; cpu: number; memory?: number };
+export type ProcessSample = { pid: number; name: string; user?: string; cpu: number; memory?: number; cmd?: string };
 export type Metrics = {
   hostname?: string; platform?: string; agent_version?: string; cpu?: number; cpu_count?: number; memory?: number; disk?: number;
   load?: number; swap?: number; uptime_seconds?: number; net_rx_bps?: number | null; net_tx_bps?: number | null;
@@ -48,7 +48,7 @@ export type Dashboard = {
 export type Point = { t: string; [key: string]: number | string | undefined };
 export type Daily = { date: string; pct: number | null };
 export type ServerHistory = {
-  points: Point[]; samples: number; uptime_pct: number | null; daily: Daily[];
+  points: Point[]; samples: number; uptime_pct: number | null; daily: Daily[]; summary?: Record<string, { avg: number; max: number }>;
   latency_points: Point[]; latency_avg: number | null; latency_p95: number | null; latency_max: number | null;
 };
 export type ServiceHistory = {

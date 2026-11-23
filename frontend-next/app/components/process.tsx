@@ -62,6 +62,7 @@ export function ProcessDrawer({ serverId, pid, name, onClose }: { serverId: numb
           {busy && <p className="muted"><span className="spinner" /> Asking the agent…</p>}
           {error && <div className="err">{error}</div>}
           {p && <>
+            {p.status === 'zombie' && <div className="banner" style={{ marginBottom: 12 }}><b>Already stopped (zombie).</b> This process was killed or exited and runs nothing any more: it only waits for its parent (PID {p.ppid}) to collect it. It uses no CPU or memory. It disappears when the parent collects it or is stopped; check what that parent is.</div>}
             {p.flags.length > 0 && <div className="proc-flags">{p.flags.map((f, i) => <div key={i} className={`proc-flag ${f.severity}`}><Icon name="alert" size={14} /><span>This process {f.reason}.</span></div>)}</div>}
             <div className="facts proc-facts">
               <div><small>User</small><b>{p.user ?? p.uid ?? '–'}</b>{p.group && <span className="muted sm">group {p.group}</span>}</div>

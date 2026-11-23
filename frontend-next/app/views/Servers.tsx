@@ -223,15 +223,15 @@ function ServerDetail({ server }: { server: Server }) {
                 {h && <span className="muted sm">{h.samples} samples · uptime {pct(h.uptime_pct, 2)}</span>}
               </div>
               <div className="grid g2">
-                <MetricCard title="CPU" unit="%" metric="cpu" peakKey="cpu_max" now={m?.cpu} limit={server.cpu_threshold} limitLabel="alert limit" color="var(--c1)" points={h?.points ?? []} showDate={showDate} percent
+                <MetricCard summary={h?.summary} title="CPU" unit="%" metric="cpu" peakKey="cpu_max" now={m?.cpu} limit={server.cpu_threshold} limitLabel="alert limit" color="var(--c1)" points={h?.points ?? []} showDate={showDate} percent
                   note="Average over each reporting interval; the shaded band reaches up to the highest CPU seen in it." />
-                <MetricCard title="Memory" unit="%" metric="memory" peakKey="memory_max" now={m?.memory} limit={server.memory_threshold} limitLabel="alert limit" color="var(--c2)" points={h?.points ?? []} showDate={showDate} percent
+                <MetricCard summary={h?.summary} title="Memory" unit="%" metric="memory" peakKey="memory_max" now={m?.memory} limit={server.memory_threshold} limitLabel="alert limit" color="var(--c2)" points={h?.points ?? []} showDate={showDate} percent
                   note="Memory in use, not counting cache the system can give back." />
-                <MetricCard title="Load average (1 min)" metric="load" peakKey="load_max" now={m?.load} limit={server.load_threshold} limitLabel="alert limit" color="var(--c3)" points={h?.points ?? []} showDate={showDate}
+                <MetricCard summary={h?.summary} title="Load average (1 min)" metric="load" peakKey="load_max" now={m?.load} limit={server.load_threshold} limitLabel="alert limit" color="var(--c3)" points={h?.points ?? []} showDate={showDate}
                   note={m?.cpu_count ? `Runnable processes; ${m.cpu_count} CPU cores, so a load above ${m.cpu_count} means work is queuing.` : 'Runnable processes waiting for a CPU.'} />
-                <MetricCard title="Swap" unit="%" metric="swap" peakKey="swap_max" now={m?.swap} limit={server.swap_threshold} limitLabel="alert limit" color="var(--c5)" points={h?.points ?? []} showDate={showDate} percent />
-                <MetricCard title="Disk" unit="%" metric="disk" peakKey="disk_max" now={m?.disk} limit={server.disk_threshold} limitLabel="alert limit" color="var(--c4)" points={h?.points ?? []} showDate={showDate} percent />
-                <MetricCard title="Network" metric="net_rx_bps" peakKey="net_rx_bps_max" color="var(--c1)" points={h?.points ?? []} showDate={showDate} format={bytesPerSecond}
+                <MetricCard summary={h?.summary} title="Swap" unit="%" metric="swap" peakKey="swap_max" now={m?.swap} limit={server.swap_threshold} limitLabel="alert limit" color="var(--c5)" points={h?.points ?? []} showDate={showDate} percent />
+                <MetricCard summary={h?.summary} title="Disk" unit="%" metric="disk" peakKey="disk_max" now={m?.disk} limit={server.disk_threshold} limitLabel="alert limit" color="var(--c4)" points={h?.points ?? []} showDate={showDate} percent />
+                <MetricCard summary={h?.summary} title="Network" metric="net_rx_bps" peakKey="net_rx_bps_max" color="var(--c1)" points={h?.points ?? []} showDate={showDate} format={bytesPerSecond}
                   second={{ key: 'net_tx_bps', peakKey: 'net_tx_bps_max', label: 'Send', color: 'var(--c4)' }} firstLabel="Receive" now={m?.net_rx_bps ?? undefined} />
               </div>
             </>
@@ -267,10 +267,10 @@ function ServerDetail({ server }: { server: Server }) {
           </section>
           {server.monitor_mode !== 'ping' && <section className="card">
             <div className="card-head"><h2>Top processes</h2>{canInspect && <><span className="grow" /><span className="muted sm">click one for details</span></>}</div>
-            {m?.process_cpu_total != null && <p className="sm muted" style={{ margin: '0 0 8px' }}>CPU is % of <b>one core</b> ({m.cpu_count ?? '?'} cores = {(m.cpu_count ?? 1) * 100}%). All {m.process_count ?? ''} processes together: <b>{pct(m.process_cpu_total, 1)}</b> of the machine{synced ? ', measured live' : ', averaged since the previous report'}.</p>}
+            {m?.process_cpu_total != null && <p className="sm muted" style={{ margin: '0 0 8px' }}>CPU is % of <b>one core</b> ({m.cpu_count ?? '?'} cores = {(m.cpu_count ?? 1) * 100}%). All {m.process_count ?? ''} processes together: <b>{pct(m.process_cpu_total, 1)}</b> of the machine{synced ? ', measured live' : ', averaged since the previous report'}{(m.synced_at || m.received_at) ? ` (as of ${new Date((m.synced_at || m.received_at)!).toLocaleTimeString()})` : ''}. A process that has ended since then is no longer on the server.</p>}
             {m?.processes?.length ? <table className="tbl"><thead><tr><th>Process</th><th className="num" title="% of one CPU core">CPU</th><th className="num">Mem</th></tr></thead><tbody>
               {m.processes.slice(0, 8).map(p => <tr key={`${p.pid}-${p.name}`} className={canInspect ? 'link' : ''} tabIndex={canInspect ? 0 : undefined} title={canInspect ? 'Show what this process is' : undefined}
-                onClick={() => canInspect && setProc({ pid: p.pid, name: p.name })} onKeyDown={e => canInspect && e.key === 'Enter' && setProc({ pid: p.pid, name: p.name })}><td><div className="name">{p.name}<small>PID {p.pid}</small></div></td><td className="num">{pct(p.cpu, 1)}</td><td className="num">{p.memory != null ? pct(p.memory, 1) : '–'}</td></tr>)}
+                onClick={() => canInspect && setProc({ pid: p.pid, name: p.name })} onKeyDown={e => canInspect && e.key === 'Enter' && setProc({ pid: p.pid, name: p.name })}><td><div className="name">{p.name}<small title={p.cmd || undefined}>PID {p.pid}{p.cmd ? <> · <span className="mono">{p.cmd.length > 48 ? `${p.cmd.slice(0, 48)}…` : p.cmd}</span></> : null}</small></div></td><td className="num">{pct(p.cpu, 1)}</td><td className="num">{p.memory != null ? pct(p.memory, 1) : '–'}</td></tr>)}
             </tbody></table> : <p className="muted sm">No process data.</p>}
           </section>}
           {canLogs && <LogPolicyCard serverId={server.id} />}
@@ -286,15 +286,17 @@ function ServerDetail({ server }: { server: Server }) {
 
 type MetricPoint = Record<string, number | string | undefined>;
 /** One chart in its own card: what it is now, the average and peak over the chosen range, and the alert limit as a dashed line. */
-function MetricCard({ title, metric, peakKey, now, limit, limitLabel, color, points, showDate, percent, unit = '', format, note, second, firstLabel }: {
-  title: string; metric: string; peakKey: string; now?: number; limit?: number; limitLabel?: string; color: string; points: Point[]; showDate: boolean; percent?: boolean; unit?: string;
+function MetricCard({ title, metric, peakKey, now, limit, limitLabel, color, points, showDate, percent, unit = '', format, note, second, firstLabel, summary }: {
+  title: string; metric: string; peakKey: string; now?: number; limit?: number; limitLabel?: string; color: string; points: Point[]; showDate: boolean; percent?: boolean; unit?: string; summary?: ServerHistory['summary'];
   format?: (v: number) => string; note?: string; firstLabel?: string; second?: { key: string; peakKey: string; label: string; color: string };
 }) {
   const fmt = format ?? ((v: number) => (percent ? pct(v, 0) : `${+v.toFixed(2)}`));
   const vals = points.map(p => (p as MetricPoint)[metric]).filter((v): v is number => typeof v === 'number');
   const peaks = points.map(p => (p as MetricPoint)[peakKey] ?? (p as MetricPoint)[metric]).filter((v): v is number => typeof v === 'number');
-  const avg = vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
-  const peak = peaks.length ? Math.max(...peaks) : null;
+  // exact over every sample in the range (from the server); the bucket mean is only a fallback for an older API
+  const exact = summary?.[metric];
+  const avg = exact ? exact.avg : vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+  const peak = exact ? exact.max : peaks.length ? Math.max(...peaks) : null;
   const series = [{ key: metric, label: firstLabel ?? title, color, peakKey, format: fmt }, ...(second ? [{ key: second.key, label: second.label, color: second.color, peakKey: second.peakKey, format: fmt }] : [])];
   return (
     <section className="card metric">
