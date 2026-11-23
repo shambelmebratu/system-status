@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.15-slim
 
 # The API, the worker and the migrations run as an ordinary user (uid 10001, group 0), never root. Group 0 lets the bundled
 # host agent (root) read the token file the API writes into the shared volume, without extra capabilities.
