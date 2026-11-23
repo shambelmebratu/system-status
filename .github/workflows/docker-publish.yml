@@ -147,3 +147,35 @@ jobs:
           provenance: false
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,scope=${{ matrix.image }},mode=max
+
+  # Publishes docs/dockerhub/README.md as the overview of every image's Docker Hub page (and a short description per image).
+  # Off until the repository VARIABLE  DOCKERHUB_README=true  is set (Settings > Secrets and variables > Actions > Variables).
+  # Docker Hub only accepts description updates from an access token with "Read, Write, Delete" permission.
+  dockerhub-readme:
+    name: Docker Hub description ${{ matrix.image }}
+    needs: images
+    if: vars.DOCKERHUB_README == 'true' && github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: sm-watch-api
+            short: "SM-Watch API, worker and migrations: self-hosted monitoring for servers, websites and Kubernetes."
+          - image: sm-watch-frontend
+            short: "SM-Watch dashboard (Next.js): self-hosted monitoring for servers, websites and Kubernetes."
+          - image: sm-watch-agent
+            short: "SM-Watch agent for monitored servers: metrics, logs, SSH and security checks. Outbound only."
+          - image: sm-watch-host-agent
+            short: "SM-Watch agent for the machine running SM-Watch itself (bundled in the Compose stack)."
+          - image: sm-watch-k8s-agent
+            short: "SM-Watch read-only in-cluster agent: Kubernetes health, logs and security checks."
+    steps:
+      - uses: actions/checkout@v4
+      - uses: peter-evans/dockerhub-description@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ secrets.DOCKERHUB_USERNAME }}/${{ matrix.image }}
+          short-description: ${{ matrix.short }}
+          readme-filepath: docs/dockerhub/README.md

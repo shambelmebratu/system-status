@@ -654,7 +654,14 @@ Notes: on nginx older than 1.25.1 replace `http2 on;` with `listen 443 ssl http2
 
 ## Publishing images to Docker Hub (GitHub Actions)
 
-`.github/workflows/docker-publish.yml` tests the code and publishes four multi-architecture (amd64 + arm64) images to Docker Hub:
+`.github/workflows/docker-publish.yml` tests the code and publishes five multi-architecture (amd64 + arm64) images to Docker Hub.
+
+**Docker Hub page:** `docs/dockerhub/README.md` is the overview shown on Docker Hub. It covers how SM-Watch works, the `.env` to create, the full `docker-compose.yml`, HTTPS with nginx, agents (shell, Docker and Compose), Kubernetes, updates, backups and troubleshooting.
+- To have the workflow publish it, with a short description, to all five repositories after each push, set the repository **variable** `DOCKERHUB_README=true`.
+- Docker Hub only accepts description updates from an access token with *Read, Write, Delete* permission.
+- Otherwise, paste the file into each repository's *Overview* on hub.docker.com.
+
+The images:
 
 | Image | Built from | Used for |
 | --- | --- | --- |
