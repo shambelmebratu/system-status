@@ -167,6 +167,8 @@ def test_docker_and_kubernetes_ports_are_scanned(client, monkeypatch):
     assert found[16379]["risk"] == "critical" and "Redis" in found[16379]["service"] and "Docker container cache" in found[16379]["service"]   # risky as what runs inside
     assert found[31432]["risk"] == "critical" and "NodePort shop/api" in found[31432]["service"] and found[31432]["source"] == "kubernetes"
     assert found[8081]["risk"] == "medium" and "ufw" in found[8081]["advice"] and result["grade"] == "F"
+    assert found[16379]["meta"] == {"container": "cache", "image": "redis:7", "inner_port": 6379}                    # exact details for the fix command
+    assert found[31432]["meta"] == {"inner_port": 5432, "namespace": "shop", "name": "api", "cluster": "prod"}
     # the cluster itself: NodePorts on one node, the LoadBalancer's external address with the service port
     with database.SessionLocal() as db:
         c = db.get(Cluster, cid)

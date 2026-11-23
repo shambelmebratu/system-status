@@ -180,8 +180,9 @@ def describe_port(port: int, extra: dict | None = None) -> dict:
     risk = known[1] if known else inner[1] if inner else extra.get("risk", "medium")
     if not known and risk == "info":
         risk = "medium"                                         # a normal service (web, mail) on an unusual public port: worth a look
+    meta = {k: extra[k] for k in ("container", "image", "inner_port", "namespace", "name", "cluster", "process") if extra.get(k)}   # for exact fix commands
     return {"port": port, "service": service[:120], "risk": risk,
-            "advice": " ".join(a for a in ((base[2] if base else ""), extra.get("advice", "")) if a), "source": extra.get("source")}
+            "advice": " ".join(a for a in ((base[2] if base else ""), extra.get("advice", "")) if a), "source": extra.get("source"), "meta": meta}
 
 
 def scan_ports(address: str, ports: list[int] | None = None, timeout: float = 1.5, extra: dict[int, dict] | None = None) -> dict:
@@ -306,10 +307,10 @@ def server_extra_ports(server) -> dict[int, dict]:
     extra: dict[int, dict] = {}
     for l in sec.get("listening") or []:
         if l.get("all_interfaces") and l.get("port"):
-            extra[int(l["port"])] = {"label": f"{l.get('process') or 'a program'} (listening on every network)", "source": "agent", "advice": LISTEN_ADVICE}
+            extra[int(l["port"])] = {"label": f"{l.get('process') or 'a program'} (listening on every network)", "source": "agent", "advice": LISTEN_ADVICE, "process": l.get("process") or ""}
     for p in sec.get("published") or []:
         extra[int(p["port"])] = {"label": f"Docker container {p.get('container') or '?'}" + (f" (port {p['private_port']} inside)" if p.get("private_port") and p["private_port"] != p["port"] else ""),
-                                 "source": "docker", "inner_port": p.get("private_port") or 0, "advice": DOCKER_ADVICE}
+                                 "source": "docker", "inner_port": p.get("private_port") or 0, "advice": DOCKER_ADVICE, "container": p.get("container") or "", "image": p.get("image") or ""}
     addresses = server_addresses(server)
     names = {a for a in [metrics.get("hostname"), addresses.get("public_ip"), server.host, *(addresses.get("private_ips") or [])] if a}
     with SessionLocal() as db:
@@ -324,7 +325,7 @@ def server_extra_ports(server) -> dict[int, dict]:
                 for port in svc.get("ports") or []:
                     if port.get("node_port"):
                         extra[int(port["node_port"])] = {"label": f"Kubernetes NodePort {svc['namespace']}/{svc['name']} ({cluster.name})", "source": "kubernetes",
-                                                         "inner_port": port.get("port") or 0, "advice": NODEPORT_ADVICE}
+                                                         "inner_port": port.get("port") or 0, "advice": NODEPORT_ADVICE, "namespace": svc["namespace"], "name": svc["name"], "cluster": cluster.name}
     return dict(sorted(extra.items())[:300])
 
 
@@ -362,10 +363,11 @@ def cluster_targets(cluster) -> tuple[list[tuple[str, dict[int, dict]]], str]:
         where = f"{svc['namespace']}/{svc['name']}"
         for port in svc.get("ports") or []:
             if port.get("node_port") and node_address:
-                targets.setdefault(node_address, {})[int(port["node_port"])] = {"label": f"NodePort {where}", "source": "kubernetes", "inner_port": port.get("port") or 0, "advice": NODEPORT_ADVICE}
+                targets.setdefault(node_address, {})[int(port["node_port"])] = {"label": f"NodePort {where}", "source": "kubernetes", "inner_port": port.get("port") or 0, "advice": NODEPORT_ADVICE,
+                                                                                "namespace": svc["namespace"], "name": svc["name"], "cluster": cluster.name}
             if svc.get("type") == "LoadBalancer" and port.get("port"):
                 for ext in svc.get("external") or []:
-                    targets.setdefault(ext, {})[int(port["port"])] = {"label": f"LoadBalancer {where}", "source": "kubernetes",
+                    targets.setdefault(ext, {})[int(port["port"])] = {"label": f"LoadBalancer {where}", "source": "kubernetes", "namespace": svc["namespace"], "name": svc["name"], "cluster": cluster.name,
                                                                       "advice": "Exposed through the cluster's load balancer. Check it should be public."}
     if not targets:
         return [], ("No NodePort or LoadBalancer services" if summary.get("exposed") == [] else "No node address SM-Watch is allowed to scan")
