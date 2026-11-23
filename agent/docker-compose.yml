@@ -1,8 +1,8 @@
 services:
   sm-watch-agent:
-    # The published agent image (repository sm-watch, tag agent-<version>). Set AGENT_IMAGE to override (for example
-    # sm-watch-agent:local after `docker build -f agent/Dockerfile -t sm-watch-agent:local .` from the repository root).
-    image: ${AGENT_IMAGE:-${DOCKERHUB_USERNAME:-shambi21}/${DOCKERHUB_REPO:-sm-watch}:agent-${SMWATCH_VERSION:-latest}}
+    # The published agent image. Set AGENT_IMAGE to override (for example sm-watch-agent:local after
+    # `docker build -f agent/Dockerfile -t sm-watch-agent:local .` from the repository root).
+    image: ${AGENT_IMAGE:-${DOCKERHUB_USERNAME:-shambi21}/sm-watch-agent:${SMWATCH_VERSION:-latest}}
     container_name: sm-watch-agent
     restart: unless-stopped
     pid: host

@@ -4,10 +4,9 @@
 #   docker compose pull && docker compose up -d                  run the published images
 #   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build    build from this source tree instead (development)
 #
-# The images come from one Docker Hub repository, shambi21/sm-watch, one tag per service and version: api-latest, api-1.2.3,
-# frontend-1.2.3, host-agent-1.2.3 ... DOCKERHUB_USERNAME / DOCKERHUB_REPO in .env change where; SMWATCH_VERSION picks the version.
-x-api-image: &api-image ${DOCKERHUB_USERNAME:-shambi21}/${DOCKERHUB_REPO:-sm-watch}:api-${SMWATCH_VERSION:-latest}
-x-host-agent-image: &host-agent-image ${DOCKERHUB_USERNAME:-shambi21}/${DOCKERHUB_REPO:-sm-watch}:host-agent-${SMWATCH_VERSION:-latest}
+# The images come from Docker Hub account "shambi21" unless DOCKERHUB_USERNAME says otherwise in .env (SMWATCH_VERSION picks the tag).
+x-api-image: &api-image ${DOCKERHUB_USERNAME:-shambi21}/sm-watch-api:${SMWATCH_VERSION:-latest}
+x-host-agent-image: &host-agent-image ${DOCKERHUB_USERNAME:-shambi21}/sm-watch-host-agent:${SMWATCH_VERSION:-latest}
 # Containers get no new privileges and no Linux capabilities beyond what they need.
 x-hardening: &hardening
   security_opt: ["no-new-privileges:true"]
@@ -17,7 +16,7 @@ x-readonly: &readonly
   read_only: true
   tmpfs: ["/tmp:rw,noexec,nosuid,size=64m"]
 
-x-frontend-image: &frontend-image ${DOCKERHUB_USERNAME:-shambi21}/${DOCKERHUB_REPO:-sm-watch}:frontend-${SMWATCH_VERSION:-latest}
+x-frontend-image: &frontend-image ${DOCKERHUB_USERNAME:-shambi21}/sm-watch-frontend:${SMWATCH_VERSION:-latest}
 
 services:
   postgres:
@@ -66,7 +65,6 @@ services:
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
       HOST_AGENT_TOKEN_FILE: /shared/agent.token
       DOCKERHUB_USERNAME: ${DOCKERHUB_USERNAME:-shambi21}
-      DOCKERHUB_REPO: ${DOCKERHUB_REPO:-sm-watch}
       SMWATCH_VERSION: ${SMWATCH_VERSION:-latest}
       AGENT_IMAGE: ${AGENT_IMAGE:-}
     env_file:

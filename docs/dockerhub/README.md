@@ -10,22 +10,15 @@ SM-Watch watches your servers, websites/APIs and Kubernetes clusters in one plac
 
 Everything runs in Docker on your own machine. Nothing is sent to a third party unless you turn on an AI provider.
 
-Every service lives in this one repository, **`shambi21/sm-watch`**. The tag says which service and which version:
-
-| Tag | What it is |
+| Image | What it is |
 | --- | --- |
-| `api-<version>` | The API, the background worker and the database migrations: one image, three Compose services. |
-| `frontend-<version>` | The web dashboard (Next.js). It also proxies `/api/*` to the API, so it is the only port you publish. |
-| `host-agent-<version>` | The agent for the machine SM-Watch runs on, and the image the dashboard's Docker install command runs on your servers. |
-| `agent-<version>` | The standalone agent for `docker compose` on a monitored server. |
-| `k8s-agent-<version>` | The read-only in-cluster agent for Kubernetes. The dashboard gives you a `kubectl apply` command. |
+| `shambi21/sm-watch-api` | The API, the background worker and the database migrations: one image, three Compose services. |
+| `shambi21/sm-watch-frontend` | The web dashboard (Next.js). It also proxies `/api/*` to the API, so it is the only port you publish. |
+| `shambi21/sm-watch-host-agent` | Optional agent that monitors the machine SM-Watch itself runs on. |
+| `shambi21/sm-watch-agent` | The agent for your other servers, Docker variant. Most people install it with one command from the dashboard. |
+| `shambi21/sm-watch-k8s-agent` | The read-only in-cluster agent for Kubernetes. The dashboard gives you a `kubectl apply` command. |
 
-**Versions:**
-- `latest` follows the main branch, for example `api-latest`.
-- Releases have `1.2.3` and `1.2`, for example `api-1.2.3`.
-- Every build also gets its short commit hash, for example `api-1a2b3c4`.
-
-Use the same version for every service; `SMWATCH_VERSION` in `.env` sets it for all of them. Every image is built for `linux/amd64` and `linux/arm64`. Pin a release in production.
+**Tags:** `latest` follows the main branch. Releases are tagged `1.2.3` and `1.2`, and every build also gets `sha-<commit>`. Every image is built for `linux/amd64` and `linux/arm64`. Pin a release in production.
 
 ---
 
@@ -36,10 +29,10 @@ Use the same version for every service; `SMWATCH_VERSION` in `.env` sets it for 
                                                                    │  /api/*
                                                                    ▼
   monitored servers ──outbound HTTPS──▶ ─────────────────────▶  api :8000 ◀──▶ PostgreSQL
-  (agent)             reports every 30-60 s                         ▲
+  (sm-watch-agent)    reports every 30-60 s                         ▲
                                                                     │
   Kubernetes clusters ──outbound HTTPS──▶ ──────────────────────────┘
-  (k8s-agent, read-only)                                   worker: website/API/ping checks,
+  (sm-watch-k8s-agent, read-only)                         worker: website/API/ping checks,
                                                           alerts, scans, retention, schedules
 ```
 
@@ -76,8 +69,7 @@ PUBLIC_URL=https://monitor.example.com                # how your OTHER servers r
 
 # --- recommended ----------------------------------------------------------------------------------
 DOCKERHUB_USERNAME=shambi21
-DOCKERHUB_REPO=sm-watch
-SMWATCH_VERSION=latest                                # pin a release, e.g. 1.2.3, in production (same version for every service)
+SMWATCH_VERSION=latest                                # pin a release, e.g. 1.2.3, in production
 ENVIRONMENT=production
 COMPANY_NAME=SM-Watch
 
@@ -90,10 +82,9 @@ COMPANY_NAME=SM-Watch
 
 ```yaml
 # SM-Watch: dashboard, API, worker, PostgreSQL, and an optional agent for this machine.
-# One repository, the service and version in the tag: shambi21/sm-watch:api-1.2.3, :frontend-1.2.3, :host-agent-1.2.3
-x-api-image: &api-image ${DOCKERHUB_USERNAME:-shambi21}/${DOCKERHUB_REPO:-sm-watch}:api-${SMWATCH_VERSION:-latest}
-x-host-agent-image: &host-agent-image ${DOCKERHUB_USERNAME:-shambi21}/${DOCKERHUB_REPO:-sm-watch}:host-agent-${SMWATCH_VERSION:-latest}
-x-frontend-image: &frontend-image ${DOCKERHUB_USERNAME:-shambi21}/${DOCKERHUB_REPO:-sm-watch}:frontend-${SMWATCH_VERSION:-latest}
+x-api-image: &api-image ${DOCKERHUB_USERNAME:-shambi21}/sm-watch-api:${SMWATCH_VERSION:-latest}
+x-host-agent-image: &host-agent-image ${DOCKERHUB_USERNAME:-shambi21}/sm-watch-host-agent:${SMWATCH_VERSION:-latest}
+x-frontend-image: &frontend-image ${DOCKERHUB_USERNAME:-shambi21}/sm-watch-frontend:${SMWATCH_VERSION:-latest}
 x-hardening: &hardening                       # no new privileges, no Linux capabilities
   security_opt: ["no-new-privileges:true"]
   cap_drop: [ALL]
@@ -144,7 +135,6 @@ services:
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
       HOST_AGENT_TOKEN_FILE: /shared/agent.token
       DOCKERHUB_USERNAME: ${DOCKERHUB_USERNAME:-shambi21}
-      DOCKERHUB_REPO: ${DOCKERHUB_REPO:-sm-watch}
       SMWATCH_VERSION: ${SMWATCH_VERSION:-latest}
     env_file:
       - path: .env
@@ -300,7 +290,7 @@ The server appears within seconds. The join link expires after 15 minutes. The a
 ```yaml
 services:
   sm-watch-agent:
-    image: shambi21/sm-watch:agent-latest
+    image: shambi21/sm-watch-agent:latest
     container_name: sm-watch-agent
     restart: unless-stopped
     pid: host
@@ -340,7 +330,7 @@ SMWATCH_JOIN=smwj_paste-the-join-token-here
 curl -fsSL -X POST "https://monitor.example.com/api/agent/k8s/<join-token>?name=prod" | kubectl apply -f -
 ```
 
-It creates the `smwatch` namespace and a read-only service account (no Secrets, no exec), and runs the `k8s-agent` image, which connects outbound only.
+It creates the `smwatch` namespace and a read-only service account (no Secrets, no exec), and runs `sm-watch-k8s-agent`, which connects outbound only.
 
 You get:
 - cluster health, workloads and pod logs;
@@ -359,8 +349,8 @@ Every setting has a safe default except the required ones. Most behaviour is als
 | `POSTGRES_PASSWORD` | **required** | Database password. It is fixed the first time the volume is created; changing it later needs an `ALTER USER` inside PostgreSQL. |
 | `ADMIN_EMAIL` / `ADMIN_PASSWORD` | **required** | The first admin (12+ character password). Only used to create that account; manage users in the dashboard afterwards. |
 | `PUBLIC_URL` | – | Address your other servers use to reach SM-Watch. Install commands use it. |
-| `SMWATCH_VERSION` | `latest` | Version of every service: the tags become `api-<version>`, `frontend-<version>` and so on. Pin a release in production. |
-| `DOCKERHUB_USERNAME` / `DOCKERHUB_REPO` | `shambi21` / `sm-watch` | Where the images come from: `<user>/<repo>:<service>-<version>`. |
+| `SMWATCH_VERSION` | `latest` | Image tag for all services. Pin a release in production. |
+| `DOCKERHUB_USERNAME` | `shambi21` | Docker Hub namespace the images come from. |
 | `POSTGRES_DB` / `POSTGRES_USER` | `smwatch` | Database name and user. |
 | `ENCRYPTION_KEY` | derived from `JWT_SECRET` | A separate Fernet key for secrets at rest. |
 | `ENVIRONMENT` | `production` | `development` disables the startup safety checks. Only use it for local experiments. |

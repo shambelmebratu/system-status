@@ -180,14 +180,3 @@ def test_docker_and_kubernetes_ports_are_scanned(client, monkeypatch):
     with database.SessionLocal() as db:
         empty = Cluster(name="old-agent", enabled=True, summary=json.dumps({"nodes_total": 1}))
         assert secscan.cluster_targets(empty) == ([], "Needs the Kubernetes agent 1.4 or newer")
-
-
-def test_published_images_share_one_repository():
-    """Every service is published to <user>/<repo>, the service and version in the tag; full overrides still win."""
-    from app.config import Settings, published_image, resolved_agent_image, resolved_k8s_agent_image
-    s = Settings(dockerhub_username="acme", dockerhub_repo="sm-watch", smwatch_version="1.4.2", jwt_secret="x" * 40)
-    assert published_image(s, "api") == "acme/sm-watch:api-1.4.2"
-    assert resolved_agent_image(s) == "acme/sm-watch:host-agent-1.4.2"          # what the Docker install command runs
-    assert resolved_k8s_agent_image(s) == "acme/sm-watch:k8s-agent-1.4.2"       # what the Kubernetes manifest deploys
-    s2 = Settings(agent_image="registry.example.com/agent:dev", k8s_agent_image="registry.example.com/k8s:dev", jwt_secret="x" * 40)
-    assert resolved_agent_image(s2) == "registry.example.com/agent:dev" and resolved_k8s_agent_image(s2) == "registry.example.com/k8s:dev"

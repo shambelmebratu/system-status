@@ -7,9 +7,8 @@ name: Build and push Docker images
 #   DOCKERHUB_USERNAME   your Docker Hub username (or organisation namespace owner)
 #   DOCKERHUB_TOKEN      a Docker Hub access token with "Read & Write" permission
 #
-# One repository, <user>/sm-watch, with one tag family per service (api, frontend, agent, host-agent, k8s-agent):
-#   on main:            <service>-latest  and  <service>-<short commit>     e.g. api-latest, api-1a2b3c4
-#   on a v1.2.3 tag:    <service>-1.2.3, <service>-1.2  and  <service>-<short commit>
+# Images:  <user>/sm-watch-api  <user>/sm-watch-frontend  <user>/sm-watch-agent  <user>/sm-watch-host-agent  <user>/sm-watch-k8s-agent
+# Tags:    latest + sha-<short> on main;  1.2.3, 1.2 and sha-<short> on a v1.2.3 tag.
 
 on:
   push:
@@ -76,26 +75,26 @@ jobs:
   #       run: npm audit --omit=dev --audit-level=high
 
   images:
-    name: Image ${{ matrix.service }}
+    name: Image ${{ matrix.image }}
     #needs: test
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - service: api                   # API, worker and migrations (one image, three compose services)
+          - image: sm-watch-api            # API, worker and migrations (one image, three compose services)
             context: .
             file: backend/Dockerfile
-          - service: frontend
+          - image: sm-watch-frontend
             context: frontend-next
             file: frontend-next/Dockerfile
-          - service: agent                 # standalone agent (Docker Compose variant)
+          - image: sm-watch-agent          # standalone agent (Docker variant)
             context: .
             file: agent/Dockerfile
-          - service: host-agent            # agent for the machine running SM-Watch, and for the Docker install command
+          - image: sm-watch-host-agent     # agent for the machine running SM-Watch (includes journalctl)
             context: .
             file: backend/Dockerfile.host-agent
-          - service: k8s-agent             # in-cluster agent for Kubernetes monitoring (read-only)
+          - image: sm-watch-k8s-agent      # in-cluster agent for Kubernetes monitoring (read-only)
             context: .
             file: backend/Dockerfile.k8s-agent
     env:
@@ -128,14 +127,13 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ secrets.DOCKERHUB_USERNAME || 'local' }}/${{ vars.DOCKERHUB_REPO || 'sm-watch' }}
-          flavor: latest=false
+          images: ${{ secrets.DOCKERHUB_USERNAME || 'local' }}/${{ matrix.image }}
           tags: |
-            type=raw,value=latest,prefix=${{ matrix.service }}-,enable={{is_default_branch}}
-            type=semver,pattern={{version}},prefix=${{ matrix.service }}-
-            type=semver,pattern={{major}}.{{minor}},prefix=${{ matrix.service }}-
-            type=sha,format=short,prefix=${{ matrix.service }}-
-            type=ref,event=pr,prefix=${{ matrix.service }}-pr-
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+            type=ref,event=pr
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -147,5 +145,5 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
-          cache-from: type=gha,scope=${{ matrix.service }}
-          cache-to: type=gha,scope=${{ matrix.service }},mode=max
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,scope=${{ matrix.image }},mode=max
