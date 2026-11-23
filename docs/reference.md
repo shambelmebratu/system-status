@@ -42,7 +42,7 @@ Before monitoring real servers:
   - optionally set a separate `ENCRYPTION_KEY`;
   - store `.env` away from database backups (both together decrypt the stored tokens);
   - set `chmod 600 .env`.
-- [ ] **Admin accounts:** require two-factor sign-in for admins (*Security → Sign-in*), give people the lowest role they need, and remove the first admin's temporary password.
+- [ ] **Admin accounts:** require two-factor sign-in for admins (*Settings → Sign-in & access*), give people the lowest role they need, and remove the first admin's temporary password.
 - [ ] **Alert channels:** rotate any bot token or webhook URL that has ever been pasted into a chat, ticket or log.
 - [ ] **The machine running SM-Watch:**
   - its `host-agent` has root-equivalent access through the Docker socket; set `HOST_AGENT_LOGS=nodocker` if container logs aren't needed;
@@ -454,7 +454,7 @@ Review the manifest first by running the `curl` alone. It creates a `smwatch` na
 - Clicking a server anywhere opens its **server drawer**. It shows why the score is what it is (each reason links to its section), the threats needing attention, weak settings, security updates, what SM-Watch can reach, the top SSH attackers and the SSH keys. Buttons: *Run checks now*, *Scan ports now*, *Only this server* and *Server page*.
 - Clicking a finding opens the **finding drawer**: what was found, a *What to do* guide for that kind of problem, the evidence, the command, a timeline (first seen, still seen, acknowledged with the note, resolved), and *Inspect process* / *Acknowledge*.
 
-- **Two-factor sign-in:** each person turns it on in *Settings* (any authenticator app) and gets 10 one-time recovery codes. Admins can require it for admins or for everyone (*Security → Sign-in*); people without it are then sent to the setup screen after signing in. Admins can reset someone's 2FA from *Users*.
+- **Two-factor sign-in:** each person turns it on in *Settings* (any authenticator app) and gets 10 one-time recovery codes. Admins can require it for admins or for everyone (*Settings → Sign-in & access*); people without it are then sent to the setup screen after signing in. Admins can reset someone's 2FA from *Users*.
 - **SSH brute-force detection:** agents ≥ 2.14.0 report failed SSH logins (IP and user name only, never log lines). `SSH_ATTACK_THRESHOLD` (30) failures in 10 minutes on one server raise an alert (at most hourly). *Security → SSH attacks* lists top source IPs.
 - **Pending security updates:** the agent checks apt / dnf / yum / apk every `AGENT_UPDATES_HOURS` (6) using a dry run (nothing is installed) and reports counts, the packages and whether a reboot is needed. `AGENT_SECURITY=off` on a server turns both agent features off.
 - **Security alerts** (*Security → Alerts*): every user sees what is sent; admins change it (audited).

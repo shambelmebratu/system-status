@@ -412,7 +412,7 @@ docker compose exec -T postgres pg_restore -U smwatch -d smwatch --clean < smwat
 - **Agents:** they connect outbound only. Join links expire, each server gets its own token, and tokens are stored encrypted and hashed. Rotate or revoke a token from the server page.
 - **Keep `.env` and database backups apart.** Anyone holding both can decrypt the stored secrets.
 - **The host-agent service has root-equivalent access**, because it mounts the host read-only and the Docker socket. Set `HOST_AGENT_LOGS=nodocker` or delete the service if you don't need this machine monitored.
-- **Sign-in:** two-factor sign-in can be required for admins or everyone (*Security → Sign-in*), and every sensitive action is written to the audit log.
+- **Sign-in:** two-factor sign-in can be required for admins or everyone (*Settings → Sign-in & access*), and every sensitive action is written to the audit log.
 
 ## Troubleshooting
 

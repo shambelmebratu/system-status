@@ -74,6 +74,8 @@ def test_policy_requires_setup(client):
     secret = _code_for(client)
     client.post("/api/auth/2fa/enable", headers=CSRF, json={"code": mfa._code(secret, int(time.time()) // 30)})
     assert client.put("/api/security/policy", headers=CSRF, json={"require_2fa": "everyone"}).status_code == 200
+    pol = client.get("/api/security/policy").json()                      # Settings → Sign-in & access: policy + adoption for admins
+    assert pol["require_2fa"] == "everyone" and pol["adoption"]["enabled"] >= 1 and pol["adoption"]["total"] >= pol["adoption"]["enabled"]
     try:
         make_user(client, "viewer-2fa@example.com", "viewer")
         v = session_for("viewer-2fa@example.com", new_password="viewer-2fa-pass-1")

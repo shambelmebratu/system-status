@@ -4,7 +4,7 @@ import { FormEvent, Fragment, useEffect, useState } from 'react';
 import { JoinCommands, expiryText, useActiveEnrollment, useControlPlaneUrl } from '../components/join';
 import { RetentionCard } from '../components/retention';
 import { CodeBox, Field } from '../components/ui';
-import { post, put } from '../lib/api';
+import { api, post, put } from '../lib/api';
 import { ROLE_INFO } from '../lib/types';
 import { timeAgo } from '../lib/format';
 import { MfaSetup } from '../components/mfa';
@@ -35,7 +35,8 @@ export function Settings() {
 
   return (
     <>
-      <div className="topbar"><h1>Settings</h1></div>
+      <div className="topbar"><div><h1>Settings</h1><p className="muted sm">Your account, how people sign in, agent install links, the public status page and data retention.</p></div></div>
+      <h2 className="set-group">Your account</h2>
       <div className="grid g2">
         <section className="card"><div className="card-head"><h2>Profile</h2><span className="grow" /><span className={`role-pill ${me.role}`}>{ROLE_INFO[me.role].label}</span></div>
           <form onSubmit={saveProfile} style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
@@ -56,14 +57,18 @@ export function Settings() {
             <button className="btn primary" style={{ alignSelf: 'flex-start' }}>Change password</button>
           </form>
         </section>
+      </div>
+      {isAdmin && <><h2 className="set-group">Sign-in &amp; access</h2><SignInPolicy /></>}
+      {canManage && <><h2 className="set-group">Agents</h2><JoinTokens /></>}
+      <h2 className="set-group">Sharing</h2>
+      <div className="grid g2">
         <section className="card"><div className="card-head"><h2>Public status page</h2></div>
           <p className="muted" style={{ marginBottom: 12 }}>The only page that can be opened without signing in. It shows just the servers and services you tick “Show on the public status page” for (name, status and uptime). Turn it off completely with <code>PUBLIC_STATUS_ENABLED=false</code>.</p>
           <CodeBox value={`${origin}/status`} />
           <p className="sm muted" style={{ marginTop: 14 }}>{(data?.services.filter(s => s.public).length ?? 0) + (data?.servers.filter(s => s.public).length ?? 0)} item(s) are public.</p>
         </section>
       </div>
-      {canManage && <JoinTokens />}
-      {isAdmin && <RetentionCard />}
+      {isAdmin && <><h2 className="set-group">Data</h2><RetentionCard /></>}
     </>
   );
 }
@@ -89,7 +94,7 @@ function JoinTokens() {
   }
 
   return (
-    <section className="card" style={{ marginTop: 16 }}>
+    <section className="card">
       <div className="card-head"><h2>Agent join tokens</h2></div>
       <p className="muted sm" style={{ marginBottom: 14 }}>A join token lets a server register itself as a new monitor with a single command. Anyone holding an active token can add servers to this dashboard, so links are short-lived ({lim.enrollDefault} minutes by default, {Math.round(lim.enrollMax / 60)} hours at most). Add a server limit for extra safety and revoke links you no longer need. Revoking never disconnects servers that already joined.</p>
       <form onSubmit={create} className="form-grid" style={{ marginBottom: 16, alignItems: 'end' }}>
@@ -117,6 +122,39 @@ function JoinTokens() {
   );
 }
 
+
+type Policy = { require_2fa: 'none' | 'admins' | 'everyone'; adoption?: { enabled: number; total: number; without: { id: number; email: string; role: string }[] } };
+
+/** Who must use two-factor sign-in (all accounts), and who has not turned it on yet. Admins only. */
+function SignInPolicy() {
+  const { toast, me, go } = useApp();
+  const [p, setP] = useState<Policy | null>(null);
+  const [busy, setBusy] = useState(false);
+  const load = () => api<Policy>('/security/policy').then(setP).catch(e => toast((e as Error).message, true));
+  useEffect(() => { void load(); }, []);
+  async function set(policy: Policy['require_2fa']) {
+    setBusy(true);
+    try { await put('/security/policy', { require_2fa: policy }); toast('Sign-in policy saved'); await load(); } catch (e) { toast((e as Error).message, true); } finally { setBusy(false); }
+  }
+  const a = p?.adoption;
+  return (
+    <div className="grid g-side">
+      <section className="card"><div className="card-head"><h2>Require two-factor sign-in</h2></div>
+        <p className="muted sm" style={{ marginBottom: 12 }}>Applies to every account. People who must use it are asked to set it up at their next sign-in, before they can open anything else.</p>
+        {!p ? <p className="muted">Loading…</p> : <div className="method">{([['none', 'Optional', 'Everyone can turn it on for their own account.'], ['admins', 'Admins', 'Admins must set it up before they can continue.'], ['everyone', 'Everyone', 'Every user must set it up at their next sign-in.']] as const).map(([v, l, d]) =>
+          <button key={v} type="button" className={p.require_2fa === v ? 'on' : ''} disabled={busy} aria-pressed={p.require_2fa === v} onClick={() => void set(v)}><b>{l}</b><span>{d}</span></button>)}</div>}
+        {!me.totp_enabled && <p className="sm warn" style={{ marginTop: 10 }}>Turn on two-factor sign-in for your own account (above) before requiring it, so you are not locked out.</p>}
+      </section>
+      <section className="card"><div className="card-head"><h2>Adoption</h2><span className="grow" />{a && <b>{a.enabled} of {a.total}</b>}</div>
+        {a && <div className="slo-bar"><i className={a.enabled === a.total ? 'good' : 'warn'} style={{ width: `${(a.enabled / Math.max(1, a.total)) * 100}%` }} /></div>}
+        {a && a.without.length > 0 ? <><h3 className="drawer-h">Without two-factor sign-in</h3>
+          <table className="tbl"><tbody>{a.without.map(u => <tr key={u.id}><td>{u.email}</td><td className="num"><span className={`role-pill ${u.role}`}>{u.role}</span></td></tr>)}</tbody></table></>
+          : a && <p className="muted sm" style={{ marginTop: 10 }}>Every active account signs in with a second factor.</p>}
+        <button className="btn sm ghost" style={{ marginTop: 10 }} onClick={() => go('users')}>Manage users</button>
+      </section>
+    </div>
+  );
+}
 
 function TwoFactorCard() {
   const { me, reloadMe, toast } = useApp();

@@ -3,7 +3,7 @@
 /** The Security page's sections, shown nested under "Security" in the main menu, with live counts the page publishes. */
 import { useSyncExternalStore } from 'react';
 
-export type SecSection = 'overview' | 'activity' | 'servers' | 'threats' | 'kubernetes' | 'ssh' | 'hardening' | 'updates' | 'exposure' | 'alerts' | 'signin' | 'reports';
+export type SecSection = 'overview' | 'activity' | 'servers' | 'threats' | 'kubernetes' | 'ssh' | 'hardening' | 'updates' | 'exposure' | 'alerts' | 'reports';
 export type SecNavItem = { id: SecSection; label: string; icon: string; group: string; admin?: boolean; k8s?: boolean };
 export const SEC_NAV: SecNavItem[] = [
   { id: 'overview', label: 'Overview', icon: 'overview', group: '' },
@@ -16,7 +16,6 @@ export const SEC_NAV: SecNavItem[] = [
   { id: 'updates', label: 'Updates', icon: 'refresh', group: 'Posture' },
   { id: 'exposure', label: 'Exposure & TLS', icon: 'globe', group: 'Posture' },
   { id: 'alerts', label: 'Alerts', icon: 'bell', group: 'Configure' },
-  { id: 'signin', label: 'Sign-in', icon: 'users', group: 'Configure', admin: true },
   { id: 'reports', label: 'Reports', icon: 'logs', group: 'Configure' },
 ];
 export const SEC_SECTIONS = SEC_NAV.map(i => i.id);
@@ -27,12 +26,12 @@ export const SEC_GROUPS: SecGroup[] = [
   { id: 'overview', label: 'Overview', icon: 'overview', tabs: ['overview', 'servers'] },
   { id: 'threats', label: 'Threats', icon: 'alert', tabs: ['threats', 'kubernetes'] },
   { id: 'posture', label: 'Posture', icon: 'check', tabs: ['exposure', 'hardening', 'updates'] },
-  { id: 'access', label: 'Access', icon: 'terminal', tabs: ['ssh', 'signin'] },
+  { id: 'access', label: 'Access', icon: 'terminal', tabs: ['ssh'] },
   { id: 'activity', label: 'Activity', icon: 'clock', tabs: ['activity', 'reports'] },
   { id: 'alerts', label: 'Alerts', icon: 'bell', tabs: ['alerts'] },
 ];
 /** Tab names inside a group (shorter than the section names where the group already says it). */
-export const TAB_LABEL: Partial<Record<SecSection, string>> = { threats: 'Servers', overview: 'Summary', activity: 'Timeline', ssh: 'SSH logins', signin: 'Two-factor sign-in' };
+export const TAB_LABEL: Partial<Record<SecSection, string>> = { threats: 'Servers', overview: 'Summary', activity: 'Timeline', ssh: 'SSH logins' };
 export const groupOfSection = (s: SecSection) => SEC_GROUPS.find(g => g.tabs.includes(s)) ?? SEC_GROUPS[0];
 /** The tabs of a group this person can see (Kubernetes only with clusters, sign-in only for admins). */
 export const visibleTabs = (g: SecGroup, k8s: boolean, isAdmin: boolean) =>

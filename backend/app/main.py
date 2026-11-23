@@ -432,9 +432,15 @@ def mfa_disable(payload: MfaDisable, request: Request, claims: dict = Depends(re
 
 
 @app.get("/api/security/policy")
-def security_policy(_: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
+def security_policy(user: dict = Depends(require_user), db: Session = Depends(get_db)) -> dict:
+    """The two-factor sign-in policy (Settings → Sign-in policy); admins also get who has it on."""
     from . import mfa
-    return {"require_2fa": mfa.policy(db)}
+    out: dict = {"require_2fa": mfa.policy(db)}
+    if user["role"] == "admin":
+        users = db.scalars(select(User).where(User.active.is_(True))).all()
+        out["adoption"] = {"enabled": sum(1 for u in users if u.totp_enabled), "total": len(users),
+                           "without": [{"id": u.id, "email": u.email, "role": u.role} for u in users if not u.totp_enabled][:50]}
+    return out
 
 
 @app.put("/api/security/policy")

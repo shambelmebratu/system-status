@@ -39,7 +39,7 @@ from typing import Any
 
 import psutil
 
-AGENT_VERSION = "2.18.0"
+AGENT_VERSION = "2.18.1"
 _ENV_TOKEN = os.getenv("AGENT_TOKEN", "")                      # the token supplied by configuration; a rotation may supersede it (see _load_state)
 AGENT_TOKEN = ""                                                # the token in use: resolved by ensure_token() (saved state first, then configuration)
 AGENT_ALLOW_INSECURE = os.getenv("AGENT_ALLOW_INSECURE", "") == "1"   # permit http:// to a public address (not recommended)
@@ -1956,10 +1956,12 @@ def _shell_connections(findings: list[dict]) -> None:
 def _scan_processes(findings: list[dict]) -> None:
     for process in psutil.process_iter():
         try:
-            info = process.as_dict(["pid", "name", "username", "cmdline", "ppid"])   # local copy: see process_rows
+            info = process.as_dict(["pid", "name", "username", "cmdline", "ppid", "status"])   # local copy: see process_rows
             pid, name = info["pid"], info["name"] or ""
             if pid <= 2:
                 continue
+            if info.get("status") in (psutil.STATUS_ZOMBIE, getattr(psutil, "STATUS_DEAD", "dead")):
+                continue      # killed but not yet collected by its parent: nothing runs any more (no program, no command line, no CPU)
             exe = _proc_exe(pid) if not IS_MAC else (process.exe() or "")
             cmd = " ".join(info["cmdline"] or [])[:2000]
             flags = process_flags(pid, name, exe, cmd)

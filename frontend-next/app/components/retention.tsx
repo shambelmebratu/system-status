@@ -43,7 +43,7 @@ export function RetentionCard() {
     setAuto(s.auto); setFrequency(s.frequency); setTime(s.time); setWeekday(s.weekday); setLoaded(true);
   }, [value, loaded]);
 
-  if (!value) return <section className="card" style={{ marginTop: 16 }}><div className="card-head"><h2>Data retention</h2></div><p className="muted sm">Loading…</p></section>;
+  if (!value) return <section className="card"><div className="card-head"><h2>Data retention</h2></div><p className="muted sm">Loading…</p></section>;
   const { stats, settings } = value;
 
   async function save() {
@@ -76,7 +76,7 @@ export function RetentionCard() {
   const chosen = ORDER.filter(k => picked[k]);
   return (
     <>
-      <section className="card" style={{ marginTop: 16 }}>
+      <section className="card">
         <div className="card-head"><h2>Data retention</h2><span className="grow" /><span className="sm muted">{totalRows.toLocaleString()} rows stored{totalBytes ? ` · ${size(totalBytes)}` : ''}</span></div>
         <p className="muted sm" style={{ marginBottom: 6 }}>How long SM-Watch keeps its own history. Logs from your servers and clusters are not part of this: they are read on demand and dropped after {lim.logTtl} minutes.</p>
 

@@ -1514,3 +1514,7 @@ kbd{font-family:var(--mono);font-size:10px;line-height:1;padding:3px 5px;border-
 .cmdk-foot{display:flex;gap:14px;padding:8px 16px;border-top:1px solid var(--line);background:var(--surface-2);font-size:11px;color:var(--muted)}
 .cmdk-foot kbd{margin-right:3px}
 @media (max-width:640px){.cmdk-overlay{padding-top:4vh}.cmdk-hint{display:none}.cmdk-label{max-width:none}.cmdk-foot{display:none}}
+/* Settings: grouped sections */
+.set-group{font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:26px 2px 10px;display:flex;align-items:center;gap:10px}
+.set-group::after{content:"";flex:1;height:1px;background:var(--line)}
+.topbar + .set-group{margin-top:4px}

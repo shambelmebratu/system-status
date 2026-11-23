@@ -1,7 +1,7 @@
 'use client';
 
 import { createContext, FormEvent, Fragment, ReactNode, useContext, useEffect, useMemo, useRef, useState } from 'react';
-import { Empty, Field, Icon, Modal, StatusPill } from '../components/ui';
+import { Empty, Field, Icon, Modal } from '../components/ui';
 import { ProcessDrawer } from '../components/process';
 import { TargetPicker, type PickerOption } from '../components/logviewer';
 import { api, ApiError, post, put } from '../lib/api';
@@ -113,6 +113,7 @@ export function Security() {
   const servers = usePoll(() => api<Who[]>('/security/servers'), [], 120000).value ?? [];
   const data = usePoll(() => api<Overview>(withQ('/security/overview', server)), [server], 60000, true);
   const tab: Tab = SECTIONS.includes(route[1] as Tab) ? route[1] as Tab : 'overview';
+  useEffect(() => { if (route[1] === 'signin') navigate('settings'); }, [route[1]]);   // old link: the sign-in policy now lives in Settings
   const setTab = (t: Tab) => navigate(t === 'overview' ? 'security' : `security/${t}`);
   const [drawer, setDrawer] = useState<DrawerState>(null);
   const [version, setVersion] = useState(0);
@@ -184,8 +185,6 @@ export function Security() {
               {tab === 'exposure' && <Exposure key={`e${preset.n}`} o={o} reload={data.reload} pick={pickTo('exposure')} preset={presetFor('exposure')} />}
               {tab === 'alerts' && <SecurityAlerts />}
               {tab === 'reports' && <Reports server={server} servers={servers} />}
-              {tab === 'signin' && o.two_factor && <SignIn tf={o.two_factor} reload={data.reload} />}
-              {tab === 'signin' && !o.two_factor && <div className="card"><p className="muted">Sign-in settings apply to everyone. <button className="lg-link" onClick={() => setServer('')}>Clear the server filter</button> to see them.</p></div>}
               {drawer?.kind === 'server' && <ServerDrawer key={`${drawer.id}-${drawer.focus ?? ''}-${drawer.port ?? ''}`} id={drawer.id} focus={drawer.focus} port={drawer.port} onClose={() => setDrawer(null)} />}
               {drawer?.kind === 'tls' && <TlsDrawer id={drawer.id} onClose={() => setDrawer(null)} />}
               {drawer?.kind === 'port' && <PortDrawer target={drawer.target} id={drawer.id} port={drawer.port} address={drawer.address} onClose={() => setDrawer(null)} />}
@@ -381,7 +380,7 @@ const ACT_LABEL: Record<ActivityItem['type'], string> = { found: 'Found', acknow
 
 function SecurityHome({ server }: { server: string }) {
   const { o, go, openServer, openTls } = useSec();
-  const { isAdmin } = useApp();
+  const { isAdmin, go: navigate } = useApp();
   const total = overallScore(o);
   const rows = o.servers.map(row => ({ row, score: scoreOf(row) }));
   const act = usePoll(() => api<ActivityItem[]>(withQ('/security/activity?days=7&limit=8', server)), [server], 60000, true);
@@ -404,7 +403,7 @@ function SecurityHome({ server }: { server: string }) {
   for (const { row } of rows) if (row.updates?.security) actions.push({ sev: row.updates.security > 10 ? 'high' : 'medium', title: `${plural(row.updates.security, 'security update')} waiting on ${row.name}`, sub: row.updates.reboot_required ? 'and a reboot is needed' : 'install them soon', open: () => openServer(row.id, 'updates') });
   for (const { row } of rows) if (row.hardening.failed) actions.push({ sev: 'medium', title: `${plural(row.hardening.failed, 'hardening check')} failed on ${row.name}`, sub: 'see which settings to change', open: () => openServer(row.id, 'hardening') });
   for (const s of weakTls(o)) actions.push({ sev: s.tls!.grade === 'F' ? 'high' : 'medium', title: `Weak TLS on ${s.name}`, sub: `grade ${s.tls!.grade}: see what to fix`, open: () => openTls(s.id) });
-  if (tf && tf.enabled < tf.total) actions.push({ sev: tf.without.some(u => u.role === 'admin') ? 'high' : 'low', title: `${plural(tf.total - tf.enabled, 'person')} without two-factor sign-in`, sub: tf.without.some(u => u.role === 'admin') ? 'including admins' : 'ask them to turn it on in Settings', open: () => go('signin') });
+  if (tf && tf.enabled < tf.total) actions.push({ sev: tf.without.some(u => u.role === 'admin') ? 'high' : 'low', title: `${plural(tf.total - tf.enabled, 'person')} without two-factor sign-in`, sub: tf.without.some(u => u.role === 'admin') ? 'including admins' : 'ask them to turn it on in Settings', open: () => navigate('settings') });
   const order: Record<Severity, number> = { critical: 0, high: 1, medium: 2, low: 3 };
   actions.sort((a, b) => order[a.sev] - order[b.sev]);
   const [allActions, setAllActions] = useState(false);
@@ -418,7 +417,7 @@ function SecurityHome({ server }: { server: string }) {
     { label: 'Failed hardening checks', value: String(weak), tone: weak ? 'warn' : 'good', hint: 'settings that weaken a server, all servers', open: () => go('hardening', { failedOnly: true }) },
     { label: 'Failed SSH logins (24 h)', value: o.ssh.total.toLocaleString(), tone: o.ssh.total > 500 ? 'bad' : o.ssh.total ? 'warn' : 'good', hint: 'password guesses against your servers, last 24 hours', open: () => go('ssh') },
   ];
-  if (tf && isAdmin) kpis.push({ label: 'People with two-factor', value: `${tf.enabled} of ${tf.total}`, tone: tf.enabled === tf.total ? 'good' : 'warn', hint: 'active accounts that sign in with a second factor', open: () => go('signin') });
+  if (tf && isAdmin) kpis.push({ label: 'People with two-factor', value: `${tf.enabled} of ${tf.total}`, tone: tf.enabled === tf.total ? 'good' : 'warn', hint: 'active accounts that sign in with a second factor (policy in Settings)', open: () => navigate('settings') });
   const ago = (iso?: string | null) => (iso ? timeAgo(iso) : '–');
   return (
     <div className="grid">
@@ -1439,24 +1438,3 @@ function SecurityReport({ data, template, onClose }: { data: ReportData; templat
 }
 
 /* ---------------------------------------------------------------- sign-in */
-function SignIn({ tf, reload }: { tf: NonNullable<Overview['two_factor']>; reload: () => Promise<void> }) {
-  const { toast, me } = useApp();
-  const [busy, setBusy] = useState(false);
-  async function set(policy: string) {
-    setBusy(true);
-    try { await put('/security/policy', { require_2fa: policy }); toast('Policy saved'); await reload(); } catch (e) { toast((e as Error).message, true); } finally { setBusy(false); }
-  }
-  return (
-    <div className="grid">
-      <section className="card"><div className="card-head"><h2>Require two-factor sign-in</h2></div>
-        <div className="method">{([['none', 'Optional', 'Everyone can turn it on in Settings.'], ['admins', 'Admins', 'Admins must set it up before they can continue.'], ['everyone', 'Everyone', 'Every user must set it up at their next sign-in.']] as const).map(([v, l, d]) =>
-          <button key={v} type="button" className={tf.policy === v ? 'on' : ''} disabled={busy} onClick={() => set(v)}><b>{l}</b><span>{d}</span></button>)}</div>
-        {!me.totp_enabled && <p className="sm warn" style={{ marginTop: 10 }}>Turn on two-factor sign-in for your own account (Settings) before requiring it.</p>}
-      </section>
-      <section className="card"><div className="card-head"><h2>Adoption</h2><span className="grow" /><b>{tf.enabled} of {tf.total}</b></div>
-        <div className="slo-bar"><i className={tf.enabled === tf.total ? 'good' : 'warn'} style={{ width: `${(tf.enabled / Math.max(1, tf.total)) * 100}%` }} /></div>
-        {tf.without.length > 0 && <><h3 className="drawer-h">Without two-factor sign-in</h3><table className="tbl"><tbody>{tf.without.map(u => <tr key={u.id}><td>{u.email}</td><td><StatusPill status="unknown" label={u.role} /></td></tr>)}</tbody></table></>}
-      </section>
-    </div>
-  );
-}

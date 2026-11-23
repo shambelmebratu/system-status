@@ -123,7 +123,7 @@ Database migrations run automatically before the API starts. To roll back, set t
 
 - **Roles.** Viewers see monitors, graphs and incidents only. Operators can also read logs and security findings. Admins manage users, settings and agent links. Logs can contain secrets, so give out the operator and admin roles carefully. The **Audit log** records who opened which log.
 - **Protect `.env` and the database together.** Anyone with both can decrypt the stored tokens. Back them up separately, and rotate agent tokens after any suspected breach.
-- **Two-factor sign-in** can be required under **Security → Sign-in**.
+- **Two-factor sign-in** can be required under **Settings → Sign-in & access**.
 - **AI uses two tiers** (**AI → Settings**), both off until an admin turns them on:
   - The **Confidential tier** serves every AI feature by default: incident explanations, log analysis and the assistant. It accepts only a local Ollama, or a provider that offers zero data retention and no training on paid/enterprise plans. An admin must confirm, on record, that the account has those terms; SM-Watch cannot tell from a key.
   - The **Development tier** is for testing with free or keyless providers. Data sent through it may be logged, retained or used for training. A feature moves there only after an explicit, audited confirmation, and the assistant never sends security findings there unless that is allowed separately.
