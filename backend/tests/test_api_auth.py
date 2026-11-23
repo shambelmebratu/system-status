@@ -945,7 +945,7 @@ def test_install_scripts_are_integrity_checked_and_download_no_code(client):
     assert f"SMWATCH_AGENT_SHA256={hashlib.sha256(agent_bytes).hexdigest()}" in sh               # announced hash == the exact bytes served
     assert "require_secure_url" in sh and "does not match the checksum" in sh
     dk = anon.get(f"/api/agent/join/{token}/docker").text
-    assert "SMWATCH_AGENT_IMAGE='shambi21/sm-watch-host-agent:latest'" in dk
+    assert "SMWATCH_AGENT_IMAGE='shambi21/sm-watch:host-agent-latest'" in dk                   # one repository, the service in the tag
     assert "urlretrieve" not in dk and "pip install" not in dk and "apt-get" not in dk           # nothing is fetched or executed at container start
     assert "--cap-drop ALL" in dk and "no-new-privileges" in dk and "--read-only" in dk and "require_secure_url" in dk
 

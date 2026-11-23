@@ -33,10 +33,11 @@ class Settings(BaseSettings):
     public_status_ranges: str = "7,30,90"      # ... and visitors can switch between these (days, 1 to 365)
     audit_retention_days: int = 365
     agent_min_report_seconds: float = 2   # an agent may not report more often than this (flood protection)
-    dockerhub_username: str = "shambi21"  # where the published agent image lives (used by the Docker install command)
+    dockerhub_username: str = "shambi21"  # where the published images live: <dockerhub_username>/<dockerhub_repo>:<service>-<smwatch_version>
+    dockerhub_repo: str = "sm-watch"      # one repository for every service; the tag names the service (api-1.2.3, host-agent-1.2.3 ...)
     smwatch_version: str = "latest"
-    agent_image: str = ""                  # full override, e.g. registry.example.com/sm-watch-host-agent:1.2.3
-    k8s_agent_image: str = ""              # image the Kubernetes manifest deploys; default <dockerhub_username>/sm-watch-k8s-agent:<smwatch_version>
+    agent_image: str = ""                  # full override, e.g. registry.example.com/sm-watch:host-agent-1.2.3
+    k8s_agent_image: str = ""              # image the Kubernetes manifest deploys; default <dockerhub_username>/<dockerhub_repo>:k8s-agent-<smwatch_version>
     host_agent_token_file: str = ""  # when set, the API provisions a server entry + token for the bundled host agent
     host_public_ip: str = ""  # optional: public address of the machine running SM-Watch (shown for the bundled agent); default: resolved from PUBLIC_URL
     public_url: str = ""  # externally reachable control-plane URL shown in agent install commands (e.g. https://monitor.example.com)
@@ -118,13 +119,18 @@ class Settings(BaseSettings):
         return self
 
 
+def published_image(settings: "Settings", service: str) -> str:
+    """A published image: one repository, the service and version in the tag, e.g. shambi21/sm-watch:host-agent-1.2.3."""
+    return f"{settings.dockerhub_username}/{settings.dockerhub_repo}:{service}-{settings.smwatch_version}"
+
+
 def resolved_agent_image(settings: "Settings") -> str:
     """The image the Docker install command runs. The agent code is baked into it: nothing is downloaded at start-up."""
-    return settings.agent_image or f"{settings.dockerhub_username}/sm-watch-host-agent:{settings.smwatch_version}"
+    return settings.agent_image or published_image(settings, "host-agent")
 
 
 def resolved_k8s_agent_image(settings: "Settings") -> str:
-    return settings.k8s_agent_image or f"{settings.dockerhub_username}/sm-watch-k8s-agent:{settings.smwatch_version}"
+    return settings.k8s_agent_image or published_image(settings, "k8s-agent")
 
 
 @lru_cache

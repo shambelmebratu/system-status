@@ -62,7 +62,7 @@ An agent can only read from a **fixed allow-list** of log sources; it never runs
 
 - The agent runs code on your server and ships its logs. **Never install over unencrypted HTTP to a public address**: the installers, and the agent itself, **refuse** it. Plain `http://` is accepted only on private networks (10.x, 172.16-31.x, 192.168.x, loopback, link-local, `.lan`/`.local`/`.internal` or single-word host names). Use HTTPS (see *HTTPS with nginx*). Overrides exist for VPN/overlay networks you trust (`SMWATCH_ALLOW_HTTP=1` for the installer, `AGENT_ALLOW_INSECURE=1` for the agent), but they are deliberate and not recommended.
 - The shell installer **verifies the SHA-256** of the agent it downloads against the hash announced in the install command, and refuses a mismatch. The agent is installed once and is **never auto-updated** from the network; you update it by re-running the command.
-- The **Docker agent runs a published image** (`<user>/sm-watch-host-agent:<version>`): the agent code is inside the image, nothing is downloaded when the container starts. The container runs with all capabilities dropped, `no-new-privileges`, and a read-only filesystem. Pin a version (`SMWATCH_VERSION=1.2.3`) so updates are deliberate.
+- The **Docker agent runs a published image** (`<user>/sm-watch:host-agent-<version>`): the agent code is inside the image, nothing is downloaded when the container starts. The container runs with all capabilities dropped, `no-new-privileges`, and a read-only filesystem. Pin a version (`SMWATCH_VERSION=1.2.3`) so updates are deliberate.
 - The Linux service runs as an unprivileged user with `NoNewPrivileges`, a read-only system and no access to home directories. **Log access is optional**: joining the `docker` group is root-equivalent on that server, so choose `SMWATCH_LOGS=nodocker` or `off` unless you need container logs.
 - Install links contain a secret in the URL. Treat the command like a password until it expires, and keep it out of chat logs and tickets. The provided nginx config masks it in its access log.
 
@@ -106,7 +106,7 @@ docker compose pull          # download the images
 docker compose up -d         # start everything; add notification channels afterwards in the console under Alerts
 ```
 
-- **Choose the version** with `SMWATCH_VERSION` in `.env`: `latest` (every push to `main`), a release such as `1.2.3` (recommended for production) or `sha-<commit>`. `docker compose pull && docker compose up -d` upgrades; the migration service applies database changes automatically before the API starts. Roll back by setting the previous version and running the same two commands.
+- **Choose the version** with `SMWATCH_VERSION` in `.env`: `latest` (every push to `main`), a release such as `1.2.3` (recommended for production) or a short commit such as `1a2b3c4`. Every service uses the same version: the tags are `api-1.2.3`, `frontend-1.2.3` and so on. `docker compose pull && docker compose up -d` upgrades; the migration service applies database changes automatically before the API starts. Roll back by setting the previous version and running the same two commands.
 - **Develop from source instead:** `docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build` builds all images from this checkout (they get the same names, so a later `pull` replaces them with the published ones). To make plain `docker compose` always build, add `COMPOSE_FILE=docker-compose.yml:docker-compose.build.yml` to `.env`.
 - The images come from the Docker Hub account `shambi21` by default; set `DOCKERHUB_USERNAME` in `.env` to use another account (for example a fork). Until the GitHub Action has pushed the images, use the build override above.
 
@@ -399,7 +399,7 @@ Review the manifest first by running the `curl` alone. It creates a `smwatch` na
 
 **Tokens.** Rotate from Settings (delivered to the agent automatically and written to its Secret) or *Revoke now* (shows a `kubectl patch` command). Re-using a cluster name while that cluster is connected is refused, so an install link cannot hijack a live cluster.
 
-**Images.** `sm-watch-k8s-agent` is published with the other images (override with `K8S_AGENT_IMAGE`). Live CPU/memory needs metrics-server in the cluster; without it everything else still works.
+**Images.** The Kubernetes agent is published with the other images as `<user>/sm-watch:k8s-agent-<version>` (override with `K8S_AGENT_IMAGE`). Live CPU/memory needs metrics-server in the cluster; without it everything else still works.
 
 ## Quality: API tests, content checks, DNS and domains
 
@@ -654,35 +654,42 @@ Notes: on nginx older than 1.25.1 replace `http2 on;` with `listen 443 ssl http2
 
 ## Publishing images to Docker Hub (GitHub Actions)
 
-`.github/workflows/docker-publish.yml` tests the code and publishes five multi-architecture (amd64 + arm64) images to Docker Hub.
+`.github/workflows/docker-publish.yml` tests the code and publishes five multi-architecture (amd64 + arm64) images to **one** Docker Hub repository, `<user>/sm-watch`. The tag names the service and the version:
 
-**Docker Hub page:** `docs/dockerhub/README.md` is the overview shown on Docker Hub. It covers how SM-Watch works, the `.env` to create, the full `docker-compose.yml`, HTTPS with nginx, agents (shell, Docker and Compose), Kubernetes, updates, backups and troubleshooting. It is not published automatically: after changing it, paste it into each repository's *Overview* on hub.docker.com.
+- `api-1.2.3`, `api-1.2` and `api-latest` for releases and `main`;
+- `api-1a2b3c4` for the short commit hash;
+- the same pattern for `frontend-…`, `agent-…`, `host-agent-…` and `k8s-agent-…`.
+
+Set the repository *variable* `DOCKERHUB_REPO` to use another repository name; also set `DOCKERHUB_REPO` in `.env`.
+
+**Docker Hub page:** `docs/dockerhub/README.md` is the overview shown on Docker Hub. It covers how SM-Watch works, the `.env` to create, the full `docker-compose.yml`, HTTPS with nginx, agents (shell, Docker and Compose), Kubernetes, updates, backups and troubleshooting. It is not published automatically: after changing it, paste it into the repository's *Overview* on hub.docker.com.
 
 The images:
 
-| Image | Built from | Used for |
+| Tag prefix | Built from | Used for |
 | --- | --- | --- |
-| `<user>/sm-watch-api` | `backend/Dockerfile` | the API, the worker and the database migrations (one image, three compose services) |
-| `<user>/sm-watch-frontend` | `frontend-next/Dockerfile` | the web dashboard |
-| `<user>/sm-watch-agent` | `agent/Dockerfile` | the standalone agent in Docker |
-| `<user>/sm-watch-host-agent` | `backend/Dockerfile.host-agent` | the agent for the machine running SM-Watch (includes `journalctl`) |
+| `api-` | `backend/Dockerfile` | the API, the worker and the database migrations (one image, three compose services) |
+| `frontend-` | `frontend-next/Dockerfile` | the web dashboard |
+| `agent-` | `agent/Dockerfile` | the standalone agent in Docker (`agent/docker-compose.yml`) |
+| `host-agent-` | `backend/Dockerfile.host-agent` | the agent for the machine running SM-Watch, and the image the Docker install command runs (includes `journalctl`) |
+| `k8s-agent-` | `backend/Dockerfile.k8s-agent` | the read-only in-cluster Kubernetes agent |
 
 **One-time setup.** In Docker Hub create an access token (*Account settings → Personal access tokens*, permission **Read & Write**). In the GitHub repository open *Settings → Secrets and variables → Actions → New repository secret* and add:
 
 - `DOCKERHUB_USERNAME`: your Docker Hub username
 - `DOCKERHUB_TOKEN`: the access token
 
-The repositories are created on the first push. For an organisation namespace, create them first (or use a token that may create repositories).
+The repository is created on the first push. For an organisation namespace, create it first (or use a token that may create repositories).
 
 **When it runs**
 - **Pull request:** runs the tests and *builds* every image to prove it still builds. Nothing is pushed (and fork PRs never see your secrets).
-- **Push to `main`:** tests, then pushes `latest` and `sha-<short-commit>`.
-- **Tag `v1.2.3`:** tests, then pushes `1.2.3`, `1.2` and `sha-<short-commit>`. Release with `git tag v1.2.3 && git push origin v1.2.3`.
+- **Push to `main`:** tests, then pushes `<service>-latest` and `<service>-<short-commit>`.
+- **Tag `v1.2.3`:** tests, then pushes `<service>-1.2.3`, `<service>-1.2` and `<service>-<short-commit>`. Release with `git tag v1.2.3 && git push origin v1.2.3`.
 - **Manual:** *Actions → Build and push Docker images → Run workflow*; untick *Push* for a dry run.
 
 Images are only pushed when the backend tests, the frontend type-check and the installer-script syntax check all pass. If the secrets are missing the job fails immediately with a message saying which to add.
 
-**Using the published images.** `docker-compose.yml` already pulls them (see *Run with Docker Compose*): set `DOCKERHUB_USERNAME` and `SMWATCH_VERSION` in `.env`. Pin a version tag (for example `1.2.3`) instead of `latest` in production so an update is always a deliberate step. The standalone agent needs no repo either: in `agent/.env` set `DOCKERHUB_USERNAME` (and `SMWATCH_VERSION`), or `AGENT_IMAGE` to a full image name, then `docker compose -f agent/docker-compose.yml up -d`.
+**Using the published images.** `docker-compose.yml` already pulls them (see *Run with Docker Compose*): set `DOCKERHUB_USERNAME`, `DOCKERHUB_REPO` (default `sm-watch`) and `SMWATCH_VERSION` in `.env`. Pin a version tag (for example `1.2.3`) instead of `latest` in production so an update is always a deliberate step. The standalone agent needs no repo either: in `agent/.env` set `DOCKERHUB_USERNAME` (and `DOCKERHUB_REPO`, `SMWATCH_VERSION`), or `AGENT_IMAGE` to a full image name, then `docker compose -f agent/docker-compose.yml up -d`.
 
 ## Deploy with Docker
 

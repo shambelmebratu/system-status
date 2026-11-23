@@ -2,7 +2,7 @@
 #
 #   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 #
-# The built images get the same names as the published ones (DOCKERHUB_USERNAME/sm-watch-*), so a later
+# The built images get the same names as the published ones (DOCKERHUB_USERNAME/sm-watch:<service>-<version>), so a later
 # `docker compose pull` replaces them with the published versions. To make plain `docker compose` always
 # build, put   COMPOSE_FILE=docker-compose.yml:docker-compose.build.yml   in .env.
 services:
