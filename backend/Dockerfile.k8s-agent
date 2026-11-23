@@ -1,6 +1,6 @@
 # SM-Watch Kubernetes agent: stdlib only, runs as an unprivileged user with a read-only root filesystem.
 # Build from the repository root:  docker build -f backend/Dockerfile.k8s-agent -t sm-watch-k8s-agent .
-FROM python:3.12-slim
+FROM python:3.15-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
