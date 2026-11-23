@@ -53,6 +53,14 @@ def needs_rehash(encoded: str) -> bool:
     return not encoded.startswith(f"scrypt2${SCRYPT_N}${SCRYPT_R}${SCRYPT_P}$")
 
 
+def purpose_key(purpose: str) -> str:
+    """A signing key derived for one purpose (e.g. the two-factor ticket). A token made with it can never verify as a session,
+    which is signed with JWT_SECRET itself."""
+    import hashlib
+    import hmac
+    return hmac.new(get_settings().jwt_secret.encode(), f"smwatch:{purpose}".encode(), hashlib.sha256).hexdigest()
+
+
 def create_token(user_id: int, email: str, version: int) -> str:
     settings = get_settings()
     now = int(time.time())
@@ -174,6 +182,8 @@ def require_user(request: Request, credentials: HTTPAuthorizationCredentials | N
         claims = jwt.decode(token, get_settings().jwt_secret, algorithms=["HS256"], options={"require": ["exp", "sub"]})
     except jwt.PyJWTError as error:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired session") from error
+    if claims.get("purpose"):        # a purpose-bound token (e.g. the two-factor ticket) is never a session
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired session")
     account = db.get(User, int(claims["sub"]))
     if not account or account.token_version != claims.get("ver", 0) or not account.active:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Session is no longer valid")

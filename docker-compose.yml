@@ -50,6 +50,20 @@ services:
         condition: service_healthy
     restart: "no"
 
+  # One-shot, then exits: hands the shared volume to the API's user (uid 10001). Volumes created by versions that ran the
+  # API as root are owned by root; without this the API could not renew the bundled agent's token. Only CHOWN/FOWNER.
+  shared-volume:
+    image: *api-image
+    user: "0:0"
+    command: ["sh", "-c", "chown -R 10001:0 /shared && chmod 0770 /shared && (chmod 0640 /shared/agent.token 2>/dev/null || true)"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER]
+    network_mode: none
+    volumes:
+      - host_agent:/shared
+    restart: "no"
+
   api:
     <<: [*hardening, *readonly]
     image: *api-image
@@ -73,6 +87,8 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+      shared-volume:
+        condition: service_completed_successfully
     volumes:
       - host_agent:/shared
     healthcheck:
@@ -86,8 +102,7 @@ services:
     <<: [*hardening, *readonly]
     image: *api-image
     command: ["python", "-m", "app.worker"]
-    cap_add:
-      - NET_RAW
+    # Ping checks use unprivileged ICMP sockets (no NET_RAW needed: the image runs as an ordinary user).
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-smwatch}:${POSTGRES_PASSWORD:-replace-this-password}@postgres:5432/${POSTGRES_DB:-smwatch}
       JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET (32+ random chars) in .env}
@@ -143,6 +158,7 @@ services:
     image: *frontend-image
     environment:
       BACKEND_URL: http://api:8000
+      HOSTNAME: 0.0.0.0     # listen address; Docker's default (the container ID) may not resolve: "getaddrinfo EAI_AGAIN"
       # Whose X-Forwarded-For is believed (default: only this machine, i.e. nginx on the Docker host). See frontend-next/start.js.
       TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
     depends_on:

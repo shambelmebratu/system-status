@@ -56,8 +56,15 @@ def _ping_once(host: str) -> float | None:
         match = re.search(rb"time[=<]([0-9.]+)", result.stdout)
         return float(match.group(1)) if match else round((time.perf_counter() - started) * 1000, 1)
 
-    # Minimal IPv4 ICMP echo fallback for slim containers without iputils.
-    # The worker container needs CAP_NET_RAW for this socket.
+    # Unprivileged ICMP ("ping socket"): works for a non-root user when net.ipv4.ping_group_range includes its group, which
+    # Docker sets for every container. No CAP_NET_RAW needed, so the worker image runs as an ordinary user.
+    try:
+        return _ping_dgram(socket.gethostbyname(host))
+    except PermissionError:
+        pass                                                   # ping sockets not allowed here: fall back to a raw socket
+    except OSError:
+        return None
+    # Raw-socket fallback: needs root with CAP_NET_RAW.
     try:
         destination = socket.gethostbyname(host)
         identifier = (os.getpid() ^ int(time.time() * 1000)) & 0xFFFF
@@ -80,6 +87,28 @@ def _ping_once(host: str) -> float | None:
         return None
     except PermissionError as error:
         raise RuntimeError("ICMP ping requires NET_RAW capability on the worker container") from error
+
+
+def _ping_dgram(destination: str) -> float | None:
+    """One ICMP echo over an unprivileged datagram socket. The kernel sets the identifier; replies arrive with (macOS) or
+    without (Linux) the IP header."""
+    payload = b"sm-watch-ping"
+    sequence = 1
+    header = struct.pack("!BBHHH", 8, 0, 0, 0, sequence)
+    packet = struct.pack("!BBHHH", 8, 0, icmp_checksum(header + payload), 0, sequence) + payload
+    started = time.perf_counter()
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_ICMP) as sock:
+        sock.settimeout(2.0)
+        sock.sendto(packet, (destination, 0))
+        try:
+            while True:
+                reply, address = sock.recvfrom(2048)
+                if reply and reply[0] >> 4 == 4:                   # IPv4 header included: skip it
+                    reply = reply[(reply[0] & 0x0F) * 4:]
+                if len(reply) >= 8 and reply[0] == 0 and struct.unpack("!H", reply[6:8])[0] == sequence and reply[8:] == payload and address[0] == destination:
+                    return round((time.perf_counter() - started) * 1000, 1)
+        except socket.timeout:
+            return None
 
 
 def evaluate_metrics(server: Server, metrics: dict) -> tuple[str, list[str]]:

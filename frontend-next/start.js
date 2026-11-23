@@ -57,4 +57,8 @@ http.Server.prototype.emit = function (event, request, ...rest) {
   return emit.call(this, event, request, ...rest);
 };
 
+// Next.js listens on process.env.HOSTNAME. Docker sets that variable to the container ID, which the container cannot always
+// resolve ("getaddrinfo EAI_AGAIN <id>": the dashboard never starts). Listen on every interface of the container instead;
+// LISTEN_HOST overrides it.
+process.env.HOSTNAME = process.env.LISTEN_HOST || '0.0.0.0';
 require('./server.js');

@@ -66,9 +66,17 @@ def ensure_host_agent(session: Session) -> None:
             session.add(server)
         server.monitor_mode = "push"
         set_token(server, token)
-        session.commit()
-        with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as handle:
+        session.flush()
+        # The file first, then the database: if the file cannot be written (e.g. a volume owned by another user), the
+        # stored token stays the one the agent already has, instead of locking it out. 0640 with group 0: the bundled
+        # agent (root) can read it without extra capabilities; the API runs as user 10001, group 0.
+        with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o640), "w") as handle:
             handle.write(token)
+        try:
+            os.chmod(path, 0o640)
+        except OSError:
+            pass
+        session.commit()
     except Exception:  # never block API startup on this convenience feature
         session.rollback()
         logging.getLogger(__name__).exception("could not provision the host agent")
@@ -140,6 +148,21 @@ def cookie_secure(request: Request | None = None) -> bool:
         return False
     return True
 
+
+class _RedactSecretPaths(logging.Filter):
+    """Uvicorn's access log prints full URLs. Install links (/api/agent/join/<token>, /api/agent/k8s/<token>) and heartbeat
+    pings (/api/ping/<token>) carry their secret in the path: mask it, so `docker logs` never shows a usable token."""
+    _pattern = re.compile(r"(/api/(?:agent/join|agent/k8s|ping)/)[^/?\s\"]+")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple):
+            record.args = tuple(self._pattern.sub(r"\1[token]", a) if isinstance(a, str) else a for a in record.args)
+        elif isinstance(record.msg, str):
+            record.msg = self._pattern.sub(r"\1[token]", record.msg)
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(_RedactSecretPaths())
 
 _dev = settings.environment.lower() in ("development", "dev", "test")
 # The interactive API docs describe every endpoint: only served for local development.
@@ -314,7 +337,8 @@ def mfa_ticket(user: User) -> str:
     """A 5-minute ticket proving the password step passed. Useless on its own: it is not a session."""
     import jwt
     now = int(datetime.now(timezone.utc).timestamp())
-    return jwt.encode({"sub": str(user.id), "ver": user.token_version, "purpose": "mfa", "iat": now, "exp": now + 300}, settings.jwt_secret, algorithm="HS256")
+    from .security import purpose_key   # its own key: the ticket can never be presented as a session (that would skip the second factor)
+    return jwt.encode({"sub": str(user.id), "ver": user.token_version, "purpose": "mfa", "iat": now, "exp": now + 300}, purpose_key("mfa"), algorithm="HS256")
 
 
 def _start_session(user: User, request: Request, response: Response, db: Session, how: str) -> dict:
@@ -331,7 +355,8 @@ def login_second_factor(payload: MfaLogin, request: Request, response: Response,
     import jwt
     from . import mfa
     try:
-        claims = jwt.decode(payload.mfa_token, settings.jwt_secret, algorithms=["HS256"], options={"require": ["exp", "sub"]})
+        from .security import purpose_key
+        claims = jwt.decode(payload.mfa_token, purpose_key("mfa"), algorithms=["HS256"], options={"require": ["exp", "sub"]})
     except jwt.PyJWTError as error:
         raise HTTPException(401, "The sign-in took too long. Enter your password again.") from error
     user = db.get(User, int(claims["sub"])) if claims.get("purpose") == "mfa" else None

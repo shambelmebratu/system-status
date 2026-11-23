@@ -124,6 +124,20 @@ services:
       postgres: { condition: service_healthy }
     restart: "no"
 
+  # One-shot, then exits: hands the shared volume to the API's user (uid 10001). Volumes created by versions that ran the
+  # API as root are owned by root; without this the API could not renew the bundled agent's token. Only CHOWN/FOWNER.
+  shared-volume:
+    image: *api-image
+    user: "0:0"
+    command: ["sh", "-c", "chown -R 10001:0 /shared && chmod 0770 /shared && (chmod 0640 /shared/agent.token 2>/dev/null || true)"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER]
+    network_mode: none
+    volumes:
+      - host_agent:/shared
+    restart: "no"
+
   api:
     <<: [*hardening, *readonly]
     image: *api-image
@@ -141,6 +155,7 @@ services:
         required: false
     depends_on:
       migrate: { condition: service_completed_successfully }
+      shared-volume: { condition: service_completed_successfully }
     volumes:
       - host_agent:/shared
     healthcheck:
@@ -153,8 +168,7 @@ services:
   worker:                                    # checks, alerts, scans, retention, scheduled messages
     <<: [*hardening, *readonly]
     image: *api-image
-    command: ["python", "-m", "app.worker"]
-    cap_add: [NET_RAW]                       # ping checks
+    command: ["python", "-m", "app.worker"]   # pings with unprivileged ICMP sockets: no extra capability
     environment:
       <<: *app-env
       CHECK_INTERVAL_SECONDS: ${CHECK_INTERVAL_SECONDS:-60}
@@ -200,6 +214,7 @@ services:
     image: *frontend-image
     environment:
       BACKEND_URL: http://api:8000
+      HOSTNAME: 0.0.0.0                      # listen address (Docker's default, the container ID, may not resolve)
       TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}  # whose X-Forwarded-For is believed (default: this machine only)
     depends_on:
       api: { condition: service_healthy }

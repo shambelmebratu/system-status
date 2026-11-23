@@ -32,6 +32,30 @@ The supported environment settings include `POSTGRES_DB`, `POSTGRES_USER`, `POST
 
 ## Security model
 
+### Production checklist
+
+Before monitoring real servers:
+
+- [ ] **HTTPS:** set `PUBLIC_URL=https://…`, `COOKIE_SECURE=true` and `FRONTEND_BIND=127.0.0.1`, with nginx in front (see *HTTPS with nginx*). Agents refuse plain HTTP to public addresses.
+- [ ] **Secrets:**
+  - generate `JWT_SECRET` and `POSTGRES_PASSWORD` with `openssl rand -hex 32`;
+  - optionally set a separate `ENCRYPTION_KEY`;
+  - store `.env` away from database backups (both together decrypt the stored tokens);
+  - set `chmod 600 .env`.
+- [ ] **Admin accounts:** require two-factor sign-in for admins (*Security → Sign-in*), give people the lowest role they need, and remove the first admin's temporary password.
+- [ ] **Alert channels:** rotate any bot token or webhook URL that has ever been pasted into a chat, ticket or log.
+- [ ] **The machine running SM-Watch:**
+  - its `host-agent` has root-equivalent access through the Docker socket; set `HOST_AGENT_LOGS=nodocker` if container logs aren't needed;
+  - firewall everything except 80/443 (and SSH from your own addresses).
+- [ ] **Agents:**
+  - install them with the dashboard's join command;
+  - give join links the shortest life and a server limit;
+  - use push mode, which needs no inbound port;
+  - choose `SMWATCH_LOGS=nodocker` or `off` where container logs aren't needed.
+- [ ] **Versions:** pin `SMWATCH_VERSION` to a release, and keep the CI tests and dependency audits switched on so no image is published untested.
+- [ ] **Backups:** a nightly `pg_dump`, plus a copy of `.env`, kept separately. Test a restore.
+
+
 SM-Watch holds credentials that reach every server you monitor, so this section says what each credential can do, how it can be abused, and how to respond. Short version: sign in over **HTTPS only**, keep agent install links short-lived, read the **Audit log**, and rotate or revoke an agent token the moment you doubt it.
 
 ### What each credential can do
