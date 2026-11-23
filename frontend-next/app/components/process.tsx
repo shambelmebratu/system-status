@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { Icon } from './ui';
-import { api, post } from '../lib/api';
+import { api, ApiError, post } from '../lib/api';
 import { duration } from '../lib/format';
 
 type Proc = {
@@ -27,13 +27,26 @@ export function ProcessDrawer({ serverId, pid, name, onClose }: { serverId: numb
     setBusy(true); setError(''); setProc(null);
     try {
       const { id } = await post<{ id: number }>(`/servers/${serverId}/processes/${target}`);
-      for (let i = 0; i < 4; i++) {
-        const r = await api<{ status: string; output: string; error: string | null }>(`/servers/${serverId}/logs/${id}?wait=15`);
-        if (r.status === 'done') { setProc(JSON.parse(r.output)); return; }
-        if (r.status === 'error') { setError(r.error ?? 'The agent could not inspect this process'); return; }
+      // Short waits, repeated: a proxy in front of SM-Watch with a short timeout may cut a long-held request (HTTP 499 / 502 / 504),
+      // and a busy server answers slowly. Such a cut is retried; only the agent's own error, or 90 s of silence, ends the wait.
+      const deadline = Date.now() + 90_000;
+      let cuts = 0;
+      while (Date.now() < deadline) {
+        try {
+          const r = await api<{ status: string; output: string; error: string | null }>(`/servers/${serverId}/logs/${id}?wait=8`);
+          if (r.status === 'done') { setProc(JSON.parse(r.output)); return; }
+          if (r.status === 'error') { setError(r.error ?? 'The agent could not inspect this process'); return; }
+        } catch (e) {
+          const status = (e as ApiError).status;
+          if (![0, 408, 499, 502, 503, 504].includes(status ?? 0) || ++cuts > 12) throw e;
+          await new Promise(r => setTimeout(r, 1000));
+        }
       }
-      setError('The agent did not answer in time.');
-    } catch (e) { setError((e as Error).message); } finally { setBusy(false); }
+      setError('The agent did not answer within 90 seconds. It may be offline or the server overloaded. The finding itself still shows the process path, user and command.');
+    } catch (e) {
+      const status = (e as ApiError).status;
+      setError(status === 499 || status === 504 ? `The connection was cut before the agent answered (HTTP ${status}): a proxy in front of SM-Watch closes slow requests. Press refresh to try again.` : (e as Error).message);
+    } finally { setBusy(false); }
   }, [serverId]);
   useEffect(() => { void load(current); }, [current, load]);
   useEffect(() => { const k = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); }; window.addEventListener('keydown', k); return () => window.removeEventListener('keydown', k); }, [onClose]);
