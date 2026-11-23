@@ -91,9 +91,13 @@ function ServerTag({ who, onPick }: { who: Partial<Who> | null | undefined; onPi
 }
 
 /* ---------------------------------------------------------------- page */
-type DrawerState = { kind: 'server'; id: number } | { kind: 'finding'; finding: Finding; from?: number } | null;
-type SecApi = { o: Overview; openServer: (id: number) => void; openFinding: (f: Finding, from?: number) => void; go: (t: Tab) => void; filterTo: (id: number) => void;
-  reload: () => Promise<void>; version: number; changed: () => void };
+/** The part of a server's drawer a click should land on (it scrolls there and highlights it). */
+type Focus = 'threats' | 'hardening' | 'updates' | 'exposure' | 'ssh';
+/** How a section opens when a number or item elsewhere is clicked: already filtered to what that number counted. */
+type Preset = { sev?: Severity[]; failedOnly?: boolean; riskyOnly?: boolean; highlight?: string };
+type DrawerState = { kind: 'server'; id: number; focus?: Focus; port?: number } | { kind: 'finding'; finding: Finding; from?: number } | { kind: 'tls'; id: number } | null;
+type SecApi = { o: Overview; openServer: (id: number, focus?: Focus, port?: number) => void; openFinding: (f: Finding, from?: number) => void; openTls: (id: number) => void;
+  go: (t: Tab, preset?: Preset) => void; filterTo: (id: number) => void; reload: () => Promise<void>; version: number; changed: () => void };
 const SecCtx = createContext<SecApi | null>(null);
 const useSec = () => useContext(SecCtx)!;
 const SECTIONS: Tab[] = SEC_SECTIONS;
@@ -108,6 +112,9 @@ export function Security() {
   const setTab = (t: Tab) => navigate(t === 'overview' ? 'security' : `security/${t}`);
   const [drawer, setDrawer] = useState<DrawerState>(null);
   const [version, setVersion] = useState(0);
+  const [preset, setPreset] = useState<{ tab: Tab; data: Preset; n: number }>({ tab: 'overview', data: {}, n: 0 });
+  const presetFor = (t: Tab): Preset => (preset.tab === t ? preset.data : {});
+  const go = (t: Tab, p?: Preset) => { setPreset(x => ({ tab: t, data: p ?? {}, n: x.n + 1 })); setDrawer(null); setTab(t); };
   const o = data.value;
   const k8s = o?.kubernetes;
   const n = useMemo(() => {
@@ -131,11 +138,12 @@ export function Security() {
   const tabs = visibleTabs(group, !!k8s?.clusters, isAdmin);
   const label = (t: Tab) => TAB_LABEL[t] ?? SEC_NAV.find(i => i.id === t)?.label ?? t;
   const sec: SecApi | null = o ? {
-    o, go: setTab, reload: data.reload, version, changed: () => { setVersion(v => v + 1); void data.reload(); },
-    openServer: id => setDrawer({ kind: 'server', id }), openFinding: (f, from) => setDrawer({ kind: 'finding', finding: f, from }),
+    o, go, reload: data.reload, version, changed: () => { setVersion(v => v + 1); void data.reload(); },
+    openServer: (id, focus, port) => setDrawer({ kind: 'server', id, focus, port }), openFinding: (f, from) => setDrawer({ kind: 'finding', finding: f, from }),
+    openTls: id => setDrawer({ kind: 'tls', id }),
     filterTo: id => { setServer(String(id)); setDrawer(null); },
   } : null;
-  const pick = (id: number) => setDrawer({ kind: 'server', id });
+  const pickTo = (focus: Focus) => (id: number) => setDrawer({ kind: 'server', id, focus });   // a server clicked in a section opens at that section's part
   return (
     <>
       <div className="topbar"><div><h1>Security</h1><p className="muted sm">Attacks and break-ins, signs of malware, missing patches, weak settings, what is exposed to the internet, and how people sign in.</p></div>
@@ -144,24 +152,25 @@ export function Security() {
         <div className="sec-main">
           <div className="sec-main-head"><h2>{group.label}</h2><span className="grow" /><ServerFilter servers={servers} value={server} onChange={setServer} /></div>
           {tabs.length > 1 && <div className="ktabs sec-subtabs" role="tablist">{tabs.map(t => { const c = (n as Record<string, number>)[COUNT_KEY[t] ?? ''] ?? 0;
-            return <button key={t} role="tab" aria-selected={tab === t} className={tab === t ? 'on' : ''} onClick={() => setTab(t)}>{label(t)}{c > 0 && <span className={`sub-count ${COUNT_TONE[t] ?? 'warn'}`} title={COUNT_HINT[t]?.(c)}>{c}</span>}</button>; })}</div>}
+            return <button key={t} role="tab" aria-selected={tab === t} className={tab === t ? 'on' : ''} onClick={() => go(t)}>{label(t)}{c > 0 && <span className={`sub-count ${COUNT_TONE[t] ?? 'warn'}`} title={COUNT_HINT[t]?.(c)}>{c}</span>}</button>; })}</div>}
           {data.error && <div className="err">{data.error}</div>}
           {!o || !sec ? <div className="card"><p className="muted"><span className="spinner" /> Loading…</p></div> : o.servers.length === 0 && server ? <div className="card"><Empty title="No server matches">Nothing matches “{server}”. Search by name, host name, IP address or server number. <button className="lg-link" onClick={() => setServer('')}>Show all servers</button></Empty></div> :
             <SecCtx.Provider value={sec}>
               {tab === 'overview' && <SecurityHome server={server} />}
               {tab === 'activity' && <Activity server={server} />}
               {tab === 'servers' && <ServersSection />}
-              {tab === 'threats' && <Threats server={server} />}
+              {tab === 'threats' && <Threats key={`t${preset.n}`} server={server} preset={presetFor('threats')} />}
               {tab === 'kubernetes' && <KubernetesSecurity reload={data.reload} />}
-              {tab === 'ssh' && <SshAccess server={server} pick={pick} />}
-              {tab === 'updates' && <UpdatesView o={o} pick={pick} />}
-              {tab === 'hardening' && <HardeningView server={server} pick={pick} />}
-              {tab === 'exposure' && <Exposure o={o} reload={data.reload} pick={pick} />}
+              {tab === 'ssh' && <SshAccess server={server} pick={pickTo('ssh')} />}
+              {tab === 'updates' && <UpdatesView o={o} pick={pickTo('updates')} />}
+              {tab === 'hardening' && <HardeningView key={`h${preset.n}`} server={server} pick={pickTo('hardening')} preset={presetFor('hardening')} />}
+              {tab === 'exposure' && <Exposure key={`e${preset.n}`} o={o} reload={data.reload} pick={pickTo('exposure')} preset={presetFor('exposure')} />}
               {tab === 'alerts' && <SecurityAlerts />}
               {tab === 'reports' && <Reports server={server} servers={servers} />}
               {tab === 'signin' && o.two_factor && <SignIn tf={o.two_factor} reload={data.reload} />}
               {tab === 'signin' && !o.two_factor && <div className="card"><p className="muted">Sign-in settings apply to everyone. <button className="lg-link" onClick={() => setServer('')}>Clear the server filter</button> to see them.</p></div>}
-              {drawer?.kind === 'server' && <ServerDrawer id={drawer.id} onClose={() => setDrawer(null)} />}
+              {drawer?.kind === 'server' && <ServerDrawer key={`${drawer.id}-${drawer.focus ?? ''}-${drawer.port ?? ''}`} id={drawer.id} focus={drawer.focus} port={drawer.port} onClose={() => setDrawer(null)} />}
+              {drawer?.kind === 'tls' && <TlsDrawer id={drawer.id} onClose={() => setDrawer(null)} />}
               {drawer?.kind === 'finding' && <FindingDrawer finding={drawer.finding} from={drawer.from} onClose={() => setDrawer(null)} />}
             </SecCtx.Provider>}
         </div>
@@ -257,19 +266,19 @@ function ServerFilter({ servers, value, onChange }: { servers: Who[]; value: str
 }
 
 /* ---------------------------------------------------------------- exposure, counted once */
-type ExposedPort = OpenPort & { where: string; serverId?: number };
+type ExposedPort = OpenPort & { where: string; serverId?: number; clusterId?: number };
 /** Critical / high ports reachable from SM-Watch, each counted once: a Kubernetes NodePort appears in its node's server scan AND in
  * the cluster scan (same port on every node), and the same address can be both a server and a cluster node. */
 function riskyPorts(o: Overview): ExposedPort[] {
   const seen = new Set<string>(), out: ExposedPort[] = [];
   const key = (address: string | undefined, p: OpenPort) => (p.source === 'kubernetes' && /NodePort/.test(p.service) ? `nodeport:${p.port}` : `${address ?? ''}:${p.port}`);
-  const add = (address: string | undefined, p: OpenPort, where: string, serverId?: number) => {
+  const add = (address: string | undefined, p: OpenPort, where: string, serverId?: number, clusterId?: number) => {
     if (p.risk !== 'critical' && p.risk !== 'high') return;
     const k = key(address, p);
-    if (!seen.has(k)) { seen.add(k); out.push({ ...p, where, serverId }); }
+    if (!seen.has(k)) { seen.add(k); out.push({ ...p, where, serverId, clusterId }); }
   };
   for (const s of o.servers) for (const p of s.scan?.results.open ?? []) add(s.scan?.address, p, s.name, s.id);
-  for (const c of o.clusters ?? []) for (const p of c.scan?.results.open ?? []) add(p.address, p, `cluster ${c.name}`);
+  for (const c of o.clusters ?? []) for (const p of c.scan?.results.open ?? []) add(p.address, p, `cluster ${c.name}`, undefined, c.id);
   return out;
 }
 const weakTls = (o: Overview) => o.services.filter(s => s.tls && ['C', 'D', 'F'].includes(s.tls.grade ?? ''));
@@ -346,12 +355,13 @@ const groupLabel = (kind: string) => GROUPS.find(g => g.kinds.includes(kind))?.l
 
 /* ---------------------------------------------------------------- overview */
 type ActivityItem = { at: string; type: 'found' | 'acknowledged' | 'resolved' | 'scan' | 'alert' | 'action'; severity: Severity; title: string; detail?: string;
-  server: { id: number; name: string } | null; finding_id?: number; kind?: string | null; actor?: string | null; sent?: boolean };
+  server: { id: number; name: string } | null; finding_id?: number; kind?: string | null; actor?: string | null; sent?: boolean;
+  target?: { type: 'server' | 'service' | 'cluster' | string; id: number } };
 const ACT_ICON: Record<ActivityItem['type'], string> = { found: 'alert', acknowledged: 'check', resolved: 'check', scan: 'globe', alert: 'bell', action: 'settings' };
 const ACT_LABEL: Record<ActivityItem['type'], string> = { found: 'Found', acknowledged: 'Acknowledged', resolved: 'Resolved', scan: 'Scan', alert: 'Alert', action: 'Change' };
 
 function SecurityHome({ server }: { server: string }) {
-  const { o, go, openServer } = useSec();
+  const { o, go, openServer, openTls } = useSec();
   const { isAdmin } = useApp();
   const total = overallScore(o);
   const rows = o.servers.map(row => ({ row, score: scoreOf(row) }));
@@ -361,31 +371,35 @@ function SecurityHome({ server }: { server: string }) {
   const crit = o.servers.reduce((a, s) => a + s.threats.critical, 0), high = o.servers.reduce((a, s) => a + s.threats.high, 0);
   const weak = o.servers.reduce((a, s) => a + s.hardening.failed, 0);
   const tf = o.two_factor;
-  // Fix first: the most serious things, each opening where it can be fixed
+  // Fix first: the most serious things. Each one opens exactly that thing (the drawer scrolled to it), never a general page.
   const actions: { sev: Severity; title: string; sub: string; open: () => void }[] = [];
   for (const { row } of rows) {
-    if (row.threats.critical) actions.push({ sev: 'critical', title: `${plural(row.threats.critical, 'critical threat')} on ${row.name}`, sub: 'Possible compromise: look now', open: () => openServer(row.id) });
-    else if (row.threats.high) actions.push({ sev: 'high', title: `${plural(row.threats.high, 'high-risk finding')} on ${row.name}`, sub: 'Review and acknowledge or fix', open: () => openServer(row.id) });
+    const { critical: c, high: h } = row.threats;
+    const what = [c ? plural(c, 'critical threat') : '', h ? plural(h, 'high-risk finding') : ''].filter(Boolean).join(' and ');
+    if (c + h) actions.push({ sev: c ? 'critical' : 'high', title: `${what} on ${row.name}`,
+      sub: row.threats.critical ? 'possible compromise: open the evidence' : 'review it, then fix or acknowledge', open: () => openServer(row.id, 'threats') });
   }
-  for (const e of exposed) actions.push({ sev: e.risk === 'critical' ? 'critical' : 'high', title: `${e.service.split(' · ')[0]} reachable on ${e.where}`, sub: `port ${e.port}${e.source ? ` · ${SOURCE_LABEL[e.source] ?? e.source}` : ''}`,
-    open: () => (e.serverId ? openServer(e.serverId) : go('exposure')) });
-  if (o.kubernetes && o.kubernetes.critical + o.kubernetes.high) actions.push({ sev: o.kubernetes.critical ? 'critical' : 'high', title: `${plural(o.kubernetes.critical + o.kubernetes.high, 'serious Kubernetes risk')}`, sub: 'Privileged or malicious workloads, too much access', open: () => go('kubernetes') });
-  for (const { row } of rows) if (row.updates?.security) actions.push({ sev: row.updates.security > 10 ? 'high' : 'medium', title: `${plural(row.updates.security, 'security update')} on ${row.name}`, sub: row.updates.reboot_required ? 'and a reboot is needed' : 'install them soon', open: () => openServer(row.id) });
-  for (const { row } of rows) if (row.hardening.failed) actions.push({ sev: 'medium', title: `${plural(row.hardening.failed, 'weak setting')} on ${row.name}`, sub: 'see Hardening', open: () => openServer(row.id) });
-  for (const s of weakTls(o)) actions.push({ sev: s.tls!.grade === 'F' ? 'high' : 'medium', title: `Weak TLS on ${s.name}`, sub: `grade ${s.tls!.grade}`, open: () => go('exposure') });
-  if (tf && tf.enabled < tf.total) actions.push({ sev: tf.without.some(u => u.role === 'admin') ? 'high' : 'low', title: `${plural(tf.total - tf.enabled, 'person')} without two-factor sign-in`, sub: tf.without.some(u => u.role === 'admin') ? 'including admins' : 'turn it on in Settings', open: () => go('signin') });
+  for (const e of exposed) actions.push({ sev: e.risk === 'critical' ? 'critical' : 'high', title: `${e.service.split(' · ')[0]} reachable on ${e.where}`, sub: `port ${e.port}${e.source ? ` · via ${SOURCE_LABEL[e.source] ?? e.source}` : ''}`,
+    open: () => (e.serverId ? openServer(e.serverId, 'exposure', e.port) : go('exposure', { highlight: `cluster-${e.clusterId}` })) });
+  if (o.kubernetes && o.kubernetes.critical + o.kubernetes.high) actions.push({ sev: o.kubernetes.critical ? 'critical' : 'high', title: `${plural(o.kubernetes.critical + o.kubernetes.high, 'serious Kubernetes risk')}`, sub: 'privileged or malicious workloads, too much access', open: () => go('kubernetes') });
+  for (const { row } of rows) if (row.updates?.security) actions.push({ sev: row.updates.security > 10 ? 'high' : 'medium', title: `${plural(row.updates.security, 'security update')} waiting on ${row.name}`, sub: row.updates.reboot_required ? 'and a reboot is needed' : 'install them soon', open: () => openServer(row.id, 'updates') });
+  for (const { row } of rows) if (row.hardening.failed) actions.push({ sev: 'medium', title: `${plural(row.hardening.failed, 'hardening check')} failed on ${row.name}`, sub: 'see which settings to change', open: () => openServer(row.id, 'hardening') });
+  for (const s of weakTls(o)) actions.push({ sev: s.tls!.grade === 'F' ? 'high' : 'medium', title: `Weak TLS on ${s.name}`, sub: `grade ${s.tls!.grade}: see what to fix`, open: () => openTls(s.id) });
+  if (tf && tf.enabled < tf.total) actions.push({ sev: tf.without.some(u => u.role === 'admin') ? 'high' : 'low', title: `${plural(tf.total - tf.enabled, 'person')} without two-factor sign-in`, sub: tf.without.some(u => u.role === 'admin') ? 'including admins' : 'ask them to turn it on in Settings', open: () => go('signin') });
   const order: Record<Severity, number> = { critical: 0, high: 1, medium: 2, low: 3 };
   actions.sort((a, b) => order[a.sev] - order[b.sev]);
+  const [allActions, setAllActions] = useState(false);
   const headline = total.score == null ? 'Waiting for the first checks' : total.score >= 90 ? 'Looking good' : total.score >= 75 ? 'A few things to tidy up' : total.score >= 60 ? 'Needs attention' : 'At risk';
   const scored = rows.filter(x => x.score.score != null);
-  const kpis: { label: string; value: string; tone: string; tab: Tab }[] = [
-    { label: 'Threats', value: String(crit + high), tone: crit ? 'bad' : high ? 'warn' : 'good', tab: 'threats' },
-    { label: 'Failed SSH logins 24 h', value: o.ssh.total.toLocaleString(), tone: o.ssh.total > 500 ? 'bad' : o.ssh.total ? 'warn' : 'good', tab: 'ssh' },
-    { label: 'Security updates', value: String(secUpdates), tone: secUpdates ? 'warn' : 'good', tab: 'updates' },
-    { label: 'Weak settings', value: String(weak), tone: weak ? 'warn' : 'good', tab: 'hardening' },
-    { label: 'Risky ports open', value: String(exposed.length), tone: exposed.some(e => e.risk === 'critical') ? 'bad' : exposed.length ? 'warn' : 'good', tab: 'exposure' },
+  // Every number says what it counts, and opens a list that shows exactly those items.
+  const kpis: { label: string; value: string; tone: string; hint: string; open: () => void }[] = [
+    { label: 'Serious threats', value: String(crit + high), tone: crit ? 'bad' : high ? 'warn' : 'good', hint: 'critical and high findings not yet acknowledged', open: () => go('threats', { sev: ['critical', 'high'] }) },
+    { label: 'Exposed to the internet', value: String(exposed.length + weakTls(o).length), tone: exposed.some(e => e.risk === 'critical') ? 'bad' : exposed.length + weakTls(o).length ? 'warn' : 'good', hint: 'risky open ports plus https services with weak TLS', open: () => go('exposure', { riskyOnly: true }) },
+    { label: 'Security updates waiting', value: String(secUpdates), tone: secUpdates ? 'warn' : 'good', hint: 'security packages not yet installed, all servers', open: () => go('updates') },
+    { label: 'Failed hardening checks', value: String(weak), tone: weak ? 'warn' : 'good', hint: 'settings that weaken a server, all servers', open: () => go('hardening', { failedOnly: true }) },
+    { label: 'Failed SSH logins (24 h)', value: o.ssh.total.toLocaleString(), tone: o.ssh.total > 500 ? 'bad' : o.ssh.total ? 'warn' : 'good', hint: 'password guesses against your servers, last 24 hours', open: () => go('ssh') },
   ];
-  if (tf && isAdmin) kpis.push({ label: 'Two-factor', value: `${tf.enabled}/${tf.total}`, tone: tf.enabled === tf.total ? 'good' : 'warn', tab: 'signin' });
+  if (tf && isAdmin) kpis.push({ label: 'People with two-factor', value: `${tf.enabled} of ${tf.total}`, tone: tf.enabled === tf.total ? 'good' : 'warn', hint: 'active accounts that sign in with a second factor', open: () => go('signin') });
   const hist = o.ssh.hourly ?? [];
   const peak = Math.max(1, ...hist.map(h => h.attempts));
   const worst = [...scored].sort((a, b) => a.score.score! - b.score.score!).slice(0, 5);
@@ -398,15 +412,20 @@ function SecurityHome({ server }: { server: string }) {
           <h2>{headline}</h2>
           <p className="muted sm">{total.score == null ? 'Install the agent (2.15+) on your servers to see threats, updates and weak settings.' :
             `${plural(scored.length, 'server')} scored${total.worst && total.worst.score.score! < 75 ? `; the weakest is ${total.worst.row.name} (${total.worst.score.score}).` : '.'} ${actions.filter(a => a.sev === 'critical' || a.sev === 'high').length ? `${plural(actions.filter(a => a.sev === 'critical' || a.sev === 'high').length, 'serious item')} to fix first.` : 'Nothing serious to fix.'}`}</p>
-          {total.reasons.length > 0 && <div className="chips">{total.reasons.map(r => <button key={r.text} className="chip" onClick={() => go(r.tab)}>{r.text} <span className="muted">−{r.points}</span></button>)}</div>}
+          <details className="sec-howto"><summary>How is the score calculated?</summary>
+            <p className="sm muted">Each server starts at 100 and loses points for what is wrong: a critical threat −30, a high-risk finding −12, a finding to review −3,
+              a critical port reachable from outside −20, a risky port −8, each waiting security update −2, a needed reboot −5, each failed hardening check −4,
+              and heavy SSH attacks −5. Each kind is capped, so one problem cannot hide the others. The page score is the average of your servers; when one
+              server is far worse than the rest it counts more, and weak TLS or serious Kubernetes risks take points off too. 90+ is A, 75+ B, 60+ C, 40+ D, below 40 F.</p></details>
+          {total.reasons.length > 0 && <div className="chips">{total.reasons.map(r => <button key={r.text} className="chip" onClick={() => go(r.tab, r.tab === 'exposure' ? { riskyOnly: true } : undefined)}>{r.text} <span className="muted">−{r.points}</span></button>)}</div>}
         </div>
-        <div className="sec-kpis">{kpis.map(k => <button key={k.label} className={`sec-kpi ${k.tone}`} onClick={() => go(k.tab)}><b>{k.value}</b><small>{k.label}</small></button>)}</div>
+        <div className="sec-kpis">{kpis.map(k => <button key={k.label} className={`sec-kpi ${k.tone}`} onClick={k.open} title={k.hint}><b>{k.value}</b><small>{k.label}</small><span className="sec-kpi-hint">{k.hint}</span></button>)}</div>
       </section>
       <div className="sec-home">
         <section className="card"><div className="card-head"><h2>Fix first</h2><span className="grow" /><span className="muted sm">{actions.length ? `${actions.length} item${actions.length === 1 ? '' : 's'}` : ''}</span></div>
           {actions.length === 0 ? <div className="sec-allgood"><Icon name="check" size={20} /><div><b>Nothing to fix right now</b><div className="muted sm">No threats, risky ports, pending security updates or weak settings found.</div></div></div>
-            : <ul className="sec-actions">{actions.slice(0, 8).map((a, i) => <li key={i}><button onClick={a.open}><span className={`sev-dot ${a.sev}`} /><span className="grow"><b>{a.title}</b><small className="muted">{a.sub}</small></span><span className={`sev ${a.sev}`}>{SEV_LABEL[a.sev]}</span></button></li>)}</ul>}
-          {actions.length > 8 && <p className="muted sm">and {actions.length - 8} more: see <button className="lg-link" onClick={() => go('servers')}>Servers</button>.</p>}
+            : <ul className="sec-actions">{(allActions ? actions : actions.slice(0, 8)).map((a, i) => <li key={i}><button onClick={a.open}><span className={`sev-dot ${a.sev}`} /><span className="grow"><b>{a.title}</b><small className="muted">{a.sub}</small></span><span className={`sev ${a.sev}`}>{SEV_LABEL[a.sev]}</span></button></li>)}</ul>}
+          {actions.length > 8 && <button className="lg-link sm" onClick={() => setAllActions(!allActions)}>{allActions ? 'Show the first 8' : `Show all ${actions.length} (${actions.length - 8} more)`}</button>}
         </section>
         <section className="card"><div className="card-head"><h2>Recent activity</h2><span className="grow" /><button className="lg-link sm" onClick={() => go('activity')}>All activity →</button></div>
           {!act.value ? <p className="muted"><span className="spinner" /> Loading…</p> : act.value.length === 0 ? <p className="muted sm">Nothing happened in the last 7 days.</p> : <ActivityList items={act.value} compact />}
@@ -429,12 +448,19 @@ function SecurityHome({ server }: { server: string }) {
 
 /* ---------------------------------------------------------------- activity */
 function ActivityList({ items, compact }: { items: ActivityItem[]; compact?: boolean }) {
-  const { openServer, openFinding } = useSec();
+  const { openServer, openFinding, openTls, go } = useSec();
   const { toast } = useApp();
-  async function openItem(i: ActivityItem) {
-    if (!i.finding_id) return;
-    try { openFinding(await api<Finding>(`/security/findings/${i.finding_id}`)); } catch (e) { toast((e as Error).message, true); }
-  }
+  // Each entry opens what it is about: a finding its finding, a scan its result, an alert the part of the server it concerns.
+  const focusOf = (kind?: string | null): Focus => (kind === 'exposure' ? 'exposure' : kind?.startsWith('ssh') ? 'ssh' : 'threats');
+  const opener = (i: ActivityItem): (() => void) | null => {
+    if (i.finding_id) return () => { api<Finding>(`/security/findings/${i.finding_id}`).then(f => openFinding(f)).catch(e => toast((e as Error).message, true)); };
+    const t = i.target;
+    if (!t || (i.type !== 'scan' && i.type !== 'alert')) return null;
+    if (t.type === 'server') return () => openServer(t.id, i.type === 'scan' ? 'exposure' : focusOf(i.kind));
+    if (t.type === 'service') return () => openTls(t.id);
+    if (t.type === 'cluster') return () => (i.type === 'scan' || i.kind === 'exposure' ? go('exposure', { highlight: `cluster-${t.id}` }) : go('kubernetes'));
+    return null;
+  };
   let day = '';
   return <ol className={`sec-timeline ${compact ? 'compact' : ''}`}>{items.map((i, n) => {
     const d = new Date(i.at).toLocaleDateString([], { weekday: 'long', day: 'numeric', month: 'short' });
@@ -443,10 +469,10 @@ function ActivityList({ items, compact }: { items: ActivityItem[]; compact?: boo
       <li className={`sec-tl ${i.type} ${i.type === 'found' || i.type === 'alert' ? i.severity : ''}`}>
         <span className="sec-tl-icon"><Icon name={ACT_ICON[i.type]} size={13} /></span>
         <div className="sec-tl-body">
-          <div className="sec-tl-head">{i.finding_id ? <button className="lg-link sec-tl-title" onClick={() => void openItem(i)}>{i.title}</button> : <b className="sec-tl-title">{i.title}</b>}
+          <div className="sec-tl-head">{(() => { const open = opener(i); return open ? <button className="lg-link sec-tl-title" onClick={open}>{i.title}</button> : <b className="sec-tl-title">{i.title}</b>; })()}
             {i.type === 'found' && <span className={`sev ${i.severity}`}>{SEV_LABEL[i.severity]}</span>}</div>
           <div className="sec-tl-meta muted sm"><span className="tag">{ACT_LABEL[i.type]}</span>
-            {i.server && <button className="lg-link" onClick={() => openServer(i.server!.id)}><Icon name="server" size={11} /> {i.server.name}</button>}
+            {i.server && <button className="lg-link" onClick={() => openServer(i.server!.id, i.type === 'scan' ? 'exposure' : i.type === 'alert' ? focusOf(i.kind) : 'threats')}><Icon name="server" size={11} /> {i.server.name}</button>}
             {i.actor && <span>by {i.actor}</span>}
             {i.type === 'alert' && <span className={i.sent ? 'good' : ''}>{i.sent ? 'delivered' : i.detail}</span>}
             <span title={new Date(i.at).toLocaleString()}>{timeAgo(i.at)}</span></div>
@@ -509,18 +535,19 @@ function ServersSection() {
 }
 
 /* ---------------------------------------------------------------- threats */
-function Threats({ server }: { server: string }) {
+function Threats({ server, preset }: { server: string; preset: Preset }) {
   const { openFinding, version } = useSec();
   const [status, setStatus] = useState<'attention' | 'acknowledged' | 'resolved' | 'all'>('attention');
   const [group, setGroup] = useState('');
-  const [sev, setSev] = useState<'' | Severity>('');
+  const [sevs, setSevs] = useState<Severity[]>(preset.sev ?? []);      // empty = every severity
+  const toggleSev = (x: Severity) => setSevs(v => (v.includes(x) ? v.filter(y => y !== x) : [...v, x]));
   const [q, setQ] = useState('');
   const [allGroups, setAllGroups] = useState(false);
   const list = usePoll(() => api<Finding[]>(withQ(`/security/findings?status=${status}&limit=500`, server)), [status, server, version], 30000, true);
   const all = list.value ?? [];
   const counts = useMemo(() => Object.fromEntries(GROUPS.map(g => [g.id, all.filter(f => g.kinds.includes(f.kind)).length])), [all]);
   const needle = q.trim().toLowerCase();
-  const shown = all.filter(f => (!group || groupOf(f.kind) === group) && (!sev || f.severity === sev)
+  const shown = all.filter(f => (!group || groupOf(f.kind) === group) && (!sevs.length || sevs.includes(f.severity))
     && (!needle || [f.title, f.detail, f.server?.name, f.evidence.process, f.evidence.path, f.evidence.user, f.evidence.ip].some(v => v && v.toLowerCase().includes(needle))));
   const groups = allGroups ? GROUPS : GROUPS.filter(g => counts[g.id] || g.id === group);
   const sevCount = (s: Severity) => all.filter(f => f.severity === s && (!group || groupOf(f.kind) === group)).length;
@@ -528,15 +555,15 @@ function Threats({ server }: { server: string }) {
     <div className="grid">
       <div className="filterbar"><div className="seg">{([['attention', 'Needs attention'], ['acknowledged', 'Acknowledged'], ['resolved', 'Resolved'], ['all', 'All']] as const).map(([id, l]) => <button key={id} className={status === id ? 'on' : ''} onClick={() => setStatus(id)}>{l}</button>)}</div>
         <input className="sec-search" value={q} onChange={e => setQ(e.target.value)} placeholder="Search title, server, process, path, user, address" aria-label="Search findings" />
-        <div className="seg">{(['critical', 'high', 'medium', 'low'] as Severity[]).map(s => <button key={s} className={sev === s ? 'on' : ''} onClick={() => setSev(sev === s ? '' : s)}><span className={`sev-dot ${s}`} /> {SEV_LABEL[s]} <span className="muted">{sevCount(s)}</span></button>)}</div></div>
+        <div className="seg">{(['critical', 'high', 'medium', 'low'] as Severity[]).map(s => <button key={s} className={sevs.includes(s) ? 'on' : ''} onClick={() => toggleSev(s)}><span className={`sev-dot ${s}`} /> {SEV_LABEL[s]} <span className="muted">{sevCount(s)}</span></button>)}</div></div>
       <div className="sec-cats">
         <button className={`chip-btn ${!group ? 'on' : ''}`} onClick={() => setGroup('')}>All kinds <span className="muted">{all.length}</span></button>
         {groups.map(g => <button key={g.id} className={`chip-btn ${group === g.id ? 'on' : ''}`} title={g.hint} onClick={() => setGroup(group === g.id ? '' : g.id)}>{g.label} <span className="muted">{counts[g.id] ?? 0}</span></button>)}
         <button className="lg-link sm" onClick={() => setAllGroups(!allGroups)}>{allGroups ? 'hide empty kinds' : `show all ${GROUPS.length} kinds`}</button>
       </div>
       {list.error && <div className="err">{list.error}</div>}
-      {!list.value ? <div className="card"><p className="muted"><span className="spinner" /> Loading…</p></div> : shown.length === 0 ? <div className="card"><Empty title={status === 'attention' && !group && !q && !sev ? 'No signs of compromise' : 'Nothing here'}>
-        {status === 'attention' && !group && !q && !sev ? 'Agents look for running malware, back doors, suspicious logins and system changes every 10 minutes. Anything they find shows up here and is sent to your alert channels.' : 'No findings match these filters.'}</Empty></div>
+      {!list.value ? <div className="card"><p className="muted"><span className="spinner" /> Loading…</p></div> : shown.length === 0 ? <div className="card"><Empty title={status === 'attention' && !group && !q && !sevs.length ? 'No signs of compromise' : 'Nothing here'}>
+        {status === 'attention' && !group && !q && !sevs.length ? 'Agents look for running malware, back doors, suspicious logins and system changes every 10 minutes. Anything they find shows up here and is sent to your alert channels.' : 'No findings match these filters.'}</Empty></div>
         : <div className="card sec-flist">{shown.map(f => (
           <button key={f.id} className={`sec-frow ${f.severity} ${f.resolved_at ? 'resolved' : f.acknowledged_at ? 'acked' : ''}`} onClick={() => openFinding(f)}>
             <span className={`sev ${f.severity}`}>{SEV_LABEL[f.severity]}</span>
@@ -611,13 +638,25 @@ function FindingDrawer({ finding, from, onClose }: { finding: Finding; from?: nu
   );
 }
 
-function ServerDrawer({ id, onClose }: { id: number; onClose: () => void }) {
-  const { o, go, openFinding, filterTo, version, changed } = useSec();
+function ServerDrawer({ id, focus, port, onClose }: { id: number; focus?: Focus; port?: number; onClose: () => void }) {
+  const { o, openFinding, filterTo, version, changed } = useSec();
   const { canOperate, toast, go: navigate } = useApp();
   const row = o.servers.find(s => s.id === id);
   const findings = usePoll(() => api<Finding[]>(`/security/findings?server=${id}&status=attention&limit=100`), [id, version], 30000, true);
   const hard = usePoll(() => api<Hardening[]>(`/security/hardening?server=${id}`), [id, version], 120000, true);
   const [busy, setBusy] = useState('');
+  const [target, setTarget] = useState<Focus | undefined>(focus);
+  const parts = useRef<Partial<Record<Focus, HTMLElement | null>>>({});
+  const loaded = !!findings.value && !!hard.value;
+  useEffect(() => {   // land on the part that was clicked (once its data is there) and highlight it
+    if (!target || !loaded) return;
+    const el = parts.current[target];
+    if (!el) return;
+    el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    Object.values(parts.current).forEach(x => x?.classList.remove('sec-flash'));   // only the part just asked for is highlighted
+    void el.offsetWidth; el.classList.add('sec-flash');
+  }, [target, loaded]);
+  const part = (f: Focus) => (el: HTMLElement | null) => { parts.current[f] = el; };
   if (!row) return <DrawerShell label="Server security" title={`Server #${id}`} onClose={onClose}><p className="muted">This server is hidden by the server filter.</p><button className="btn sm" onClick={() => filterTo(id)}>Show this server</button></DrawerShell>;
   const score = scoreOf(row);
   const h = hard.value?.[0];
@@ -631,7 +670,7 @@ function ServerDrawer({ id, onClose }: { id: number; onClose: () => void }) {
       changed();
     } catch (e) { toast((e as Error).message, true); } finally { setBusy(''); }
   }
-  const goto = (t: Tab) => { onClose(); go(t); };
+  const goto = (t: Tab) => setTarget((['threats', 'hardening', 'updates', 'exposure', 'ssh'] as Tab[]).includes(t) ? t as Focus : undefined);   // stays in this drawer
   return (
     <DrawerShell wide label={<><Icon name="server" size={12} /> Server security {addr(row) && <span className="mono">· {addr(row)}</span>}</>} title={row.name} onClose={onClose}
       actions={<><button className="btn sm" onClick={() => navigate(`servers/${id}`)}><Icon name="external" size={13} />Server page</button>
@@ -648,23 +687,59 @@ function ServerDrawer({ id, onClose }: { id: number; onClose: () => void }) {
         <div><small className="muted">Port scan</small><b>{row.scan ? `${timeAgo(row.scan.started_at)} · grade ${row.scan.grade ?? '–'}` : row.scan_unavailable ?? 'not yet'}</b></div>
         <div><small className="muted">Failed SSH logins 24 h</small><b className={row.ssh_24h.total > 100 ? 'bad' : ''}>{row.ssh_24h.total.toLocaleString()}{row.ssh_24h.distinct_ips ? ` from ${plural(row.ssh_24h.distinct_ips, 'address')}` : ''}</b></div>
       </div>
-      <h3 className="drawer-h">Threats needing attention ({findings.value?.length ?? '…'})</h3>
+      <section ref={part('threats')} className="sec-part"><h3 className="drawer-h">Threats needing attention ({findings.value?.length ?? '…'})</h3>
       {!findings.value ? <p className="muted sm"><span className="spinner" /> Loading…</p> : findings.value.length === 0 ? <p className="sm good">None.</p>
         : <div className="sec-flist compact">{findings.value.map(f => <button key={f.id} className={`sec-frow ${f.severity}`} onClick={() => openFinding(f, id)}>
-          <span className={`sev ${f.severity}`}>{SEV_LABEL[f.severity]}</span><span className="sec-frow-main"><b>{f.title}</b><small className="muted">{groupLabel(f.kind)} · {timeAgo(f.first_seen)}</small></span></button>)}</div>}
-      <h3 className="drawer-h">Weak settings ({h ? failed.length : '…'})</h3>
+          <span className={`sev ${f.severity}`}>{SEV_LABEL[f.severity]}</span><span className="sec-frow-main"><b>{f.title}</b><small className="muted">{groupLabel(f.kind)} · {timeAgo(f.first_seen)}</small></span></button>)}</div>}</section>
+      <section ref={part('hardening')} className="sec-part"><h3 className="drawer-h">Failed hardening checks ({h ? failed.length : '…'})</h3>
       {!hard.value ? <p className="muted sm"><span className="spinner" /> Loading…</p> : !h?.supported ? <p className="muted sm">{missing(row, 2, 15)}</p> : failed.length === 0 ? <p className="sm good">All {h.checks.length} checks pass.</p>
-        : <ul className="sec-checks compact">{failed.map(c => <li key={c.id} className={`fail ${c.severity}`}><Icon name="x" size={14} /><div><b>{c.title}</b><div className="muted sm">{c.detail}</div></div></li>)}</ul>}
-      <h3 className="drawer-h">Updates</h3>
+        : <ul className="sec-checks compact">{failed.map(c => <li key={c.id} className={`fail ${c.severity}`}><Icon name="x" size={14} /><div><b>{c.title}</b> <span className={`sev ${c.severity}`}>{SEV_LABEL[c.severity]}</span><div className="muted sm">{c.detail}</div></div></li>)}</ul>}</section>
+      <section ref={part('updates')} className="sec-part"><h3 className="drawer-h">Security updates waiting</h3>
       {!row.updates ? <p className="muted sm">{missing(row, 2, 14)}</p> : row.updates.total === 0 ? <p className="sm good">Up to date.</p> : <>
         <p className="sm">{row.updates.security ? <b className="warn">{plural(row.updates.security, 'security update')}</b> : 'No security updates'}{row.updates.total > row.updates.security ? `, ${row.updates.total - row.updates.security} other` : ''}{row.updates.reboot_required ? ' · reboot needed' : ''}</p>
-        <div className="chips">{row.updates.packages.filter(p => p.security).slice(0, 30).map(p => <span key={p.name} className="chip mono warn" title={p.version}>{p.name}</span>)}</div></>}
-      <h3 className="drawer-h">Reachable from SM-Watch {row.scan?.address ? <span className="mono muted">({row.scan.address})</span> : null}</h3>
-      {!row.scan ? <p className="muted sm">{row.scan_unavailable ?? 'Not scanned yet.'}</p> : open.length === 0 ? <p className="sm good">Nothing reachable.</p> : <OpenPorts open={open} compact />}
-      {row.ssh_24h.top_ips.length > 0 && <><h3 className="drawer-h">Top SSH attackers · 24 h</h3>
-        <table className="tbl"><tbody>{row.ssh_24h.top_ips.slice(0, 5).map(([ip, n]) => <tr key={ip}><td className="mono sm">{ip}</td><td className="num sm">{n.toLocaleString()}</td></tr>)}</tbody></table></>}
+        <div className="chips">{row.updates.packages.filter(p => p.security).slice(0, 30).map(p => <span key={p.name} className="chip mono warn" title={p.version}>{p.name}</span>)}</div>
+        {row.updates.manager === 'apt' && <p className="muted sm">Install with <code>sudo apt-get update && sudo apt-get upgrade</code>{row.updates.reboot_required ? ', then reboot' : ''}.</p>}</>}</section>
+      <section ref={part('exposure')} className="sec-part"><h3 className="drawer-h">Reachable from SM-Watch {row.scan?.address ? <span className="mono muted">({row.scan.address})</span> : null}</h3>
+      {!row.scan ? <p className="muted sm">{row.scan_unavailable ?? 'Not scanned yet.'}</p> : open.length === 0 ? <p className="sm good">Nothing reachable.</p> : <OpenPorts open={open} compact highlight={port} />}</section>
+      <section ref={part('ssh')} className="sec-part"><h3 className="drawer-h">SSH attacks · last 24 h</h3>
+        {row.ssh_24h.total === 0 ? <p className="sm good">No failed SSH logins.</p> : <>
+          <p className="sm"><b className={row.ssh_24h.total > 100 ? 'bad' : 'warn'}>{row.ssh_24h.total.toLocaleString()} failed logins</b> from {plural(row.ssh_24h.distinct_ips, 'address')}.</p>
+          <table className="tbl"><tbody>{row.ssh_24h.top_ips.slice(0, 5).map(([ip, n]) => <tr key={ip}><td className="mono sm">{ip}</td><td className="num sm">{n.toLocaleString()}</td></tr>)}</tbody></table></>}</section>
       {h && h.authorized_keys.length > 0 && <><h3 className="drawer-h">SSH keys that can log in ({h.authorized_keys.length})</h3>
         <table className="tbl"><tbody>{h.authorized_keys.map(k => <tr key={k.user + k.fingerprint}><td className="mono sm">{k.user}</td><td className="sm">{k.type.replace('ssh-', '')}</td><td className="sm muted trunc">{k.comment || k.fingerprint.slice(0, 22)}</td></tr>)}</tbody></table></>}
+    </DrawerShell>
+  );
+}
+
+/** One https service's TLS audit: what was found and what to fix. */
+function TlsDrawer({ id, onClose }: { id: number; onClose: () => void }) {
+  const { o, changed } = useSec();
+  const { canOperate, toast, go: navigate } = useApp();
+  const [busy, setBusy] = useState(false);
+  const svc = o.services.find(s => s.id === id);
+  if (!svc) return <DrawerShell label="TLS" title={`Service #${id}`} onClose={onClose}><p className="muted">This service is not shown with the current server filter.</p></DrawerShell>;
+  const t = svc.tls?.results;
+  async function check() {
+    setBusy(true);
+    try { const r = await post<Scan>(`/security/scan/service/${id}`); toast(r.error ? r.error : `TLS checked: grade ${r.grade}`, !!r.error); changed(); }
+    catch (e) { toast((e as Error).message, true); } finally { setBusy(false); }
+  }
+  return (
+    <DrawerShell label={<>TLS of an https service · <span className="mono">{svc.url}</span></>} title={svc.name} onClose={onClose}
+      actions={<><button className="btn sm" onClick={() => navigate(`services/${id}`)}><Icon name="external" size={13} />Service page</button>
+        {canOperate && <button className="btn sm" disabled={busy} onClick={() => void check()}><Icon name="refresh" size={13} />{busy ? 'Checking…' : 'Check now'}</button>}</>}>
+      <div className="sec-drawer-score"><span className={`grade big ${GRADE_TONE(svc.tls?.grade)}`} style={{ width: 64, height: 64, fontSize: 28 }}>{svc.tls?.grade ?? '–'}</span>
+        <div><b>{!svc.tls ? 'Not audited yet' : svc.tls.error || t?.error ? 'The audit could not finish' : (t?.issues.length ?? 0) === 0 ? 'No problems found' : plural(t!.issues.length, 'problem') + ' found'}</b>
+          <div className="muted sm">{svc.tls ? `audited ${timeAgo(svc.tls.started_at)}` : 'press Check now'}</div></div></div>
+      {(svc.tls?.error || t?.error) && <p className="sm warn">{svc.tls?.error || t?.error}</p>}
+      {t && !t.error && <>
+        {t.issues.length > 0 && <><h3 className="drawer-h">What to fix</h3><ul className="sec-issues">{t.issues.map((i, n) => <li key={n} className={i.severity}>{i.text}</li>)}</ul></>}
+        <h3 className="drawer-h">Details</h3>
+        <dl className="sec-facts">
+          {Object.entries(t.versions ?? {}).map(([v, ok]) => <Fragment key={v}><dt>{v}</dt><dd className={ok === null ? 'muted' : (v === 'TLS 1.0' || v === 'TLS 1.1') ? (ok ? 'bad' : 'good') : ok ? 'good' : 'warn'}>{ok === null ? 'not testable' : ok ? 'accepted' : 'refused'}</dd></Fragment>)}
+          <dt>Certificate</dt><dd>{t.days_left != null ? `${t.days_left} days left` : '–'}{t.issuer ? ` · ${t.issuer}` : ''}</dd>
+          <dt>Key</dt><dd>{t.key ?? '–'}</dd><dt>Signature</dt><dd>{t.signature?.toUpperCase() ?? '–'}</dd><dt>HSTS</dt><dd>{t.hsts ? 'yes' : 'no'}</dd>
+        </dl></>}
     </DrawerShell>
   );
 }
@@ -823,7 +898,8 @@ function UpdatesView({ o, pick }: { o: Overview; pick: (id: number) => void }) {
 }
 
 /* ---------------------------------------------------------------- hardening (agent data collectors) */
-function HardeningView({ server, pick }: { server: string; pick: (id: number) => void }) {
+function HardeningView({ server, pick, preset }: { server: string; pick: (id: number) => void; preset: Preset }) {
+  const [failedOnly, setFailedOnly] = useState(!!preset.failedOnly);
   const { canOperate, toast } = useApp();
   // server id -> the checked_at seen when "Check now" was pressed, and when; cleared once newer results arrive
   const [pending, setPending] = useState<Record<number, { before: string | null; at: number }>>({});
@@ -853,11 +929,17 @@ function HardeningView({ server, pick }: { server: string; pick: (id: number) =>
     } catch (e) { toast((e as Error).message, true); }
   }
   if (!d.value) return <div className="card"><p className="muted"><span className="spinner" /> Loading…</p></div>;
-  const list = d.value;
+  const all = d.value;
+  const failedOf = (h: Hardening) => h.checks.filter(c => c.ok === false);
+  const list = failedOnly ? all.filter(h => failedOf(h).length > 0) : all;
+  const totalFailed = all.reduce((a, h) => a + failedOf(h).length, 0);
   return (
     <div className="grid">
-      <div className="filterbar"><span className="sm muted">Checked by each server&apos;s agent with its threat scan. Use <b>Check now</b> after changing a setting to see the result straight away.</span><span className="grow" />
+      <div className="filterbar"><div className="seg"><button className={failedOnly ? 'on' : ''} onClick={() => setFailedOnly(true)}>Failed checks only <span className="muted">{totalFailed}</span></button>
+        <button className={!failedOnly ? 'on' : ''} onClick={() => setFailedOnly(false)}>Everything</button></div>
+        <span className="sm muted">Checked by each server&apos;s agent. Use <b>Check now</b> after changing a setting.</span><span className="grow" />
         {canOperate && list.length > 1 && <button className="btn sm primary" disabled={waiting} onClick={() => void recheck(list, server || null)}><Icon name="refresh" size={14} />{waiting ? 'Checking…' : server ? 'Re-check these' : 'Re-check all'}</button>}</div>
+      {list.length === 0 && <div className="card"><Empty title={failedOnly ? 'No failed checks' : 'No servers'}>{failedOnly ? 'Every hardening check passes on every server.' : 'No server matches.'}</Empty></div>}
       {list.map(h => {
         const busy = !!pending[h.server.id];
         return (
@@ -868,7 +950,7 @@ function HardeningView({ server, pick }: { server: string; pick: (id: number) =>
                 onClick={() => void recheck([h], String(h.server.id))}><Icon name="refresh" size={13} />{busy ? 'Checking…' : 'Check now'}</button>}</div>
             {!h.supported ? <p className="muted sm">{!h.push ? 'Needs the installed agent.' : !atLeast(h.agent_version, 2, 15) ? `Agent ${h.agent_version ?? ''} does not collect this yet: re-run the install command to update to 2.15+.` : /mac|darwin|windows/i.test(h.server.os ?? '') ? 'These checks run on Linux servers only.' : 'Waiting for the agent\'s first check.'}</p> : <div className="sec-hard">
               <div><h3 className="drawer-h">Settings</h3>
-                <ul className="sec-checks">{h.checks.map(c => <li key={c.id} className={c.ok === true ? 'ok' : c.ok === false ? `fail ${c.severity}` : 'unknown'}>
+                <ul className="sec-checks">{(failedOnly ? failedOf(h) : h.checks).map(c => <li key={c.id} className={c.ok === true ? 'ok' : c.ok === false ? `fail ${c.severity}` : 'unknown'}>
                   <Icon name={c.ok === true ? 'check' : c.ok === false ? 'x' : 'alert'} size={14} /><div><b>{c.title}</b><div className="muted sm">{c.detail}</div></div></li>)}</ul></div>
               <div><h3 className="drawer-h">Listening on every network ({h.listening.filter(l => l.all_interfaces).length})</h3>
                 {h.listening.length === 0 ? <p className="muted sm">Not readable by the agent.</p> : <div className="chips">{h.listening.map(l => <span key={`${l.port}-${l.process}`} className={`chip mono ${l.all_interfaces ? '' : 'muted'}`} title={l.all_interfaces ? 'reachable from every network the server is on' : `only on ${l.address}`}>{l.port} {l.process}{l.all_interfaces ? '' : ` (${l.address})`}</span>)}</div>}
@@ -885,44 +967,59 @@ function HardeningView({ server, pick }: { server: string; pick: (id: number) =>
 }
 
 /* ---------------------------------------------------------------- exposure and TLS */
-function Exposure({ o, reload, pick }: { o: Overview; reload: () => Promise<void>; pick: (id: number) => void }) {
+function Exposure({ o, reload, pick, preset }: { o: Overview; reload: () => Promise<void>; pick: (id: number) => void; preset: Preset }) {
   const { toast, canOperate } = useApp();
+  const { openTls } = useSec();
   const [busy, setBusy] = useState('');
+  const [riskyOnly, setRiskyOnly] = useState(!!preset.riskyOnly);
+  useEffect(() => {   // opened from a click on one cluster or service: scroll to it and highlight it
+    if (!preset.highlight) return;
+    const el = document.getElementById(`exp-${preset.highlight}`);
+    el?.scrollIntoView({ behavior: 'smooth', block: 'center' }); el?.classList.add('sec-flash');
+  }, [preset.highlight]);
+  const risky = (p: OpenPort) => p.risk === 'critical' || p.risk === 'high';
+  const servers = riskyOnly ? o.servers.filter(s => (s.scan?.results.open ?? []).some(risky)) : o.servers;
+  const clusters = riskyOnly ? (o.clusters ?? []).filter(c => (c.scan?.results.open ?? []).some(risky) || `cluster-${c.id}` === preset.highlight) : (o.clusters ?? []);
+  const services = riskyOnly ? weakTls(o) : o.services;
   async function scan(kind: 'server' | 'service' | 'cluster', id: number) {
     setBusy(`${kind}${id}`);
     try { const r = await post<Scan>(`/security/scan/${kind}/${id}`); toast(r.error ? r.error : `Scan finished: grade ${r.grade}`, !!r.error); await reload(); } catch (e) { toast((e as Error).message, true); } finally { setBusy(''); }
   }
   return (
     <div className="grid">
-      <section className="card"><div className="card-head"><h2>Open ports</h2><span className="grow" /><span className="muted sm">Checked from SM-Watch on each server&apos;s public address: common ports, plus ports Docker publishes, Kubernetes NodePorts and programs listening on every network</span></div>
-        {o.servers.map(s => { const r = s.scan?.results; return (
-          <div key={s.id} className="sec-row">
+      <div className="filterbar"><div className="seg"><button className={riskyOnly ? 'on' : ''} onClick={() => setRiskyOnly(true)}>Problems only <span className="muted">{riskyPorts(o).length + weakTls(o).length}</span></button>
+        <button className={!riskyOnly ? 'on' : ''} onClick={() => setRiskyOnly(false)}>Everything</button></div>
+        <span className="sm muted">Problems = critical or high-risk ports reachable from SM-Watch, and https services graded C or worse.</span></div>
+      {riskyOnly && servers.length + clusters.length + services.length === 0 && <div className="card"><Empty title="Nothing risky is exposed">No critical or high-risk port answered from SM-Watch, and every https service has a good TLS grade.</Empty></div>}
+      {(!riskyOnly || servers.length > 0) && <section className="card"><div className="card-head"><h2>Open ports</h2><span className="grow" /><span className="muted sm">Checked from SM-Watch on each server&apos;s public address: common ports, plus ports Docker publishes, Kubernetes NodePorts and programs listening on every network</span></div>
+        {servers.map(s => { const r = s.scan?.results; const open = (r?.open ?? []).filter(p => !riskyOnly || risky(p)); return (
+          <div key={s.id} id={`exp-server-${s.id}`} className="sec-row">
             <div className="sec-row-head"><span className={`grade big ${GRADE_TONE(s.scan?.grade)}`}>{s.scan?.grade ?? '–'}</span><div style={{ minWidth: 0 }}><ServerTag who={s} onPick={pick} /><div className="sm muted mono">{s.scan ? 'scanned' : 'will scan'} {s.scan?.address || s.scan_address || '–'}{r?.private ? ' · private (shows what your network can reach)' : ''}</div></div>
               <span className="grow" /><span className="sm muted">{s.scan ? `scanned ${timeAgo(s.scan.started_at)}` : s.scan_unavailable ?? 'not scanned yet'}</span>
               {canOperate && s.scan_address && <button className="btn sm" onClick={() => scan('server', s.id)} disabled={busy === `server${s.id}`}><Icon name="refresh" size={13} />{busy === `server${s.id}` ? 'Scanning…' : 'Scan now'}</button>}</div>
             {s.scan?.error && <p className="sm warn">{s.scan.error}</p>}
             {!s.scan && s.scan_unavailable && <p className="sm muted">{s.scan_unavailable}</p>}
-            {r?.open && (r.open.length === 0 ? <p className="sm good">Nothing reachable{r.checked_ports ? ` (${r.checked_ports} ports checked)` : ''}.</p> : <OpenPorts open={r.open} />)}
+            {r?.open && (open.length === 0 ? <p className="sm good">Nothing reachable{r.checked_ports ? ` (${r.checked_ports} ports checked)` : ''}.</p> : <OpenPorts open={open} />)}
           </div>); })}
-      </section>
-      {(o.clusters ?? []).length > 0 && <section className="card"><div className="card-head"><h2>Kubernetes services reachable from outside</h2><span className="grow" /><span className="muted sm">NodePort services on a node&apos;s address and LoadBalancer addresses, checked from SM-Watch</span></div>
-        {o.clusters!.map(c => { const r = c.scan?.results; return (
-          <div key={c.id} className="sec-row">
+      </section>}
+      {clusters.length > 0 && <section className="card"><div className="card-head"><h2>Kubernetes services reachable from outside</h2><span className="grow" /><span className="muted sm">NodePort services on a node&apos;s address and LoadBalancer addresses, checked from SM-Watch</span></div>
+        {clusters.map(c => { const r = c.scan?.results; const open = (r?.open ?? []).filter(p => !riskyOnly || risky(p)); return (
+          <div key={c.id} id={`exp-cluster-${c.id}`} className="sec-row">
             <div className="sec-row-head"><span className={`grade big ${GRADE_TONE(c.scan?.grade)}`}>{c.scan?.grade ?? '–'}</span><div style={{ minWidth: 0 }}><b><Icon name="k8s" size={13} /> {c.name}</b>
               <div className="sm muted">{c.exposed.length} exposed service{c.exposed.length === 1 ? '' : 's'} · {c.nodes} node{c.nodes === 1 ? '' : 's'}{c.scan?.address ? <> · <span className="mono">{c.scan.address}</span></> : ''}</div></div>
               <span className="grow" /><span className="sm muted">{c.scan ? `scanned ${timeAgo(c.scan.started_at)}` : c.scan_unavailable ?? 'not scanned yet'}</span>
               {canOperate && c.scannable && <button className="btn sm" onClick={() => scan('cluster', c.id)} disabled={busy === `cluster${c.id}`}><Icon name="refresh" size={13} />{busy === `cluster${c.id}` ? 'Scanning…' : 'Scan now'}</button>}</div>
             {!c.scannable && c.scan_unavailable && <p className="sm muted">{c.scan_unavailable}</p>}
             {c.scan?.error && <p className="sm warn">{c.scan.error}</p>}
-            {r?.open && (r.open.length === 0 ? <p className="sm good">None of the {c.exposed.length} exposed services answered from SM-Watch.</p> : <OpenPorts open={r.open} withAddress />)}
+            {r?.open && (open.length === 0 ? <p className="sm good">None of the {c.exposed.length} exposed services answered from SM-Watch.</p> : <OpenPorts open={open} withAddress />)}
             {c.exposed.length > 0 && <details className="sm"><summary className="muted">Exposed services ({c.exposed.length})</summary><ul className="sec-issues">{c.exposed.map(e => <li key={`${e.namespace}/${e.name}`}>
               <b>{e.namespace}/{e.name}</b> <span className="tag">{e.type}</span> {e.ports.map(p => `${p.port}${p.node_port ? ` → node ${p.node_port}` : ''}`).join(', ')}{e.external.length ? ` · ${e.external.join(', ')}` : ''}</li>)}</ul></details>}
           </div>); })}
       </section>}
-      <section className="card"><div className="card-head"><h2>TLS of https services</h2></div>
-        {o.services.length === 0 ? <p className="muted">No https services{o.filter ? ' on this server' : ''}.</p> : o.services.map(s => { const t = s.tls?.results; return (
-          <div key={s.id} className="sec-row">
-            <div className="sec-row-head"><span className={`grade big ${GRADE_TONE(s.tls?.grade)}`}>{s.tls?.grade ?? '–'}</span><div style={{ minWidth: 0 }}><b>{s.name}</b><div className="sm muted mono trunc">{s.url}</div></div><span className="grow" />
+      {(!riskyOnly || services.length > 0) && <section className="card"><div className="card-head"><h2>TLS of https services</h2></div>
+        {services.length === 0 ? <p className="muted">No https services{o.filter ? ' on this server' : ''}.</p> : services.map(s => { const t = s.tls?.results; return (
+          <div key={s.id} id={`exp-service-${s.id}`} className="sec-row">
+            <div className="sec-row-head"><span className={`grade big ${GRADE_TONE(s.tls?.grade)}`}>{s.tls?.grade ?? '–'}</span><div style={{ minWidth: 0 }}><button className="lg-link" onClick={() => openTls(s.id)}><b>{s.name}</b></button><div className="sm muted mono trunc">{s.url}</div></div><span className="grow" />
               <span className="sm muted">{s.tls ? `audited ${timeAgo(s.tls.started_at)}` : 'not audited yet'}</span>
               {canOperate && <button className="btn sm" onClick={() => scan('service', s.id)} disabled={busy === `service${s.id}`}><Icon name="refresh" size={13} />{busy === `service${s.id}` ? 'Checking…' : 'Check now'}</button>}</div>
             {t && !t.error && <div className="sec-tls">
@@ -931,13 +1028,13 @@ function Exposure({ o, reload, pick }: { o: Overview; reload: () => Promise<void
             </div>}
             {(t?.error || s.tls?.error) && <p className="sm warn">{t?.error || s.tls?.error}</p>}
           </div>); })}
-      </section>
+      </section>}
     </div>
   );
 }
 
-function OpenPorts({ open, withAddress, compact }: { open: OpenPort[]; withAddress?: boolean; compact?: boolean }) {
-  if (compact) return <ul className="sec-ports">{open.map(p => <li key={`${p.address ?? ''}:${p.port}`}>
+function OpenPorts({ open, withAddress, compact, highlight }: { open: OpenPort[]; withAddress?: boolean; compact?: boolean; highlight?: number }) {
+  if (compact) return <ul className="sec-ports">{open.map(p => <li key={`${p.address ?? ''}:${p.port}`} className={p.port === highlight ? 'sec-port-hl' : ''}>
     <div className="sec-ports-head"><span className="mono">{p.port}</span><b className="grow">{p.service}</b>{p.source && <span className="tag">{SOURCE_LABEL[p.source] ?? p.source}</span>}<span className={`risk ${p.risk}`}>{RISK_LABEL[p.risk]}</span></div>
     {p.risk !== 'info' && <div className="muted sm">{p.advice}</div>}</li>)}</ul>;
   return <table className="tbl"><tbody>{open.map(p => <tr key={`${p.address ?? ''}:${p.port}`}>

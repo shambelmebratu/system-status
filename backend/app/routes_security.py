@@ -165,7 +165,7 @@ def activity(days: int = Query(7, ge=1, le=90), server: str | None = Query(None,
             continue
         target = who.get(sc.target_id) if sc.target_type == "server" else None
         label = target["name"] if target else names.get((sc.target_type, sc.target_id)) or f"{sc.target_type} #{sc.target_id}"
-        out.append({"at": aware(sc.started_at).isoformat(), "type": "scan", "server": target, "severity": "high" if (sc.findings or 0) else "low",
+        out.append({"at": aware(sc.started_at).isoformat(), "type": "scan", "server": target, "target": {"type": sc.target_type, "id": sc.target_id}, "severity": "high" if (sc.findings or 0) else "low",
                     "title": f"{'Port scan' if sc.kind == 'ports' else 'TLS audit'} of {label}: " + (f"failed ({sc.error[:120]})" if sc.error else f"grade {sc.grade or '–'}, {sc.findings or 0} risky"),
                     "detail": sc.address or "", "kind": sc.kind})
     alert_q = select(AlertEvent).where(AlertEvent.state.in_(secalerts.SECURITY_STATES), AlertEvent.created_at >= since)
@@ -175,7 +175,7 @@ def activity(days: int = Query(7, ge=1, le=90), server: str | None = Query(None,
         if server and e.target_type != "server":
             continue
         lines = [ln for ln in (e.message or "").replace("<b>", "").replace("</b>", "").splitlines() if ln.strip()]
-        out.append({"at": aware(e.created_at).isoformat(), "type": "alert", "server": who.get(e.target_id) if e.target_type == "server" else None,
+        out.append({"at": aware(e.created_at).isoformat(), "type": "alert", "server": who.get(e.target_id) if e.target_type == "server" else None, "target": {"type": e.target_type, "id": e.target_id},
                     "severity": "critical" if e.severity == "critical" else "medium", "title": lines[1][:200] if len(lines) > 1 else (lines[0][:200] if lines else "Security alert"),
                     "detail": "sent" if e.sent else (e.delivery_error or "not sent yet"), "sent": bool(e.sent), "kind": secalerts.category_of(e.state, e.target_type)})
     if not server:

@@ -38,6 +38,10 @@ def test_finding_detail_and_activity_timeline(client):
     assert ("found", ids["old"]) not in kinds                                                 # found 20 days ago: outside the 7 days
     assert any(i["type"] == "alert" and i["sent"] and i["title"] == "Possible web shell: x.php" for i in mine)
     assert any(i["type"] == "scan" and "cluster timeline-k8s" in i["title"] for i in mine)      # clusters by name, not "#id"
+    scan = next(i for i in mine if i["type"] == "scan")
+    assert scan["target"]["type"] == "cluster" and scan["target"]["id"]                       # a click opens what was scanned
+    alert = next(i for i in mine if i["type"] == "alert")
+    assert alert["target"] == {"type": "server", "id": ids["a"]}
     assert any(i["type"] == "action" and i["title"] == "Finding acknowledged" for i in items)
     assert [i["at"] for i in items] == sorted((i["at"] for i in items), reverse=True)          # newest first
     ack = next(i for i in mine if i["type"] == "acknowledged")
