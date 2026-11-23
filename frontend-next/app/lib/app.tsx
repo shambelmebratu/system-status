@@ -4,6 +4,7 @@ import { createContext, ReactNode, useCallback, useContext, useEffect, useRef, u
 import { api } from './api';
 import type { Channel, Dashboard, Me } from './types';
 import { ConfirmModal } from '../components/confirm';
+import { Icon } from '../components/ui';
 
 type Toast = { id: number; text: string; error: boolean };
 type Ctx = {
@@ -67,7 +68,7 @@ export function AppProvider({ children, me, reloadMe, onUnauthorized }: { childr
     <AppContext.Provider value={{ data, channels, refresh, toast, confirm, go, route, me, canOperate: me.role !== 'viewer', canManage: me.role !== 'viewer' && !me.access /* add/remove monitors, links, channels: not for people limited to selected monitors */, isAdmin: me.role === 'admin', reloadMe }}>
       {children}
       {dialog && <ConfirmModal {...dialog} onClose={ok => { dialog.resolve(ok); setDialog(null); }} />}
-      <div className="toasts" aria-live="polite">{toasts.map(t => <div key={t.id} className={`toast ${t.error ? 'error' : ''}`}>{t.text}</div>)}</div>
+      <div className="toasts" aria-live="polite">{toasts.map(t => <div key={t.id} className={`toast ${t.error ? 'error' : ''}`}><Icon name={t.error ? 'alert' : 'check'} size={15} /><span>{t.text}</span></div>)}</div>
     </AppContext.Provider>
   );
 }

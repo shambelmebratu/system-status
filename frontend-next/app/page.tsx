@@ -5,7 +5,7 @@ import { Logo } from './components/logo';
 import { Icon } from './components/ui';
 import { api, post } from './lib/api';
 import { AppProvider, useApp, clearPollCache } from './lib/app';
-import { SEC_GROUPS, SEC_SECTIONS, groupOfSection, type SecSection, useSecCounts, visibleTabs } from './lib/secnav';
+import { SEC_GROUPS, SEC_NAV, SEC_SECTIONS, TAB_LABEL, groupOfSection, type SecSection, useSecCounts, visibleTabs } from './lib/secnav';
 import { Audit } from './views/Audit';
 import { Channels } from './views/Channels';
 import { Kubernetes } from './views/Kubernetes';
@@ -27,6 +27,7 @@ import { Settings } from './views/Settings';
 import { Users } from './views/Users';
 import { ForcePasswordChange } from './views/ForcePasswordChange';
 import { MfaSetup } from './components/mfa';
+import { CommandPalette, type PaletteItem } from './components/palette';
 import { Logo as BrandLogo } from './components/logo';
 import { ROLE_INFO, type Me, type Role } from './lib/types';
 
@@ -88,13 +89,14 @@ const NAV: NavItem[] = [
   { id: 'audit', label: 'Audit log', icon: 'shield', min: 'admin', group: 'Admin' },
   { id: 'settings', label: 'Settings', icon: 'settings', min: 'viewer', group: 'Admin' },
 ];
+const SEC_LABEL: Partial<Record<SecSection, string>> = Object.fromEntries(SEC_NAV.map(n => [n.id, TAB_LABEL[n.id] ?? n.label]));
 const RANK: Record<Role, number> = { viewer: 1, operator: 2, admin: 3 };
 
 const COUNT_WORDS: Partial<Record<SecSection, string>> = { servers: 'servers at risk', threats: 'serious threats', kubernetes: 'Kubernetes risks', exposure: 'exposure / TLS problems',
   hardening: 'failed hardening checks', updates: 'security updates' };
 
 /** The Security menu: six entries nested under "Security" while that page is open (related sections are tabs on the page). */
-function SecuritySubNav({ section, isAdmin, go }: { section?: string; isAdmin: boolean; go: (path: string) => void }) {
+function SecuritySubNav({ section, onPage, isAdmin, go }: { section?: string; onPage: boolean; isAdmin: boolean; go: (path: string) => void }) {
   const { k8s, counts } = useSecCounts();
   const current = groupOfSection(SEC_SECTIONS.includes(section as SecSection) ? section as SecSection : 'overview');
   const ref = useRef<HTMLDivElement>(null);
@@ -105,7 +107,8 @@ function SecuritySubNav({ section, isAdmin, go }: { section?: string; isAdmin: b
     const parts = tabs.map(t => ({ t, c: counts[t] })).filter((x): x is { t: SecSection; c: { n: number; tone: 'bad' | 'warn' } } => !!x.c && x.c.n > 0);
     const n = parts.reduce((a, x) => a + x.c.n, 0), tone = parts.some(x => x.c.tone === 'bad') ? 'bad' : 'warn';
     const why = parts.map(x => `${x.c.n} ${COUNT_WORDS[x.t] ?? x.t}`).join(' · ');
-    return <button key={g.id} className={`nav nav-sub-item ${current.id === g.id ? 'active' : ''}`} aria-current={current.id === g.id ? 'page' : undefined}
+    const on = onPage && current.id === g.id;
+    return <button key={g.id} className={`nav nav-sub-item ${on ? 'active' : ''}`} aria-current={on ? 'page' : undefined}
       onClick={() => go(g.id === 'overview' ? 'security' : `security/${tabs[0]}`)}>
       <Icon name={g.icon} size={15} />{g.label}{n > 0 && <span className={`sub-count ${tone}`} title={why}>{n > 999 ? '999+' : n}</span>}</button>;
   })}</div>;
@@ -119,6 +122,22 @@ function Shell({ company, me, onSignOut }: { company: string; me: Me; onSignOut:
   const [theme, setTheme] = useState<'dark' | 'light'>('dark');
   useEffect(() => { setTheme(document.documentElement.dataset.theme === 'light' || (!document.documentElement.dataset.theme && matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark'); }, []);
   useEffect(() => setOpen(false), [route.join('/')]);
+  const [palette, setPalette] = useState(false);
+  // The Security sections stay listed in the menu (collapsible, remembered per browser); opening Security always expands them.
+  const [secOpen, setSecOpen] = useState(true);
+  useEffect(() => { try { if (localStorage.getItem('smw_secnav') === 'closed') setSecOpen(false); } catch { /* storage unavailable */ } }, []);
+  const toggleSec = (next: boolean) => { setSecOpen(next); try { localStorage.setItem('smw_secnav', next ? 'open' : 'closed'); } catch { /* storage unavailable */ } };
+  useEffect(() => { if (route[0] === 'security') setSecOpen(true); }, [route[0]]);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k')) return;
+      const logs = document.querySelector<HTMLElement>('.lgx');   // the log viewer keeps its own ⌘K (jump to a log)
+      if (logs && logs.offsetParent !== null) return;
+      e.preventDefault(); setPalette(p => !p);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
 
   const aiOn = me.features?.ai !== false;   // AI_ENABLED=false: no AI pages at all; Anomalies (plain statistics) moves to Monitor
   const allowed = NAV.filter(n => RANK[me.role] >= RANK[n.min] && !(n.fleet && me.access) && (aiOn || !AI_PAGES.includes(n.id)))   // fleet-wide pages are hidden from people limited to selected monitors
@@ -131,23 +150,39 @@ function Shell({ company, me, onSignOut }: { company: string; me: Me; onSignOut:
     try { localStorage.setItem('smw_theme', next); } catch { /* storage unavailable */ }
   };
 
+  const paletteItems: PaletteItem[] = [
+    ...allowed.map(n => ({ id: `p-${n.id}`, label: n.label, hint: n.group, icon: n.icon, path: n.id, group: 'Pages' })),
+    ...(allowed.some(n => n.id === 'security') ? SEC_GROUPS.flatMap(g => visibleTabs(g, secCounts.k8s, me.role === 'admin').map(t => ({
+      id: `sec-${t}`, label: g.tabs.length > 1 ? `${g.label} · ${SEC_LABEL[t] ?? t}` : g.label, hint: 'Security', icon: g.icon,
+      path: t === 'overview' ? 'security' : `security/${t}`, group: 'Security' }))) : []),
+  ];
+
   const view = { overview: <Overview />, servers: <Servers />, services: <Services />, kubernetes: <Kubernetes />, databases: <Databases />, tests: <Tests />, dns: <Dns />, heartbeats: <Heartbeats />, security: <Security />, assistant: <Assistant />, anomalies: <Anomalies />, 'ai-settings': <AiSettingsView />, maintenance: <MaintenanceView />, slos: <Slos />, performance: <Performance />, incidents: <Incidents />, alerts: <Channels />, schedules: <Schedules />, logs: <Logs />, users: <Users />, audit: <Audit />, settings: <Settings /> }[page] ?? <Overview />;
 
   return (
     <div className="shell">
-      <div className="mobile-bar"><button className="btn ghost sm" onClick={() => setOpen(!open)} aria-label="Menu"><Icon name="menu" /></button><Logo size={26} /><b>{company}</b></div>
+      <div className="mobile-bar"><button className="btn ghost sm" onClick={() => setOpen(!open)} aria-label="Menu"><Icon name="menu" /></button><Logo size={26} /><b>{company}</b><span className="grow" /><button className="btn ghost sm" onClick={() => setPalette(true)} aria-label="Jump anywhere"><Icon name="search" size={16} /></button></div>
+      {open && <div className="side-backdrop" onClick={() => setOpen(false)} />}
       <aside className={`side ${open ? 'open' : ''}`}>
         <div className="brand"><Logo size={32} /><span>{company}</span></div>
+        <button type="button" className="side-search" onClick={() => setPalette(true)}><Icon name="search" size={14} /><span>Jump anywhere</span><kbd>⌘K</kbd></button>
         <nav className="side-nav">
           {GROUPS.map(g => { const items = allowed.filter(i => i.group === g); return items.length ? (
             <div key={g} className="nav-group"><div className="nav-group-label">{g}</div>
-              {items.map(item => (
+              {items.map(item => item.id === 'security' ? (
+                <div key={item.id} className="nav-acc">
+                  <button className={`nav ${page === item.id ? 'active' : ''}`} onClick={() => { go(item.id); setSecOpen(true); }}>
+                    <Icon name={item.icon} />{item.label}
+                    {!secOpen && secAttention > 0 && <span className="count">{secAttention}</span>}
+                  </button>
+                  <button type="button" className={`nav-caret ${secOpen ? 'open' : ''}`} onClick={() => toggleSec(!secOpen)} aria-expanded={secOpen} aria-label={secOpen ? 'Hide security sections' : 'Show security sections'}><Icon name="chevron-down" size={14} /></button>
+                </div>
+              ) : (
                 <button key={item.id} className={`nav ${page === item.id ? 'active' : ''}`} onClick={() => go(item.id)}>
                   <Icon name={item.icon} />{item.label}
                   {item.id === 'incidents' && !!data?.summary.open_incidents && <span className="count">{data.summary.open_incidents}</span>}
-                  {item.id === 'security' && page !== 'security' && secAttention > 0 && <span className="count">{secAttention}</span>}
                 </button>))}
-              {g === 'Security' && page === 'security' && <SecuritySubNav section={route[1]} isAdmin={me.role === 'admin'} go={go} />}
+              {g === 'Security' && secOpen && items.some(i => i.id === 'security') && <SecuritySubNav section={page === 'security' ? route[1] : undefined} onPage={page === 'security'} isAdmin={me.role === 'admin'} go={go} />}
             </div>) : null; })}
         </nav>
         <div className="side-foot">
@@ -160,6 +195,7 @@ function Shell({ company, me, onSignOut }: { company: string; me: Me; onSignOut:
         </div>
       </aside>
       <main className="main">{view}</main>
+      {palette && <CommandPalette pages={paletteItems} onClose={() => setPalette(false)} />}
     </div>
   );
 }

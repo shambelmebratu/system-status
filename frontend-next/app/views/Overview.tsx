@@ -49,10 +49,10 @@ export function Overview() {
       </div>
 
       <div className="hero">
-        <div className="card"><div className={`health ${state}`}><div className="dot">{state === 'up' ? '✓' : state === 'unknown' ? '…' : '!'}</div><div><h2>{headline}</h2><p className="muted">{servers.length} servers · {services.length} services · {summary.open_incidents} open incidents</p></div></div></div>
-        <div className="card stat"><span className="label">Availability · 24h</span><span className="value">{pct(avgUptime, 2)}</span><span className="sub">across all monitors</span></div>
-        <div className="card stat"><span className="label">Servers online</span><span className="value">{online}<small className="muted" style={{ fontSize: 16 }}> / {servers.length}</small></span><span className="sub">{avg('cpu') != null ? `Avg CPU ${pct(avg('cpu'), 0)} · Mem ${pct(avg('memory'), 0)}` : 'no agent metrics yet'}</span></div>
-        <div className="card stat"><span className="label">Avg response</span><span className="value">{ms(avgLatency)}</span><span className="sub">{services.filter(s => s.last_status === 'up').length}/{services.length} services up</span></div>
+        <div className="card clickable" role="button" tabIndex={0} onClick={() => go('incidents')} onKeyDown={e => e.key === 'Enter' && go('incidents')} title="Open incidents"><div className={`health ${state}`}><div className="dot">{state === 'up' ? '✓' : state === 'unknown' ? '…' : '!'}</div><div><h2>{headline}</h2><p className="muted">{servers.length} servers · {services.length} services · {summary.open_incidents} open incidents</p></div></div></div>
+        <div className="card stat clickable" role="button" tabIndex={0} onClick={() => go('services')} onKeyDown={e => e.key === 'Enter' && go('services')}><span className="label">Availability · 24h</span><span className="value">{pct(avgUptime, 2)}</span><span className="sub">across all monitors</span></div>
+        <div className="card stat clickable" role="button" tabIndex={0} onClick={() => go('servers')} onKeyDown={e => e.key === 'Enter' && go('servers')}><span className="label">Servers online</span><span className="value">{online}<small className="muted" style={{ fontSize: 16 }}> / {servers.length}</small></span><span className="sub">{avg('cpu') != null ? `Avg CPU ${pct(avg('cpu'), 0)} · Mem ${pct(avg('memory'), 0)}` : 'no agent metrics yet'}</span></div>
+        <div className="card stat clickable" role="button" tabIndex={0} onClick={() => go('performance')} onKeyDown={e => e.key === 'Enter' && go('performance')}><span className="label">Avg response</span><span className="value">{ms(avgLatency)}</span><span className="sub">{services.filter(s => s.last_status === 'up').length}/{services.length} services up</span></div>
       </div>
 
       <div className="grid g-side" style={{ marginTop: 16 }}>

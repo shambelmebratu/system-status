@@ -4,7 +4,7 @@ import { createContext, FormEvent, Fragment, ReactNode, useContext, useEffect, u
 import { Empty, Field, Icon, Modal, StatusPill } from '../components/ui';
 import { ProcessDrawer } from '../components/process';
 import { TargetPicker, type PickerOption } from '../components/logviewer';
-import { api, post, put } from '../lib/api';
+import { api, ApiError, post, put } from '../lib/api';
 import { useApp, usePoll } from '../lib/app';
 import { timeAgo } from '../lib/format';
 import { CommandBlock, fixForCheck, fixForPort, fixForTls, fixForUpdates } from '../components/secfix';
@@ -571,27 +571,39 @@ function Threats({ server, preset }: { server: string; preset: Preset }) {
   const toggleSev = (x: Severity) => setSevs(v => (v.includes(x) ? v.filter(y => y !== x) : [...v, x]));
   const [q, setQ] = useState('');
   const [allGroups, setAllGroups] = useState(false);
-  const list = usePoll(() => api<Finding[]>(withQ(`/security/findings?status=${status}&limit=500`, server)), [status, server, version], 30000, true);
-  const all = list.value ?? [];
-  const counts = useMemo(() => Object.fromEntries(GROUPS.map(g => [g.id, all.filter(f => g.kinds.includes(f.kind)).length])), [all]);
+  // One list (every status), filtered here: each count below is exactly what clicking it would show, given the other filters.
+  const list = usePoll(() => api<Finding[]>(withQ('/security/findings?status=all&limit=1000', server)), [server, version], 30000, true);
+  const everything = list.value ?? [];
+  const inStatus = (f: Finding, st: typeof status) => st === 'all' || (st === 'resolved' ? !!f.resolved_at : !f.resolved_at && (st === 'acknowledged' ? !!f.acknowledged_at : !f.acknowledged_at));
   const needle = q.trim().toLowerCase();
-  const shown = all.filter(f => (!group || groupOf(f.kind) === group) && (!sevs.length || sevs.includes(f.severity))
-    && (!needle || [f.title, f.detail, f.server?.name, f.evidence.process, f.evidence.path, f.evidence.user, f.evidence.ip].some(v => v && v.toLowerCase().includes(needle))));
+  const matchQ = (f: Finding) => !needle || [f.title, f.detail, f.server?.name, f.evidence.process, f.evidence.path, f.evidence.user, f.evidence.ip].some(v => v && v.toLowerCase().includes(needle));
+  const matchSev = (f: Finding) => !sevs.length || sevs.includes(f.severity);
+  const matchGroup = (f: Finding) => !group || groupOf(f.kind) === group;
+  const all = everything.filter(f => inStatus(f, status));
+  const shown = all.filter(f => matchGroup(f) && matchSev(f) && matchQ(f));
+  const counts = useMemo(() => Object.fromEntries(GROUPS.map(g => [g.id, all.filter(f => g.kinds.includes(f.kind) && matchSev(f) && matchQ(f)).length])), [all, sevs, needle]);   // eslint-disable-line react-hooks/exhaustive-deps
+  const kindsTotal = all.filter(f => matchSev(f) && matchQ(f)).length;
   const groups = allGroups ? GROUPS : GROUPS.filter(g => counts[g.id] || g.id === group);
-  const sevCount = (s: Severity) => all.filter(f => f.severity === s && (!group || groupOf(f.kind) === group)).length;
+  const sevCount = (x: Severity) => all.filter(f => f.severity === x && matchGroup(f) && matchQ(f)).length;
+  const statusCount = (st: typeof status) => everything.filter(f => inStatus(f, st) && matchGroup(f) && matchSev(f) && matchQ(f)).length;
+  const filtered = !!group || sevs.length > 0 || !!needle;
+  const clear = () => { setGroup(''); setSevs([]); setQ(''); };
+  const hiddenBy = !shown.length && all.length ? [sevs.length && all.some(f => matchGroup(f) && matchQ(f)) ? `the ${sevs.map(x => SEV_LABEL[x]).join(' / ')} filter` : '', needle ? 'the search' : '', group && !all.some(f => matchGroup(f)) ? 'the kind' : ''].filter(Boolean) : [];
   return (
     <div className="grid">
-      <div className="filterbar"><div className="seg">{([['attention', 'Needs attention'], ['acknowledged', 'Acknowledged'], ['resolved', 'Resolved'], ['all', 'All']] as const).map(([id, l]) => <button key={id} className={status === id ? 'on' : ''} onClick={() => setStatus(id)}>{l}</button>)}</div>
+      <div className="filterbar"><div className="seg">{([['attention', 'Needs attention'], ['acknowledged', 'Acknowledged'], ['resolved', 'Resolved'], ['all', 'All']] as const).map(([id, l]) => <button key={id} className={status === id ? 'on' : ''} onClick={() => setStatus(id)}>{l} <span className="muted">{statusCount(id)}</span></button>)}</div>
         <input className="sec-search" value={q} onChange={e => setQ(e.target.value)} placeholder="Search title, server, process, path, user, address" aria-label="Search findings" />
         <div className="seg">{(['critical', 'high', 'medium', 'low'] as Severity[]).map(s => <button key={s} className={sevs.includes(s) ? 'on' : ''} onClick={() => toggleSev(s)}><span className={`sev-dot ${s}`} /> {SEV_LABEL[s]} <span className="muted">{sevCount(s)}</span></button>)}</div></div>
       <div className="sec-cats">
-        <button className={`chip-btn ${!group ? 'on' : ''}`} onClick={() => setGroup('')}>All kinds <span className="muted">{all.length}</span></button>
+        <button className={`chip-btn ${!group ? 'on' : ''}`} onClick={() => setGroup('')}>All kinds <span className="muted">{kindsTotal}</span></button>
         {groups.map(g => <button key={g.id} className={`chip-btn ${group === g.id ? 'on' : ''}`} title={g.hint} onClick={() => setGroup(group === g.id ? '' : g.id)}>{g.label} <span className="muted">{counts[g.id] ?? 0}</span></button>)}
         <button className="lg-link sm" onClick={() => setAllGroups(!allGroups)}>{allGroups ? 'hide empty kinds' : `show all ${GROUPS.length} kinds`}</button>
+        {filtered && <button className="btn sm ghost" onClick={clear}><Icon name="x" size={12} />Clear filters</button>}
       </div>
       {list.error && <div className="err">{list.error}</div>}
       {!list.value ? <div className="card"><p className="muted"><span className="spinner" /> Loading…</p></div> : shown.length === 0 ? <div className="card"><Empty title={status === 'attention' && !group && !q && !sevs.length ? 'No signs of compromise' : 'Nothing here'}>
-        {status === 'attention' && !group && !q && !sevs.length ? 'Agents look for running malware, back doors, suspicious logins and system changes every 10 minutes. Anything they find shows up here and is sent to your alert channels.' : 'No findings match these filters.'}</Empty></div>
+        {status === 'attention' && !group && !q && !sevs.length ? 'Agents look for running malware, back doors, suspicious logins and system changes every 10 minutes. Anything they find shows up here and is sent to your alert channels.'
+          : <>{hiddenBy.length ? `${plural(all.filter(f => matchGroup(f)).length, 'finding')} here, hidden by ${hiddenBy.join(' and ')}.` : 'No findings match these filters.'} {filtered && <button className="lg-link" onClick={clear}>Clear filters</button>}</>}</Empty></div>
         : <div className="card sec-flist">{shown.map(f => (
           <button key={f.id} className={`sec-frow ${f.severity} ${f.resolved_at ? 'resolved' : f.acknowledged_at ? 'acked' : ''}`} onClick={() => openFinding(f)}>
             <span className={`sev ${f.severity}`}>{SEV_LABEL[f.severity]}</span>
@@ -706,8 +718,38 @@ function FindingDrawer({ finding, from, onClose }: { finding: Finding; from?: nu
   const [acking, setAcking] = useState(false);
   const [note, setNote] = useState('');
   const [proc, setProc] = useState(false);
+  const [checking, setChecking] = useState<{ since: number } | null>(null);
   useEffect(() => setF(finding), [finding]);
   const group = groupOf(f.kind);
+  // "Re-check now": the agent runs its threat scan at its next report (about a minute). A finding the agent no longer sees is resolved;
+  // one it sees again (last seen moves past the request) is still there, for example a killed process that something restarted.
+  async function recheck() {
+    try {
+      await post('/security/recheck', { server: String(f.server_id) });
+      setChecking({ since: Date.now() });
+    } catch (err) {
+      const status = (err as ApiError).status;
+      if (status === 429) setChecking({ since: Date.now() - 30_000 }); else toast((err as Error).message, true);
+    }
+  }
+  useEffect(() => {
+    if (!checking) return;
+    let stop = false;
+    const tick = async () => {
+      while (!stop && Date.now() - checking.since < 240_000) {
+        await new Promise(r => setTimeout(r, 5000));
+        if (stop) return;
+        try {
+          const now = await api<Finding>(`/security/findings/${f.id}`);
+          if (now.resolved_at) { setF(now); setChecking(null); changed(); toast('Resolved: the agent no longer sees it'); return; }
+          if (new Date(now.last_seen).getTime() > checking.since) { setF(now); setChecking(null); changed(); toast(`Still there: the agent saw it again ${timeAgo(now.last_seen)}. If you stopped it, something started it again.`, true); return; }
+        } catch { /* keep waiting */ }
+      }
+      if (!stop) { setChecking(null); toast('No new scan arrived within 4 minutes. Is the agent online?', true); }
+    };
+    void tick();
+    return () => { stop = true; };
+  }, [checking]);   // eslint-disable-line react-hooks/exhaustive-deps
   async function ack(e: FormEvent) {
     e.preventDefault();
     try {
@@ -727,10 +769,13 @@ function FindingDrawer({ finding, from, onClose }: { finding: Finding; from?: nu
       actions={<>{from != null && <button className="btn sm ghost" onClick={() => openServer(from)}><Icon name="back" size={13} />Back to server</button>}
         {from == null && f.server && <button className="btn sm ghost" onClick={() => openServer(f.server!.id, 'threats')}><Icon name="server" size={13} />Server security</button>}
         <span className="grow" />
+        {canOperate && f.source === 'agent' && !f.resolved_at && <button className="btn sm" disabled={!!checking} onClick={() => void recheck()} title="Ask the agent to scan again now"><Icon name="refresh" size={13} />{checking ? 'Waiting for the agent…' : 'Re-check now'}</button>}
         {canOperate && ev.pid && f.source === 'agent' && !f.resolved_at && <button className="btn sm" onClick={() => setProc(true)}><Icon name="terminal" size={13} />Inspect process</button>}
         {canOperate && !f.resolved_at && !f.acknowledged_at && !acking && <button className="btn sm primary" onClick={() => setAcking(true)}><Icon name="check" size={13} />{f.source === 'smwatch' ? 'It was us: acknowledge' : 'Acknowledge'}</button>}</>}>
       {acking && <form className="sec-ack card" onSubmit={ack}><input value={note} onChange={e => setNote(e.target.value)} maxLength={500} placeholder="Note (optional): who did it and why" autoFocus aria-label="Note" />
         <button className="btn sm primary">Acknowledge</button><button type="button" className="btn sm ghost" onClick={() => setAcking(false)}>Cancel</button></form>}
+      {f.source === 'agent' && !f.resolved_at && <div className={`sec-note ${checking ? 'ok' : ''}`}><Icon name={checking ? 'refresh' : 'clock'} size={14} /><div><b>{checking ? 'Waiting for the agent to scan again…' : `Last seen by the agent ${timeAgo(f.last_seen)}`}</b>
+        <p>{checking ? 'It runs its threat scan at its next report, usually within a minute or two. This updates by itself.' : 'The agent re-checks every 10 minutes (Security → Schedule). Stopped it already? Press Re-check now: it is marked resolved as soon as the agent no longer sees it.'}</p></div></div>}
       {facts.length > 0 && <dl className="sec-meta">{facts.map(([k, v]) => <div key={k}><dt>{k}</dt><dd className="mono">{v}</dd></div>)}</dl>}
       <div className={`sec-note ${f.severity === 'critical' || f.severity === 'high' ? 'bad' : ''}`}><Icon name="info" size={14} /><div><b>What was found</b><p>{f.detail}</p></div></div>
       <div className="sec-playbook"><h3 className="drawer-h" style={{ marginTop: 0 }}>What to do</h3><ol>{(PLAYBOOK[group] ?? PLAYBOOK.other).map(s => <li key={s}>{s}</li>)}</ol></div>

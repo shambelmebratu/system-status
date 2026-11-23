@@ -49,3 +49,22 @@ def test_finding_detail_and_activity_timeline(client):
     only_b = client.get(f"/api/security/activity?days=7&server={ids['b']}").json()
     assert only_b and all((i.get("server") or {}).get("id") == ids["b"] for i in only_b)      # the server filter applies
     assert client.get("/api/security/activity?days=91").status_code == 422
+
+
+def test_sync_now_also_rechecks_security(client):
+    """Sync now asks the agent for a fresh threat scan too, so a stopped process is resolved without waiting 10 minutes."""
+    from fastapi.testclient import TestClient
+    from test_api_auth import main
+    from app import secscan
+    sign_in(client)
+    anon = TestClient(main.app)
+    tok = client.post("/api/enrollments", headers=CSRF, json={}).json()["token"]
+    r = anon.post("/api/agent/enroll", headers={"Authorization": f"Bearer {tok}"}, json={"hostname": "sync-sec", "machine_id": "m-sync-sec"}).json()
+    sid, auth = r["server_id"], {"Authorization": f"Bearer {r['agent_token']}"}
+    anon.post("/api/agent/report", headers=auth, json={"cpu": 1, "memory": 1, "disk": 1, "load": 0, "swap": 0, "agent_version": "2.18.0", "capabilities": ["logs", "process", "sync"]})
+    with database.SessionLocal() as db:
+        assert secscan.agent_config(db, sid)["rescan"] is None
+    assert client.post(f"/api/servers/{sid}/sync", headers=CSRF).json()["security_recheck"] is True
+    with database.SessionLocal() as db:
+        assert secscan.agent_config(db, sid)["rescan"]                                       # the agent gets a new token: it scans now
+    assert client.post("/api/security/recheck", headers=CSRF, json={"server": str(sid)}).status_code == 429   # shared 30 s limit

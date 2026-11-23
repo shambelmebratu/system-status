@@ -182,9 +182,17 @@ def sync_now(server_id: int, request: Request, user: dict = Depends(require_user
         raise HTTPException(429, "Too many requests are already waiting for this server")
     item = LogRequest(server_id=server_id, query=json.dumps({"source": "snapshot", "target": "", "lines": 1, "seconds": 1}))
     db.add(item)
+    # "Sync now" refreshes security too: the agent also re-runs its threat scan (so a stopped process is resolved, a new one found)
+    # and the update check at its next report. At most every 30 s per server, shared with Security → "Re-check".
+    import time as _time
+    from .routes_security import _last_recheck
+    from .secscan import request_agent_rescan
+    if _time.monotonic() - _last_recheck.get(server_id, -1e9) >= 30:
+        _last_recheck[server_id] = _time.monotonic()
+        request_agent_rescan(db, [server_id], user["email"])
     db.commit(); db.refresh(item)
     _wake(_task_waiters, server_id)
-    return {"id": item.id, "status": item.status}
+    return {"id": item.id, "status": item.status, "security_recheck": True}
 
 
 def apply_snapshot(db: Session, server: Server, output: str, now: datetime) -> str | None:
