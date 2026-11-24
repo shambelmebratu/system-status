@@ -847,6 +847,11 @@ def pause_monitor(kind: str, item_id: int, payload: PauseRequest, request: Reque
         if until <= now + timedelta(seconds=30):
             raise HTTPException(422, "Pick a time in the future")
     item.pause_mode, item.paused_until, item.paused_by, item.pause_reason = payload.mode, until, user["email"], payload.reason.strip() or None
+    if payload.mode == "monitor":   # nothing is checked while paused: an open incident would only count up an outage nobody measures
+        from .models import Incident
+        for incident in db.scalars(select(Incident).where(Incident.target_type == target_type, Incident.target_id == item.id, Incident.resolved_at.is_(None))).all():
+            incident.resolved_at = now
+            incident.detail = ((incident.detail or "") + f"\nClosed: monitoring paused by {user['email']}")[:1000]
     what = "monitoring and alerts" if payload.mode == "monitor" else "alerts"
     audit(db, request, f"{target_type}.pause", user=user, target=f"{target_type}:{item.id}",
           detail=f"{item.name}: {what} paused " + (f"until {until.isoformat(timespec='minutes')}" if until else "until resumed") + (f" ({payload.reason.strip()})" if payload.reason.strip() else ""))

@@ -187,12 +187,14 @@ def sync_now(server_id: int, request: Request, user: dict = Depends(require_user
     import time as _time
     from .routes_security import _last_recheck
     from .secscan import request_agent_rescan
-    if _time.monotonic() - _last_recheck.get(server_id, -1e9) >= 30:
+    recheck = user["role"] in ("operator", "admin") and _time.monotonic() - _last_recheck.get(server_id, -1e9) >= 30   # a security re-scan is operator work, like Security → Re-check
+    if recheck:
         _last_recheck[server_id] = _time.monotonic()
         request_agent_rescan(db, [server_id], user["email"])
+        audit(db, request, "security.recheck", user=user, target=f"server:{server_id}", detail="with Sync now")
     db.commit(); db.refresh(item)
     _wake(_task_waiters, server_id)
-    return {"id": item.id, "status": item.status, "security_recheck": True}
+    return {"id": item.id, "status": item.status, "security_recheck": recheck}
 
 
 def apply_snapshot(db: Session, server: Server, output: str, now: datetime) -> str | None:

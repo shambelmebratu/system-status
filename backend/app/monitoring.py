@@ -132,7 +132,10 @@ def evaluate_metrics(server: Server, metrics: dict) -> tuple[str, list[str]]:
     failures = [f"{name} {value}{unit} >= {threshold}{unit}" for name, value, threshold, unit in checks if value >= threshold]
     configured_processes = {name.strip().lower() for name in server.process_names.split(",") if name.strip()}
     process_failures = [item for item in metrics.get("processes", []) if item["cpu"] >= server.process_threshold and (not configured_processes or item["name"].lower() in configured_processes)]
-    failures.extend(f"Process {process_label(item)} CPU {item['cpu']}% >= {server.process_threshold}%" for item in process_failures)
+    cores = metrics.get("cpu_count")
+    def busy(item: dict) -> str:   # a process's CPU is % of ONE core: 2400 % reads as "24 of 32 cores", not a broken number
+        return f" ({item['cpu'] / 100:.1f} of {cores} cores)" if cores and item["cpu"] >= 150 else ""
+    failures.extend(f"Process {process_label(item)} CPU {item['cpu']}%{busy(item)} >= {server.process_threshold}%" for item in process_failures)
     return ("alert" if failures else "up", failures)
 
 
@@ -713,8 +716,16 @@ def queue_event(session, target_type: str, target, severity: str, message: str, 
     event = AlertEvent(target_type=target_type, target_id=target.id, severity=severity, message=message, state=state)
     session.add(event)
     session.flush()
-    if deliver:
+    if deliver and not _background_delivery:
         deliver_event(event, session)
+    if deliver:
+        _alert_wake.set()      # the worker's delivery thread sends it within a second of the commit
+
+
+# In the worker, alerts are sent by their own thread (never by the check loop): a slow or failing channel then cannot delay checks, and
+# a slow check (a service timing out, a long API test) cannot delay an alert. The API and tests deliver inline.
+_background_delivery = False
+_alert_wake = __import__("threading").Event()
 
 
 def confirm_checks(target) -> int:
@@ -925,28 +936,52 @@ def run_once() -> None:
                     logger.exception("failed to record result for %s id=%s", kind, target.id)
                     _defer(session, target)
 
-        # Push-mode agents: the agent reports on its own; the worker only detects silence.
-        now = datetime.now(timezone.utc)
-        for server in servers:
-            if server.monitor_mode != "push" or server.last_seen_at is None:
-                continue
-            seen = server.last_seen_at if server.last_seen_at.tzinfo else server.last_seen_at.replace(tzinfo=timezone.utc)
-            silent_for = (now - seen).total_seconds()
-            if silent_for > heartbeat_grace(server.check_interval_seconds) and is_due(server.last_checked_at, server.check_interval_seconds):
-                apply_server_result(session, server, "down", error=f"No agent heartbeat for {int(silent_for)}s", debounce=False)
-        session.commit()
-        from .routes_k8s import check_cluster_heartbeats
-        check_cluster_heartbeats(session)
-        session.commit()
+        if not _background_delivery:          # tests / single-threaded use: everything in this tick
+            check_silence(session)
+            retry_pending_alerts(session)
+            session.commit()
         from . import devops
         devops.check_heartbeats(session)
         devops.check_slos(session)
-        retry_pending_alerts(session)
         session.commit()
         from .scheduler import run_due_schedules
         run_due_schedules(session)
     finally:
         session.close()
+
+
+def check_silence(session) -> None:
+    """Push-mode agents and cluster agents report on their own; this only detects silence (an agent that stopped reporting)."""
+    now = datetime.now(timezone.utc)
+    for server in session.scalars(select(Server).where(Server.enabled.is_(True), Server.monitor_mode == "push", Server.last_seen_at.is_not(None))).all():
+        if pause_state(server) == "monitor":
+            continue
+        seen = server.last_seen_at if server.last_seen_at.tzinfo else server.last_seen_at.replace(tzinfo=timezone.utc)
+        silent_for = (now - seen).total_seconds()
+        if silent_for > heartbeat_grace(server.check_interval_seconds) and is_due(server.last_checked_at, server.check_interval_seconds):
+            apply_server_result(session, server, "down", error=f"No agent heartbeat for {int(silent_for)}s", debounce=False)
+    session.commit()
+    from .routes_k8s import check_cluster_heartbeats
+    check_cluster_heartbeats(session)
+    session.commit()
+
+
+def _fast_loop(name: str, job, every: float, wake=None) -> None:
+    """A small loop on its own thread with its own database session per run."""
+    while True:
+        session = SessionLocal()
+        try:
+            job(session)
+            session.commit()
+        except Exception:
+            session.rollback()
+            logger.exception("%s failed", name)
+        finally:
+            session.close()
+        if wake is not None:
+            wake.wait(every); wake.clear()
+        else:
+            time.sleep(every)
 
 
 def prune_history() -> None:
@@ -995,7 +1030,8 @@ def retry_pending_alerts(session) -> None:
     for stale in session.scalars(select(AlertEvent).where(AlertEvent.sent.is_(False), AlertEvent.delivery_attempts < 10, AlertEvent.created_at < cutoff)).all():
         stale.delivery_attempts = 10  # stop retrying: a delayed "down" message hours later is just noise
         stale.delivery_error = ((stale.delivery_error or "") + " [expired, not retried]").strip()
-    pending = session.scalars(select(AlertEvent).where(AlertEvent.sent.is_(False), AlertEvent.delivery_attempts < 10)).all()
+    pending = session.scalars(select(AlertEvent).where(AlertEvent.created_at >= cutoff, AlertEvent.sent.is_(False), AlertEvent.delivery_attempts < 10)
+                              .order_by(AlertEvent.id)).all()        # created_at is indexed: cheap even when polled every second
     for event in pending:
         if event.last_attempt_at is not None:
             last_attempt = event.last_attempt_at
@@ -1030,6 +1066,10 @@ def run_forever() -> None:
     logger.info("monitor worker started scheduler_poll_seconds=1 concurrency=%s", get_settings().worker_concurrency)
     import threading
     threading.Thread(target=_security_loop, name="security-scans", daemon=True).start()
+    global _background_delivery
+    _background_delivery = True
+    threading.Thread(target=_fast_loop, args=("alert delivery", retry_pending_alerts, 1.0, _alert_wake), name="alerts", daemon=True).start()
+    threading.Thread(target=_fast_loop, args=("heartbeat check", check_silence, 2.0), name="heartbeats", daemon=True).start()
     last_prune = 0.0
     while True:
         try:

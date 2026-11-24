@@ -51,9 +51,9 @@ def record_logins(db: Session, server, accepted: list[dict], now: datetime) -> N
     settings = get_settings()
     since = now - timedelta(hours=24)
     failures: dict[str, int] = {}
-    for raw in db.scalars(select(SshFailureSample.ips).where(SshFailureSample.ts >= since)).all():
-        for ip, n in json.loads(raw or "{}").items():
-            failures[ip] = failures.get(ip, 0) + int(n)
+    for ip in {login["ip"] for login in accepted[:60]}:    # only the addresses that logged in: a busy brute-force day holds thousands of samples
+        for raw in db.scalars(select(SshFailureSample.ips).where(SshFailureSample.ts >= since, SshFailureSample.ips.contains(json.dumps(ip)))).all():
+            failures[ip] = failures.get(ip, 0) + int((json.loads(raw or "{}") or {}).get(ip, 0))
     first = db.scalar(select(func.min(SshLoginEvent.ts)).where(SshLoginEvent.server_id == server.id))
     has_baseline = first is not None and now - aware(first) >= timedelta(hours=24)
     for login in accepted[:60]:
@@ -214,6 +214,18 @@ def hardening_weakened(db: Session, server, current: list[dict], previous: list[
             _change(db, server, f"weakened:{c['id']}:{now.date().isoformat()}", "hardening_weakened", c.get("severity") or "medium",
                     f"Protection turned off: {c['title']}", f"This passed in the previous check and fails now. {c.get('detail') or ''} If nobody on your team changed it, investigate.",
                     {"check": c["id"]}, now, level)
+    passing = {c["id"] for c in current if c.get("ok") is True}
+    _resolve_where(db, server, "weakened:", lambda key: key.split(":")[1] in passing, now)   # turned back on: no longer a problem
+
+
+def _resolve_where(db: Session, server, prefix: str, gone, now: datetime) -> None:
+    """Closes open SM-Watch change findings (key starting with `prefix`) whose condition the latest scan no longer shows. Event
+    findings (a new account, a changed file) are not closed this way: they stay until someone acknowledges them."""
+    from .models import SecurityFinding
+    for row in db.scalars(select(SecurityFinding).where(SecurityFinding.server_id == server.id, SecurityFinding.source == "smwatch",
+                                                        SecurityFinding.key.like(prefix + "%"), SecurityFinding.resolved_at.is_(None))).all():
+        if gone(row.key):
+            row.resolved_at = now
 
 
 def ports_opened(db: Session, server, current: list[dict], previous: list[dict], now: datetime, level: int) -> None:
@@ -229,6 +241,8 @@ def ports_opened(db: Session, server, current: list[dict], previous: list[dict],
         _change(db, server, f"port_opened:{p['port']}:{p.get('process') or ''}", "port_opened", severity, f"New service open to every network: {what}",
                 f"{p.get('process') or 'A program'} started accepting connections on {what} from any address. {advice} Acknowledge it if you opened it on purpose.",
                 {"port": p["port"], "process": p.get("process") or ""}, now, level)
+    still_open = {str(p["port"]) for p in current if p.get("all_interfaces")}
+    _resolve_where(db, server, "port_opened:", lambda key: key.split(":")[1] not in still_open, now)    # closed again (or back to localhost only)
 
 
 SENSITIVE_FILES = ("/etc/sudoers", "/etc/sudoers.d/", "/etc/pam.d/", "/etc/ld.so.preload")
