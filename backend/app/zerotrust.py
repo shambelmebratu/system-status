@@ -177,7 +177,7 @@ def verify_server(db: Session, s, metrics: dict, open_findings: list, port_scan,
     add("exposure", "No risky ports reachable", None if port_scan is None else not risky, "not scanned yet" if port_scan is None else (f"{len(risky)} reachable: " + ", ".join(str(p.get("port")) for p in risky[:5]) if risky else "nothing risky reachable"))
     failed = [c for c in checks if c["ok"] is False]
     status = "untrusted" if any(c["weight"] == "untrusted" for c in failed) else "review" if failed else "verified"
-    return {"status": status, "checks": checks, "passed": sum(1 for c in checks if c["ok"] is True), "total": sum(1 for c in checks if c["ok"] is not None)}
+    return {"status": status, "checks": checks, "passed": sum(1 for c in checks if c["ok"] is True), "total": sum(1 for c in checks if c["ok"] is not None), "risky_ports": len(risky)}
 
 
 def _ago(t, now) -> str:

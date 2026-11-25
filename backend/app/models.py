@@ -658,3 +658,13 @@ class CheckDaily(Base):
     target_id: Mapped[int] = mapped_column(Integer, primary_key=True)
     total: Mapped[int] = mapped_column(Integer, default=0)
     ok: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class SecuritySnapshot(Base):
+    """The security state of every server, recorded every hour by the worker, so Security → Compare can show how it changed from
+    hour to hour, day to day, week to week and month to month. Hourly rows are kept 35 days; one row per day is kept 400 days."""
+    __tablename__ = "security_snapshots"
+    __table_args__ = (Index("ix_security_snapshots_ts", "ts"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    data: Mapped[str] = mapped_column(Text, default="{}")     # JSON {"servers": {id: {...}}}

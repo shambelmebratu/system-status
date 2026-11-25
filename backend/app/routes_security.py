@@ -231,6 +231,14 @@ ZT_CHANGE_KINDS = {"user_added", "admin_granted", "critical_file_changed", "syst
                    "ssh_login_new_source", "ssh_login_after_failures", "ssh_key_added", "ssh_many_logins", "file_transfer"}
 
 
+@router.get("/compare")
+def compare(period: str = Query("day", pattern="^(hour|day|week|month)$"), server: str | None = Query(None, max_length=200),
+            user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+    """How security changed: this hour / day / week / month against the one before (state and events), per server, with a trend."""
+    from . import secsnap
+    return secsnap.compare(db, visible_servers(db, user, server), period, smwatch=user["role"] == "admin" and not server)
+
+
 @router.get("/trust")
 def trust(server: str | None = Query(None, max_length=200), user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
     """Zero trust: is every server verified right now (and why not), who can get in (SM-Watch accounts and SSH identities, with

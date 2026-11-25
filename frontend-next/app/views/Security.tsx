@@ -7,6 +7,7 @@ import { TargetPicker, type PickerOption } from '../components/logviewer';
 import { api, ApiError, post, put } from '../lib/api';
 import { useApp, usePoll } from '../lib/app';
 import { timeAgo } from '../lib/format';
+import { AreaChart } from '../components/charts';
 import { CommandBlock, fixForCheck, fixForPort, fixForTls, fixForUpdates } from '../components/secfix';
 import { SEC_NAV, SEC_SECTIONS, TAB_LABEL, groupOfSection, setSecCounts, type SecSection, visibleTabs } from '../lib/secnav';
 
@@ -95,6 +96,33 @@ function ServerTag({ who, onPick }: { who: Partial<Who> | null | undefined; onPi
 /* ---------------------------------------------------------------- page */
 /** The part of a server's drawer a click should land on (it scrolls there and highlights it). */
 type Focus = 'threats' | 'hardening' | 'updates' | 'exposure' | 'ssh';
+/** The part of a server an event is about, so a click opens that part, never an unrelated one. Takes a finding kind, an alert kind or an activity type. */
+function focusFor(kind?: string | null, type?: string): Focus {
+  const k = kind ?? '';
+  if (type === 'login') return 'ssh';
+  if (type === 'scan') return 'exposure';
+  if (k.startsWith('ssh') || k === 'file_transfer' || k === 'login' || k === 'sftp') return 'ssh';
+  if (k === 'hardening_weakened' || k === 'hardening') return 'hardening';
+  if (k === 'port_opened' || k === 'exposure' || k.startsWith('tls')) return 'exposure';
+  if (k === 'updates' || k === 'foreign_packages') return 'updates';
+  return 'threats';
+}
+/** One short line under the section title: what it shows, and what to do with it. */
+const TAB_INTRO: Partial<Record<SecSection, string>> = {
+  overview: 'Your security score, what to fix first, and every server at a glance. Click anything to open exactly that item.',
+  compare: 'How security changed: this hour, day, week or month against the one before. Red means worse, green means better.',
+  servers: 'Each server with its grade and the reasons for it. Click one to see everything about it.',
+  trust: 'Zero trust: a server is verified only while every check passes now; anything new waits for a person to review it.',
+  threats: 'Signs of compromise found by the agents. Open one for the evidence, fix it, then acknowledge it with a note.',
+  kubernetes: 'Risky workloads and access in your clusters.',
+  exposure: 'What can be reached from the internet, and weak TLS. Close what does not need to be public.',
+  hardening: 'Settings that make a server easier to break into. Each failed check comes with the command to fix it.',
+  updates: 'Security updates waiting to be installed, per server.',
+  ssh: 'Who logged in over SSH, and who is trying to guess passwords.',
+  activity: 'Everything that happened, newest first, with who, from where and when. Updates every 15 seconds.',
+  reports: 'Printable reports for a period: pick one, create it, print or save as PDF.',
+  alerts: 'Which security events send a message, and to which channels.',
+};
 /** How a section opens when a number or item elsewhere is clicked: already filtered to what that number counted. */
 type Preset = { sev?: Severity[]; failedOnly?: boolean; riskyOnly?: boolean; highlight?: string };
 type DrawerState = { kind: 'server'; id: number; focus?: Focus; port?: number } | { kind: 'finding'; finding: Finding; from?: number } | { kind: 'tls'; id: number }
@@ -169,6 +197,7 @@ export function Security() {
       <div className="sec-layout">
         <div className="sec-main">
           {group.id === 'posture' && o && <PostureMetrics o={o} go={go} />}
+          {TAB_INTRO[tab] && <p className="sec-intro">{TAB_INTRO[tab]}</p>}
           {tabs.length > 1 && <div className="ktabs sec-subtabs" role="tablist">{tabs.map(t => { const c = (n as Record<string, number>)[COUNT_KEY[t] ?? ''] ?? 0;
             return <button key={t} role="tab" aria-selected={tab === t} className={tab === t ? 'on' : ''} onClick={() => go(t)}>{label(t)}{c > 0 && <span className={`sub-count ${COUNT_TONE[t] ?? 'warn'}`} title={COUNT_HINT[t]?.(c)}>{c}</span>}</button>; })}</div>}
           {data.error && <div className="err">{data.error}</div>}
@@ -176,6 +205,7 @@ export function Security() {
             <SecCtx.Provider value={sec}>
               {tab === 'overview' && <SecurityHome server={server} />}
               {tab === 'trust' && <ZeroTrust server={server} />}
+              {tab === 'compare' && <Compare server={server} />}
               {tab === 'activity' && <Activity server={server} />}
               {tab === 'servers' && <ServersSection />}
               {tab === 'threats' && <Threats key={`t${preset.n}`} server={server} preset={presetFor('threats')} />}
@@ -376,7 +406,7 @@ const groupLabel = (kind: string) => GROUPS.find(g => g.kinds.includes(kind))?.l
 type ActCategory = 'access' | 'changes' | 'threats' | 'scans' | 'alerts' | 'smwatch' | 'agents';
 type ActivityItem = { at: string; type: 'found' | 'acknowledged' | 'resolved' | 'scan' | 'alert' | 'action' | 'login'; severity: Severity; title: string; detail?: string;
   server: { id: number; name: string } | null; finding_id?: number; kind?: string | null; actor?: string | null; sent?: boolean; ip?: string | null; success?: boolean;
-  category?: ActCategory; target?: { type: 'server' | 'service' | 'cluster' | string; id: number } };
+  category?: ActCategory; target?: { type: 'server' | 'service' | 'cluster' | string; id: number }; target_ref?: string | null };
 const ACT_ICON: Record<ActivityItem['type'], string> = { found: 'alert', acknowledged: 'check', resolved: 'check', scan: 'globe', alert: 'bell', action: 'settings', login: 'terminal' };
 const ACT_LABEL: Record<ActivityItem['type'], string> = { found: 'Found', acknowledged: 'Reviewed', resolved: 'Resolved', scan: 'Scan', alert: 'Alert', action: 'SM-Watch', login: 'Access' };
 const ACT_CATEGORIES: [ActCategory | 'all', string, string][] = [['all', 'Everything', 'every event below'], ['access', 'Access', 'SSH logins, file transfers and sign-ins to SM-Watch'],
@@ -459,7 +489,7 @@ function SecurityHome({ server }: { server: string }) {
         </section>
       </div>
       <section className="card flush"><div className="card-head pad"><div><h2>Server security matrix</h2><p className="muted sm">Click a server to see everything about it.</p></div><span className="grow" /><button className="lg-link sm" onClick={() => go('servers')}>Cards view →</button></div>
-        {rows.length === 0 ? <p className="muted sm pad-x">No servers yet.</p> : <div className="tbl-wrap"><table className="tbl"><thead><tr><th>Server</th><th>Grade</th><th className="num">Serious threats</th><th className="num">Risky ports</th><th>Hardening</th><th className="num">Security updates</th><th className="num">SSH failures 24 h</th><th className="num">Last scan</th></tr></thead><tbody>
+        {rows.length === 0 ? <p className="muted sm pad-x">No servers yet.</p> : <div className="tbl-wrap"><table className="tbl sec-mx"><thead><tr><th>Server</th><th>Grade</th><th className="num">Serious threats</th><th className="num">Risky ports</th><th>Hardening</th><th className="num">Security updates</th><th className="num hide-md">SSH failures 24 h</th><th className="num hide-md">Last scan</th></tr></thead><tbody>
           {[...rows].sort((a, b) => (a.score.score ?? 101) - (b.score.score ?? 101)).map(({ row: s, score }) => {
             const risky = (s.scan?.results.open ?? []).filter(p => p.risk === 'critical' || p.risk === 'high').length;
             const pctOk = s.hardening.total ? Math.round((100 * s.hardening.passed) / s.hardening.total) : null;
@@ -471,8 +501,8 @@ function SecurityHome({ server }: { server: string }) {
               <td className={`num mono ${risky ? 'bad' : s.scan ? 'good' : 'muted'}`}>{s.scan ? risky : '–'}</td>
               <td>{pctOk == null ? <span className="muted">–</span> : <span className="sec-bar"><span className={pctOk >= 85 ? 'good' : pctOk >= 70 ? 'warn' : 'bad'} style={{ width: `${pctOk}%` }} /></span>}{pctOk != null && <span className="mono sm"> {pctOk}%</span>}</td>
               <td className={`num mono ${s.updates?.security ? 'warn' : 'muted'}`}>{s.updates ? s.updates.security : '–'}</td>
-              <td className={`num mono ${s.ssh_24h.total > 100 ? 'bad' : 'muted'}`}>{s.ssh_24h.total.toLocaleString()}</td>
-              <td className="num muted sm">{ago(s.scan?.started_at ?? s.threat_scan_at)}</td></tr>; })}
+              <td className={`num mono hide-md ${s.ssh_24h.total > 100 ? 'bad' : 'muted'}`}>{s.ssh_24h.total.toLocaleString()}</td>
+              <td className="num muted sm hide-md">{ago(s.scan?.started_at ?? s.threat_scan_at)}</td></tr>; })}
         </tbody></table></div>}
       </section>
     </div>
@@ -482,14 +512,19 @@ function SecurityHome({ server }: { server: string }) {
 /* ---------------------------------------------------------------- activity */
 function ActivityList({ items, compact }: { items: ActivityItem[]; compact?: boolean }) {
   const { openServer, openFinding, openTls, go } = useSec();
-  const { toast } = useApp();
+  const { toast, go: navigate } = useApp();
   // Each entry opens what it is about: a finding its finding, a scan its result, an alert the part of the server it concerns.
-  const focusOf = (kind?: string | null): Focus => (kind === 'exposure' ? 'exposure' : kind?.startsWith('ssh') ? 'ssh' : 'threats');
   const opener = (i: ActivityItem): (() => void) | null => {
     if (i.finding_id) return () => { api<Finding>(`/security/findings/${i.finding_id}`).then(f => openFinding(f)).catch(e => toast((e as Error).message, true)); };
+    if (i.type === 'login' && i.server) return () => openServer(i.server!.id, 'ssh');
+    if (i.type === 'action' && i.target_ref) {            // a change in SM-Watch opens the page of what was changed
+      const [kind, id] = i.target_ref.split(':');
+      const page = kind === 'server' ? `servers/${id}` : kind === 'service' ? `services/${id}` : kind === 'cluster' ? `kubernetes/${id}` : kind === 'user' ? 'users' : kind === 'channel' ? 'alerts' : null;
+      return page && /^\d*$/.test(id ?? '') ? () => navigate(page) : null;
+    }
     const t = i.target;
     if (!t || (i.type !== 'scan' && i.type !== 'alert')) return null;
-    if (t.type === 'server') return () => openServer(t.id, i.type === 'scan' ? 'exposure' : focusOf(i.kind));
+    if (t.type === 'server') return () => openServer(t.id, focusFor(i.kind, i.type));
     if (t.type === 'service') return () => openTls(t.id);
     if (t.type === 'cluster') return () => (i.type === 'scan' || i.kind === 'exposure' ? go('exposure', { highlight: `cluster-${t.id}` }) : go('kubernetes'));
     return null;
@@ -505,7 +540,7 @@ function ActivityList({ items, compact }: { items: ActivityItem[]; compact?: boo
           <div className="sec-tl-head">{(() => { const open = opener(i); return open ? <button className="lg-link sec-tl-title" onClick={open}>{i.title}</button> : <b className="sec-tl-title">{i.title}</b>; })()}
             {i.type === 'found' && <span className={`sev ${i.severity}`}>{SEV_LABEL[i.severity]}</span>}</div>
           <div className="sec-tl-meta muted sm"><span className="tag">{ACT_LABEL[i.type]}</span>
-            {i.server && <button className="lg-link" onClick={() => openServer(i.server!.id, i.type === 'scan' ? 'exposure' : i.type === 'alert' ? focusOf(i.kind) : 'threats')}><Icon name="server" size={11} /> {i.server.name}</button>}
+            {i.server && <button className="lg-link" onClick={() => openServer(i.server!.id, focusFor(i.kind, i.type))}><Icon name="server" size={11} /> {i.server.name}</button>}
             {i.actor && <span>by <b>{i.actor}</b></span>}
             {i.ip && <span className="mono">from {i.ip}</span>}
             {i.success === false && <span className="bad">refused</span>}
@@ -530,7 +565,6 @@ function Activity({ server }: { server: string }) {
   const cats = ACT_CATEGORIES.filter(([id]) => isAdmin || id !== 'smwatch');
   return (
     <div className="grid">
-      <div className="sec-note"><Icon name="shield" size={14} /><div><b>Everything that happens, as it happens</b><p>Every SSH login and file transfer, every sign-in to SM-Watch (and every refused one), every change on your servers and in this dashboard, with who did it, from which address, on which server and when. Nothing is left out because it looks routine: review what you did not expect.</p></div></div>
       <div className="filterbar"><div className="seg">{[1, 7, 30, 90].map(n => <button key={n} className={days === n ? 'on' : ''} onClick={() => setDays(n)}>{n === 1 ? '24 hours' : `${n} days`}</button>)}</div>
         <span className="sec-live"><i />live · every 15 s</span><span className="grow" />
         <input className="inc-search" value={q} onChange={e => setQ(e.target.value)} placeholder="Search person, address, server, event…" aria-label="Search activity" /></div>
@@ -538,6 +572,83 @@ function Activity({ server }: { server: string }) {
       {d.error && <div className="err">{d.error}</div>}
       <section className="card">{!d.value ? <p className="muted"><span className="spinner" /> Loading…</p> : shown.length === 0 ? <Empty title="Nothing in this period">{needle ? 'Nothing matches the search.' : 'Logins, sign-ins, changes, findings, alerts and scans appear here as they happen.'}</Empty> : <ActivityList items={shown} />}
         {d.value && d.value.length >= 1000 && <p className="muted sm">Showing the newest 1000 events: choose a shorter period or a category to see older ones.</p>}</section>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------- compare over time */
+type CmpPeriod = 'hour' | 'day' | 'week' | 'month';
+type CmpState = Record<'critical' | 'high' | 'unreviewed' | 'hardening_failed' | 'updates' | 'risky_ports' | 'verified' | 'untrusted', number>;
+type CmpEvents = Record<string, number>;
+type CmpData = { period: CmpPeriod; generated_at: string; history_since: string | null;
+  current: { start: string; end: string; events: CmpEvents; state: CmpState }; previous: { start: string; end: string; events: CmpEvents; state: CmpState | null; snapshot_at: string | null };
+  servers: { id: number; name: string; now: CmpState; then: CmpState | null }[]; series: ({ t: string } & Record<string, number | string>)[] };
+const CMP_PERIODS: [CmpPeriod, string, string, string][] = [['hour', 'Hour to hour', 'this hour', 'the hour before'], ['day', 'Day to day', 'last 24 hours', 'the 24 hours before'],
+  ['week', 'Week to week', 'last 7 days', 'the 7 days before'], ['month', 'Month to month', 'last 30 days', 'the 30 days before']];
+// [key, label, better when it goes up?]
+const CMP_STATE: [keyof CmpState, string, boolean][] = [['critical', 'Critical threats open', false], ['high', 'High-risk findings open', false], ['unreviewed', 'Waiting for review', false],
+  ['risky_ports', 'Risky ports reachable', false], ['hardening_failed', 'Failed hardening checks', false], ['updates', 'Security updates missing', false], ['verified', 'Servers verified', true]];
+const CMP_EVENTS: [string, string, boolean][] = [['new_critical', 'New critical threats', false], ['new_high', 'New high-risk findings', false], ['resolved', 'Findings resolved', true],
+  ['reviewed', 'Findings reviewed', true], ['ssh_failed', 'Failed SSH logins', false], ['ssh_logins', 'Successful SSH logins', false], ['ssh_new_sources', 'Logins from new addresses', false],
+  ['alerts', 'Security alerts', false], ['signins', 'Sign-ins to SM-Watch', false], ['signins_failed', 'Refused sign-ins to SM-Watch', false], ['smwatch_changes', 'Changes in SM-Watch', false]];
+
+function Delta({ now, then, upGood }: { now: number; then: number | null | undefined; upGood: boolean }) {
+  if (then == null) return <span className="cmp-delta none">no earlier data</span>;
+  const d = now - then;
+  if (d === 0) return <span className="cmp-delta same">no change</span>;
+  const better = upGood ? d > 0 : d < 0;
+  const pctTxt = then ? ` (${d > 0 ? '+' : ''}${Math.round((d / then) * 100)}%)` : '';
+  return <span className={`cmp-delta ${better ? 'better' : 'worse'}`}>{d > 0 ? '▲' : '▼'} {Math.abs(d).toLocaleString()}{pctTxt}</span>;
+}
+
+function Compare({ server }: { server: string }) {
+  const { openServer } = useSec();
+  const [period, setPeriod] = useState<CmpPeriod>('day');
+  const d = usePoll(() => api<CmpData>(withQ(`/security/compare?period=${period}`, server)), [period, server], 60000, true);
+  const meta = CMP_PERIODS.find(p => p[0] === period)!;
+  const r = d.value;
+  const fmtRange = (a: string, b: string) => { const o: Intl.DateTimeFormatOptions = period === 'hour' ? { hour: '2-digit', minute: '2-digit' } : { day: 'numeric', month: 'short', hour: period === 'day' ? '2-digit' : undefined, minute: period === 'day' ? '2-digit' : undefined };
+    return `${new Date(a).toLocaleString([], o)} → ${new Date(b).toLocaleString([], o)}`; };
+  return (
+    <div className="grid">
+      <div className="filterbar"><div className="seg">{CMP_PERIODS.map(([id, label]) => <button key={id} className={period === id ? 'on' : ''} onClick={() => setPeriod(id)}>{label}</button>)}</div>
+        {r && <span className="muted sm">{meta[2]} ({fmtRange(r.current.start, r.current.end)}) compared with {meta[3]}</span>}</div>
+      {d.error && <div className="err">{d.error}</div>}
+      {!r ? <div className="card"><p className="muted"><span className="spinner" /> Comparing…</p></div> : <>
+        <section className="card">
+          <div className="card-head"><h2>Security state: now vs {meta[3].replace('the ', '')}</h2><span className="grow" />
+            <span className="muted sm">{r.previous.snapshot_at ? `earlier state recorded ${new Date(r.previous.snapshot_at).toLocaleString()}` : ''}</span></div>
+          {!r.previous.state && <p className="sec-intro warn">No snapshot from {meta[3]} yet: SM-Watch records the security state every hour{r.history_since ? `, starting ${new Date(r.history_since).toLocaleString()}` : ' (the first one is taken within an hour of this update)'}. Events below are compared already.</p>}
+          <div className="cmp-grid">{CMP_STATE.map(([k, label, upGood]) => <div key={k} className="cmp-cell">
+            <span className="cmp-label">{label}</span><b className="cmp-now">{r.current.state[k].toLocaleString()}</b>
+            <span className="cmp-then">{r.previous.state ? <>was {r.previous.state[k].toLocaleString()}</> : '–'}</span><Delta now={r.current.state[k]} then={r.previous.state?.[k]} upGood={upGood} /></div>)}</div>
+        </section>
+        <section className="card">
+          <div className="card-head"><h2>What happened: {meta[2]} vs {meta[3]}</h2></div>
+          <div className="cmp-grid">{CMP_EVENTS.filter(([k]) => k in r.current.events).map(([k, label, upGood]) => <div key={k} className="cmp-cell">
+            <span className="cmp-label">{label}</span><b className="cmp-now">{r.current.events[k].toLocaleString()}</b>
+            <span className="cmp-then">was {r.previous.events[k].toLocaleString()}</span><Delta now={r.current.events[k]} then={r.previous.events[k]} upGood={upGood} /></div>)}</div>
+        </section>
+        <section className="card">
+          <div className="card-head"><h2>Trend</h2><span className="grow" /><span className="muted sm">one point per {period}, last {r.series.length} {period}s</span></div>
+          <div className="cmp-charts">
+            <div><h3 className="drawer-h">Failed SSH logins</h3><AreaChart points={r.series} height={130} showDate={period !== 'hour'} series={[{ key: 'ssh_failed', label: 'Failed SSH logins', color: 'var(--c5)' }]} /></div>
+            <div><h3 className="drawer-h">New serious threats and resolved findings</h3><AreaChart points={r.series} height={130} showDate={period !== 'hour'} series={[{ key: 'new_threats', label: 'New critical/high', color: 'var(--bad)' }, { key: 'resolved', label: 'Resolved', color: 'var(--good)' }]} /></div>
+            <div><h3 className="drawer-h">Open threats and missing updates</h3><AreaChart points={r.series} height={130} showDate={period !== 'hour'} series={[{ key: 'critical', label: 'Critical open', color: 'var(--bad)' }, { key: 'high', label: 'High open', color: 'var(--warn)' }, { key: 'updates', label: 'Updates missing', color: 'var(--c1)' }]} /></div>
+            <div><h3 className="drawer-h">SSH logins and security alerts</h3><AreaChart points={r.series} height={130} showDate={period !== 'hour'} series={[{ key: 'ssh_logins', label: 'SSH logins', color: 'var(--c2)' }, { key: 'alerts', label: 'Alerts', color: 'var(--c3)' }]} /></div>
+          </div>
+        </section>
+        <section className="card flush">
+          <div className="card-head pad"><h2>Per server: now vs {meta[3].replace('the ', '')}</h2><span className="grow" /><span className="muted sm">click a server to see why</span></div>
+          <div className="tbl-wrap"><table className="tbl"><thead><tr><th>Server</th><th className="num">Critical</th><th className="num">High</th><th className="num hide-sm">To review</th><th className="num hide-sm">Risky ports</th><th className="num hide-sm">Hardening</th><th className="num">Updates</th><th>Verified</th></tr></thead><tbody>
+            {[...r.servers].sort((a, b) => (b.now.critical + b.now.high) - (a.now.critical + a.now.high)).map(sv => {
+              const cell = (k: keyof CmpState, cls = '') => { const n = sv.now[k] ?? 0, t = sv.then?.[k]; const dd = t == null ? 0 : n - t;
+                return <td className={`num ${cls}`}>{n}{t != null && dd !== 0 && <small className={dd > 0 ? 'bad' : 'good'}> {dd > 0 ? '▲' : '▼'}{Math.abs(dd)}</small>}</td>; };
+              return <tr key={sv.id} className="link" onClick={() => openServer(sv.id)}><td><b>{sv.name}</b></td>{cell('critical')}{cell('high')}{cell('unreviewed', 'hide-sm')}{cell('risky_ports', 'hide-sm')}{cell('hardening_failed', 'hide-sm')}{cell('updates')}
+                <td className="sm">{sv.now.verified ? <span className="good">yes</span> : <span className="warn">no</span>}{sv.then && sv.then.verified !== sv.now.verified && <span className="muted"> (was {sv.then.verified ? 'yes' : 'no'})</span>}</td></tr>; })}
+          </tbody></table></div>
+        </section>
+      </>}
     </div>
   );
 }
@@ -551,6 +662,15 @@ type TrustData = { generated_at: string; devices: TrustDevice[]; identities: { u
   summary: { devices: { total: number; verified: number; review: number; untrusted: number }; people: { total: number; verified: number; without_mfa: number } | null; ssh: { identities: number; new_sources: number; root: number }; unreviewed: number } };
 const TRUST_LABEL: Record<TrustDevice['status'], string> = { verified: 'Verified', review: 'Needs review', untrusted: 'Untrusted', unverified: 'Cannot be verified' };
 const TRUST_TONE: Record<TrustDevice['status'], string> = { verified: 'good', review: 'warn', untrusted: 'bad', unverified: 'bad' };
+
+/** Source addresses that wrap inside their cell: new ones first and highlighted, the rest behind "+N more". */
+function IpList({ ips, fresh, max = 4 }: { ips: string[]; fresh: string[]; max?: number }) {
+  const [all, setAll] = useState(false);
+  const sorted = [...ips].sort((a, b) => Number(fresh.includes(b)) - Number(fresh.includes(a)));
+  const shown = all ? sorted : sorted.slice(0, max);
+  return <div className="zt-ips">{shown.map(ip => <span key={ip} className={`chip mono ${fresh.includes(ip) ? 'zt-new' : ''}`} title={fresh.includes(ip) ? 'first login from this address' : undefined}>{ip}</span>)}
+    {sorted.length > max && <button type="button" className="lg-link sm" title={sorted.join(', ')} onClick={e => { e.stopPropagation(); setAll(!all); }}>{all ? 'show fewer' : `+${sorted.length - max} more`}</button>}</div>;
+}
 
 function ZeroTrust({ server }: { server: string }) {
   const { openServer, openFinding } = useSec();
@@ -567,7 +687,6 @@ function ZeroTrust({ server }: { server: string }) {
   const scrollTo = (id: string) => document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   return (
     <div className="grid">
-      <div className="sec-note"><Icon name="shield" size={14} /><div><b>Zero trust: verify everything, all the time</b><p>Nothing counts as safe because it was safe yesterday. A server is <b>verified</b> only while every check below passes right now; every person and SSH identity is listed with what is new; every change and new kind of access waits here until someone reviews it. Checked {timeAgo(t.generated_at)}, refreshed every 30 s.</p></div></div>
       <div className="kpis">
         {kpi('Servers verified', <>{sm.devices.verified}<small> / {sm.devices.total}</small></>, sm.devices.untrusted ? 'bad' : sm.devices.review ? 'warn' : 'good', sm.devices.untrusted ? `${sm.devices.untrusted} untrusted or not verifiable` : sm.devices.review ? `${sm.devices.review} need review` : 'every server passes every check', 'server', () => scrollTo('zt-devices'))}
         {kpi('Waiting for review', sm.unreviewed, sm.unreviewed ? 'warn' : 'good', sm.unreviewed ? 'changes and new access nobody has looked at' : 'everything has been reviewed', 'eye', () => scrollTo('zt-review'))}
@@ -599,30 +718,30 @@ function ZeroTrust({ server }: { server: string }) {
       <section className="card flush" id="zt-review">
         <div className="card-head pad"><h2>Waiting for review</h2><span className="grow" /><span className="muted sm">acknowledge each one with a note once you know what it was</span></div>
         {t.review.length === 0 ? <div className="pad"><p className="good sm">Nothing waiting: every change and every new kind of access has been reviewed.</p></div> :
-          <table className="tbl"><thead><tr><th>Severity</th><th>What</th><th className="hide-sm">Server</th><th className="num">Seen</th></tr></thead><tbody>
+          <div className="tbl-wrap"><table className="tbl"><thead><tr><th>Severity</th><th>What</th><th className="hide-sm">Server</th><th className="num">Seen</th></tr></thead><tbody>
             {t.review.map(f => <tr key={f.id} className="link" onClick={() => openFinding(f)}><td><span className={`sev ${f.severity}`}>{SEV_LABEL[f.severity]}</span></td>
-              <td><div className="name">{f.title}<small>{groupLabel(f.kind)}</small></div></td><td className="hide-sm">{f.server?.name ?? '–'}</td><td className="num sm" title={new Date(f.first_seen).toLocaleString()}>{timeAgo(f.first_seen)}</td></tr>)}</tbody></table>}
+              <td><div className="name">{f.title}<small>{groupLabel(f.kind)}{f.server ? <span className="show-sm"> · {f.server.name}</span> : null}</small></div></td><td className="hide-sm">{f.server?.name ?? '–'}</td><td className="num sm" title={new Date(f.first_seen).toLocaleString()}>{timeAgo(f.first_seen)}</td></tr>)}</tbody></table></div>}
       </section>
 
       {t.identities.users && <section className="card flush" id="zt-people">
         <div className="card-head pad"><h2>Who can sign in to SM-Watch</h2><span className="grow" /><button className="btn sm ghost" onClick={() => navigate('users')}>Manage users</button></div>
-        <table className="tbl"><thead><tr><th>Person</th><th>Role</th><th>Two-factor</th><th className="hide-sm">Last sign-in</th><th className="hide-sm">Addresses (7 days)</th><th>Status</th></tr></thead><tbody>
-          {t.identities.users.map(u => <tr key={u.id}><td><div className="name">{u.name || u.email}<small>{u.email}</small></div></td><td><span className={`role-pill ${u.role}`}>{u.role}</span></td>
+        <div className="tbl-wrap"><table className="tbl"><thead><tr><th>Person</th><th className="hide-sm">Role</th><th>Two-factor</th><th className="hide-sm">Last sign-in</th><th className="hide-sm">Addresses (7 days)</th><th>Status</th></tr></thead><tbody>
+          {t.identities.users.map(u => <tr key={u.id}><td><div className="name">{u.name || u.email}<small>{u.email}<span className="show-sm"> · {u.role}</span></small></div></td><td className="hide-sm"><span className={`role-pill ${u.role}`}>{u.role}</span></td>
             <td>{u.mfa ? <span className="good sm">on</span> : <span className="bad sm">off</span>}</td>
             <td className="hide-sm sm">{u.last_sign_in ? <>{timeAgo(u.last_sign_in)}{u.last_ip && <span className="mono muted"> · {u.last_ip}</span>}</> : <span className="muted">never</span>}</td>
             <td className="hide-sm mono sm">{u.addresses_7d.join(', ') || '–'}</td>
-            <td className="sm">{u.verified ? <span className="good">verified</span> : <span className="warn">{u.issues.join(', ') || 'not verified'}</span>}</td></tr>)}</tbody></table>
+            <td className="sm">{u.verified ? <span className="good">verified</span> : <span className="warn">{u.issues.join(', ') || 'not verified'}</span>}</td></tr>)}</tbody></table></div>
       </section>}
 
       <section className="card flush" id="zt-ssh">
         <div className="card-head pad"><h2>Who logged in to your servers (7 days)</h2><span className="grow" /><span className="muted sm">every user, key and address; new ones highlighted</span></div>
         {t.identities.ssh.length === 0 ? <div className="pad"><p className="muted sm">No SSH logins recorded in the last 7 days.</p></div> :
-          <table className="tbl"><thead><tr><th>User</th><th className="hide-sm">Server</th><th className="num">Logins</th><th>From</th><th className="hide-sm">Keys</th><th className="num hide-sm">Last</th></tr></thead><tbody>
+          <div className="tbl-wrap"><table className="tbl zt-ssh"><thead><tr><th>User</th><th className="hide-sm">Server</th><th className="num">Logins</th><th>From</th><th className="hide-sm">Keys</th><th className="num hide-sm">Last</th></tr></thead><tbody>
             {t.identities.ssh.map(g => <tr key={`${g.server.id}-${g.user}`} className="link" onClick={() => openServer(g.server.id, 'ssh')}>
-              <td><b className={g.root ? 'warn' : ''}>{g.user || '?'}</b>{g.suspicious > 0 && <span className="tag bad-tag">{g.suspicious} after failures</span>}</td><td className="hide-sm">{g.server.name}</td>
+              <td><div className="name"><b className={g.root ? 'warn' : ''}>{g.user || '?'}</b><small className="show-sm">{g.server.name}</small></div>{g.suspicious > 0 && <span className="tag bad-tag">{g.suspicious} after failures</span>}</td><td className="hide-sm">{g.server.name}</td>
               <td className="num">{g.logins}{g.transfers ? <small className="muted"> +{g.transfers} sftp</small> : null}</td>
-              <td className="sm mono">{g.sources.map(ip => <span key={ip} className={`chip mono ${g.new_sources.includes(ip) ? 'zt-new' : ''}`} title={g.new_sources.includes(ip) ? 'first login from this address' : undefined}>{ip}</span>)}</td>
-              <td className="hide-sm sm mono">{g.keys.join(', ') || <span className="muted">password or unknown</span>}</td><td className="num sm hide-sm">{g.last ? timeAgo(g.last) : '–'}</td></tr>)}</tbody></table>}
+              <td><IpList ips={g.sources} fresh={g.new_sources} /></td>
+              <td className="hide-sm sm mono">{g.keys.join(', ') || <span className="muted">password or unknown</span>}</td><td className="num sm hide-sm nowrap">{g.last ? timeAgo(g.last) : '–'}</td></tr>)}</tbody></table></div>}
       </section>
 
       <section className="card"><div className="card-head"><h2>Access in the last 24 hours</h2><span className="grow" /><span className="sec-live"><i />live</span><button className="btn sm ghost" onClick={() => navigate('security/activity')}>Full activity</button></div>
@@ -871,7 +990,7 @@ function FindingDrawer({ finding, from, onClose }: { finding: Finding; from?: nu
     <DrawerShell badges={<><span className={`sev ${f.severity}`}>{SEV_LABEL[f.severity]}</span><Tag kind={groupLabel(f.kind).toUpperCase()} />{status}</>}
       title={f.title} label={<>{f.server?.name ?? `server #${f.server_id}`}{f.server && addr(f.server) && <> · <span className="mono">{addr(f.server)}</span></>} · first seen {timeAgo(f.first_seen)}</>} onClose={onClose}
       actions={<>{from != null && <button className="btn sm ghost" onClick={() => openServer(from)}><Icon name="back" size={13} />Back to server</button>}
-        {from == null && f.server && <button className="btn sm ghost" onClick={() => openServer(f.server!.id, 'threats')}><Icon name="server" size={13} />Server security</button>}
+        {from == null && f.server && <button className="btn sm ghost" onClick={() => openServer(f.server!.id, focusFor(f.kind))}><Icon name="server" size={13} />Server security</button>}
         <span className="grow" />
         {canOperate && f.source === 'agent' && !f.resolved_at && <button className="btn sm" disabled={!!checking} onClick={() => void recheck()} title="Ask the agent to scan again now"><Icon name="refresh" size={13} />{checking ? 'Waiting for the agent…' : 'Re-check now'}</button>}
         {canOperate && ev.pid && f.source === 'agent' && !f.resolved_at && <button className="btn sm" onClick={() => setProc(true)}><Icon name="terminal" size={13} />Inspect process</button>}
@@ -1456,7 +1575,21 @@ const TEMPLATES = [
 ] as const;
 type Template = typeof TEMPLATES[number]['id'];
 
-function risk(s: ReportData['servers'][number]): { level: 'critical' | 'high' | 'medium' | 'low'; reasons: string[] } {
+/** A server's risk for a report, counting only what that report is about (a patch report does not rank by logins, and so on). */
+function risk(s: ReportData['servers'][number], template: Template = 'server'): { level: 'critical' | 'high' | 'medium' | 'low'; reasons: string[] } {
+  if (template === 'patch') {
+    const failed = s.hardening.filter(c => c.ok === false), sec = s.updates?.security ?? 0, foreign = s.foreign_packages?.packages.length ?? 0;
+    const reasons = [sec ? `${sec} security update${sec > 1 ? 's' : ''} missing` : '', s.updates?.reboot_required ? 'reboot needed' : '', failed.length ? `${failed.length} hardening check${failed.length > 1 ? 's' : ''} failed` : '',
+      foreign ? `${foreign} package${foreign > 1 ? 's' : ''} from unknown sources` : ''].filter(Boolean);
+    const level = sec > 10 || failed.some(c => c.severity === 'critical') ? 'high' : sec || failed.some(c => c.severity === 'high') ? 'medium' : 'low';
+    return { level, reasons };
+  }
+  if (template === 'access') {
+    const reasons = [s.logins.suspicious ? `${s.logins.suspicious} login${s.logins.suspicious > 1 ? 's' : ''} after failed attempts` : '', s.logins.new_sources ? `${s.logins.new_sources} from new addresses` : '',
+      s.ssh_failures.total ? `${s.ssh_failures.total.toLocaleString()} failed logins` : ''].filter(Boolean);
+    const level = s.logins.suspicious ? 'critical' : s.logins.new_sources || s.ssh_failures.total > 1000 ? 'high' : s.ssh_failures.total ? 'medium' : 'low';
+    return { level, reasons };
+  }
   const open = s.findings.filter(f => !f.resolved_at && !f.acknowledged_at);
   const reasons: string[] = [];
   const crit = open.filter(f => f.severity === 'critical').length, high = open.filter(f => f.severity === 'high').length;
@@ -1506,24 +1639,31 @@ function csvOf(data: ReportData): string {
 
 function SecurityReport({ data, template, onClose }: { data: ReportData; template: Template; onClose: () => void }) {
   const title = TEMPLATES.find(t => t.id === template)!.label;
-  const ranked = [...data.servers].map(s => ({ s, r: risk(s) })).sort((a, b) => ['critical', 'high', 'medium', 'low'].indexOf(a.r.level) - ['critical', 'high', 'medium', 'low'].indexOf(b.r.level));
+  const ranked = [...data.servers].map(s => ({ s, r: risk(s, template) })).sort((a, b) => ['critical', 'high', 'medium', 'low'].indexOf(a.r.level) - ['critical', 'high', 'medium', 'low'].indexOf(b.r.level));
   const totals = { crit: ranked.filter(x => x.r.level === 'critical').length, high: ranked.filter(x => x.r.level === 'high').length,
     threats: data.servers.reduce((a, s) => a + s.findings.filter(f => !f.resolved_at && !f.acknowledged_at).length, 0), sec: data.servers.reduce((a, s) => a + (s.updates?.security ?? 0), 0),
     suspicious: data.servers.reduce((a, s) => a + s.logins.suspicious, 0) };
   const download = () => { const url = URL.createObjectURL(new Blob([csvOf(data)], { type: 'text/csv' })); const a = document.createElement('a'); a.href = url; a.download = `security-findings-${data.generated_at.slice(0, 10)}.csv`; a.click(); URL.revokeObjectURL(url); };
   useEffect(() => { const k = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); }; window.addEventListener('keydown', k); return () => window.removeEventListener('keydown', k); }, [onClose]);
-  const show = { threats: template !== 'patch', logins: template === 'server' || template === 'access', attacks: template === 'server' || template === 'access', updates: template === 'server' || template === 'patch', hardening: template === 'server' || template === 'patch', exposure: template === 'server' };
+  const show = { threats: template === 'server', logins: template === 'server' || template === 'access', attacks: template === 'server' || template === 'access', updates: template === 'server' || template === 'patch', hardening: template === 'server' || template === 'patch', exposure: template === 'server' };
   return (
     <div className="db-report-overlay">
-      <div className="db-report-bar no-print"><b>{title}</b><span className="grow" /><button className="btn sm" onClick={() => window.print()}>Print / save as PDF</button><button className="btn sm" onClick={download}>Findings as CSV</button><button className="btn sm ghost" onClick={onClose} aria-label="Close"><Icon name="x" /></button></div>
+      <div className="db-report-bar no-print"><b>{title}</b><span className="grow" /><button className="btn sm" onClick={() => window.print()}>Print / save as PDF</button>{(template === 'executive' || template === 'server') && <button className="btn sm" onClick={download}>Findings as CSV</button>}<button className="btn sm ghost" onClick={onClose} aria-label="Close"><Icon name="x" /></button></div>
       <article className="db-report sec-report">
         <header><div className="muted sm">Security report · last {data.days} days · {data.servers.length} server{data.servers.length === 1 ? '' : 's'}{data.filter ? ` · filter “${data.filter}”` : ''}</div><h1>{title}</h1>
           <div className="muted sm">Generated {new Date(data.generated_at).toLocaleString()} · period from {new Date(data.since).toLocaleDateString()}</div></header>
-        <div className="db-r-kpis"><div><b className={totals.crit ? 'bad' : 'good'}>{totals.crit}</b><small>servers at critical risk</small></div><div><b className={totals.threats ? 'warn' : 'good'}>{totals.threats}</b><small>open threats</small></div>
+        {(template === 'executive' || template === 'server') && <div className="db-r-kpis"><div><b className={totals.crit ? 'bad' : 'good'}>{totals.crit}</b><small>servers at critical risk</small></div><div><b className={totals.threats ? 'warn' : 'good'}>{totals.threats}</b><small>open threats</small></div>
           <div><b className={totals.suspicious ? 'bad' : 'good'}>{totals.suspicious}</b><small>suspicious logins</small></div><div><b className={totals.sec ? 'warn' : 'good'}>{totals.sec}</b><small>security updates missing</small></div>
-          <div><b>{data.ssh.total.toLocaleString()}</b><small>failed SSH logins</small></div></div>
+          <div><b>{data.ssh.total.toLocaleString()}</b><small>failed SSH logins</small></div></div>}
+        {template === 'access' && <div className="db-r-kpis"><div><b>{data.servers.reduce((a, s) => a + s.logins.total, 0)}</b><small>successful SSH logins</small></div>
+          <div><b className={totals.suspicious ? 'bad' : 'good'}>{totals.suspicious}</b><small>logins after failed attempts</small></div><div><b className={data.servers.some(s => s.logins.new_sources) ? 'warn' : 'good'}>{data.servers.reduce((a, s) => a + s.logins.new_sources, 0)}</b><small>logins from new addresses</small></div>
+          <div><b>{data.ssh.total.toLocaleString()}</b><small>failed SSH logins</small></div><div><b>{data.ssh.top_ips.length}</b><small>top attacking addresses</small></div></div>}
+        {template === 'patch' && <div className="db-r-kpis"><div><b className={totals.sec ? 'warn' : 'good'}>{totals.sec}</b><small>security updates missing</small></div>
+          <div><b className={data.servers.some(s => s.updates?.reboot_required) ? 'warn' : 'good'}>{data.servers.filter(s => s.updates?.reboot_required).length}</b><small>servers need a reboot</small></div>
+          <div><b className={data.servers.some(s => s.hardening.some(c => c.ok === false)) ? 'warn' : 'good'}>{data.servers.reduce((a, s) => a + s.hardening.filter(c => c.ok === false).length, 0)}</b><small>failed hardening checks</small></div>
+          <div><b>{data.servers.reduce((a, s) => a + (s.foreign_packages?.packages.length ?? 0), 0)}</b><small>packages from unknown sources</small></div></div>}
         {template === 'zerotrust' && <ZeroTrustReport data={data} />}
-        {template !== 'zerotrust' && <><h2>Risk by server</h2>
+        {template !== 'zerotrust' && <><h2>{template === 'patch' ? 'Patch and hardening by server' : template === 'access' ? 'Access risk by server' : 'Risk by server'}</h2>
         <table className="db-r-cols"><thead><tr><th>Server</th><th>Risk</th><th>Why</th></tr></thead><tbody>
           {ranked.map(({ s, r }) => <tr key={s.server.id}><td><b>{s.server.name}</b><div className="muted sm mono">{addr(s.server)}</div></td><td><span className={`sev ${r.level}`}>{SEV_LABEL[r.level]}</span></td><td className="sm">{r.reasons.join(' · ') || 'nothing found'}</td></tr>)}</tbody></table></>}
         {template === 'executive' && <><h2>Fix first</h2><ol className="sec-fix">{ranked.flatMap(({ s }) => s.findings.filter(f => !f.resolved_at && !f.acknowledged_at && (f.severity === 'critical' || f.severity === 'high')).map(f => <li key={f.id}><span className={`sev ${f.severity}`}>{SEV_LABEL[f.severity]}</span> <b>{s.server.name}</b>: {f.title}</li>)).slice(0, 15)}

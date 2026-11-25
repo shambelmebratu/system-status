@@ -1044,6 +1044,11 @@ def retry_pending_alerts(session) -> None:
         deliver_event(event, session)
 
 
+def _security_snapshot(session) -> None:
+    from .secsnap import take
+    take(session)
+
+
 def _security_loop() -> None:
     """Slow background work on its own thread, so it never delays the regular checks: storing yesterday's (and older) uptime per
     day, scheduled exposure scans and TLS audits, anomaly detection, and (when enabled) AI explanations of new incidents."""
@@ -1051,7 +1056,7 @@ def _security_loop() -> None:
     from .secscan import scans_due
     while True:
         from .stats import backfill_days
-        for name, job in (("uptime per day", lambda s: backfill_days(s, 60)), ("security scan", scans_due), ("anomaly detection", lambda s: anomaly.run(s, ai.load(s)["anomaly_alerts"])), ("AI explanation", lambda s: get_settings().ai_enabled and ai.auto_explain(s))):
+        for name, job in (("uptime per day", lambda s: backfill_days(s, 60)), ("security scan", scans_due), ("anomaly detection", lambda s: anomaly.run(s, ai.load(s)["anomaly_alerts"])), ("security snapshot", _security_snapshot), ("AI explanation", lambda s: get_settings().ai_enabled and ai.auto_explain(s))):
             session = SessionLocal()
             try:
                 job(session)
