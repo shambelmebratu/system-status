@@ -1,3 +1,4 @@
+:root{--font-inter:'Inter Variable';--font-jb:'JetBrains Mono Variable'}   /* bundled fonts (see layout.tsx) */
 :root{
   color-scheme:dark;
   --bg:#0b1220;--bg-2:#0f1830;--surface:#121c33;--surface-2:#182544;--line:#23324f;--line-2:#2d4066;
