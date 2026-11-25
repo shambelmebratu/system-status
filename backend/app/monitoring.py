@@ -174,6 +174,7 @@ _STATE = {"anomaly": ("📈", "UNUSUAL BEHAVIOUR"), "ai_note": ("🤖", "AI ANAL
           "ssh_attack": ("🛡", "SSH BRUTE-FORCE ATTACK"), "security_finding": ("🛡", "SECURITY FINDING"),
           "ssh_login_breach": ("🚨", "POSSIBLE BREAK-IN: SSH LOGIN AFTER FAILED ATTEMPTS"), "ssh_login_new": ("🔑", "SSH LOGIN FROM A NEW ADDRESS"),
           "threat": ("🚨", "POSSIBLE COMPROMISE"), "ssh_login_many": ("🔁", "MANY SSH LOGINS TODAY"), "ssh_key_added": ("🔑", "NEW SSH KEY AUTHORIZED"), "security_change": ("🛡", "SECURITY CHANGE"),
+          "zt_signin": ("🔐", "SM-WATCH SIGN-IN"), "zt_admin": ("🛠", "CHANGE IN SM-WATCH"), "zt_agent": ("🤖", "AGENT IDENTITY"), "zt_guard": ("🚨", "PROTECTION CHANGED"),
           "slo_fast": ("🔥", "ERROR BUDGET BURNING FAST"), "slo_slow": ("🟠", "ERROR BUDGET BURNING"), "slo_exhausted": ("⛔", "ERROR BUDGET EXHAUSTED"),
           "dns_changed": ("🧭", "DNS CHANGED"), "domain": ("🌐", "DOMAIN EXPIRES SOON"), "domain_expired": ("⛔", "DOMAIN EXPIRED"), "domain_renewed": ("✅", "DOMAIN RENEWED"),
           "cert": ("🔐", "CERTIFICATE EXPIRES SOON"), "cert_expired": ("⛔", "CERTIFICATE EXPIRED"), "cert_renewed": ("✅", "CERTIFICATE RENEWED"),
@@ -301,7 +302,7 @@ def channel_wants(channel: Channel, target_type: str | None, state: str | None) 
     kinds = [k for k in (channel.notify_kinds or "").split(",") if k]
     events = [e for e in (channel.notify_events or "").split(",") if e]
     category = event_category(state)
-    if kinds and target_type and target_type not in kinds:
+    if kinds and target_type and target_type != "system" and target_type not in kinds:   # SM-Watch's own events are not a monitor kind
         return False
     if events and category and category not in events:
         return False

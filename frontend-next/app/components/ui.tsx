@@ -24,6 +24,7 @@ const ICONS: Record<string, string> = {
   search: 'M11 4a7 7 0 100 14 7 7 0 000-14zm10 17l-4.3-4.3',
   lock: 'M6 11h12v10H6zM8 11V7a4 4 0 018 0v4',
   play: 'M7 4l13 8-13 8V4z',
+  eye: 'M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12zm10-3a3 3 0 100 6 3 3 0 000-6z',
   check: 'M5 12l5 5 9-10',
   x: 'M6 6l12 12M18 6L6 18',
   refresh: 'M21 12a9 9 0 11-3-6.7L21 8m0-5v5h-5',

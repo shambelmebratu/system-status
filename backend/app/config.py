@@ -89,6 +89,9 @@ class Settings(BaseSettings):
     ssh_success_after_failures: int = 5        # a successful SSH login from an address with at least this many failures (24 h) is a likely break-in
     ssh_new_source_alerts: bool = True
     ssh_daily_login_alert: int = 4             # alert when one server has more SSH logins than this in a day, even legitimate ones (0 = off; admins can change it)         # alert on an SSH login from an address never seen on that server before
+    zt_known_address_days: int = 90            # zero trust: a sign-in to SM-Watch from an address not used by that person in this many days alerts
+    zt_failed_signin_alert: int = 5            # failed SM-Watch sign-ins (one account or one address) within 10 minutes that alert (0 = off)
+    zt_token_max_days: int = 90                # a server whose agent token is older than this is not "verified" until the token is rotated
     threat_alert_severity: str = "high"        # agent threat findings at or above this severity send an alert: critical | high | medium | off
     ai_enabled: bool = True                     # AI_ENABLED=false removes every AI feature: menu, Ask AI, explanations, log analysis, and their API
     security_scan_hours: int = 24              # how often servers' open ports and services' TLS are re-checked (0 = only on demand); admins can change it in Security → Scans

@@ -16,5 +16,7 @@ def audit(db: Session, request: Request | None, action: str, *, user: dict | Non
         actor=who[:320], actor_role=(user or {}).get("role"), action=action[:60], target=str(target)[:200],
         detail=(detail or None) and detail[:1000], ip=client_ip(request) if request is not None else None, success=success,
     ))
+    from .zerotrust import on_audit
+    on_audit(db, action=action, actor=who, target=str(target), detail=detail, ip=client_ip(request) if request is not None else None, success=success)
     if commit:
         db.commit()

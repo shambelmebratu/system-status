@@ -25,7 +25,12 @@ CATEGORIES: dict[str, tuple[str, str, tuple[str, ...]]] = {
     "ssh_many": ("Many logins in a day", "More SSH logins on a server in one day than the limit, even legitimate ones.", ("ssh_login_many",)),
     "exposure": ("Exposed ports and TLS problems", "New risky ports reachable from SM-Watch, and new TLS problems on https services.", ("security_finding",)),
     "kubernetes": ("Kubernetes threats", "Risky pods, privileged containers and RBAC findings in your clusters.", ("threat",)),
+    "signin": ("SM-Watch sign-ins", "A sign-in to this dashboard from an address that person never used before, and bursts of failed sign-ins.", ("zt_signin",)),
+    "admin": ("Changes in SM-Watch", "Users added, changed or removed, alert channels added, monitors and clusters removed, agent tokens rotated or revoked, join tokens created.", ("zt_admin",)),
+    "agent": ("Agent identity", "An agent reporting from a new address, a new server or cluster joining, an agent using a wrong or revoked token.", ("zt_agent",)),
+    "guard": ("Protection changes (always on)", "Alert settings or channels changed, maintenance windows and pauses that mute alerts, data deleted, two-factor turned off or reset, admin rights granted. Cannot be turned off: these are what an intruder would change to hide.", ("zt_guard",)),
 }
+LOCKED = {"guard"}          # zero trust: changes that could hide an attack are always reported
 SECURITY_STATES = {state for _, _, states in CATEGORIES.values() for state in states}
 SEVERITIES = ("critical", "high", "medium", "off")
 _cache: dict = {"at": 0.0, "value": None}
@@ -64,6 +69,7 @@ def config(db: Session, fresh: bool = False) -> dict:
             out["categories"] = {**out["categories"], **{k: bool(v) for k, v in (saved.get("categories") or {}).items() if k in CATEGORIES}}
         except ValueError:
             pass
+    out["categories"].update({k: True for k in LOCKED})
     with _lock:
         _cache.update(at=time.monotonic(), value=out)
     return out
@@ -96,6 +102,8 @@ def blocked(db: Session, state: str | None, target_type: str | None) -> str | No
     """Why this security alert must not be sent (a choice in Security → Alerts), or None."""
     category = category_of(state, target_type)
     if category is None:
+        return None
+    if category in LOCKED:
         return None
     cfg = config(db)
     if not cfg["enabled"]:

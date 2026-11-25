@@ -3,10 +3,11 @@
 /** The Security page's sections, shown nested under "Security" in the main menu, with live counts the page publishes. */
 import { useSyncExternalStore } from 'react';
 
-export type SecSection = 'overview' | 'activity' | 'servers' | 'threats' | 'kubernetes' | 'ssh' | 'hardening' | 'updates' | 'exposure' | 'alerts' | 'reports';
+export type SecSection = 'overview' | 'trust' | 'activity' | 'servers' | 'threats' | 'kubernetes' | 'ssh' | 'hardening' | 'updates' | 'exposure' | 'alerts' | 'reports';
 export type SecNavItem = { id: SecSection; label: string; icon: string; group: string; admin?: boolean; k8s?: boolean };
 export const SEC_NAV: SecNavItem[] = [
   { id: 'overview', label: 'Overview', icon: 'overview', group: '' },
+  { id: 'trust', label: 'Zero trust', icon: 'shield', group: '' },
   { id: 'activity', label: 'Activity', icon: 'clock', group: '' },
   { id: 'servers', label: 'Servers', icon: 'server', group: '' },
   { id: 'threats', label: 'Threats', icon: 'alert', group: 'Detect' },
@@ -24,6 +25,7 @@ export const SEC_SECTIONS = SEC_NAV.map(i => i.id);
 export type SecGroup = { id: string; label: string; icon: string; tabs: SecSection[] };
 export const SEC_GROUPS: SecGroup[] = [
   { id: 'overview', label: 'Overview', icon: 'overview', tabs: ['overview', 'servers'] },
+  { id: 'trust', label: 'Zero trust', icon: 'shield', tabs: ['trust'] },
   { id: 'threats', label: 'Threats', icon: 'alert', tabs: ['threats', 'kubernetes'] },
   { id: 'posture', label: 'Posture', icon: 'check', tabs: ['exposure', 'hardening', 'updates'] },
   { id: 'access', label: 'Access', icon: 'terminal', tabs: ['ssh'] },

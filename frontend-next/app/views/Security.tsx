@@ -175,6 +175,7 @@ export function Security() {
           {!o || !sec ? <div className="card"><p className="muted"><span className="spinner" /> Loading…</p></div> : o.servers.length === 0 && server ? <div className="card"><Empty title="No server matches">Nothing matches “{server}”. Search by name, host name, IP address or server number. <button className="lg-link" onClick={() => setServer('')}>Show all servers</button></Empty></div> :
             <SecCtx.Provider value={sec}>
               {tab === 'overview' && <SecurityHome server={server} />}
+              {tab === 'trust' && <ZeroTrust server={server} />}
               {tab === 'activity' && <Activity server={server} />}
               {tab === 'servers' && <ServersSection />}
               {tab === 'threats' && <Threats key={`t${preset.n}`} server={server} preset={presetFor('threats')} />}
@@ -372,11 +373,16 @@ const PLAYBOOK: Record<string, string[]> = {
 const groupLabel = (kind: string) => GROUPS.find(g => g.kinds.includes(kind))?.label ?? 'Other';
 
 /* ---------------------------------------------------------------- overview */
-type ActivityItem = { at: string; type: 'found' | 'acknowledged' | 'resolved' | 'scan' | 'alert' | 'action'; severity: Severity; title: string; detail?: string;
-  server: { id: number; name: string } | null; finding_id?: number; kind?: string | null; actor?: string | null; sent?: boolean;
-  target?: { type: 'server' | 'service' | 'cluster' | string; id: number } };
-const ACT_ICON: Record<ActivityItem['type'], string> = { found: 'alert', acknowledged: 'check', resolved: 'check', scan: 'globe', alert: 'bell', action: 'settings' };
-const ACT_LABEL: Record<ActivityItem['type'], string> = { found: 'Found', acknowledged: 'Acknowledged', resolved: 'Resolved', scan: 'Scan', alert: 'Alert', action: 'Change' };
+type ActCategory = 'access' | 'changes' | 'threats' | 'scans' | 'alerts' | 'smwatch' | 'agents';
+type ActivityItem = { at: string; type: 'found' | 'acknowledged' | 'resolved' | 'scan' | 'alert' | 'action' | 'login'; severity: Severity; title: string; detail?: string;
+  server: { id: number; name: string } | null; finding_id?: number; kind?: string | null; actor?: string | null; sent?: boolean; ip?: string | null; success?: boolean;
+  category?: ActCategory; target?: { type: 'server' | 'service' | 'cluster' | string; id: number } };
+const ACT_ICON: Record<ActivityItem['type'], string> = { found: 'alert', acknowledged: 'check', resolved: 'check', scan: 'globe', alert: 'bell', action: 'settings', login: 'terminal' };
+const ACT_LABEL: Record<ActivityItem['type'], string> = { found: 'Found', acknowledged: 'Reviewed', resolved: 'Resolved', scan: 'Scan', alert: 'Alert', action: 'SM-Watch', login: 'Access' };
+const ACT_CATEGORIES: [ActCategory | 'all', string, string][] = [['all', 'Everything', 'every event below'], ['access', 'Access', 'SSH logins, file transfers and sign-ins to SM-Watch'],
+  ['changes', 'Changes', 'accounts, admin rights, security files, programs, ports and settings that changed on servers'], ['threats', 'Threats', 'malware, back doors and other signs of compromise'],
+  ['smwatch', 'In SM-Watch', 'what people changed or looked at in this dashboard (admins)'], ['agents', 'Agents', 'servers and clusters joining, agents changing address or using a bad token'],
+  ['alerts', 'Alerts', 'every security alert and whether it was delivered'], ['scans', 'Scans', 'port scans and TLS audits']];
 
 function SecurityHome({ server }: { server: string }) {
   const { o, go, openServer, openTls } = useSec();
@@ -493,14 +499,16 @@ function ActivityList({ items, compact }: { items: ActivityItem[]; compact?: boo
     const d = new Date(i.at).toLocaleDateString([], { weekday: 'long', day: 'numeric', month: 'short' });
     const head = !compact && d !== day ? (day = d) : null;
     return <Fragment key={n}>{head && <li className="sec-tl-day">{head}</li>}
-      <li className={`sec-tl ${i.type} ${i.type === 'found' || i.type === 'alert' ? i.severity : ''}`}>
+      <li className={`sec-tl ${i.type === 'login' ? 'tl-access' : i.type} ${i.type === 'found' || i.type === 'alert' ? i.severity : ''}`}>
         <span className="sec-tl-icon"><Icon name={ACT_ICON[i.type]} size={13} /></span>
         <div className="sec-tl-body">
           <div className="sec-tl-head">{(() => { const open = opener(i); return open ? <button className="lg-link sec-tl-title" onClick={open}>{i.title}</button> : <b className="sec-tl-title">{i.title}</b>; })()}
             {i.type === 'found' && <span className={`sev ${i.severity}`}>{SEV_LABEL[i.severity]}</span>}</div>
           <div className="sec-tl-meta muted sm"><span className="tag">{ACT_LABEL[i.type]}</span>
             {i.server && <button className="lg-link" onClick={() => openServer(i.server!.id, i.type === 'scan' ? 'exposure' : i.type === 'alert' ? focusOf(i.kind) : 'threats')}><Icon name="server" size={11} /> {i.server.name}</button>}
-            {i.actor && <span>by {i.actor}</span>}
+            {i.actor && <span>by <b>{i.actor}</b></span>}
+            {i.ip && <span className="mono">from {i.ip}</span>}
+            {i.success === false && <span className="bad">refused</span>}
             {i.type === 'alert' && <span className={i.sent ? 'good' : ''}>{i.sent ? 'delivered' : i.detail}</span>}
             <span title={new Date(i.at).toLocaleString()}>{timeAgo(i.at)}</span></div>
           {!compact && i.detail && i.type !== 'alert' && <p className="sm sec-tl-detail">{i.detail}</p>}
@@ -509,20 +517,117 @@ function ActivityList({ items, compact }: { items: ActivityItem[]; compact?: boo
 }
 
 function Activity({ server }: { server: string }) {
-  const [days, setDays] = useState(7);
-  const [type, setType] = useState<'all' | 'findings' | 'alerts' | 'scans' | 'changes'>('all');
-  const d = usePoll(() => api<ActivityItem[]>(withQ(`/security/activity?days=${days}&limit=500`, server)), [days, server], 60000, true);
-  const all = d.value ?? [];
-  const match = (i: ActivityItem) => type === 'all' || (type === 'findings' ? ['found', 'acknowledged', 'resolved'].includes(i.type) : type === 'alerts' ? i.type === 'alert' : type === 'scans' ? i.type === 'scan' : i.type === 'action');
-  const shown = all.filter(match);
-  const count = (t: typeof type) => all.filter(i => t === 'all' || (t === 'findings' ? ['found', 'acknowledged', 'resolved'].includes(i.type) : t === 'alerts' ? i.type === 'alert' : t === 'scans' ? i.type === 'scan' : i.type === 'action')).length;
+  const { isAdmin } = useApp();
+  const [days, setDays] = useState(1);
+  const [cat, setCat] = useState<ActCategory | 'all'>('all');
+  const [q, setQ] = useState('');
+  // live: refreshed every 15 seconds, so what is happening now is on screen without pressing anything
+  const d = usePoll(() => api<ActivityItem[]>(withQ(`/security/activity?days=${days}&limit=1000`, server)), [days, server], 15000, true);
+  const needle = q.trim().toLowerCase();
+  const all = (d.value ?? []).filter(i => !needle || [i.title, i.detail, i.actor, i.ip, i.server?.name].some(v => v && v.toLowerCase().includes(needle)));
+  const shown = all.filter(i => cat === 'all' || i.category === cat);
+  const count = (c: ActCategory | 'all') => all.filter(i => c === 'all' || i.category === c).length;
+  const cats = ACT_CATEGORIES.filter(([id]) => isAdmin || id !== 'smwatch');
   return (
     <div className="grid">
+      <div className="sec-note"><Icon name="shield" size={14} /><div><b>Everything that happens, as it happens</b><p>Every SSH login and file transfer, every sign-in to SM-Watch (and every refused one), every change on your servers and in this dashboard, with who did it, from which address, on which server and when. Nothing is left out because it looks routine: review what you did not expect.</p></div></div>
       <div className="filterbar"><div className="seg">{[1, 7, 30, 90].map(n => <button key={n} className={days === n ? 'on' : ''} onClick={() => setDays(n)}>{n === 1 ? '24 hours' : `${n} days`}</button>)}</div>
-        <div className="seg">{([['all', 'Everything'], ['findings', 'Findings'], ['alerts', 'Alerts'], ['scans', 'Scans'], ['changes', 'Settings changes']] as const).map(([id, l]) =>
-          <button key={id} className={type === id ? 'on' : ''} onClick={() => setType(id)}>{l} <span className="muted">{count(id)}</span></button>)}</div></div>
+        <span className="sec-live"><i />live · every 15 s</span><span className="grow" />
+        <input className="inc-search" value={q} onChange={e => setQ(e.target.value)} placeholder="Search person, address, server, event…" aria-label="Search activity" /></div>
+      <div className="chips">{cats.map(([id, label, hint]) => <button key={id} type="button" title={hint} className={`chip-btn ${cat === id ? 'on' : ''}`} onClick={() => setCat(id)}>{label} <span className="muted">{count(id)}</span></button>)}</div>
       {d.error && <div className="err">{d.error}</div>}
-      <section className="card">{!d.value ? <p className="muted"><span className="spinner" /> Loading…</p> : shown.length === 0 ? <Empty title="Nothing in this period">Findings, alerts, scans and security settings changes appear here as they happen.</Empty> : <ActivityList items={shown} />}</section>
+      <section className="card">{!d.value ? <p className="muted"><span className="spinner" /> Loading…</p> : shown.length === 0 ? <Empty title="Nothing in this period">{needle ? 'Nothing matches the search.' : 'Logins, sign-ins, changes, findings, alerts and scans appear here as they happen.'}</Empty> : <ActivityList items={shown} />}
+        {d.value && d.value.length >= 1000 && <p className="muted sm">Showing the newest 1000 events: choose a shorter period or a category to see older ones.</p>}</section>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------- zero trust */
+type TrustCheck = { id: string; label: string; ok: boolean | null; detail: string; weight: 'untrusted' | 'review' };
+type TrustDevice = { server: Who; status: string; checks: TrustCheck[]; passed: number; total: number } & { status: 'verified' | 'review' | 'untrusted' | 'unverified' };
+type TrustUser = { id: number; email: string; name: string; role: string; active: boolean; mfa: boolean; last_sign_in: string | null; last_ip: string | null; addresses_7d: string[]; failed_24h: number; issues: string[]; verified: boolean };
+type TrustSsh = { server: { id: number; name: string }; user: string; logins: number; transfers: number; sources: string[]; keys: string[]; new_sources: string[]; suspicious: number; last: string | null; root: boolean };
+type TrustData = { generated_at: string; devices: TrustDevice[]; identities: { users: TrustUser[] | null; ssh: TrustSsh[] }; review: Finding[];
+  summary: { devices: { total: number; verified: number; review: number; untrusted: number }; people: { total: number; verified: number; without_mfa: number } | null; ssh: { identities: number; new_sources: number; root: number }; unreviewed: number } };
+const TRUST_LABEL: Record<TrustDevice['status'], string> = { verified: 'Verified', review: 'Needs review', untrusted: 'Untrusted', unverified: 'Cannot be verified' };
+const TRUST_TONE: Record<TrustDevice['status'], string> = { verified: 'good', review: 'warn', untrusted: 'bad', unverified: 'bad' };
+
+function ZeroTrust({ server }: { server: string }) {
+  const { openServer, openFinding } = useSec();
+  const { isAdmin, go: navigate } = useApp();
+  const d = usePoll(() => api<TrustData>(withQ('/security/trust', server)), [server], 30000, true);
+  const recent = usePoll(() => api<ActivityItem[]>(withQ('/security/activity?days=1&limit=40&category=access', server)), [server], 15000, true);
+  const [open, setOpen] = useState<number | null>(null);
+  if (d.error && !d.value) return <div className="err">{d.error}</div>;
+  if (!d.value) return <div className="card"><p className="muted"><span className="spinner" /> Verifying…</p></div>;
+  const t = d.value, sm = t.summary;
+  const kpi = (label: string, value: ReactNode, tone: string, hint: string, icon: string, onClick?: () => void) =>
+    <div className={`kpi ${tone} ${onClick ? 'clickable' : ''}`} role={onClick ? 'button' : undefined} tabIndex={onClick ? 0 : undefined} onClick={onClick} onKeyDown={e => onClick && e.key === 'Enter' && onClick()}>
+      <div className="kpi-head"><span className="kpi-ico"><Icon name={icon} size={16} /></span><span className="kpi-label">{label}</span></div><div className="kpi-value">{value}</div><div className="kpi-sub">{hint}</div></div>;
+  const scrollTo = (id: string) => document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  return (
+    <div className="grid">
+      <div className="sec-note"><Icon name="shield" size={14} /><div><b>Zero trust: verify everything, all the time</b><p>Nothing counts as safe because it was safe yesterday. A server is <b>verified</b> only while every check below passes right now; every person and SSH identity is listed with what is new; every change and new kind of access waits here until someone reviews it. Checked {timeAgo(t.generated_at)}, refreshed every 30 s.</p></div></div>
+      <div className="kpis">
+        {kpi('Servers verified', <>{sm.devices.verified}<small> / {sm.devices.total}</small></>, sm.devices.untrusted ? 'bad' : sm.devices.review ? 'warn' : 'good', sm.devices.untrusted ? `${sm.devices.untrusted} untrusted or not verifiable` : sm.devices.review ? `${sm.devices.review} need review` : 'every server passes every check', 'server', () => scrollTo('zt-devices'))}
+        {kpi('Waiting for review', sm.unreviewed, sm.unreviewed ? 'warn' : 'good', sm.unreviewed ? 'changes and new access nobody has looked at' : 'everything has been reviewed', 'eye', () => scrollTo('zt-review'))}
+        {sm.people && kpi('People verified', <>{sm.people.verified}<small> / {sm.people.total}</small></>, sm.people.without_mfa ? 'warn' : 'good', sm.people.without_mfa ? `${sm.people.without_mfa} without two-factor sign-in` : 'two-factor on, no failed sign-ins', 'users', () => scrollTo('zt-people'))}
+        {kpi('SSH identities (7 days)', sm.ssh.identities, sm.ssh.new_sources ? 'warn' : 'good', sm.ssh.new_sources ? `${sm.ssh.new_sources} new source address${sm.ssh.new_sources === 1 ? '' : 'es'}${sm.ssh.root ? ` · ${sm.ssh.root} log in as root` : ''}` : sm.ssh.root ? `${sm.ssh.root} log in as root` : 'no new source addresses', 'terminal', () => scrollTo('zt-ssh'))}
+      </div>
+
+      <section className="card flush" id="zt-devices">
+        <div className="card-head pad"><h2>Servers: verified right now?</h2><span className="grow" /><span className="muted sm">click a server to see every check</span></div>
+        {t.devices.length === 0 ? <div className="pad"><Empty title="No servers">Add a server with the agent to verify it.</Empty></div> :
+          <ul className="zt-devices">{t.devices.map(dv => {
+            const failed = dv.checks.filter(c => c.ok === false);
+            const expanded = open === dv.server.id;
+            return <li key={dv.server.id} className={`zt-device ${dv.status}`}>
+              <button type="button" className="zt-device-row" onClick={() => setOpen(expanded ? null : dv.server.id)} aria-expanded={expanded}>
+                <span className={`zt-status ${TRUST_TONE[dv.status]}`}><Icon name={dv.status === 'verified' ? 'check' : 'alert'} size={13} />{TRUST_LABEL[dv.status]}</span>
+                <span className="zt-name"><b>{dv.server.name}</b><small className="mono">{addr(dv.server)}</small></span>
+                <span className="zt-dots" aria-label={`${dv.passed} of ${dv.total} checks pass`}>{dv.checks.map(c => <i key={c.id} className={c.ok === true ? 'ok' : c.ok === false ? 'fail' : 'na'} title={`${c.label}: ${c.detail}`} />)}</span>
+                <span className="zt-why sm">{failed.length ? failed.map(c => c.label).slice(0, 3).join(' · ') + (failed.length > 3 ? ` +${failed.length - 3}` : '') : <span className="good">all checks pass</span>}</span>
+                <span className="muted sm nowrap">{dv.passed}/{dv.total}</span><Icon name={expanded ? 'chevron-down' : 'chevron-right'} size={14} />
+              </button>
+              {expanded && <div className="zt-checks"><ul className="sec-checks compact">{dv.checks.map(c => <li key={c.id} className={c.ok === true ? 'ok' : c.ok === false ? `fail ${c.weight === 'untrusted' ? 'critical' : 'high'}` : 'unknown'}>
+                <Icon name={c.ok === true ? 'check' : c.ok === false ? 'x' : 'info'} size={13} /><span><b>{c.label}</b> <span className="muted sm">{c.detail}</span>{c.ok === false && c.weight === 'untrusted' && <span className="tag bad-tag">makes it untrusted</span>}</span></li>)}</ul>
+                <button className="btn sm" onClick={() => openServer(dv.server.id)}>Open server security</button></div>}
+            </li>;
+          })}</ul>}
+      </section>
+
+      <section className="card flush" id="zt-review">
+        <div className="card-head pad"><h2>Waiting for review</h2><span className="grow" /><span className="muted sm">acknowledge each one with a note once you know what it was</span></div>
+        {t.review.length === 0 ? <div className="pad"><p className="good sm">Nothing waiting: every change and every new kind of access has been reviewed.</p></div> :
+          <table className="tbl"><thead><tr><th>Severity</th><th>What</th><th className="hide-sm">Server</th><th className="num">Seen</th></tr></thead><tbody>
+            {t.review.map(f => <tr key={f.id} className="link" onClick={() => openFinding(f)}><td><span className={`sev ${f.severity}`}>{SEV_LABEL[f.severity]}</span></td>
+              <td><div className="name">{f.title}<small>{groupLabel(f.kind)}</small></div></td><td className="hide-sm">{f.server?.name ?? '–'}</td><td className="num sm" title={new Date(f.first_seen).toLocaleString()}>{timeAgo(f.first_seen)}</td></tr>)}</tbody></table>}
+      </section>
+
+      {t.identities.users && <section className="card flush" id="zt-people">
+        <div className="card-head pad"><h2>Who can sign in to SM-Watch</h2><span className="grow" /><button className="btn sm ghost" onClick={() => navigate('users')}>Manage users</button></div>
+        <table className="tbl"><thead><tr><th>Person</th><th>Role</th><th>Two-factor</th><th className="hide-sm">Last sign-in</th><th className="hide-sm">Addresses (7 days)</th><th>Status</th></tr></thead><tbody>
+          {t.identities.users.map(u => <tr key={u.id}><td><div className="name">{u.name || u.email}<small>{u.email}</small></div></td><td><span className={`role-pill ${u.role}`}>{u.role}</span></td>
+            <td>{u.mfa ? <span className="good sm">on</span> : <span className="bad sm">off</span>}</td>
+            <td className="hide-sm sm">{u.last_sign_in ? <>{timeAgo(u.last_sign_in)}{u.last_ip && <span className="mono muted"> · {u.last_ip}</span>}</> : <span className="muted">never</span>}</td>
+            <td className="hide-sm mono sm">{u.addresses_7d.join(', ') || '–'}</td>
+            <td className="sm">{u.verified ? <span className="good">verified</span> : <span className="warn">{u.issues.join(', ') || 'not verified'}</span>}</td></tr>)}</tbody></table>
+      </section>}
+
+      <section className="card flush" id="zt-ssh">
+        <div className="card-head pad"><h2>Who logged in to your servers (7 days)</h2><span className="grow" /><span className="muted sm">every user, key and address; new ones highlighted</span></div>
+        {t.identities.ssh.length === 0 ? <div className="pad"><p className="muted sm">No SSH logins recorded in the last 7 days.</p></div> :
+          <table className="tbl"><thead><tr><th>User</th><th className="hide-sm">Server</th><th className="num">Logins</th><th>From</th><th className="hide-sm">Keys</th><th className="num hide-sm">Last</th></tr></thead><tbody>
+            {t.identities.ssh.map(g => <tr key={`${g.server.id}-${g.user}`} className="link" onClick={() => openServer(g.server.id, 'ssh')}>
+              <td><b className={g.root ? 'warn' : ''}>{g.user || '?'}</b>{g.suspicious > 0 && <span className="tag bad-tag">{g.suspicious} after failures</span>}</td><td className="hide-sm">{g.server.name}</td>
+              <td className="num">{g.logins}{g.transfers ? <small className="muted"> +{g.transfers} sftp</small> : null}</td>
+              <td className="sm mono">{g.sources.map(ip => <span key={ip} className={`chip mono ${g.new_sources.includes(ip) ? 'zt-new' : ''}`} title={g.new_sources.includes(ip) ? 'first login from this address' : undefined}>{ip}</span>)}</td>
+              <td className="hide-sm sm mono">{g.keys.join(', ') || <span className="muted">password or unknown</span>}</td><td className="num sm hide-sm">{g.last ? timeAgo(g.last) : '–'}</td></tr>)}</tbody></table>}
+      </section>
+
+      <section className="card"><div className="card-head"><h2>Access in the last 24 hours</h2><span className="grow" /><span className="sec-live"><i />live</span><button className="btn sm ghost" onClick={() => navigate('security/activity')}>Full activity</button></div>
+        {!recent.value ? <p className="muted"><span className="spinner" /> Loading…</p> : recent.value.length === 0 ? <p className="muted sm">No logins or sign-ins in the last 24 hours.</p> : <ActivityList items={recent.value} compact />}</section>
+      {!isAdmin && <p className="muted sm">Sign-ins to SM-Watch and changes made in it are shown to admins.</p>}
     </div>
   );
 }
@@ -1244,12 +1349,13 @@ function OpenPorts({ open, withAddress, compact, highlight }: { open: OpenPort[]
 
 
 /* ---------------------------------------------------------------- alert settings */
-type AlertKind = { id: string; label: string; description: string; last_7_days: number };
+type AlertKind = { id: string; label: string; description: string; last_7_days: number; locked?: boolean };
 type SecAlerts = { enabled: boolean; categories: Record<string, boolean>; channels: number[]; threat_severity: 'critical' | 'high' | 'medium' | 'off'; ssh_attack_threshold: number;
   ssh_success_after_failures: number; daily_login_alert: number; updated_by: string | null; updated_at: string | null; kinds: AlertKind[];
   available_channels: { id: number; name: string; type: string; enabled: boolean }[];
   recent: { id: number; at: string; kind: string | null; severity: string; target: string; summary: string; sent: boolean; error: string | null }[] };
-const KIND_ICON: Record<string, string> = { threat: 'alert', changes: 'settings', ssh_breach: 'alert', ssh_attack: 'shield', ssh_key: 'shield', ssh_new: 'terminal', ssh_many: 'users', exposure: 'globe', kubernetes: 'k8s' };
+const KIND_ICON: Record<string, string> = { threat: 'alert', changes: 'settings', ssh_breach: 'alert', ssh_attack: 'shield', ssh_key: 'shield', ssh_new: 'terminal', ssh_many: 'users', exposure: 'globe', kubernetes: 'k8s',
+  signin: 'lock', admin: 'settings', agent: 'server', guard: 'shield-alert' };
 
 /** Security → Alerts: which security alerts are sent, where to, and the limits behind them. Everyone sees it; admins change it. */
 function SecurityAlerts() {
@@ -1294,11 +1400,12 @@ function SecurityAlerts() {
           <label className="switch-row"><input type="checkbox" checked={f.enabled} disabled={!isAdmin} onChange={e => set({ enabled: e.target.checked })} /><b>{f.enabled ? 'On' : 'Off'}</b></label></div>
         <p className="muted sm" style={{ marginTop: 0 }}>Which security events send a message to your channels. Everything is still recorded on the Security page and in the delivery log; a kind that is off is marked “not sent”.
           {saved.updated_by ? ` Last changed by ${saved.updated_by}${saved.updated_at ? ` ${timeAgo(saved.updated_at)}` : ''}.` : ' Defaults come from .env.'}</p>
+        {off && <p className="sm warn">Security alerts are off. Protection changes are still sent: turning alerts off is itself one of them.</p>}
         <div className={`sec-alert-kinds ${off ? 'dim' : ''}`}>
           {f.kinds.map(k => (
             <div key={k.id} className={`sec-alert-kind ${f.categories[k.id] ? 'on' : ''}`}>
-              <label className="sec-alert-toggle"><input type="checkbox" checked={!!f.categories[k.id]} disabled={!isAdmin || off} onChange={e => set({ categories: { ...f.categories, [k.id]: e.target.checked } })} />
-                <Icon name={KIND_ICON[k.id] ?? 'bell'} size={16} /><b>{k.label}</b></label>
+              <label className="sec-alert-toggle"><input type="checkbox" checked={k.locked || !!f.categories[k.id]} disabled={!isAdmin || (off && !k.locked) || k.locked} onChange={e => set({ categories: { ...f.categories, [k.id]: e.target.checked } })} />
+                <Icon name={KIND_ICON[k.id] ?? 'bell'} size={16} /><b>{k.label}</b>{k.locked && <span className="tag" title="Zero trust: what an intruder would change to hide is always reported"><Icon name="lock" size={10} /> always on</span>}</label>
               <span className="muted sm">{k.description}</span>
               <div className="sec-alert-foot">{limits[k.id] ?? <span />}<span className={`sm ${k.last_7_days ? '' : 'muted'}`}>{k.last_7_days} in the last 7 days</span></div>
             </div>))}
@@ -1337,8 +1444,11 @@ function SecurityAlerts() {
 type ReportData = { generated_at: string; days: number; since: string; filter: string | null; ssh: { total: number; top_ips: { ip: string; attempts: number; servers: number }[]; top_users: [string, number][] };
   servers: { server: Who; status: string; agent_version: string | null; updates: Updates | null; ssh_failures: { total: number; distinct_ips: number; top_ips: [string, number][] };
     logins: { total: number; suspicious: number; new_sources: number; users: string[]; sources: string[]; transfers?: number; keys?: string[] }; findings: Finding[]; hardening: Check[]; listening: Listen[]; authorized_keys: number;
-    foreign_packages: Foreign; exposure: Scan | null; threat_scan_at: string | null }[] };
+    foreign_packages: Foreign; exposure: Scan | null; threat_scan_at: string | null }[];
+  zero_trust?: Pick<TrustData, 'summary' | 'devices' | 'identities' | 'review'>;
+  smwatch?: { sign_ins: number; failed_sign_ins: number; addresses: string[]; data_access: number; changes: { at: string; actor: string; ip: string | null; action: string; title: string; detail: string; success: boolean }[] } | null };
 const TEMPLATES = [
+  { id: 'zerotrust', label: 'Zero trust report', desc: 'Is every server verified, who can get in, every sign-in and change in the period, and what nobody has reviewed.' },
   { id: 'executive', label: 'Executive summary', desc: 'One page: the risk level of each server and what to fix first.' },
   { id: 'server', label: 'Full server report', desc: 'Everything per server: threats, logins, updates, hardening, exposure.' },
   { id: 'access', label: 'SSH access report', desc: 'Who logged in from where, suspicious logins, attacks and attackers.' },
@@ -1364,7 +1474,7 @@ function risk(s: ReportData['servers'][number]): { level: 'critical' | 'high' | 
 
 function Reports({ server, servers }: { server: string; servers: Who[] }) {
   const { toast } = useApp();
-  const [template, setTemplate] = useState<Template>('executive');
+  const [template, setTemplate] = useState<Template>('zerotrust');
   const [days, setDays] = useState(7);
   const [busy, setBusy] = useState(false);
   const [report, setReport] = useState<ReportData | null>(null);
@@ -1412,12 +1522,13 @@ function SecurityReport({ data, template, onClose }: { data: ReportData; templat
         <div className="db-r-kpis"><div><b className={totals.crit ? 'bad' : 'good'}>{totals.crit}</b><small>servers at critical risk</small></div><div><b className={totals.threats ? 'warn' : 'good'}>{totals.threats}</b><small>open threats</small></div>
           <div><b className={totals.suspicious ? 'bad' : 'good'}>{totals.suspicious}</b><small>suspicious logins</small></div><div><b className={totals.sec ? 'warn' : 'good'}>{totals.sec}</b><small>security updates missing</small></div>
           <div><b>{data.ssh.total.toLocaleString()}</b><small>failed SSH logins</small></div></div>
-        <h2>Risk by server</h2>
+        {template === 'zerotrust' && <ZeroTrustReport data={data} />}
+        {template !== 'zerotrust' && <><h2>Risk by server</h2>
         <table className="db-r-cols"><thead><tr><th>Server</th><th>Risk</th><th>Why</th></tr></thead><tbody>
-          {ranked.map(({ s, r }) => <tr key={s.server.id}><td><b>{s.server.name}</b><div className="muted sm mono">{addr(s.server)}</div></td><td><span className={`sev ${r.level}`}>{SEV_LABEL[r.level]}</span></td><td className="sm">{r.reasons.join(' · ') || 'nothing found'}</td></tr>)}</tbody></table>
+          {ranked.map(({ s, r }) => <tr key={s.server.id}><td><b>{s.server.name}</b><div className="muted sm mono">{addr(s.server)}</div></td><td><span className={`sev ${r.level}`}>{SEV_LABEL[r.level]}</span></td><td className="sm">{r.reasons.join(' · ') || 'nothing found'}</td></tr>)}</tbody></table></>}
         {template === 'executive' && <><h2>Fix first</h2><ol className="sec-fix">{ranked.flatMap(({ s }) => s.findings.filter(f => !f.resolved_at && !f.acknowledged_at && (f.severity === 'critical' || f.severity === 'high')).map(f => <li key={f.id}><span className={`sev ${f.severity}`}>{SEV_LABEL[f.severity]}</span> <b>{s.server.name}</b>: {f.title}</li>)).slice(0, 15)}
           {ranked.flatMap(({ s }) => (s.updates?.security ? [<li key={`u${s.server.id}`}><span className="sev medium">Patch</span> <b>{s.server.name}</b>: install {s.updates.security} security update{s.updates.security > 1 ? 's' : ''}{s.updates.reboot_required ? ' and reboot' : ''}</li>] : [])).slice(0, 10)}</ol></>}
-        {template !== 'executive' && ranked.map(({ s }) => {
+        {template !== 'executive' && template !== 'zerotrust' && ranked.map(({ s }) => {
           const open = s.findings.filter(f => !f.resolved_at);
           return (
             <section key={s.server.id} className="db-r-table">
@@ -1438,6 +1549,37 @@ function SecurityReport({ data, template, onClose }: { data: ReportData; templat
       </article>
     </div>
   );
+}
+
+function ZeroTrustReport({ data }: { data: ReportData }) {
+  const z = data.zero_trust, w = data.smwatch;
+  if (!z) return <p className="muted">This server does not return zero-trust data yet: update SM-Watch.</p>;
+  const sm = z.summary;
+  return <>
+    <div className="db-r-kpis"><div><b className={sm.devices.verified === sm.devices.total ? 'good' : 'bad'}>{sm.devices.verified}/{sm.devices.total}</b><small>servers verified</small></div>
+      <div><b className={sm.unreviewed ? 'warn' : 'good'}>{sm.unreviewed}</b><small>waiting for review</small></div>
+      {sm.people && <div><b className={sm.people.without_mfa ? 'warn' : 'good'}>{sm.people.without_mfa}</b><small>people without two-factor</small></div>}
+      {w && <div><b className={w.failed_sign_ins ? 'warn' : 'good'}>{w.sign_ins} / {w.failed_sign_ins}</b><small>SM-Watch sign-ins / refused</small></div>}
+      <div><b className={sm.ssh.new_sources ? 'warn' : 'good'}>{sm.ssh.new_sources}</b><small>new SSH source addresses</small></div></div>
+    <p className="sm">Zero trust: a server counts as verified only while every check passes; anything new (an address, a key, an account, a change) is unreviewed until a person acknowledges it. Verification is as of {new Date(data.generated_at).toLocaleString()}; activity covers the last {data.days} days.</p>
+    <h2>Servers</h2>
+    <table className="db-r-cols"><thead><tr><th>Server</th><th>Verification</th><th>Failing checks</th></tr></thead><tbody>
+      {z.devices.map(d => <tr key={d.server.id}><td><b>{d.server.name}</b><div className="muted sm mono">{addr(d.server)}</div></td><td><span className={TRUST_TONE[d.status]}>{TRUST_LABEL[d.status]}</span> <span className="muted sm">{d.passed}/{d.total}</span></td>
+        <td className="sm">{d.checks.filter(c => c.ok === false).map(c => `${c.label} (${c.detail})`).join(' · ') || 'none'}</td></tr>)}</tbody></table>
+    <h2>Waiting for review ({z.review.length})</h2>
+    {z.review.length === 0 ? <p className="sm good">Everything has been reviewed.</p> : <ul className="sec-r-list">{z.review.map(f => <li key={f.id}><span className={`sev ${f.severity}`}>{SEV_LABEL[f.severity]}</span> <b>{f.server?.name}</b>: {f.title} <span className="muted sm">first seen {new Date(f.first_seen).toLocaleString()}</span></li>)}</ul>}
+    {z.identities.users && <><h2>People who can sign in to SM-Watch</h2>
+      <table className="db-r-cols"><thead><tr><th>Person</th><th>Role</th><th>Two-factor</th><th>Last sign-in</th><th>Status</th></tr></thead><tbody>
+        {z.identities.users.map(u => <tr key={u.id}><td>{u.email}</td><td>{u.role}</td><td className={u.mfa ? 'good' : 'bad'}>{u.mfa ? 'on' : 'off'}</td><td className="sm">{u.last_sign_in ? `${new Date(u.last_sign_in).toLocaleString()}${u.last_ip ? ` from ${u.last_ip}` : ''}` : 'never'}</td><td className="sm">{u.verified ? 'verified' : u.issues.join(', ')}</td></tr>)}</tbody></table></>}
+    <h2>SSH identities (last 7 days)</h2>
+    {z.identities.ssh.length === 0 ? <p className="sm muted">No SSH logins.</p> : <table className="db-r-cols"><thead><tr><th>User</th><th>Server</th><th>Logins</th><th>From</th><th>Keys</th></tr></thead><tbody>
+      {z.identities.ssh.map(g => <tr key={`${g.server.id}-${g.user}`}><td><b>{g.user}</b>{g.suspicious ? <span className="bad"> · {g.suspicious} after failures</span> : ''}</td><td>{g.server.name}</td><td className="num">{g.logins}</td>
+        <td className="mono sm">{g.sources.map(ip => g.new_sources.includes(ip) ? `${ip} (new)` : ip).join(', ')}</td><td className="mono sm">{g.keys.join(', ') || '–'}</td></tr>)}</tbody></table>}
+    {w && <><h2>What happened in SM-Watch ({w.changes.length} changes, {w.data_access} log / process / database / AI look-ups)</h2>
+      {w.addresses.length > 0 && <p className="sm">Signed in from: <span className="mono">{w.addresses.join(', ')}</span></p>}
+      {w.changes.length === 0 ? <p className="sm muted">No changes.</p> : <table className="db-r-cols"><thead><tr><th>When</th><th>Who</th><th>What</th><th>Detail</th></tr></thead><tbody>
+        {w.changes.map((c, i) => <tr key={i}><td className="sm nowrap">{new Date(c.at).toLocaleString()}</td><td className="sm">{c.actor}{c.ip ? <div className="muted mono">{c.ip}</div> : null}</td><td className="sm">{c.title}{c.success ? '' : <span className="bad"> (refused)</span>}</td><td className="sm muted">{c.detail}</td></tr>)}</tbody></table>}</>}
+  </>;
 }
 
 /* ---------------------------------------------------------------- sign-in */

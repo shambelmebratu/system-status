@@ -133,11 +133,27 @@ ACTION_TITLES = {"security.alerts": "Security alert settings changed", "security
                  "security.acknowledge": "Finding acknowledged", "security.report": "Security report created", "security.policy": "Two-factor policy changed"}
 
 
+ACTIVITY_CATEGORIES = ("access", "changes", "threats", "scans", "alerts", "smwatch", "agents")
+ACCESS_KINDS = {"ssh_login_new_source", "ssh_login_after_failures", "ssh_key_added", "ssh_many_logins", "file_transfer"}
+QUIET_ACTIONS = ("auth.logout",)       # recorded in the audit log, too routine for the timeline
+
+
+def _category_of_finding(kind: str, source: str) -> str:
+    return "access" if kind in ACCESS_KINDS else "changes" if source == "smwatch" else "threats"
+
+
+def _category_of_action(action: str) -> str:
+    return "access" if action.startswith("auth.") else "agents" if action.startswith(("agent.", "k8s.register")) else "smwatch"
+
+
 @router.get("/activity")
 def activity(days: int = Query(7, ge=1, le=90), server: str | None = Query(None, max_length=200), limit: int = Query(300, ge=1, le=1000),
+             category: str | None = Query(None, pattern="^(access|changes|threats|scans|alerts|smwatch|agents)$"),
              user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> list[dict]:
-    """One timeline of security events, newest first: findings opened, acknowledged and resolved, port / TLS scans, security alerts
-    (and whether they were delivered), and security settings changes. Only the servers this person can see."""
+    """Everything that happened, newest first, each with who, what, where and when: SSH logins and file transfers, sign-ins to SM-Watch
+    (and failed ones), what people changed or looked at in SM-Watch, agent identity events, findings opened / acknowledged / resolved,
+    port and TLS scans, and every security alert with its delivery state. Only the servers this person can see; SM-Watch's own events
+    (sign-ins, settings) are shown to admins."""
     from .models import AlertEvent, AuditEvent
     since = datetime.now(timezone.utc) - timedelta(days=days)
     servers = visible_servers(db, user, server)
@@ -174,16 +190,84 @@ def activity(days: int = Query(7, ge=1, le=90), server: str | None = Query(None,
             continue
         if server and e.target_type != "server":
             continue
+        if e.target_type == "system" and user["role"] != "admin":     # SM-Watch's own sign-ins and settings: admins only
+            continue
         lines = [ln for ln in (e.message or "").replace("<b>", "").replace("</b>", "").splitlines() if ln.strip()]
         out.append({"at": aware(e.created_at).isoformat(), "type": "alert", "server": who.get(e.target_id) if e.target_type == "server" else None, "target": {"type": e.target_type, "id": e.target_id},
                     "severity": "critical" if e.severity == "critical" else "medium", "title": lines[1][:200] if len(lines) > 1 else (lines[0][:200] if lines else "Security alert"),
                     "detail": "sent" if e.sent else (e.delivery_error or "not sent yet"), "sent": bool(e.sent), "kind": secalerts.category_of(e.state, e.target_type)})
-    if not server:
-        for a in db.scalars(select(AuditEvent).where(AuditEvent.action.like("security.%"), AuditEvent.ts >= since).order_by(desc(AuditEvent.id)).limit(200)).all():
-            out.append({"at": aware(a.ts).isoformat(), "type": "action", "server": None, "severity": "low", "title": ACTION_TITLES.get(a.action, a.action.replace("security.", "").replace("_", " ").capitalize()),
-                        "detail": (a.detail or "")[:300], "actor": a.actor, "kind": a.action})
+    for row in out:
+        if row["type"] in ("found", "acknowledged", "resolved"):
+            row["category"] = _category_of_finding(row.get("kind") or "", "smwatch" if row.get("kind") in ZT_CHANGE_KINDS else "agent")
+        else:
+            row["category"] = {"scan": "scans", "alert": "alerts"}.get(row["type"], "smwatch")
+    # SSH logins and file transfers: every one, with the key and whether the address is new
+    if category in (None, "access"):
+        for e in db.scalars(select(SshLoginEvent).where(SshLoginEvent.server_id.in_(ids), SshLoginEvent.ts >= since).order_by(desc(SshLoginEvent.ts)).limit(600)).all():
+            what = "file transfer (SFTP/scp)" if e.kind == "sftp" else f"SSH login ({e.method or 'unknown method'})"
+            flags = (["new address"] if e.new_source else []) + ([f"after {e.failures_before} failed attempts"] if (e.failures_before or 0) > 0 else [])
+            out.append({"at": aware(e.ts).isoformat(), "type": "login", "category": "access", "server": who.get(e.server_id), "severity": "medium" if flags else "low",
+                        "title": f"{e.user or '?'} · {what} from {e.ip}" + (f" · {', '.join(flags)}" if flags else ""), "actor": e.user or None, "ip": e.ip,
+                        "detail": f"key {e.key_name or e.fingerprint}" if (e.key_name or e.fingerprint) else "", "kind": e.kind})
+    # SM-Watch itself: sign-ins, what people changed or read, agent identity events (admins; not narrowed to a server)
+    if not server and user["role"] == "admin" and category in (None, "access", "smwatch", "agents"):
+        from .zerotrust import ACTION_TITLES as ZT_TITLES
+        q = select(AuditEvent).where(AuditEvent.ts >= since, AuditEvent.action.not_in(QUIET_ACTIONS)).order_by(desc(AuditEvent.id)).limit(600)
+        for a in db.scalars(q).all():
+            cat = _category_of_action(a.action)
+            if category and cat != category:
+                continue
+            title = ZT_TITLES.get(a.action) or ACTION_TITLES.get(a.action) or a.action.replace(".", ": ").replace("_", " ")
+            out.append({"at": aware(a.ts).isoformat(), "type": "action", "category": cat, "server": None, "severity": "medium" if not a.success else "low",
+                        "title": title + ("" if a.success else " (refused)"), "detail": (a.detail or "")[:300], "actor": a.actor, "ip": a.ip, "target_ref": a.target or None,
+                        "kind": a.action, "success": a.success})
+    if category:
+        out = [r for r in out if r.get("category") == category]
     out.sort(key=lambda r: r["at"], reverse=True)
     return out[:limit]
+
+
+ZT_CHANGE_KINDS = {"user_added", "admin_granted", "critical_file_changed", "system_program_changed", "kernel_module_loaded", "hardening_weakened", "port_opened",
+                   "ssh_login_new_source", "ssh_login_after_failures", "ssh_key_added", "ssh_many_logins", "file_transfer"}
+
+
+@router.get("/trust")
+def trust(server: str | None = Query(None, max_length=200), user: dict = Depends(require_operator), db: Session = Depends(get_db)) -> dict:
+    """Zero trust: is every server verified right now (and why not), who can get in (SM-Watch accounts and SSH identities, with
+    what is new), and what is waiting for a person to review."""
+    from . import zerotrust
+    now = datetime.now(timezone.utc)
+    servers = visible_servers(db, user, server)
+    ids = [s.id for s in servers]
+    findings = db.scalars(select(SecurityFinding).where(SecurityFinding.server_id.in_(ids or [0]), SecurityFinding.resolved_at.is_(None))).all()
+    by_server: dict[int, list] = {}
+    for f in findings:
+        by_server.setdefault(f.server_id, []).append(f)
+    ports = latest_scans(db, "ports", "server")
+    devices = []
+    for s in servers:
+        v = zerotrust.verify_server(db, s, metrics_of(s), by_server.get(s.id, []), ports.get(s.id), now)
+        devices.append({"server": server_info(s), "status": s.last_status, **v})
+    order = {"untrusted": 0, "unverified": 1, "review": 2, "verified": 3}
+    devices.sort(key=lambda d: (order[d["status"]], d["server"]["name"].lower()))
+    who = {s.id: server_info(s) for s in servers}
+    queue = zerotrust.review_queue(db, ids)
+    ident = zerotrust.identities(db, ids, now, include_users=user["role"] == "admin" and not server)
+    users = ident["users"] or []
+    return {
+        "generated_at": now.isoformat(),
+        "devices": devices,
+        "identities": ident,
+        "review": [finding_view(f, who.get(f.server_id)) for f in queue[:200]],
+        "summary": {
+            "devices": {"total": len(devices), "verified": sum(1 for d in devices if d["status"] == "verified"), "review": sum(1 for d in devices if d["status"] == "review"),
+                        "untrusted": sum(1 for d in devices if d["status"] in ("untrusted", "unverified"))},
+            "people": None if ident["users"] is None else {"total": len(users), "verified": sum(1 for u in users if u["verified"]), "without_mfa": sum(1 for u in users if not u["mfa"] and u["active"])},
+            "ssh": {"identities": len(ident["ssh"]), "new_sources": sum(len(g["new_sources"]) for g in ident["ssh"]), "root": sum(1 for g in ident["ssh"] if g["root"])},
+            "unreviewed": len(queue),
+            "alerts_locked": sorted(secalerts.LOCKED),
+        },
+    }
 
 
 @router.get("/servers")
@@ -345,9 +429,22 @@ def report(request: Request, server: str | None = Query(None, max_length=200), d
                      "findings": [finding_view(f, None) for f in mine], "hardening": sec.get("hardening") or [], "listening": sec.get("listening") or [],
                      "authorized_keys": len(sec.get("authorized_keys") or []), "foreign_packages": sec.get("foreign_packages"), "exposure": scan_view(ports.get(s.id)),
                      "threat_scan_at": sec.get("checked_at")})
+    zero = trust(server=server, user=user, db=db)                  # verification, identities and the review queue, as of now
+    smwatch = None
+    if user["role"] == "admin" and not server:                     # what happened in SM-Watch itself during the period
+        from .models import AuditEvent
+        from .zerotrust import ACTION_TITLES as ZT_TITLES
+        events = db.scalars(select(AuditEvent).where(AuditEvent.ts >= since, AuditEvent.action.not_in(QUIET_ACTIONS)).order_by(desc(AuditEvent.id)).limit(2000)).all()
+        signins = [a for a in events if a.action == "auth.login"]
+        smwatch = {"sign_ins": sum(1 for a in signins if a.success), "failed_sign_ins": sum(1 for a in signins if not a.success),
+                   "addresses": sorted({a.ip for a in signins if a.success and a.ip})[:40],
+                   "changes": [{"at": aware(a.ts).isoformat(), "actor": a.actor, "ip": a.ip, "action": a.action, "title": ZT_TITLES.get(a.action) or ACTION_TITLES.get(a.action) or a.action,
+                                "detail": (a.detail or "")[:200], "success": a.success} for a in events if not a.action.startswith(("auth.login", "logs.", "process.", "ai.", "db.query", "db.slow"))][:300],
+                   "data_access": sum(1 for a in events if a.action.startswith(("logs.", "process.", "db.query", "ai.")))}
     audit(db, request, "security.report", user=user, detail=f"{days} days; servers: {', '.join(i['name'] for i in infos.values())[:600] or 'none'}", commit=True)
     return {"generated_at": datetime.now(timezone.utc).isoformat(), "days": days, "since": since.isoformat(), "filter": server or None, "servers": rows,
-            "ssh": {"total": ssh_data["total"], "top_ips": ssh_data["top_ips"][:15], "top_users": ssh_data["top_users"][:10]}}
+            "ssh": {"total": ssh_data["total"], "top_ips": ssh_data["top_ips"][:15], "top_users": ssh_data["top_users"][:10]},
+            "zero_trust": {"summary": zero["summary"], "devices": zero["devices"], "identities": zero["identities"], "review": zero["review"][:100]}, "smwatch": smwatch}
 
 
 class ScheduleIn(BaseModel):
@@ -404,7 +501,7 @@ def alerts_view(db: Session) -> dict:
         cat = secalerts.category_of(state, target_type)
         if cat:
             counts[cat] += n
-    return {**cfg, "kinds": [{"id": k, "label": l, "description": d, "last_7_days": counts[k]} for k, (l, d, _) in secalerts.CATEGORIES.items()],
+    return {**cfg, "kinds": [{"id": k, "label": l, "description": d, "last_7_days": counts[k], "locked": k in secalerts.LOCKED} for k, (l, d, _) in secalerts.CATEGORIES.items()],
             "available_channels": [{"id": c.id, "name": c.name, "type": c.type, "enabled": c.enabled} for c in db.scalars(select(Channel).order_by(Channel.name)).all()],
             "recent": [{"id": e.id, "at": aware(e.created_at).isoformat(), "kind": secalerts.category_of(e.state, e.target_type), "severity": e.severity,
                         "target": names.get(e.target_type, {}).get(e.target_id) or f"{e.target_type} #{e.target_id}",

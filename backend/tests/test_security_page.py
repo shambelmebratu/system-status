@@ -31,7 +31,9 @@ def test_finding_detail_and_activity_timeline(client):
     assert r.status_code == 200 and r.json()["title"] == "Possible web shell: x.php" and r.json()["server"]["name"] == "timeline-a" and r.json()["evidence"]["path"] == "/var/www/x.php"
     assert client.get("/api/security/findings/999999").status_code == 404
     client.post(f"/api/security/findings/{ids['shell']}/acknowledge", headers=CSRF, json={"note": "pentest"})
-    items = client.get("/api/security/activity?days=7").json()
+    # the feed now holds every login, sign-in and SM-Watch action too: read each kind of event through its category
+    items = [i for c in ("threats", "alerts", "scans", "smwatch") for i in client.get(f"/api/security/activity?days=7&limit=1000&category={c}").json()]
+    items.sort(key=lambda i: i["at"], reverse=True)
     mine = [i for i in items if (i.get("server") or {}).get("id") in (ids["a"], ids["b"]) or "timeline-k8s" in i["title"]]
     kinds = {(i["type"], i.get("finding_id")) for i in mine}
     assert ("found", ids["shell"]) in kinds and ("acknowledged", ids["shell"]) in kinds and ("resolved", ids["old"]) in kinds

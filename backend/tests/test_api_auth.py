@@ -36,6 +36,8 @@ def fresh_stats_cache():
             forget_days(db)
             from app.models import AppSetting
             db.query(AppSetting).filter(AppSetting.key == secalerts.KEY).delete()   # security alert settings saved by a test
+            from app.models import AlertEvent       # zero-trust alerts queued by earlier tests' actions: never delivered by a later test's worker pass
+            db.query(AlertEvent).filter(AlertEvent.target_type == "system", AlertEvent.sent.is_(False)).update({"delivery_attempts": 10}, synchronize_session=False)
             db.commit()
         clear_cache()
         secalerts.forget()
